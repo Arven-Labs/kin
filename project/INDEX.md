@@ -1,6 +1,6 @@
 # Kin — Estado do Projeto
 
-> Última atualização: 2026-10-06 (Sessão 3 — D7 identidade com provedores; Sessão 2 — estudo de prior art concluído, `STUDY.md`; Fase 0 concluída: D1–D5 decididas, só D6 em aberto). Sessão 1 (2026-09-27 — projeto criado a partir da spec original
+> Última atualização: 2026-10-29 (Sessão 4 — template de PR e guard de arquivos privados, padrão do workspace; Sessão 3 — D7 identidade com provedores; Sessão 2 — estudo de prior art concluído, `STUDY.md`; Fase 0 concluída: D1–D5 decididas, só D6 em aberto). Sessão 1 (2026-09-27 — projeto criado a partir da spec original
 > `SPEC-rede-comunicacao-p2p.md`, cujo conteúdo foi distribuído nestes arquivos e o arquivo
 > removido). **Status: pré-projeto** — ideia registrada, ainda não iniciado; entra na fila do
 > ecossistema depois dos projetos em andamento.

@@ -2,7 +2,7 @@
 
 > **Nota**: Este log foi criado junto com o projeto. As sessões serão registradas aqui conforme o trabalho avança.
 >
-> Última atualização: 2026-10-06 (Sessão 2)
+> Última atualização: 2026-10-29 (Sessão 4)
 
 ---
 
@@ -208,3 +208,12 @@
 - **Próximo passo**: Fase 3 (mailbox/offline). Antes de distribuir: teste manual entre redes reais, QUIC no
   laboratório (P17a), P16/P18, P13 (chave sem cifra). A Fase 2 só fecha de verdade com o teste em redes
   reais; no laboratório está provada.
+
+### 2026-10-29 — Sessão 4
+
+- **Objetivo**: o dono pediu para padronizar o fluxo entre os cinco projetos (anchor, kin, lume, truthid, warden) e "alinhar o máximo de coisas possíveis". Fonte das peças: pasta `padrao/` do repo `masterlxz/workspace` (privado), ADR 0005 de lá.
+- **Decisões do dono**: ruleset `protect-main` igual em todos (PR com 0 aprovações, check `guard` obrigatório, sem force push, sem apagar a `main`, admin só via PR); `guard` genérico; template de PR do warden; secret scanning, push protection e alertas do Dependabot ligados; logs de sessão não são reordenados; CI de testes por stack fica para outra rodada.
+- **Achado**: o local estava 19 commits atrás do remoto; o `kin` já tem código (workspace Rust, Fases 1 e 2) e **nenhuma proteção na `main`** nem CI. O levantamento tinha tratado o kin como "sem código" por causa disso; corrigido antes de mexer. O repositório também **mudou de dono**: `masterlxz/kin` virou `Arven-Labs/kin` (o GitHub redireciona; o `origin` local foi corrigido).
+- **Feito** (PR #1, `chore/padrao-fluxo`): `.github/pull_request_template.md` e `.github/workflows/ci-private-files.yml` (job `guard`: barra segredo, chave e credencial rastreados). Nenhum código tocado.
+- **Fica**: depois do merge e do `guard` verde na `main`, ligar o ruleset, os recursos de segurança e o `delete_branch_on_merge` (mudança de CI/permissões: uma confirmação do dono por repositório, §4). Ligar o ruleset antes deixaria todo PR esperando um check que nunca reporta. CI de testes do workspace Rust: outra rodada.
+- **Não verificado**: CI do PR #1 (visto com `gh pr view`): `guard` verde (workflow `CI Private Files`); é o único workflow do repo. Estado `CLEAN` e `MERGEABLE`. Antes do PR, o `guard` também foi testado localmente (`padrao/test-guard.sh` no workspace, com fixtures) e contra os arquivos já rastreados do repo, sem nenhum acerto. **Ainda não verificado**: o ruleset e os recursos de segurança do GitHub, que só são ligados depois do merge.
