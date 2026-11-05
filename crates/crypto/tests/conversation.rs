@@ -176,6 +176,57 @@ fn message_from_a_future_epoch_is_reported_until_the_commit_arrives() {
 }
 
 #[test]
+fn only_the_creator_of_the_conversation_is_the_committer() {
+    let (_, _, c_ana, c_bia) = pair();
+    assert!(c_ana.is_committer());
+    assert!(!c_bia.is_committer());
+}
+
+#[test]
+fn a_non_committer_cannot_issue_commits() {
+    let (_, _, c_ana, mut c_bia) = pair();
+    let before = c_bia.epoch();
+    assert!(matches!(c_bia.rotate_keys(), Err(Error::NotCommitter)));
+    assert!(matches!(c_bia.commit_pending(), Err(Error::NotCommitter)));
+    assert_eq!(c_bia.epoch(), before);
+    assert_eq!(c_ana.epoch(), before);
+}
+
+#[test]
+fn a_non_committer_rotates_its_key_through_a_proposal_the_committer_commits() {
+    let (_, _, mut c_ana, mut c_bia) = pair();
+    let before = c_ana.epoch();
+
+    let proposal = c_bia.propose_rotation().unwrap();
+    assert_eq!(c_ana.decrypt(&proposal).unwrap(), Decrypted::ProposalQueued);
+    assert_eq!(c_ana.epoch(), before, "proposta sozinha não muda a época");
+
+    let commit = c_ana.commit_pending().unwrap();
+    assert_eq!(c_bia.decrypt(&commit).unwrap(), Decrypted::EpochChanged);
+    assert_eq!((c_ana.epoch(), c_bia.epoch()), (before + 1, before + 1));
+
+    let wire = c_bia.encrypt(b"depois da proposta").unwrap();
+    assert_eq!(text(c_ana.decrypt(&wire).unwrap()), b"depois da proposta");
+    let wire = c_ana.encrypt(b"e de volta").unwrap();
+    assert_eq!(text(c_bia.decrypt(&wire).unwrap()), b"e de volta");
+}
+
+#[test]
+fn a_proposal_delivered_twice_still_yields_a_single_epoch_step() {
+    let (_, _, mut c_ana, mut c_bia) = pair();
+    let before = c_ana.epoch();
+
+    let proposal = c_bia.propose_rotation().unwrap();
+    c_ana.decrypt(&proposal).unwrap();
+    // Reentrega (at-least-once): ou é ignorada ou vira Duplicate, mas não pode duplicar a proposta.
+    let _ = c_ana.decrypt(&proposal);
+
+    let commit = c_ana.commit_pending().unwrap();
+    c_bia.decrypt(&commit).unwrap();
+    assert_eq!((c_ana.epoch(), c_bia.epoch()), (before + 1, before + 1));
+}
+
+#[test]
 fn welcome_is_useless_to_a_device_it_was_not_made_for() {
     let (ana, bia) = (person(), person());
     let intruder = person();

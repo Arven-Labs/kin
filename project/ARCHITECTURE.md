@@ -106,7 +106,8 @@ construir sobre ele.
   mostrada é a de quem está na linha.
 - **Épocas/ordem (P9)**: `max_past_epochs = 3`, tolerância fora de ordem 10 gerações, avanço máx. 2000.
   Erros tipados: `Duplicate`, `TooOld`, `UnknownEpoch`, `WrongConversation`. Com 2 membros, só um lado
-  deve emitir commits por vez; commits concorrentes **não** têm resolução automática no MLS.
+  deve emitir commits por vez; commits concorrentes **não** têm resolução automática no MLS
+  (resolvido para 1:1 por committer designado: `project/adr/0001-ordenacao-de-commits-sem-delivery-service.md`).
 - Estado do grupo e chaves só em memória (`MemoryStorage`); ver P14.
 
 **Reabrir se**: o spike mostrar que ordenação de commits sem servidor é inviável ou frágil em P2P;

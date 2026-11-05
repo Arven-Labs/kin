@@ -332,6 +332,9 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
             let id = message.map_or_else(|| "handshake".into(), |m| short(&m));
             println!("(falha no envio {id}: {reason})");
         }
+        ChatEvent::Stale { peer } => {
+            println!("(conversa com {peer} divergiu: faltam commits que não chegaram)");
+        }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
     }
 }
