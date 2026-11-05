@@ -29,7 +29,7 @@ TruthID e o consome — não é um módulo de comunicação dentro do TruthID (i
 ```
 Fase 1 — Identidade local + conexão direta + chat 1:1 E2EE    [x] Feita (falta teste em redes reais)
 Fase 2 — Hole punching + relay + convite por QR/link          [x] Feita no laboratório de NAT (falta teste em redes reais)
-Fase 3 — Store-and-forward (mailbox) + multi-device           [ ] Pendente
+Fase 3 — Store-and-forward (mailbox) + multi-device           [~] Em andamento (3.2 outbox feita; falta 3.1, 3.3–3.5)
 Fase 4 — Overlay: gossip + DHT + app-relay com limites        [ ] Pendente
 Fase 5 — Grupos/canais, arquivos, presença, notificações      [ ] Pendente
 Fase 6 — Chamadas WebRTC + TURN opt-in; relay empacotado      [ ] Pendente

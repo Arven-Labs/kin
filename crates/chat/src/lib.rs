@@ -7,6 +7,7 @@ mod chat;
 mod error;
 mod invite;
 mod message;
+mod outbox;
 mod wire;
 
 pub use chat::{Chat, ChatEvent};

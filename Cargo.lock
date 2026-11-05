@@ -1865,6 +1865,7 @@ dependencies = [
  "kin-identity",
  "kin-transport",
  "rand 0.9.5",
+ "rusqlite",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

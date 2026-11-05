@@ -61,7 +61,7 @@ direta.
 
 **Etapas** (preliminares):
 - [ ] 3.1 — Abstração de transporte de mailbox (trocar o backend sem mexer no resto)
-- [ ] 3.2 — Outbox local (entrega na janela simultânea)
+- [x] 3.2 — Outbox local (entrega na janela simultânea) — Sessão 6, ADR 0002
 - [ ] 3.3 — Backend de mailbox de fallback: relays Nostr (NIP-17/59, conforme D1)
 - [ ] 3.4 — Replicação em N mailboxes com TTL
 - [ ] 3.5 — Multi-device (vários devices por identidade, sincronização)

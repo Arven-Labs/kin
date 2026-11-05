@@ -6,6 +6,7 @@ use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Ex
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider};
 use kin_transport::{Multiaddr, NatStatus, Node, NodeConfig, NodeEvent, PeerId, SendId};
 
+use crate::outbox::Outbox;
 use crate::wire::Envelope;
 use crate::{Error, Invite, Message, MessageId};
 
@@ -54,6 +55,12 @@ pub enum ChatEvent {
         sender: IdentityId,
         message: Message,
     },
+    /// A mensagem está na outbox esperando o peer: ele está offline ou o envio falhou. Sai sozinha
+    /// quando ele conectar.
+    Queued {
+        peer: PeerId,
+        message: MessageId,
+    },
     /// O peer confirmou o recebimento.
     Delivered {
         peer: PeerId,
@@ -80,6 +87,14 @@ pub enum ChatEvent {
 /// Quantas mensagens de época futura se guardam por peer à espera do commit (P9).
 const FUTURE_LIMIT: usize = 32;
 
+/// Quantas mensagens da outbox podem estar em voo (sem ack) por peer. É 1 de propósito: envios em
+/// paralelo seguem por substreams diferentes e a rede não garante qual chega primeiro, então o
+/// destinatário veria "dois" antes de "um". Um por vez garante a ordem (custo: uma ida e volta por
+/// mensagem ao esvaziar a fila). Pode subir quando a mensagem tiver número de sequência. Qualquer
+/// valor deve ficar abaixo das 10 gerações fora de ordem que o MLS tolera, ou a rajada embaralhada
+/// viraria `TooOld`, ignorado em silêncio.
+const SEND_WINDOW: usize = 1;
+
 /// Chat 1:1: liga o transporte (`kin-transport`) à conversa cifrada (`kin-crypto`).
 ///
 /// Uma conversa por peer; persistente com [`Chat::open`], em memória com [`Chat::new`]. O
@@ -94,6 +109,12 @@ pub struct Chat {
     expected: HashMap<PeerId, IdentityId>,
     /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
     future: HashMap<PeerId, Vec<Vec<u8>>>,
+    /// Fila de saída e ids já vistos (3.2); persistente em `open`, em memória em `new`.
+    outbox: Outbox,
+    /// Peers com ao menos uma conexão de rede aberta (`PeerConnected` até `PeerDisconnected`).
+    connected: std::collections::HashSet<PeerId>,
+    /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
+    in_flight: HashMap<PeerId, std::collections::HashSet<MessageId>>,
     /// Eventos já produzidos mas ainda não entregues, em ordem.
     queue: std::collections::VecDeque<ChatEvent>,
 }
@@ -107,7 +128,7 @@ impl Chat {
         config: NodeConfig,
     ) -> Result<Self, Error> {
         let device = CryptoDevice::new(identity, &device_key.public_key(), now_secs())?;
-        Self::with_device(device, device_key, config)
+        Self::with_device(device, device_key, config, Outbox::memory()?)
     }
 
     /// Chat persistente: o estado MLS e a lista de conversas ficam no banco SQLite `db`. Ao
@@ -119,7 +140,9 @@ impl Chat {
         db: &Path,
     ) -> Result<Self, Error> {
         let device = CryptoDevice::open(identity, &device_key.public_key(), db, now_secs())?;
-        let mut chat = Self::with_device(device, device_key, config)?;
+        // A outbox fica num arquivo ao lado do banco do `crypto` (`a.db` → `a.outbox.db`).
+        let outbox = Outbox::open(&db.with_extension("outbox.db"))?;
+        let mut chat = Self::with_device(device, device_key, config, outbox)?;
         for (label, id) in chat.device.remembered()? {
             // Rótulo ou conversa que não carregam mais são ignorados: o handshake refaz.
             let Ok(peer) = label.parse::<PeerId>() else {
@@ -139,6 +162,7 @@ impl Chat {
         device: CryptoDevice,
         device_key: &DeviceKey,
         config: NodeConfig,
+        outbox: Outbox,
     ) -> Result<Self, Error> {
         Ok(Self {
             node: Node::new(device_key.keypair().clone(), config)?,
@@ -147,6 +171,9 @@ impl Chat {
             pending: HashMap::new(),
             expected: HashMap::new(),
             future: HashMap::new(),
+            outbox,
+            connected: Default::default(),
+            in_flight: HashMap::new(),
             queue: Default::default(),
         })
     }
@@ -202,28 +229,83 @@ impl Chat {
         Ok(self.node.dial_peer(peer, invite.addrs().to_vec())?)
     }
 
+    /// Quantas mensagens esperam na outbox por este peer (ainda sem confirmação de entrega).
+    pub fn queued(&self, peer: &PeerId) -> usize {
+        self.outbox.entries(peer).map_or(0, |entries| entries.len())
+    }
+
     /// Há conversa E2EE pronta com o peer?
     pub fn is_ready(&self, peer: &PeerId) -> bool {
         self.conversations.contains_key(peer)
     }
 
-    /// Cifra e envia `text` ao peer; `parent` faz a mensagem responder a outra (thread). A entrega
-    /// chega depois como [`ChatEvent::Delivered`] ou [`ChatEvent::SendFailed`].
+    /// Põe `text` na outbox do peer e tenta enviar; `parent` faz a mensagem responder a outra
+    /// (thread). A mensagem só é cifrada na hora de sair. Se o peer está offline, a janela está cheia
+    /// ou o envio falha, chega [`ChatEvent::Queued`] e ela sai sozinha quando der; a entrega chega
+    /// depois como [`ChatEvent::Delivered`].
     pub fn send(
         &mut self,
         peer: PeerId,
         text: impl Into<String>,
         parent: Option<MessageId>,
     ) -> Result<MessageId, Error> {
-        let conversation = self
-            .conversations
-            .get_mut(&peer)
-            .ok_or(Error::NoConversation(peer))?;
+        if !self.conversations.contains_key(&peer) {
+            return Err(Error::NoConversation(peer));
+        }
         let message = Message::new(text.into(), parent);
-        let wire = conversation.encrypt(&message.encode())?;
-        let id = self.node.send(peer, Envelope::Mls(wire).encode());
-        self.pending.insert(id, Some(message.id));
+        self.outbox.enqueue(&peer, &message)?;
+        self.flush(peer);
+        if !self.is_in_flight(&peer, &message.id) {
+            self.queue.push_back(ChatEvent::Queued {
+                peer,
+                message: message.id,
+            });
+        }
         Ok(message.id)
+    }
+
+    fn leave_flight(&mut self, peer: PeerId, message: &MessageId) {
+        if let Some(flying) = self.in_flight.get_mut(&peer) {
+            flying.remove(message);
+        }
+    }
+
+    fn is_in_flight(&self, peer: &PeerId, message: &MessageId) -> bool {
+        self.in_flight
+            .get(peer)
+            .is_some_and(|flying| flying.contains(message))
+    }
+
+    /// Envia o que está na outbox do peer, do mais antigo ao mais novo, até encher a janela
+    /// ([`SEND_WINDOW`]). Sem conexão, não faz nada. Cada mensagem é cifrada agora, então uma nova
+    /// tentativa sai com bytes diferentes; quem recebe deduplica pelo `MessageId`.
+    fn flush(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) {
+            return;
+        }
+        let entries = match self.outbox.entries(&peer) {
+            Ok(entries) => entries,
+            Err(e) => return self.drop_message(peer, e),
+        };
+        for message in entries {
+            let flying = self.in_flight.entry(peer).or_default();
+            if flying.len() >= SEND_WINDOW {
+                break;
+            }
+            if flying.contains(&message.id) {
+                continue;
+            }
+            let Some(conversation) = self.conversations.get_mut(&peer) else {
+                return;
+            };
+            let wire = match conversation.encrypt(&message.encode()) {
+                Ok(wire) => wire,
+                Err(e) => return self.drop_message(peer, e.into()),
+            };
+            let id = self.node.send(peer, Envelope::Mls(wire).encode());
+            self.pending.insert(id, Some(message.id));
+            self.in_flight.entry(peer).or_default().insert(message.id);
+        }
     }
 
     /// Avança o chat até o próximo evento relevante para a aplicação.
@@ -241,11 +323,14 @@ impl Chat {
         match event {
             NodeEvent::Listening(addr) => self.queue.push_back(ChatEvent::Listening(addr)),
             NodeEvent::PeerConnected(peer) => {
+                self.connected.insert(peer);
                 self.queue.push_back(ChatEvent::PeerConnected(peer));
                 self.announce_if_ready(peer);
                 self.transmit(peer, &Envelope::Hello);
+                self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
+                self.connected.remove(&peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
             }
             NodeEvent::MessageReceived { peer, data } => match Envelope::decode(&data) {
@@ -254,16 +339,29 @@ impl Chat {
             },
             NodeEvent::MessageDelivered { peer, id } => {
                 if let Some(Some(message)) = self.pending.remove(&id) {
+                    // O ack fecha o ciclo: sai da fila e libera uma vaga na janela.
+                    self.leave_flight(peer, &message);
+                    if let Err(e) = self.outbox.remove(&message) {
+                        self.drop_message(peer, e);
+                    }
                     self.queue.push_back(ChatEvent::Delivered { peer, message });
+                    self.flush(peer);
                 }
             }
             NodeEvent::SendFailed { peer, id, reason } => {
-                let message = self.pending.remove(&id).flatten();
-                self.queue.push_back(ChatEvent::SendFailed {
-                    peer,
-                    message,
-                    reason,
-                });
+                match self.pending.remove(&id).flatten() {
+                    // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
+                    Some(message) => {
+                        self.leave_flight(peer, &message);
+                        self.queue.push_back(ChatEvent::Queued { peer, message });
+                    }
+                    // Handshake: sem outbox, quem decide é a aplicação.
+                    None => self.queue.push_back(ChatEvent::SendFailed {
+                        peer,
+                        message: None,
+                        reason,
+                    }),
+                }
             }
             NodeEvent::PeerRoute { peer, relayed } => {
                 self.queue.push_back(ChatEvent::Route { peer, relayed });
@@ -343,6 +441,8 @@ impl Chat {
         self.conversations.insert(peer, conversation);
         self.expected.remove(&peer);
         self.announce_if_ready(peer);
+        // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.
+        self.flush(peer);
         Ok(())
     }
 
@@ -367,6 +467,11 @@ impl Chat {
         match conversation.decrypt(wire) {
             Ok(Decrypted::Message { sender, plaintext }) => {
                 let message = Message::decode(&plaintext)?;
+                // Nova tentativa do remetente = outros bytes cifrados, o MLS não vê repetição;
+                // quem identifica a mesma mensagem é o `MessageId`.
+                if !self.outbox.mark_seen(&peer, &message.id)? {
+                    return Ok(());
+                }
                 self.queue.push_back(ChatEvent::Received {
                     peer,
                     sender,
@@ -440,6 +545,7 @@ mod tests {
     use kin_identity::StandaloneIdentity;
 
     use super::*;
+    use crate::outbox::SEEN_LIMIT;
 
     fn chat(identity: &StandaloneIdentity, device: &DeviceKey) -> Chat {
         Chat::new(
@@ -568,6 +674,138 @@ mod tests {
 
         bia.on_mls(ana_peer, &commit).unwrap();
         assert!(received_texts(&events(&mut bia)).is_empty());
+    }
+
+    fn in_flight(chat: &Chat) -> usize {
+        chat.pending.values().filter(|m| m.is_some()).count()
+    }
+
+    fn first_in_flight(chat: &Chat) -> SendId {
+        *chat.pending.iter().find(|(_, m)| m.is_some()).unwrap().0
+    }
+
+    /// 3.2: mensagem para peer desconectado vai para a fila, não falha.
+    #[tokio::test]
+    async fn sending_to_a_disconnected_peer_queues_the_message() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let id = bia.send(ana_peer, "oi", None).unwrap();
+
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::Queued {
+                peer: ana_peer,
+                message: id
+            }]
+        );
+        assert_eq!(bia.queued(&ana_peer), 1);
+        assert_eq!(in_flight(&bia), 0, "nada sai sem conexão");
+    }
+
+    /// 3.2: ao conectar, a fila começa a sair (uma por vez, ver `SEND_WINDOW`).
+    #[tokio::test]
+    async fn queued_messages_go_out_when_the_peer_connects() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        for text in ["um", "dois", "tres"] {
+            bia.send(ana_peer, text, None).unwrap();
+        }
+
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        assert_eq!(in_flight(&bia), SEND_WINDOW);
+        assert_eq!(bia.queued(&ana_peer), 3, "só sai da fila com o ack");
+    }
+
+    /// 3.2: no máximo `SEND_WINDOW` em voo; o ack de uma libera a próxima.
+    #[tokio::test]
+    async fn the_send_window_limits_messages_in_flight() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        for i in 0..20 {
+            bia.send(ana_peer, i.to_string(), None).unwrap();
+        }
+        assert_eq!(in_flight(&bia), SEND_WINDOW);
+        assert_eq!(bia.queued(&ana_peer), 20);
+
+        let id = first_in_flight(&bia);
+        events(&mut bia);
+        bia.handle(NodeEvent::MessageDelivered { peer: ana_peer, id });
+        assert!(
+            events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. }))
+        );
+        assert_eq!(bia.queued(&ana_peer), 19);
+        assert_eq!(in_flight(&bia), SEND_WINDOW, "o ack liberou outra");
+    }
+
+    /// 3.2: a ordem da fila é respeitada: o ack de uma libera exatamente a próxima mais antiga.
+    #[tokio::test]
+    async fn the_queue_drains_oldest_first_one_at_a_time() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let ids: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|t| bia.send(ana_peer, t, None).unwrap())
+            .collect();
+
+        for (i, expected) in ids.iter().enumerate() {
+            let flying: Vec<_> = bia.in_flight[&ana_peer].iter().copied().collect();
+            assert_eq!(flying, [*expected], "passo {i}");
+            let id = first_in_flight(&bia);
+            bia.handle(NodeEvent::MessageDelivered { peer: ana_peer, id });
+        }
+        assert_eq!(bia.queued(&ana_peer), 0);
+    }
+
+    /// 3.2: falha de envio não perde a mensagem: ela volta a esperar.
+    #[tokio::test]
+    async fn a_failed_send_keeps_the_message_queued() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let message = bia.send(ana_peer, "tentando", None).unwrap();
+        events(&mut bia);
+
+        let id = first_in_flight(&bia);
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id,
+            reason: "sem rota".into(),
+        });
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::Queued {
+                peer: ana_peer,
+                message
+            }]
+        );
+        assert_eq!(bia.queued(&ana_peer), 1);
+        assert_eq!(in_flight(&bia), 0);
+    }
+
+    /// 3.2: a mesma mensagem re-cifrada (nova tentativa) chega com bytes diferentes e aparece uma vez.
+    #[tokio::test]
+    async fn the_same_message_encrypted_twice_is_shown_once() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let message = Message::new("repetida".into(), None);
+        let (first, second) = (
+            ana.encrypt(&message.encode()).unwrap(),
+            ana.encrypt(&message.encode()).unwrap(),
+        );
+        assert_ne!(first, second, "o MLS não reconheceria como repetição");
+
+        bia.on_mls(ana_peer, &first).unwrap();
+        bia.on_mls(ana_peer, &second).unwrap();
+        assert_eq!(received_texts(&events(&mut bia)), ["repetida"]);
+    }
+
+    /// 3.2: a memória de ids vistos tem teto por peer.
+    #[tokio::test]
+    async fn seen_ids_are_bounded_per_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        for i in 0..SEEN_LIMIT + 5 {
+            bia.on_mls(ana_peer, &wire(&mut ana, &i.to_string()))
+                .unwrap();
+        }
+        assert_eq!(bia.outbox.seen_count(&ana_peer).unwrap(), SEEN_LIMIT);
     }
 
     /// P15: o KeyPackage legítimo de Bia, entregue por outro Peer ID, não vira conversa.

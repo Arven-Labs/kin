@@ -4,7 +4,7 @@
 > Toda pendência encontrada em qualquer arquivo do projeto deve ser registrada aqui com um ID único.
 > Ao resolver uma, marcar como `✅ Resolvida` com a sessão em que foi corrigida.
 >
-> Última atualização: 2026-11-05 (Sessão 5)
+> Última atualização: 2026-11-05 (Sessão 6)
 
 ---
 
@@ -22,6 +22,8 @@
 | P16 | **Re-handshake após perda de estado** — se um lado perde o banco (ou reinstala), o outro continua com a conversa antiga: `on_hello`/`on_welcome` ignoram quem já tem conversa, o handshake não se refaz, o remetente recebe `Delivered` (ack de transporte) mas o destino só emite `Dropped`, e quem tem o estado ainda reanuncia `ConversationReady`. Precisa de um jeito de detectar conversa divergente (ex.: reset assinado / nova conversa que substitui a antiga, ligado a P9) | Fase 1.7 (Sessão 3) | Média (antes de distribuir o app; teste `peer_that_lost_its_database_is_not_rehandshaked_yet` documenta o estado atual) |
 | P17 | **Conectividade: o que a Fase 2 deixou de fora** — (a) o laboratório (`lab/`) só exercita TCP: o relay escuta só TCP, então o hole punching por QUIC/UDP (melhor taxa real) não foi validado; (b) o relay não tem limites por peer além dos padrões do libp2p nem proteção contra abuso de reservas; (c) a reserva no relay é pedida na hora, mesmo se o AutoNAT disser que o nó é público; (d) não há relay público embutido nem descoberta de relays pela rede (hoje a lista vem da configuração); o ranking é efêmero, não persiste entre execuções; (e) DCUtR mede ~70% no mundo real, só NAT cone/simétrico sintéticos foram testados. *Resolvidos na rodada 2: reserva que cai (failover) e dial de circuito antes da reserva.* | Fase 2 (Sessão 3) | Média (antes de distribuir) |
 | P18 | **Convite: expiração, revogação e privacidade** — o link não expira nem pode ser revogado (quem o tem, conversa, para sempre); vaza os endereços públicos de quem o gera; quando o convidado recusa por identidade, quem não exigiu nada (o convidante) pode ficar com uma conversa de um lado só (mesma família do P16); sem confirmação do convidante para aceitar a entrada | Fase 2.4 (Sessão 3) | Média (junto de P11) |
+| P19 | **Reenvio periódico da outbox** — hoje a mensagem só tenta de novo quando o peer conecta de novo ou quando um ack libera a fila. Se o envio falhar com a conexão ainda aberta (ex.: timeout de stream), ela fica parada até a próxima conexão. Precisa de temporizador com espera crescente | Fase 3.2 (Sessão 6, ADR 0002) | Média (antes de distribuir) |
+| P20 | **Número de sequência por remetente no formato da mensagem (v2)** — hoje a ordem na fila vem de enviar um por vez (`SEND_WINDOW = 1`); sem sequência não dá para paralelizar nem ordenar na interface (`sent_at_ms` empata). Também resolveria detectar lacunas | Fase 3.2 (Sessão 6, ADR 0002) | Baixa (quando a fila grande ficar lenta ou na interface) |
 | P6 | **D6 — Privacidade de metadados** — quanto entra no MVP vs Fase 7 | Spec original (Sessão 1) | Baixa |
 | P7 | **Nome definitivo** — `Kin` é provisório/"meio fixo"; pode mudar | Sessão 1 | Baixa |
 
