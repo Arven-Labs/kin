@@ -88,9 +88,10 @@ async fn chats_find_each_other_via_mdns_and_talk() {
     exchange(&mut a, &mut b, pb.peer_id(), pa.peer_id(), "mdns").await;
 }
 
-/// 2. Sem outbox (D1/Fase 3), enviar a um peer que caiu falha com `SendFailed`, nunca `Delivered`.
+/// 2. Com a outbox (3.2), enviar a um peer que caiu deixa a mensagem na fila (`Queued`), nunca
+/// `Delivered`, e não a perde.
 #[tokio::test(flavor = "multi_thread")]
-async fn send_to_offline_peer_fails_with_send_failed() {
+async fn send_to_offline_peer_is_queued_not_lost() {
     let dir = tempfile::tempdir().unwrap();
     let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
     let (mut a, mut b) = (pa.open(), pb.open());
@@ -99,17 +100,19 @@ async fn send_to_offline_peer_fails_with_send_failed() {
     drop(b);
     // Ainda há conversa (ela vem do banco), então o envio é aceito e só falha na rede.
     let sent = a.send(pb.peer_id(), "ninguém ouve", None).unwrap();
-    let failed = timeout(
+    let queued = timeout(
         WAIT,
         wait_for(&mut a, |e| match e {
             ChatEvent::Delivered { .. } => panic!("entregue a um peer offline"),
-            ChatEvent::SendFailed { message, .. } => Some(message),
+            ChatEvent::SendFailed { .. } => panic!("a mensagem não pode ser dada como perdida"),
+            ChatEvent::Queued { message, .. } => Some(message),
             _ => None,
         }),
     )
     .await
-    .expect("o envio não falhou");
-    assert_eq!(failed, Some(sent));
+    .expect("a mensagem não foi para a fila");
+    assert_eq!(queued, sent);
+    assert_eq!(a.queued(&pb.peer_id()), 1);
 }
 
 /// 3. O peer que discou cai e volta (outra porta, mesmo banco); quem ficou rodando segue de onde parou.

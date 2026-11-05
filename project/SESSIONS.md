@@ -2,7 +2,7 @@
 
 > **Nota**: Este log foi criado junto com o projeto. As sessões serão registradas aqui conforme o trabalho avança.
 >
-> Última atualização: 2026-11-05 (Sessão 5)
+> Última atualização: 2026-11-05 (Sessão 6)
 
 ---
 
@@ -246,3 +246,28 @@
   com banco SQLite reaberto (`Chat::open`); teto de 32 sem medição com mailbox real.
 - **Próximo passo**: Fase 3 (mailbox/offline). P9 segue aberto para multi-device (3.5) e grupos; P16 recebe a
   recuperação depois de `Stale`.
+
+---
+
+### 2026-11-05 — Sessão 6
+
+- **Objetivo**: Fase 3, etapa 3.2 (outbox local). Plano em dois PRs: este (outbox) e depois 3.1 (trait de
+  mailbox + backend em memória).
+- **Decisões do dono**: escopo "3.1 + 3.2 juntos" em dois PRs; outbox guarda o texto **em claro** e cifra ao
+  enviar; **um envio por vez** (janela 1) para garantir a ordem; aceitou sem reenvio periódico (P19) e o
+  esquecimento de ids vistos depois de 1024 por peer. Aprovou os testes pela tabela e o ADR 0002.
+- **Feito** (branch `fase3-outbox`):
+  - `chat/src/outbox.rs`: SQLite próprio (`<banco>.outbox.db`, 0600) com a fila e os ids vistos.
+  - `chat`: `send` enfileira e tenta enviar; sai ao conectar e ao ficar pronta a conversa; ack apaga da fila;
+    falha de envio mantém na fila (`ChatEvent::Queued`); o receptor deduplica por `MessageId`. `cli` trata `Queued`.
+  - ADR 0002; P19 e P20 em `PENDING.md`; 3.2 marcada em `PHASE.md`; Fase 3 "em andamento" em `OVERVIEW.md`.
+- **Achados**: (1) o teste de ponta a ponta que eu escrevi prometia "na ordem", mas com janela de 8 a rede
+  embaralha (`["dois","um","tres"]` na rodada 142 de 150); o erro foi do meu teste/desenho, achado repetindo o
+  teste em laço. Corrigido com janela 1 (0 falhas em 100 rodadas depois); (2) re-cifrar a cada tentativa gera
+  bytes diferentes, então só o `MessageId` identifica a repetição.
+- **Verificado (local)**: `cargo test --workspace` 86 passando, 0 falhando; `clippy` sem avisos; `fmt` ok.
+  Mutações (janela `>=`→`>`, dedupe desligada, ack sem apagar da fila, erro de um no teto de ids vistos): todas
+  pegas e revertidas.
+- **Não verificado**: rede real entre máquinas; custo de esvaziar fila grande (uma ida e volta por mensagem);
+  permissão 0600 do `outbox.db` sem teste; reenvio quando o envio falha com a conexão aberta (P19).
+- **Próximo passo**: PR 2 (3.1): trait de mailbox + backend em memória + `ChatEvent::Deposited`.

@@ -17,4 +17,13 @@ pub enum Error {
     /// Bytes que não seguem o formato do Kin.
     #[error("mensagem malformada")]
     Malformed,
+    /// Falha no banco da outbox.
+    #[error("armazenamento: {0}")]
+    Storage(String),
+}
+
+impl Error {
+    pub(crate) fn storage(e: impl std::fmt::Display) -> Self {
+        Self::Storage(e.to_string())
+    }
 }
