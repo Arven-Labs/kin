@@ -29,6 +29,9 @@ pub enum Error {
     /// O Welcome não foi feito para nenhum KeyPackage deste device.
     #[error("welcome não é para este device")]
     NotForThisDevice,
+    /// Só o committer da conversa emite commits (P9); os demais propõem.
+    #[error("só o committer da conversa pode emitir commits")]
+    NotCommitter,
     /// Mensagem MLS que o Kin ainda não trata (propostas soltas, etc.).
     #[error("tipo de mensagem não suportado")]
     Unsupported,

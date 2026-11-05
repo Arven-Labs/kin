@@ -2,7 +2,7 @@ use kin_identity::{IdentityId, PeerId};
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{
     GroupId, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
-    ProcessedMessageContent, ProtocolVersion, SenderRatchetConfiguration, StagedWelcome,
+    ProcessedMessageContent, Proposal, ProtocolVersion, SenderRatchetConfiguration, StagedWelcome,
 };
 
 use openmls_traits::OpenMlsProvider as _;
@@ -58,6 +58,8 @@ pub enum Decrypted {
     },
     /// Era um commit; a conversa avançou de época.
     EpochChanged,
+    /// Era uma proposta de outro membro; fica guardada até o committer emitir o commit (P9).
+    ProposalQueued,
 }
 
 /// Conversa E2EE (grupo MLS). Só um dos lados deve emitir commits por vez (P9).
@@ -200,9 +202,54 @@ impl Conversation {
         })
     }
 
+    /// Este device é o committer da conversa (P9)? Só ele emite commits.
+    ///
+    /// O committer é o membro de menor índice de folha: em 1:1, quem criou a conversa. A regra é
+    /// determinística e igual em todos os devices, então ninguém precisa combinar nada pela rede.
+    pub fn is_committer(&self) -> bool {
+        let own = self.group.own_leaf_index();
+        self.group.members().all(|m| m.index >= own)
+    }
+
+    /// Propõe renovar a chave deste membro (Update proposal). Qualquer membro pode; quem efetiva é o
+    /// committer, com [`Self::commit_pending`].
+    pub fn propose_rotation(&mut self) -> Result<Vec<u8>, Error> {
+        let inner = &self.device.0;
+        let (proposal, _) = self
+            .group
+            .propose_self_update(
+                &inner.provider,
+                &inner.signer,
+                openmls::prelude::LeafNodeParameters::default(),
+            )
+            .map_err(Error::mls)?;
+        proposal.to_bytes().map_err(Error::mls)
+    }
+
+    /// Efetiva as propostas guardadas num commit para os outros membros, que o aplicam com
+    /// [`Self::decrypt`]. Só o committer (P9): sem isso, dois lados poderiam commitar da mesma época.
+    pub fn commit_pending(&mut self) -> Result<Vec<u8>, Error> {
+        if !self.is_committer() {
+            return Err(Error::NotCommitter);
+        }
+        let inner = &self.device.0;
+        let (commit, _welcome, _) = self
+            .group
+            .commit_to_pending_proposals(&inner.provider, &inner.signer)
+            .map_err(Error::mls)?;
+        self.group
+            .merge_pending_commit(&inner.provider)
+            .map_err(Error::mls)?;
+        commit.to_bytes().map_err(Error::mls)
+    }
+
     /// Renova as chaves do grupo (post-compromise security). Devolve o commit para os outros
-    /// membros, que o aplicam com [`Self::decrypt`].
+    /// membros, que o aplicam com [`Self::decrypt`]. Só o committer (P9); os demais usam
+    /// [`Self::propose_rotation`].
     pub fn rotate_keys(&mut self) -> Result<Vec<u8>, Error> {
+        if !self.is_committer() {
+            return Err(Error::NotCommitter);
+        }
         let inner = &self.device.0;
         let bundle = self
             .group
@@ -260,6 +307,16 @@ impl Conversation {
                     .merge_staged_commit(&inner.provider, *staged)
                     .map_err(Error::mls)?;
                 Ok(Decrypted::EpochChanged)
+            }
+            // Só Update: Add/Remove soltos de um peer não podem entrar na fila que o committer
+            // efetiva depois, ou o peer escolheria quem entra e quem sai da conversa.
+            ProcessedMessageContent::ProposalMessage(proposal)
+                if matches!(proposal.proposal(), Proposal::Update(_)) =>
+            {
+                self.group
+                    .store_pending_proposal(inner.provider.storage(), *proposal)
+                    .map_err(Error::mls)?;
+                Ok(Decrypted::ProposalQueued)
             }
             _ => Err(Error::Unsupported),
         }

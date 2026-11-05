@@ -2,7 +2,7 @@
 
 > **Nota**: Este log foi criado junto com o projeto. As sessões serão registradas aqui conforme o trabalho avança.
 >
-> Última atualização: 2026-10-29 (Sessão 4)
+> Última atualização: 2026-11-05 (Sessão 5)
 
 ---
 
@@ -217,3 +217,31 @@
 - **Feito** (PR #1, `chore/padrao-fluxo`): `.github/pull_request_template.md` e `.github/workflows/ci-private-files.yml` (job `guard`: barra segredo, chave e credencial rastreados). Nenhum código tocado.
 - **Fica**: depois do merge e do `guard` verde na `main`, ligar o ruleset, os recursos de segurança e o `delete_branch_on_merge` (mudança de CI/permissões: uma confirmação do dono por repositório, §4). Ligar o ruleset antes deixaria todo PR esperando um check que nunca reporta. CI de testes do workspace Rust: outra rodada.
 - **Não verificado**: CI do PR #1 (visto com `gh pr view`): `guard` verde (workflow `CI Private Files`); é o único workflow do repo. Estado `CLEAN` e `MERGEABLE`. Antes do PR, o `guard` também foi testado localmente (`padrao/test-guard.sh` no workspace, com fixtures) e contra os arquivos já rastreados do repo, sem nenhum acerto. **Ainda não verificado**: o ruleset e os recursos de segurança do GitHub, que só são ligados depois do merge.
+
+---
+
+### 2026-11-05 — Sessão 5
+
+- **Objetivo**: P9 (ordenação de commits MLS sem Delivery Service), recorte 1:1 + ADR geral.
+- **Decisões do dono**: escopo "1:1 + ADR geral" (multi-device e grupos só no ADR); concorrência por
+  **committer designado** (descartados: fork com rollback; curar por re-entrada). Aprovou os testes pela
+  tabela de comportamentos (Etapa D) e a criação do ADR e da branch.
+- **Feito** (branch `p9-committer-e-buffer`):
+  - `crypto`: `is_committer` (menor índice de folha), `propose_rotation`, `commit_pending`; `rotate_keys` e
+    `commit_pending` só do committer (`NotCommitter`); `decrypt` guarda propostas `Update`
+    (`Decrypted::ProposalQueued`) e continua recusando `Add`/`Remove` soltos.
+  - `chat`: buffer de mensagens de época futura por peer (teto 32, sem repetidas), reprocessado na ordem de
+    chegada a cada commit; estouro emite `ChatEvent::Stale` e descarta o buffer. `cli` trata o evento novo.
+  - ADR 0001 (`project/adr/`), P9 reescrito em `PENDING.md`, ponteiro em `ARCHITECTURE.md` (D2).
+- **Achados**: (1) a API de proposals do `openmls` 0.9.0 (`propose_self_update`, `store_pending_proposal`,
+  `commit_to_pending_proposals`) existia como previsto (conferida no código do crate); (2) a mutação "remover a
+  deduplicação do buffer" **não era pega** pelo teste original, porque a cópia repetida vira `Duplicate` no
+  MLS; o teste foi reescrito para exigir que reentrega não gaste vagas do teto, e a mutação passou a ser pega.
+- **Verificado (local)**: `cargo test --workspace` sem falhas (+8 testes novos; antes de implementar, 7 dos 8
+  falhavam por asserção), `cargo clippy --workspace --all-targets` sem avisos, `cargo fmt --check` ok.
+  Mutações: teto `>=`→`>` (pega), committer sempre verdadeiro (pega por 2 testes), deduplicação removida
+  (pega depois do ajuste); todas revertidas.
+- **Não verificado**: CI (o do `kin` só tem o `guard`; os testes Rust não rodam lá); fluxo proposta→commit
+  com banco SQLite reaberto (`Chat::open`); teto de 32 sem medição com mailbox real.
+- **Próximo passo**: Fase 3 (mailbox/offline). P9 segue aberto para multi-device (3.5) e grupos; P16 recebe a
+  recuperação depois de `Stale`.

@@ -65,12 +65,20 @@ pub enum ChatEvent {
         message: Option<MessageId>,
         reason: String,
     },
+    /// Chegaram mensagens demais de uma época que este device não alcança: o commit que falta
+    /// provavelmente não virá e a conversa divergiu (recuperar é P16). O buffer foi descartado.
+    Stale {
+        peer: PeerId,
+    },
     /// Algo do peer foi descartado (malformado, de outra conversa, etc.).
     Dropped {
         peer: PeerId,
         reason: String,
     },
 }
+
+/// Quantas mensagens de época futura se guardam por peer à espera do commit (P9).
+const FUTURE_LIMIT: usize = 32;
 
 /// Chat 1:1: liga o transporte (`kin-transport`) à conversa cifrada (`kin-crypto`).
 ///
@@ -84,6 +92,8 @@ pub struct Chat {
     pending: HashMap<SendId, Option<MessageId>>,
     /// Identidade exigida de cada peer discado por convite (`accept`), até a conversa ficar pronta.
     expected: HashMap<PeerId, IdentityId>,
+    /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
+    future: HashMap<PeerId, Vec<Vec<u8>>>,
     /// Eventos já produzidos mas ainda não entregues, em ordem.
     queue: std::collections::VecDeque<ChatEvent>,
 }
@@ -136,6 +146,7 @@ impl Chat {
             conversations: HashMap::new(),
             pending: HashMap::new(),
             expected: HashMap::new(),
+            future: HashMap::new(),
             queue: Default::default(),
         })
     }
@@ -363,10 +374,45 @@ impl Chat {
                 });
                 Ok(())
             }
-            Ok(Decrypted::EpochChanged) => Ok(()),
+            Ok(Decrypted::EpochChanged) => {
+                self.replay_future(peer);
+                Ok(())
+            }
+            Ok(Decrypted::ProposalQueued) => Ok(()),
+            // Chegou antes do commit que a precede (P9): guarda até o commit chegar.
+            Err(CryptoError::UnknownEpoch) => {
+                self.hold_future(peer, wire);
+                Ok(())
+            }
             // Reentrega (at-least-once) ou velha demais: seguro ignorar.
             Err(CryptoError::Duplicate | CryptoError::TooOld) => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Guarda uma mensagem de época futura, sem repetir a mesma e dentro do teto [`FUTURE_LIMIT`].
+    /// Estourar o teto significa que o commit que falta provavelmente não virá: o buffer é
+    /// descartado e a aplicação é avisada com [`ChatEvent::Stale`] (recuperar é P16).
+    fn hold_future(&mut self, peer: PeerId, wire: &[u8]) {
+        let held = self.future.entry(peer).or_default();
+        if held.iter().any(|w| w == wire) {
+            return;
+        }
+        if held.len() >= FUTURE_LIMIT {
+            self.future.remove(&peer);
+            self.queue.push_back(ChatEvent::Stale { peer });
+            return;
+        }
+        held.push(wire.to_vec());
+    }
+
+    /// Reprocessa, na ordem de chegada, o que estava esperando um commit. O que ainda for de época
+    /// futura volta para o buffer.
+    fn replay_future(&mut self, peer: PeerId) {
+        for wire in self.future.remove(&peer).unwrap_or_default() {
+            if let Err(e) = self.on_mls(peer, &wire) {
+                self.drop_message(peer, e);
+            }
         }
     }
 
@@ -405,6 +451,123 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Bia (um `Chat`) já conversa com Ana, que aqui é só a `Conversation` crua para fabricar
+    /// commits e mensagens à vontade.
+    fn bia_and_raw_ana() -> (Chat, Conversation, PeerId) {
+        let (id_a, id_b) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = (DeviceKey::generate(), DeviceKey::generate());
+        let ana_device = CryptoDevice::new(&id_a, &dev_a.public_key(), 1).unwrap();
+        let mut bia = chat(&id_b, &dev_b);
+        let mut ana = Conversation::create(&ana_device).unwrap();
+        let invite = ana
+            .invite(&bia.device.key_package().unwrap(), &Expected::default())
+            .unwrap();
+        let conversation =
+            Conversation::join(&bia.device, &invite.welcome, &Expected::default()).unwrap();
+        bia.conversations.insert(dev_a.peer_id(), conversation);
+        (bia, ana, dev_a.peer_id())
+    }
+
+    fn wire(ana: &mut Conversation, text: &str) -> Vec<u8> {
+        ana.encrypt(&Message::new(text.into(), None).encode())
+            .unwrap()
+    }
+
+    fn events(chat: &mut Chat) -> Vec<ChatEvent> {
+        chat.queue.drain(..).collect()
+    }
+
+    fn received_texts(events: &[ChatEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Received { message, .. } => Some(message.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// P9: mensagem que chega antes do commit que a precede é guardada, não perdida.
+    #[tokio::test]
+    async fn message_from_a_future_epoch_is_held_until_its_commit_arrives() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let commit = ana.rotate_keys().unwrap();
+        let (m1, m2) = (wire(&mut ana, "um"), wire(&mut ana, "dois"));
+
+        bia.on_mls(ana_peer, &m2).unwrap();
+        bia.on_mls(ana_peer, &m1).unwrap();
+        assert!(
+            events(&mut bia).is_empty(),
+            "nada some nem aparece antes do commit"
+        );
+
+        bia.on_mls(ana_peer, &commit).unwrap();
+        let after = events(&mut bia);
+        assert_eq!(
+            received_texts(&after),
+            ["dois", "um"],
+            "na ordem de chegada"
+        );
+        assert!(!after.iter().any(|e| matches!(e, ChatEvent::Dropped { .. })));
+    }
+
+    /// P9 + at-least-once: a mesma mensagem futura reentregue muitas vezes aparece uma vez só e não
+    /// gasta vagas do teto (senão reentregas legítimas disparariam `Stale`).
+    #[tokio::test]
+    async fn a_future_message_delivered_repeatedly_is_shown_once_and_takes_one_slot() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let commit = ana.rotate_keys().unwrap();
+        let early = wire(&mut ana, "uma vez");
+
+        for _ in 0..FUTURE_LIMIT + 5 {
+            bia.on_mls(ana_peer, &early).unwrap();
+        }
+        assert!(events(&mut bia).is_empty(), "repetição não vira Stale");
+
+        bia.on_mls(ana_peer, &commit).unwrap();
+        assert_eq!(received_texts(&events(&mut bia)), ["uma vez"]);
+    }
+
+    /// P9: o buffer tem teto; ao estourar, avisa `Stale` e esquece o que guardou.
+    #[tokio::test]
+    async fn the_future_buffer_is_bounded_and_reports_stale() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let commit = ana.rotate_keys().unwrap();
+
+        for i in 0..FUTURE_LIMIT {
+            bia.on_mls(ana_peer, &wire(&mut ana, &i.to_string()))
+                .unwrap();
+        }
+        assert!(events(&mut bia).is_empty());
+
+        bia.on_mls(ana_peer, &wire(&mut ana, "a gota d'água"))
+            .unwrap();
+        assert_eq!(events(&mut bia), [ChatEvent::Stale { peer: ana_peer }]);
+
+        bia.on_mls(ana_peer, &commit).unwrap();
+        assert!(received_texts(&events(&mut bia)).is_empty());
+    }
+
+    /// P9: lixo e mensagem de outra conversa continuam sendo erro, nunca vão para o buffer.
+    #[tokio::test]
+    async fn garbage_is_not_buffered() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let commit = ana.rotate_keys().unwrap();
+
+        assert!(bia.on_mls(ana_peer, b"lixo").is_err());
+        let (_, mut stranger, _) = bia_and_raw_ana();
+        assert!(
+            bia.on_mls(ana_peer, &wire(&mut stranger, "intruso"))
+                .is_err()
+        );
+
+        bia.on_mls(ana_peer, &commit).unwrap();
+        assert!(received_texts(&events(&mut bia)).is_empty());
     }
 
     /// P15: o KeyPackage legítimo de Bia, entregue por outro Peer ID, não vira conversa.
