@@ -241,7 +241,8 @@
   falhavam por asserção), `cargo clippy --workspace --all-targets` sem avisos, `cargo fmt --check` ok.
   Mutações: teto `>=`→`>` (pega), committer sempre verdadeiro (pega por 2 testes), deduplicação removida
   (pega depois do ajuste); todas revertidas.
-- **Não verificado**: CI (o do `kin` só tem o `guard`; os testes Rust não rodam lá); fluxo proposta→commit
+- **CI**: PR #2, `guard` verde (visto com `gh pr view`), `CLEAN` e `MERGEABLE`. É o único workflow do repo.
+- **Não verificado**: testes Rust no CI (não rodam lá, só localmente); fluxo proposta→commit
   com banco SQLite reaberto (`Chat::open`); teto de 32 sem medição com mailbox real.
 - **Próximo passo**: Fase 3 (mailbox/offline). P9 segue aberto para multi-device (3.5) e grupos; P16 recebe a
   recuperação depois de `Stale`.
