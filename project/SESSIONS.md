@@ -268,6 +268,7 @@
 - **Verificado (local)**: `cargo test --workspace` 86 passando, 0 falhando; `clippy` sem avisos; `fmt` ok.
   Mutações (janela `>=`→`>`, dedupe desligada, ack sem apagar da fila, erro de um no teto de ids vistos): todas
   pegas e revertidas.
-- **Não verificado**: rede real entre máquinas; custo de esvaziar fila grande (uma ida e volta por mensagem);
+- **CI**: PR #3, `guard` verde (visto com `gh pr view`), `CLEAN` e `MERGEABLE`. É o único workflow do repo.
+- **Não verificado**: testes Rust no CI (não rodam lá); rede real entre máquinas; custo de esvaziar fila grande (uma ida e volta por mensagem);
   permissão 0600 do `outbox.db` sem teste; reenvio quando o envio falha com a conexão aberta (P19).
 - **Próximo passo**: PR 2 (3.1): trait de mailbox + backend em memória + `ChatEvent::Deposited`.
