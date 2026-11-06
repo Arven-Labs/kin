@@ -79,8 +79,10 @@ real), chave de wrap e destinatário descartáveis, sem segredo. Resultado:
   porque nada foi distribuído.
 - Mais uma chave para proteger (junto de P13, chave sem cifra em repouso). Ela mora no arquivo `device.key` (agora
   versionado: byte de formato, keypair de rede, chave secreta Nostr); arquivos antigos deixam de carregar.
-- Dependência `secp256k1` 0.31.1 (libsecp256k1 em C), escolhida em vez de `k256` por não usar o `crypto-bigint`
-  0.5.5 do P22. Entrou com 9 pacotes novos no lockfile (`secp256k1-sys`, `bitcoin_hashes` e família).
+- Dependência `secp256k1` (libsecp256k1 em C), escolhida em vez de `k256` por não usar o `crypto-bigint`
+  0.5.5 do P22. Entrou com 9 pacotes novos no lockfile (`secp256k1-sys`, `bitcoin_hashes` e família). Começou em
+  0.31.1 e foi alinhada a **0.30.0** na Sessão 8 porque o crate `nostr` 0.45 (backend da 3.3) exige ^0.30; assim há
+  uma só libsecp256k1 compilada. O 0.30 usa `rand` 0.8, que passa a conviver com o 0.9 no lockfile.
 - A credencial MLS cresce 34 bytes (chave Nostr + prefixo), refletida em `KeyPackage` e `Welcome`.
 - O relay vê o destinatário (tag `p`), horário e tamanho, não o remetente (D1, D6). O tamanho do evento revela
   a faixa do conteúdo (padding do NIP-44 só aproxima).

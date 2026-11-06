@@ -18,7 +18,7 @@ impl NostrPublicKey {
     /// Lê 32 bytes x-only. Falha se o tamanho for outro ou se a coordenada não for de um ponto da curva.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let array: [u8; 32] = bytes.try_into().map_err(|_| Error::InvalidNostrKey)?;
-        XOnlyPublicKey::from_byte_array(array)
+        XOnlyPublicKey::from_byte_array(&array)
             .map(Self)
             .map_err(|_| Error::InvalidNostrKey)
     }
@@ -40,7 +40,7 @@ impl DeviceKey {
         let secp = Secp256k1::signing_only();
         Self {
             network: Keypair::generate_ed25519(),
-            nostr: SchnorrKeypair::new(&secp, &mut secp256k1::rand::rng()),
+            nostr: SchnorrKeypair::new(&secp, &mut secp256k1::rand::thread_rng()),
         }
     }
 
@@ -82,7 +82,7 @@ impl DeviceKey {
             .try_into_ed25519()
             .map_err(|_| Error::NotEd25519)?;
         let secret: [u8; 32] = cur.try_into().map_err(|_| Error::InvalidDeviceKey)?;
-        let nostr = SchnorrKeypair::from_seckey_byte_array(&Secp256k1::signing_only(), secret)
+        let nostr = SchnorrKeypair::from_seckey_slice(&Secp256k1::signing_only(), &secret)
             .map_err(|_| Error::InvalidDeviceKey)?;
         Ok(Self { network, nostr })
     }
