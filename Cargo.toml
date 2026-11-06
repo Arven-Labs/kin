@@ -23,6 +23,8 @@ thiserror = "2"
 secp256k1 = { version = "=0.30.0", default-features = false, features = ["std", "rand"] }
 # Protocolo Nostr (só tipos e cripto, sem rede): NIP-44/59 do gift wrap (ADR 0004). Versão exata (cripto).
 nostr = { version = "=0.45.7", default-features = false, features = ["std", "nip59", "os-rng"] }
+# Websocket (wss com rustls e raízes embutidas) para falar com os relays Nostr (ADR 0004). Versão exata.
+tokio-tungstenite = { version = "=0.30.0", features = ["connect", "rustls-tls-webpki-roots"] }
 libp2p ={ version = "0.57", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "mdns", "identify", "macros", "request-response", "relay", "dcutr", "autonat", "quic", "dns"] }
 openmls = "=0.9.0"
 openmls_rust_crypto = "=0.6.0"

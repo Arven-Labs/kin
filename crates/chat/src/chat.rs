@@ -283,14 +283,21 @@ impl Chat {
     pub fn set_mailbox(&mut self, mailbox: impl Mailbox + 'static) {
         let (events, receiver) = futures::channel::mpsc::unbounded();
         let mut mailbox = Box::new(mailbox);
+        // Ensinar ANTES de ligar: um backend assíncrono começa a entregar assim que `attach` roda, e o
+        // que chegar de um par ainda desconhecido seria descartado. Conversas recarregadas do banco
+        // entram aqui; as novas são ensinadas em `ready`.
+        for (peer, conversation) in &self.conversations {
+            if let Some(nostr) = conversation
+                .peer_nostr_keys()
+                .ok()
+                .and_then(|keys| keys.into_iter().next())
+            {
+                mailbox.learn_peer(*peer, nostr);
+            }
+        }
         mailbox.attach(events);
         self.mailbox = Some(mailbox);
         self.mailbox_events = Some(receiver);
-        // Conversas que já existem (recarregadas do banco) também precisam ser ensinadas ao backend.
-        let peers: Vec<PeerId> = self.conversations.keys().copied().collect();
-        for peer in peers {
-            self.teach_mailbox(peer);
-        }
     }
 
     /// Diz à caixa postal a chave Nostr do `peer`, lida do certificado dele (já validado pelo MLS).

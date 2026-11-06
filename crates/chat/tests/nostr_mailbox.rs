@@ -1,0 +1,425 @@
+//! Fase 3.3 (ADR 0004): o `NostrMailbox` contra relays falsos em processo (127.0.0.1), sem rede externa.
+
+mod common;
+
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use common::fake_relay::{FakeRelay, Policy, dead_url};
+use common::{Person, WAIT, connect, until_disconnected};
+use futures::StreamExt;
+use futures::channel::mpsc::UnboundedReceiver;
+use kin_chat::nostr::{MAX_BLOB, NostrConfig, NostrMailbox, wrap};
+use kin_chat::{Chat, ChatEvent, Mailbox, MailboxEvent};
+use kin_identity::DeviceKey;
+use nostr::prelude::*;
+use tokio::time::{sleep, timeout};
+
+fn fast() -> NostrConfig {
+    NostrConfig {
+        backoff_min: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(200),
+        ack_timeout: Duration::from_secs(1),
+        ..NostrConfig::default()
+    }
+}
+
+/// Liga `mailbox` e devolve o canal de eventos que o `Chat` leria.
+fn attach(mailbox: &mut NostrMailbox) -> UnboundedReceiver<MailboxEvent> {
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    mailbox.attach(tx);
+    rx
+}
+
+async fn next(rx: &mut UnboundedReceiver<MailboxEvent>) -> MailboxEvent {
+    timeout(Duration::from_secs(5), rx.next())
+        .await
+        .expect("nenhum evento da caixa postal em 5 s")
+        .expect("canal fechado")
+}
+
+async fn quiet(rx: &mut UnboundedReceiver<MailboxEvent>, ms: u64) {
+    if let Ok(Some(event)) = timeout(Duration::from_millis(ms), rx.next()).await {
+        panic!("não devia haver evento, veio {event:?}");
+    }
+}
+
+/// Espera (até 3 s) uma condição que depende de tarefas em segundo plano.
+async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+    let end = Instant::now() + Duration::from_secs(3);
+    while !cond() {
+        assert!(Instant::now() < end, "não aconteceu: {what}");
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn mailbox<S: AsRef<str>>(device: &DeviceKey, urls: &[S]) -> NostrMailbox {
+    NostrMailbox::with_config(device, urls, fast()).unwrap()
+}
+
+fn p_tag(to: &DeviceKey) -> Tag {
+    Tag::public_key(PublicKey::from_slice(&to.nostr_public_key().to_bytes()).unwrap())
+}
+
+// 1
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deposit_reaches_every_relay_with_the_same_event_and_is_confirmed_by_the_first() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (r1, r2) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Accept).await,
+    );
+    let mut mb = mailbox(&ana, &[&r1.url, &r2.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"oi bia".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+    eventually("os dois relays guardam o evento", || {
+        r1.stored().len() == 1 && r2.stored().len() == 1
+    })
+    .await;
+    assert_eq!(r1.stored()[0].id, r2.stored()[0].id);
+}
+
+// 2
+#[tokio::test(flavor = "multi_thread")]
+async fn one_relay_refusing_does_not_fail_the_deposit() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let refusing = FakeRelay::start(Policy::Reject("blocked: not in web of trust".into())).await;
+    let accepting = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&refusing.url, &accepting.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+}
+
+// 3
+#[tokio::test(flavor = "multi_thread")]
+async fn every_relay_refusing_fails_the_deposit_with_the_relay_reason() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (r1, r2) = (
+        FakeRelay::start(Policy::Reject("blocked: not in web of trust".into())).await,
+        FakeRelay::start(Policy::Reject("blocked: not in web of trust".into())).await,
+    );
+    let mut mb = mailbox(&ana, &[&r1.url, &r2.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    match next(&mut rx).await {
+        MailboxEvent::DepositFailed { id: got, reason } => {
+            assert_eq!(got, id);
+            assert!(reason.contains("web of trust"), "motivo: {reason}");
+        }
+        other => panic!("esperava DepositFailed, veio {other:?}"),
+    }
+}
+
+// 4
+#[tokio::test(flavor = "multi_thread")]
+async fn no_relay_reachable_fails_the_deposit() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let mut mb = mailbox(&ana, &[&dead_url().await]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::DepositFailed { id: got, .. } if got == id
+    ));
+}
+
+// 5
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_never_answers_fails_the_deposit_after_the_ack_timeout() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let silent = FakeRelay::start(Policy::Silent).await;
+    let mut mb = mailbox(&ana, &[&silent.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    eventually("conexão feita", || silent.accepted_connections() >= 1).await;
+
+    let started = Instant::now();
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::DepositFailed { id: got, .. } if got == id
+    ));
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "não esperou o ack"
+    );
+}
+
+// 6
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_blob_or_an_unknown_peer_fails_without_touching_any_relay() {
+    let (ana, bia, stranger) = (
+        DeviceKey::generate(),
+        DeviceKey::generate(),
+        DeviceKey::generate(),
+    );
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let big = mb.deposit(bia.peer_id(), vec![0u8; MAX_BLOB + 1]);
+    let unknown = mb.deposit(stranger.peer_id(), b"x".to_vec());
+
+    for expected in [big, unknown] {
+        assert!(matches!(
+            next(&mut rx).await,
+            MailboxEvent::DepositFailed { id, .. } if id == expected
+        ));
+    }
+    sleep(Duration::from_millis(200)).await;
+    assert!(relay.stored().is_empty());
+}
+
+// 7
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_event_is_retrieved_when_the_recipient_connects() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"guardada").unwrap());
+
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: ana.peer_id(),
+            blob: b"guardada".to_vec()
+        }
+    );
+}
+
+// 8
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_event_from_two_relays_is_retrieved_once() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (r1, r2) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Accept).await,
+    );
+    let event = wrap(&ana, &bia.nostr_public_key(), b"uma vez").unwrap();
+    r1.inject(event.clone());
+    r2.inject(event);
+
+    let mut mb = mailbox(&bia, &[&r1.url, &r2.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved { .. }
+    ));
+    quiet(&mut rx, 700).await;
+}
+
+// 9
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_from_an_unknown_sender_is_dropped_and_the_worker_survives() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    let mut rx = attach(&mut mb);
+    eventually("assinatura feita", || !relay.reqs().is_empty()).await;
+
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"quem e voce").unwrap());
+    quiet(&mut rx, 500).await;
+
+    // O worker continua vivo: depois de conhecer a Ana, o próximo evento chega.
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"agora sim").unwrap());
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: ana.peer_id(),
+            blob: b"agora sim".to_vec()
+        }
+    );
+}
+
+// 10
+#[tokio::test(flavor = "multi_thread")]
+async fn a_garbage_gift_wrap_is_ignored_and_the_next_valid_one_arrives() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let garbage = EventBuilder::new(Kind::GiftWrap, "isto não é um gift wrap")
+        .tag(p_tag(&bia))
+        .finalize(&Keys::generate())
+        .unwrap();
+    relay.inject(garbage);
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"valida").unwrap());
+
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: ana.peer_id(),
+            blob: b"valida".to_vec()
+        }
+    );
+}
+
+// 11
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_demands_nip42_serves_the_event_after_authentication() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.require_auth();
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"so autenticado").unwrap());
+
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: ana.peer_id(),
+            blob: b"so autenticado".to_vec()
+        }
+    );
+}
+
+// 12
+#[tokio::test(flavor = "multi_thread")]
+async fn after_a_dropped_connection_the_worker_reconnects_and_resubscribes() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+    eventually("primeira assinatura", || relay.reqs().len() == 1).await;
+
+    relay.drop_connections();
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"na lacuna").unwrap());
+
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: ana.peer_id(),
+            blob: b"na lacuna".to_vec()
+        }
+    );
+    assert!(relay.reqs().len() >= 2, "devia ter reassinado");
+}
+
+// 13
+#[tokio::test(flavor = "multi_thread")]
+async fn the_subscription_asks_for_the_last_three_days() {
+    let bia = DeviceKey::generate();
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    let _rx = attach(&mut mb);
+    eventually("assinatura feita", || !relay.reqs().is_empty()).await;
+
+    let filter = relay.reqs().remove(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let since = filter["since"].as_u64().expect("o REQ leva since");
+    let expected = now - 3 * 24 * 3600;
+    assert!(
+        since.abs_diff(expected) <= 120,
+        "since={since}, esperado ~{expected}"
+    );
+    assert_eq!(filter["kinds"], serde_json::json!([1059]));
+}
+
+// 14
+#[tokio::test(flavor = "multi_thread")]
+async fn bad_relay_urls_are_refused_and_tls_to_a_plain_server_fails_without_panicking() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    assert!(NostrMailbox::new(&ana, &["http://relay.example"]).is_err());
+    assert!(NostrMailbox::new(&ana, &["ws://relay.example"]).is_err());
+    assert!(NostrMailbox::new(&ana, &["ws://127.0.0.1:1"]).is_ok());
+
+    // Servidor que aceita a conexão e fecha, sem falar TLS: o handshake do wss falha e só.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("wss://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+    let mut mb = mailbox(&ana, &[&url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    sleep(Duration::from_millis(300)).await;
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::DepositFailed { id: got, .. } if got == id
+    ));
+}
+
+// 15
+async fn until_deposited(chat: &mut Chat) {
+    timeout(WAIT, async {
+        while !matches!(chat.next_event().await, ChatEvent::Deposited { .. }) {}
+    })
+    .await
+    .expect("o depósito não foi confirmado");
+}
+
+async fn until_received(chat: &mut Chat) -> String {
+    timeout(WAIT, async {
+        loop {
+            if let ChatEvent::Received { message, .. } = chat.next_event().await {
+                return message.text;
+            }
+        }
+    })
+    .await
+    .expect("a mensagem não chegou pelo relay")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_real_chats_exchange_a_message_through_a_relay_while_one_is_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let (mut a, mut b) = (pa.open(), pb.open());
+    a.set_mailbox(mailbox(&pa.device, &[&relay.url]));
+    connect(&mut a, &mut b).await;
+
+    drop(b);
+    until_disconnected(&mut a).await;
+    a.send(pb.peer_id(), "pelo relay", None).unwrap();
+    until_deposited(&mut a).await;
+    assert_eq!(relay.stored().len(), 1);
+
+    // A Bia volta sozinha, só com o relay: conversa recarregada do banco, sem novo handshake.
+    let mut b = pb.open();
+    b.set_mailbox(mailbox(&pb.device, &[&relay.url]));
+    assert_eq!(until_received(&mut b).await, "pelo relay");
+}
+
+// 16
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_mailbox_closes_its_connections() {
+    let bia = DeviceKey::generate();
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    let _rx = attach(&mut mb);
+    eventually("conectou", || relay.open_connections() == 1).await;
+
+    drop(mb);
+
+    eventually("fechou", || relay.open_connections() == 0).await;
+}
