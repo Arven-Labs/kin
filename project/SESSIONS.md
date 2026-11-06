@@ -357,3 +357,11 @@
 - **Não verificado**: testes Rust no CI (não rodam lá); a proteção da chave secreta Nostr em repouso (P13); nenhum
   código Nostr (assinatura, NIP-44) existe ainda; a `libsecp256k1` em C não foi auditada por mim.
 - **Próximo passo**: backend `NostrMailbox` (NIP-17/59, NIP-42, vários relays), em PR próprio, com plano e testes antes.
+- **Plano do backend (aprovado pelo dono)**: crate `nostr` (só protocolo, NIP-44/59/17/42) + `tokio-tungstenite`, em
+  vez de `nostr-sdk`; PRs em sequência: A alinhar `secp256k1` a 0.30, B camada de protocolo sem rede (`wrap`/`unwrap`,
+  teto de 30 KB, `Mailbox::learn_peer`), C websocket + vários relays + NIP-42 com relay falso nos testes, D CLI.
+- **PR A (branch `secp256k1-0.30`)**: `secp256k1` `=0.31.1` → `=0.30.0` (o `nostr` 0.45 exige ^0.30). Três chamadas
+  ajustadas em `identity/src/device.rs` (`thread_rng` de `rand` 0.8, `from_byte_array(&array)`, `from_seckey_slice`);
+  sem mudança de comportamento nem de formato. `cargo test --workspace --locked` 102 passando sem editar nenhum teste;
+  `clippy`, `fmt` ok; sem `secp256k1` duplicado; `cargo audit` com os mesmos 5 itens do P22. Efeito: o lockfile ganha
+  `rand` 0.8.8 ao lado do 0.9.5. Não verificado: testes Rust no CI (não rodam lá).
