@@ -402,3 +402,19 @@
 - **Não verificado**: testes Rust no CI (não rodam lá); **nenhum relay real nem `wss://` com certificado válido**
   (só `ws://` em loopback e um servidor que não fala TLS); a cripto é a do crate `nostr`; limites no P23.
 - **Próximo passo**: PR D, flag `--nostr-relay` na CLI e roteiro com relay real (fecha o P23(f)); depois 3.4.
+
+### 2026-11-06 — Sessão 9
+
+- **Objetivo**: PR D da 3.3, flag `--nostr-relay` na CLI e roteiro com relay real (P23(f)).
+- **Feito** (branch `cli-nostr-relay`): `--nostr-relay URL` (repetível) em `crates/cli/src/main.rs` liga
+  `NostrMailbox` via `Chat::set_mailbox`; `ws://` remoto é recusado na partida. A CLI deixou de esquecer a conversa
+  atual ao desconectar (`*current = None` removido), senão não dava para enviar a quem saiu.
+- **Roteiro real (autorizado pelo dono)**: A e B (diretórios temporários, TCP loopback) fecham a conversa; A é
+  encerrado; B envia `oi-offline-1` → `(na fila…)` e `(depositada na caixa postal…)`; B é encerrado; A reinicia só com
+  os relays e recebe `[f4a79c78] peer: oi-offline-1`. Relays: `wss://nos.lol` e `wss://relay.damus.io`. Uma
+  tentativa anterior foi recusada pela CLI (`sem conversa pronta`, bug abaixo), então só 1 mensagem foi enviada aos relays.
+- **Achado**: o bug do `current` acima só apareceu no roteiro real, não nos testes.
+- **Verificado (local)**: clippy, fmt, `cargo test --workspace --locked` sem falhas.
+- **Não verificado**: qual relay aceitou (CLI não imprime por relay), logo NIP-42 do damus não isolado; só 1 mensagem;
+  sem teste automatizado da CLI; testes Rust não rodam no CI.
+- **Próximo passo**: 3.4 (replicação em N mailboxes com TTL) ou imprimir resultado por relay.

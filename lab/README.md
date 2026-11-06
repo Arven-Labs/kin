@@ -30,3 +30,22 @@ deixa o SYN reenviado passar quando o outro lado abre o mapeamento.
 ao terminar; para apagar a imagem: `docker rmi kin-lab`.
 
 Limitação: o relay do laboratório escuta só TCP, então o hole punching por QUIC/UDP não é exercitado (P17).
+
+## Roteiro manual: caixa postal Nostr com relay real
+
+Fora do `run.sh` (depende da internet e de relays de terceiros). **Publica eventos kind 1059 em relays
+públicos, que não dá para apagar**: use só mensagens de teste e peça autorização antes. Sem Docker, em dois
+terminais, com a CLI (`cargo build -p kin-cli`):
+
+```bash
+R="--nostr-relay wss://nos.lol --nostr-relay wss://relay.damus.io"
+kin --data-dir /tmp/a --listen /ip4/127.0.0.1/tcp/4102 --no-mdns $R           # A: anote o peer id
+kin --data-dir /tmp/b --no-mdns --dial /ip4/127.0.0.1/tcp/4102/p2p/<peer-id-de-A> $R   # B
+```
+
+1. Espere `conversa cifrada pronta` nos dois (o recebimento pela caixa postal exige essa conversa prévia).
+2. Encerre A (`/quit`). Em B, digite `teste-1`: esperado `(na fila…)` e `(depositada na caixa postal: …)`.
+3. Encerre B. Suba A de novo só com `$R` (sem B no ar): esperado `peer: teste-1`.
+
+Se o passo 2 não imprimir `depositada`, todos os relays recusaram (`depósito recusado: motivo`). A CLI ainda
+não mostra qual relay aceitou (P23(g)).
