@@ -2,7 +2,7 @@ use std::path::Path;
 
 use libp2p_identity::{Keypair, PublicKey};
 
-use crate::{DeviceCertificate, Error, IdentityId, IdentityProvider, store};
+use crate::{DeviceCertificate, Error, IdentityId, IdentityProvider, NostrPublicKey, store};
 
 /// Provedor padrão (D7): keypair Ed25519 gerado pelo Kin, sem conta e sem blockchain.
 pub struct StandaloneIdentity {
@@ -52,13 +52,16 @@ impl IdentityProvider for StandaloneIdentity {
         &self,
         signing_key: &PublicKey,
         network_key: &PublicKey,
+        nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
-        let payload = DeviceCertificate::signing_payload(signing_key, network_key, created_at);
+        let payload =
+            DeviceCertificate::signing_payload(signing_key, network_key, nostr_key, created_at);
         Ok(DeviceCertificate {
             identity: self.id(),
             signing_key: signing_key.clone(),
             network_key: network_key.clone(),
+            nostr_key: *nostr_key,
             created_at,
             signature: self.master.sign(&payload)?,
         })

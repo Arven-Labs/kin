@@ -341,5 +341,19 @@
 - **Não verificado (escrita)**: retenção além de 150 s; escrita e leitura autenticada no damus; relays pagos; o
   ciphertext é aleatório, não NIP-44 real. Ficaram 4 eventos no `nos.lol` e 3 no `offchain.pub` (chave descartável,
   não dá para apagar).
-- **Próximo passo**: confirmar (ou trocar) a opção B da chave; depois o plano da 3.3 em PRs separados (certificado v3,
-  backend com NIP-42 e vários relays).
+- **Certificado v3 (branch `cert-v3-nostr-key`)**: o dono confirmou a opção B e a dependência `secp256k1` 0.31.1
+  (libsecp256k1), em vez de `k256` (que usa o `crypto-bigint` 0.5.5 do P22). `DeviceKey` guarda a chave de rede e a
+  Schnorr (formato do arquivo versionado, antigos recusados); `DeviceCertificate` v3 cobre a chave Nostr no payload
+  assinado; `NostrPublicKey` só existe se for ponto válido da curva; `CryptoDevice::new/open` recebem a chave Nostr e
+  falham com `DeviceMismatch` se o banco guarda outra. Testes novos (9 comportamentos, tabela aprovada pelo dono):
+  vermelhos por não compilarem antes (14 e 7 erros), verdes depois.
+- **Verificado (local)**: `cargo test --workspace --locked` 102 passando, 0 falhando (eram 95); `clippy` sem avisos;
+  `fmt` ok; `cargo audit` sem vulnerabilidade nova (os mesmos 5 itens do P22). Mutações pegas e revertidas: chave Nostr
+  fora do payload assinado (falha `swapping_the_nostr_key_...`) e `open` sem conferir a chave Nostr (falha
+  `the_nostr_key_is_certified_...`).
+- **Achados**: a dependência nova trouxe 9 pacotes ao lockfile (`secp256k1-sys`, `bitcoin_hashes`, `bitcoin-io`,
+  `bitcoin-consensus-encoding`, `hex-conservative` x2, `arrayvec`...), e o `tempfile` passou a usar `getrandom` 0.4.3
+  (versão que já estava no lockfile). A API `from_slice` da `secp256k1` está depreciada; usei `from_byte_array`.
+- **Não verificado**: testes Rust no CI (não rodam lá); a proteção da chave secreta Nostr em repouso (P13); nenhum
+  código Nostr (assinatura, NIP-44) existe ainda; a `libsecp256k1` em C não foi auditada por mim.
+- **Próximo passo**: backend `NostrMailbox` (NIP-17/59, NIP-42, vários relays), em PR próprio, com plano e testes antes.

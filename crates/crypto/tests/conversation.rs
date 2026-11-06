@@ -11,7 +11,13 @@ struct Person {
 fn person() -> Person {
     let identity = StandaloneIdentity::generate();
     let network = DeviceKey::generate();
-    let device = CryptoDevice::new(&identity, &network.public_key(), 1_000).unwrap();
+    let device = CryptoDevice::new(
+        &identity,
+        &network.public_key(),
+        &network.nostr_public_key(),
+        1_000,
+    )
+    .unwrap();
     Person {
         id: identity.id(),
         peer: network.peer_id(),

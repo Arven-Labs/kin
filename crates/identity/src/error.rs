@@ -7,6 +7,10 @@ pub enum Error {
     Decoding(#[from] libp2p_identity::DecodingError),
     #[error("a chave não é Ed25519")]
     NotEd25519,
+    #[error("chave Nostr inválida (não é um ponto da curva secp256k1)")]
+    InvalidNostrKey,
+    #[error("arquivo de chave do device inválido ou de formato antigo")]
+    InvalidDeviceKey,
     #[error("certificado de device inválido")]
     InvalidCertificate,
     #[error("erro de E/S: {0}")]
