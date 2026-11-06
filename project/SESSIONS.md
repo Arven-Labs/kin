@@ -418,3 +418,20 @@
 - **Não verificado**: qual relay aceitou (CLI não imprime por relay), logo NIP-42 do damus não isolado; só 1 mensagem;
   sem teste automatizado da CLI; testes Rust não rodam no CI.
 - **Próximo passo**: 3.4 (replicação em N mailboxes com TTL) ou imprimir resultado por relay.
+
+### 2026-11-06 — Sessão 10
+
+- **Objetivo**: P23(g), resultado do depósito por relay (escopo escolhido pelo dono: só o item g).
+- **Feito** (branch `relay-outcome`): `MailboxEvent::RelayOutcome { id, relay, accepted, reason }` emitido por
+  `Shared::ack` a cada resposta de relay (inclusive desconectado, sem resposta a tempo e worker encerrado);
+  `ChatEvent::MailboxRelay`; a CLI imprime `(relay URL: aceitou)` ou `(relay URL: recusou: motivo)`. `Deposited` e
+  `DepositFailed` não mudaram. O motivo vem do relay (hostil): vira uma linha de no máximo 200 caracteres, sem
+  caracteres de controle (`one_line`).
+- **Testes**: 5 novos escritos antes (3 erros de compilação por falta das variantes), verdes depois. O helper `next` dos
+  testes antigos passou a pular `RelayOutcome`; nenhum assert antigo mudou.
+- **Verificado (local)**: `cargo test --workspace --locked` 138 passando, 0 falhando (eram 133); clippy e fmt ok.
+  Mutações pegas e revertidas: `accepted` sempre verdadeiro (3 testes falham) e motivo sem `one_line` (1 teste falha).
+- **Não verificado**: contra relay real (ainda não rodei o roteiro com a saída nova); CI (testes Rust não rodam lá);
+  o evento não liga o resultado ao `MessageId` (só ao relay).
+- **Próximo passo**: rodar o roteiro real para ver o resultado por relay (publica em relays públicos, pede
+  autorização) e depois 3.4.

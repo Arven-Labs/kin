@@ -54,7 +54,7 @@ pub(super) async fn run(
             tokio::select! {
                 _ = &mut pause => break,
                 command = commands.next() => match command {
-                    Some(Command::Publish { id, .. }) => shared.ack(id, false, "relay desconectado"),
+                    Some(Command::Publish { id, .. }) => shared.ack(id, url.as_str(), false, "relay desconectado"),
                     None => return,
                 },
             }
@@ -113,7 +113,7 @@ async fn session(
                     RelayMessage::Ok { event_id, status, message } => {
                         if let Some(at) = waiting.iter().position(|(_, id, _)| *id == event_id) {
                             let (_, _, deposit) = waiting.swap_remove(at);
-                            shared.ack(deposit, status, &message);
+                            shared.ack(deposit, url.as_str(), status, &message);
                         }
                     }
                     RelayMessage::Auth { challenge } => {
@@ -135,7 +135,7 @@ async fn session(
                 Some(Command::Publish { id, event }) => {
                     let event_id = event.id;
                     if send(&mut sink, &ClientMessage::event(event)).await.is_err() {
-                        shared.ack(id, false, "falha ao enviar ao relay");
+                        shared.ack(id, url.as_str(), false, "falha ao enviar ao relay");
                         break true;
                     }
                     waiting.push((Instant::now() + config.ack_timeout, event_id, id));
@@ -147,13 +147,18 @@ async fn session(
                 let (late, rest): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|(at, ..)| *at <= now);
                 waiting = rest;
                 for (_, _, deposit) in late {
-                    shared.ack(deposit, false, "o relay não respondeu a tempo");
+                    shared.ack(deposit, url.as_str(), false, "o relay não respondeu a tempo");
                 }
             }
         }
     };
     for (_, _, deposit) in waiting {
-        shared.ack(deposit, false, "conexão perdida antes da resposta");
+        shared.ack(
+            deposit,
+            url.as_str(),
+            false,
+            "conexão perdida antes da resposta",
+        );
     }
     keep
 }
