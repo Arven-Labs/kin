@@ -317,6 +317,6 @@
 - **Achado**: `cargo audit` lista 5 vulnerabilidades e 3 avisos de manutenção que o Dependabot não mostra. Registrados
   no P22, sem corrigir (fora do escopo deste PR, tocam criptografia).
 - **Verificado (local)**: `cargo test --workspace --locked` sem falhas; `clippy` sem avisos; `fmt` ok.
-- **Alertas depois**: não medido. Só vale depois do merge, relendo a API na `main`. Esperado: 0.
+- **Alertas depois**: 0 abertos, relido da API depois do merge do PR #5 (os 4 com `state=fixed`, 2026-11-06 12:42 UTC).
 - **Não verificado**: alcançabilidade dos itens do P22; testes Rust no CI (não rodam lá); redes reais.
 - **Próximo passo**: reler os alertas na `main` depois do merge; classificar o P22; depois o spike da 3.3.
