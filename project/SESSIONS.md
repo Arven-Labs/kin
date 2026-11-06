@@ -332,7 +332,14 @@
   Resultado no ADR 0004 (proposto): mensagem MLS de app = texto + 145 B; o teto prático (~30 KB) vem do NIP-44
   (64 KiB por camada, duas camadas no gift wrap), não dos relays (≥128 KB declarados). Nenhum relay da amostra
   anuncia NIP-17; só o damus anuncia NIP-59. Proposta: chave secp256k1 própria no `DeviceCertificate` v3.
-- **Não verificado (spike)**: escrita real (relay guarda e serve kind 1059?), NIP-40 por relay, tamanhos do evento
-  são estimativa, lista de relays é amostra.
-- **Próximo passo**: decidir se faz o spike de escrita (publica eventos de teste com chave descartável em poucos
-  relays) e confirmar a opção B; depois o plano da 3.3 em PRs separados (certificado v3, backend).
+- **Não verificado (spike)**: tamanhos do evento são estimativa, lista de relays é amostra.
+- **Spike de escrita (autorizado pelo dono)**: 6 eventos kind 1059 por relay (payload aleatório, chaves descartáveis,
+  script no scratchpad, nada no repo) em `nos.lol` e `offchain.pub`; o `relay.damus.io` respondeu HTTP 503. Achados:
+  `nos.lol` aceitou até 32 KB; `offchain.pub` recusou 16 e 32 KB por web of trust (a chave de wrap real também é nova a
+  cada mensagem); NIP-40 honrado nos dois; leitura sem autenticação nos dois e com NIP-42 obrigatório no damus.
+  Consequência: falha por relay é normal, o backend precisa de vários relays e de NIP-42. Detalhes no ADR 0004.
+- **Não verificado (escrita)**: retenção além de 150 s; escrita e leitura autenticada no damus; relays pagos; o
+  ciphertext é aleatório, não NIP-44 real. Ficaram 4 eventos no `nos.lol` e 3 no `offchain.pub` (chave descartável,
+  não dá para apagar).
+- **Próximo passo**: confirmar (ou trocar) a opção B da chave; depois o plano da 3.3 em PRs separados (certificado v3,
+  backend com NIP-42 e vários relays).

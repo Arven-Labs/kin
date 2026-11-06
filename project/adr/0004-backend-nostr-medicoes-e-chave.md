@@ -43,8 +43,28 @@ com base64 e padding. Resulta em **~30 KB por mensagem MLS**.
    (anexos) fica para a Fase 5, não para a 3.3.
 3. **Chave do destinatário: opção B.** O device gera uma chave secp256k1 própria, incluída no `DeviceCertificate`
    (v3), assinada pela identidade. O backend resolve Peer ID → chave secp256k1 pelo certificado.
-4. **Escrita real fica como risco aberto**: declarar NIP-59 não prova que o relay guarda e serve kind 1059. Medir
-   antes de implementar (ver "Em aberto").
+4. **Tratar cada relay como poço que pode recusar.** A escrita foi medida (seção abaixo) e a política varia por relay
+   (web of trust, autenticação na leitura). Uma recusa de um relay é falha *daquele relay*, não da entrega: o backend
+   depende de mais de um relay (3.4) e implementa NIP-42 para ler de relays que o exigem.
+
+## Medição de escrita (2026-11-06, segundo spike)
+
+O dono autorizou publicar eventos de teste: 6 por relay, kind 1059, `content` em base64 aleatório (não é NIP-44
+real), chave de wrap e destinatário descartáveis, sem segredo. Resultado:
+
+| Relay | 1 KB | 4 KB | 16 KB | 32 KB | NIP-40 (exp. 120 s) | Leitura por `#p` |
+|---|---|---|---|---|---|---|
+| nos.lol | aceito | aceito | aceito | aceito | honrou (6 → 5 em ≤150 s) | sem autenticação |
+| offchain.pub | aceito | aceito | recusado | recusado | honrou (4 → 3) | sem autenticação |
+| relay.damus.io | não testado (HTTP 503 no websocket) | | | | | exige NIP-42 (`auth-required`) |
+
+- O `offchain.pub` recusou 16 KB e 32 KB com `Policy violated and pubkey is not in our web of trust`. O gift wrap real
+  usa uma chave nova a cada mensagem, igual à do teste, então relays com web of trust podem recusar mensagens
+  maiores que alguns KB.
+- Só o `nos.lol` aceitou 32 KB. O teto de ~30 KB é o máximo; mensagens de chat devem ficar bem abaixo.
+- O `damus` só serve kind 1059 a quem se autentica (NIP-42). Bom para privacidade, mas exige implementar o NIP-42.
+- Os eventos sem expiração (1, 4, 16 e 32 KB) ficaram nos relays; a chave de wrap foi descartada de propósito, então
+  não há como apagá-los. Todos têm chave descartável e conteúdo aleatório.
 
 ## Alternativas descartadas
 
@@ -63,8 +83,9 @@ com base64 e padding. Resulta em **~30 KB por mensagem MLS**.
 
 ## Em aberto
 
-- **Escrita real**: relays aceitam, guardam e servem kind 1059 para o destinatário? Retenção? Exigem autenticação
-  (NIP-42) para ler? Só se mede publicando (segundo spike, com confirmação do dono).
-- **Expiração (NIP-40)** por relay, que decide como fazer o TTL da 3.4.
+- **Retenção longa**: só medi até 150 s; não sei por quanto tempo cada relay guarda um evento sem expiração.
+- **`relay.damus.io`**: a escrita (o 503 pode ser transitório) e a leitura autenticada com NIP-42 não foram testadas.
+- **Relays pagos ou restritos** (ex.: `nostr.wine`) não foram testados.
+- **Chave (opção B)**: ainda não confirmada pelo dono; o ADR continua "proposto" por isso (toca criptografia, §4).
 - Estimativa dos tamanhos do evento: só uma implementação real fixa os números.
 - A lista de relays é amostra de 2026-11-06 e envelhece; o dono ainda não escolheu a lista padrão.
