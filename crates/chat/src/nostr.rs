@@ -5,11 +5,16 @@
 //! O que sai daqui **não é confiável por si só**: `sender` é a chave que selou a mensagem, e quem de
 //! fato enviou continua sendo a credencial MLS na decifragem (ADR 0003). O Nostr é só transporte.
 
+mod mailbox;
+mod relay;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kin_identity::{DeviceKey, NostrPublicKey};
 use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
 use nostr::prelude::*;
+
+pub use mailbox::{NostrConfig, NostrError, NostrMailbox};
 
 /// Teto de um blob MLS (bytes) por mensagem. Política nossa, não limite do protocolo: relays com web
 /// of trust já recusaram eventos de 16 KB nos testes (ADR 0004).

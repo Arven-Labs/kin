@@ -383,3 +383,22 @@
   relay real foi usado neste PR (sem rede); o crate `nostr` aceita eventos hostis só até onde os testes exercitam.
 - **Próximo passo**: PR C, `NostrMailbox` com websocket (`tokio-tungstenite`), vários relays e NIP-42, com plano
   próprio (decisões abertas: lista padrão de relays, `since`, reconexão e backoff, `Deposited` com 1 de N relays).
+- **PR C (branch `nostr-relay-mailbox`)**: `NostrMailbox` sobre `tokio-tungstenite` 0.30.0 (`rustls-tls-webpki-roots`).
+  Decisões do dono: relays só por configuração (sem lista embutida), `Deposited` quando ≥1 relay aceita
+  (`DepositFailed` só se todos falham), `since` = agora − 3 dias a cada conexão, sem persistir. Um worker tokio por
+  relay (`nostr/relay.rs`): `REQ` kind 1059 `#p` próprio, `OK` com prazo (10 s), `AUTH` NIP-42 com a chave Nostr do
+  device, reconexão com espera de 1 s a 60 s (jitter ±20%), mensagem máxima de 1 MiB. `nostr/mailbox.rs`: diretório de
+  pares nos dois sentidos, dedupe de 4096 ids, `ws://` só para loopback. Relay falso de teste em
+  `tests/common/fake_relay.rs`.
+- **Bug achado pelo teste fim a fim**: `Chat::set_mailbox` ligava o backend (`attach`) antes de ensinar os pares; num
+  runtime multi-thread o worker já recebia o evento com o remetente "desconhecido" e o descartava. Agora ensina antes
+  de ligar. Os testes de unidade não pegavam; o teste com dois `Chat` reais pegou.
+- **Verificado (local)**: 16 testes novos escritos antes (não compilavam) e verdes depois; `cargo test --workspace
+  --locked` 133 passando, 0 falhando (eram 117); estáveis em 15 rodadas e em 8 sob carga de CPU; `clippy`, `fmt` ok;
+  `cargo audit` com os mesmos 5 itens do P22. Mutações pegas e revertidas: dedupe desligado, remetente desconhecido
+  aceito, `Deposited` só com todos os relays, `since` = agora, `AUTH` ignorado. Lockfile: 6 entradas novas
+  (`tokio-tungstenite`, `tungstenite`, `tokio-rustls`, `webpki-roots` x2, `sha1`); o provider do `rustls` segue só
+  `aws-lc-rs`.
+- **Não verificado**: testes Rust no CI (não rodam lá); **nenhum relay real nem `wss://` com certificado válido**
+  (só `ws://` em loopback e um servidor que não fala TLS); a cripto é a do crate `nostr`; limites no P23.
+- **Próximo passo**: PR D, flag `--nostr-relay` na CLI e roteiro com relay real (fecha o P23(f)); depois 3.4.

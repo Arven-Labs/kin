@@ -1,6 +1,8 @@
 //! Helpers compartilhados pelos testes de integração do chat.
 #![allow(dead_code)] // cada arquivo de teste usa só parte dos helpers
 
+pub mod fake_relay;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
