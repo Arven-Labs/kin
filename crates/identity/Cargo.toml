@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 libp2p-identity.workspace = true
+secp256k1.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

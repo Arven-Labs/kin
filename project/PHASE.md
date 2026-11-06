@@ -62,7 +62,7 @@ direta.
 **Etapas** (preliminares):
 - [x] 3.1 — Abstração de transporte de mailbox (trocar o backend sem mexer no resto) — Sessão 7, ADR 0003
 - [x] 3.2 — Outbox local (entrega na janela simultânea) — Sessão 6, ADR 0002
-- [ ] 3.3 — Backend de mailbox de fallback: relays Nostr (NIP-17/59, conforme D1). Spike de leitura feito na Sessão 8 (ADR 0004, proposto); falta o spike de escrita real e a chave secp256k1 no certificado v3
+- [ ] 3.3 — Backend de mailbox de fallback: relays Nostr (NIP-17/59, conforme D1). Spikes de leitura e de escrita feitos e certificado v3 com a chave secp256k1 do device feito na Sessão 8 (ADR 0004, aceito); falta o backend `NostrMailbox` (NIP-17/59, NIP-42, vários relays)
 - [ ] 3.4 — Replicação em N mailboxes com TTL
 - [ ] 3.5 — Multi-device (vários devices por identidade, sincronização)
 

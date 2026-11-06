@@ -132,6 +132,7 @@ async fn invite_claiming_another_identity_for_the_same_peer_is_refused() {
         .authorize_device(
             &DeviceKey::generate().public_key(),
             &ana.device.public_key(), // reivindica o Peer ID da Ana
+            &DeviceKey::generate().nostr_public_key(),
             1,
         )
         .unwrap();

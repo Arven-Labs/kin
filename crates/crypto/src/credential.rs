@@ -78,7 +78,8 @@ mod tests {
         signing: &PublicKey,
         network: &PublicKey,
     ) -> DeviceCertificate {
-        id.authorize_device(signing, network, 1).unwrap()
+        let nostr = DeviceKey::generate().nostr_public_key();
+        id.authorize_device(signing, network, &nostr, 1).unwrap()
     }
 
     const ANY: Expected = Expected {

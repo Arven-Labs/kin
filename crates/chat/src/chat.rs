@@ -162,7 +162,12 @@ impl Chat {
         device_key: &DeviceKey,
         config: NodeConfig,
     ) -> Result<Self, Error> {
-        let device = CryptoDevice::new(identity, &device_key.public_key(), now_secs())?;
+        let device = CryptoDevice::new(
+            identity,
+            &device_key.public_key(),
+            &device_key.nostr_public_key(),
+            now_secs(),
+        )?;
         Self::with_device(device, device_key, config, Outbox::memory()?)
     }
 
@@ -174,7 +179,13 @@ impl Chat {
         config: NodeConfig,
         db: &Path,
     ) -> Result<Self, Error> {
-        let device = CryptoDevice::open(identity, &device_key.public_key(), db, now_secs())?;
+        let device = CryptoDevice::open(
+            identity,
+            &device_key.public_key(),
+            &device_key.nostr_public_key(),
+            db,
+            now_secs(),
+        )?;
         // A outbox fica num arquivo ao lado do banco do `crypto` (`a.db` → `a.outbox.db`).
         let outbox = Outbox::open(&db.with_extension("outbox.db"))?;
         let mut chat = Self::with_device(device, device_key, config, outbox)?;
@@ -719,7 +730,8 @@ mod tests {
             StandaloneIdentity::generate(),
         );
         let (dev_a, dev_b) = (DeviceKey::generate(), DeviceKey::generate());
-        let ana_device = CryptoDevice::new(&id_a, &dev_a.public_key(), 1).unwrap();
+        let ana_device =
+            CryptoDevice::new(&id_a, &dev_a.public_key(), &dev_a.nostr_public_key(), 1).unwrap();
         let mut bia = chat(&id_b, &dev_b);
         let mut ana = Conversation::create(&ana_device).unwrap();
         let invite = ana
@@ -1149,7 +1161,7 @@ mod tests {
             }
         };
         let mut ana = chat(&id_a, &dev_a);
-        let bia_kp = CryptoDevice::new(&id_b, &dev_b.public_key(), 1)
+        let bia_kp = CryptoDevice::new(&id_b, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
             .unwrap()
             .key_package()
             .unwrap();

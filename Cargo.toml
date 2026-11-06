@@ -19,7 +19,9 @@ all = "warn"
 # Previstas: libp2p 0.57 (D3, transport/overlay), openmls 0.9 (D2, crypto).
 libp2p-identity = { version = "0.3", features = ["ed25519", "peerid", "rand"] }
 thiserror = "2"
-libp2p = { version = "0.57", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "mdns", "identify", "macros", "request-response", "relay", "dcutr", "autonat", "quic", "dns"] }
+# Chave Schnorr (BIP-340) do device para o backend Nostr (ADR 0004). libsecp256k1 em C, versão exata (cripto).
+secp256k1 = { version = "=0.31.1", default-features = false, features = ["std", "rand"] }
+libp2p ={ version = "0.57", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "mdns", "identify", "macros", "request-response", "relay", "dcutr", "autonat", "quic", "dns"] }
 openmls = "=0.9.0"
 openmls_rust_crypto = "=0.6.0"
 openmls_basic_credential = "=0.6.0"

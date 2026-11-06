@@ -1,6 +1,6 @@
 use libp2p_identity::{PeerId, PublicKey};
 
-use crate::{DeviceCertificate, Error};
+use crate::{DeviceCertificate, Error, NostrPublicKey};
 
 /// ID estável de uma identidade: a chave pública mestra.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,12 +34,13 @@ pub trait IdentityProvider {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error>;
 
     /// Autoriza um device ("este device pertence a esta identidade"), certificando a chave de
-    /// assinatura MLS e a chave de rede juntas.
+    /// assinatura MLS, a chave de rede e a chave Nostr juntas.
     /// `created_at` é o instante em segundos Unix, passado de fora para manter o código testável.
     fn authorize_device(
         &self,
         signing_key: &PublicKey,
         network_key: &PublicKey,
+        nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Result<DeviceCertificate, Error>;
 }

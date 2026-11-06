@@ -1,6 +1,6 @@
 # ADR 0004 — Backend Nostr da caixa postal: tamanho, envelope e chave do destinatário (Fase 3.3)
 
-- **Status**: proposto (Sessão 8, 2026-11-06). Vira "aceito" quando o dono confirmar a chave (opção B) e o segundo spike (escrita real) for feito ou dispensado.
+- **Status**: aceito (Sessão 8, 2026-11-06). O dono confirmou a opção B (chave secp256k1 no certificado v3) e a dependência `secp256k1` (libsecp256k1); o spike de escrita foi feito. A decisão 3 foi implementada no PR do certificado v3; as decisões 1, 2 e 4 ficam para o backend (PR seguinte).
 - **Relacionados**: D1 em `ARCHITECTURE.md`; ADR 0003 (interface de mailbox); P15 (certificado do device); `STUDY.md` (seção Nostr).
 
 ## Contexto
@@ -77,7 +77,11 @@ real), chave de wrap e destinatário descartáveis, sem segredo. Resultado:
 
 - Certificado v3: bancos e certificados antigos deixam de valer (como na v2, P15). Custo de migração baixo hoje,
   porque nada foi distribuído.
-- Mais uma chave para proteger (junto de P13, chave sem cifra em repouso).
+- Mais uma chave para proteger (junto de P13, chave sem cifra em repouso). Ela mora no arquivo `device.key` (agora
+  versionado: byte de formato, keypair de rede, chave secreta Nostr); arquivos antigos deixam de carregar.
+- Dependência `secp256k1` 0.31.1 (libsecp256k1 em C), escolhida em vez de `k256` por não usar o `crypto-bigint`
+  0.5.5 do P22. Entrou com 9 pacotes novos no lockfile (`secp256k1-sys`, `bitcoin_hashes` e família).
+- A credencial MLS cresce 34 bytes (chave Nostr + prefixo), refletida em `KeyPackage` e `Welcome`.
 - O relay vê o destinatário (tag `p`), horário e tamanho, não o remetente (D1, D6). O tamanho do evento revela
   a faixa do conteúdo (padding do NIP-44 só aproxima).
 
