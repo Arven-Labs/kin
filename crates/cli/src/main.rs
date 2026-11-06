@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--accept LINK] [--relay ADDR]...
-//!     [--relay-count N] [--external-addr ADDR]... [--no-mdns]
+//!     [--relay-count N] [--external-addr ADDR]... [--nostr-relay URL]... [--no-mdns]
 //! kin --serve-relay [--listen ADDR] [--external-addr ADDR]... [--relay-max-bytes N]
 //!     [--relay-max-circuits N]
 //! ```
@@ -10,11 +10,15 @@
 //! Atrás de NAT, `--relay ADDR` (que termina em `/p2p/<relay>`) reserva um lugar no relay e imprime o
 //! endereço de circuito que o outro lado deve passar a `--dial`. `--serve-relay` sobe só um relay
 //! (sem chat). `/invite` imprime o seu link de convite (e um QR) e `--accept LINK` / `/accept LINK`
-//! abre o de outra pessoa: o link prova quem é e por onde alcançá-la. Na LAN, duas instâncias se acham sozinhas via mDNS. Linhas digitadas vão ao peer da conversa;
+//! abre o de outra pessoa: o link prova quem é e por onde alcançá-la. Na LAN, duas instâncias se acham sozinhas via mDNS.
+//! `--nostr-relay URL` (`wss://...`; `ws://` só para o próprio computador) liga a caixa postal Nostr: mensagens
+//! para quem está offline são depositadas nesses relays e buscadas ao voltar (só com conversa já fechada).
+//! Linhas digitadas vão ao peer da conversa;
 //! `/r <id> texto` responde à mensagem `<id>` (thread); `/quit` sai.
 
 use std::path::{Path, PathBuf};
 
+use kin_chat::nostr::NostrMailbox;
 use kin_chat::{Chat, ChatEvent, Invite, Message, MessageId};
 use kin_identity::{DeviceKey, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
@@ -28,6 +32,7 @@ struct Args {
     relays: Vec<Multiaddr>,
     relay_count: Option<usize>,
     external_addrs: Vec<Multiaddr>,
+    nostr_relays: Vec<String>,
     serve_relay: bool,
     relay_limits: RelayLimits,
     mdns: bool,
@@ -42,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
         relays: Vec::new(),
         relay_count: None,
         external_addrs: Vec::new(),
+        nostr_relays: Vec::new(),
         serve_relay: false,
         relay_limits: RelayLimits::default(),
         mdns: true,
@@ -63,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
             "--external-addr" => args
                 .external_addrs
                 .push(value()?.parse().map_err(|e| format!("{e}"))?),
+            "--nostr-relay" => args.nostr_relays.push(value()?),
             "--serve-relay" => args.serve_relay = true,
             "--relay-max-bytes" => {
                 args.relay_limits.max_circuit_bytes =
@@ -120,7 +127,7 @@ fn short(id: &MessageId) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -148,6 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         chat.peer_id()
     );
+    if !args.nostr_relays.is_empty() {
+        // Dentro do runtime tokio: os workers dos relays sobem no `attach` de `set_mailbox`.
+        chat.set_mailbox(NostrMailbox::new(&device, &args.nostr_relays)?);
+        println!("caixa postal Nostr em {} relay(s)", args.nostr_relays.len());
+    }
 
     match args.listen {
         Some(addr) => chat.listen_on(addr)?,
@@ -286,12 +298,8 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
     match event {
         ChatEvent::Listening(addr) => println!("escutando em {addr}"),
         ChatEvent::PeerConnected(peer) => println!("conectado a {peer}"),
-        ChatEvent::PeerDisconnected(peer) => {
-            println!("desconectado de {peer}");
-            if *current == Some(peer) {
-                *current = None;
-            }
-        }
+        // Mantém `current`: com a caixa postal, enviar a quem saiu é válido (fica na fila/depósito).
+        ChatEvent::PeerDisconnected(peer) => println!("desconectado de {peer}"),
         ChatEvent::ConversationReady { peer, identity } => {
             println!(
                 "conversa cifrada pronta com {} (identidade {})",
