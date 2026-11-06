@@ -320,3 +320,10 @@
 - **Alertas depois**: 0 abertos, relido da API depois do merge do PR #5 (os 4 com `state=fixed`, 2026-11-06 12:42 UTC).
 - **Não verificado**: alcançabilidade dos itens do P22; testes Rust no CI (não rodam lá); redes reais.
 - **Próximo passo**: reler os alertas na `main` depois do merge; classificar o P22; depois o spike da 3.3.
+- **P22 (segunda rodada, branch `deps-lockfile-p22`)**: `cargo update -p rustls-webpki -p ctutils -p tokio`
+  (0.103.16, 0.4.8, 1.54.1). O diff mexe só nesses três pacotes. `cargo test --workspace --locked`: 95 passando,
+  0 falhando; `clippy` sem avisos; `fmt` ok. `cargo audit` caiu de 5 vulnerabilidades para 3 (`crypto-bigint` e os
+  dois do `libcrux-kem`) e 2 avisos de manutenção. O `libcrux-kem` não é compilado (só lockfile); o `crypto-bigint`
+  espera o upstream. Detalhes e evidências no P22.
+- **Não verificado (P22)**: se `p256`/`ml-dsa` chegam a executar (o `Ciphersuite` fixo é Ed25519/X25519, mas não li o
+  caminho dentro do `openmls`); `tokio::AsyncFd` dentro do `hickory-net`; testes Rust no CI (não rodam lá).
