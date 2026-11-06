@@ -73,6 +73,13 @@ pub enum ChatEvent {
         peer: PeerId,
         message: MessageId,
     },
+    /// Diagnóstico: um relay da caixa postal aceitou ou recusou um depósito (e por quê). Vem além de
+    /// `Deposited`/`DepositFailed`, um por relay, e pode chegar depois do `Deposited`.
+    MailboxRelay {
+        relay: String,
+        accepted: bool,
+        reason: String,
+    },
     /// A caixa postal recusou o depósito; a mensagem continua na outbox e será depositada de novo
     /// no próximo envio ou conexão.
     DepositFailed {
@@ -487,6 +494,16 @@ impl Chat {
                     self.queue.push_back(ChatEvent::Deposited { peer, message });
                 }
             }
+            MailboxEvent::RelayOutcome {
+                relay,
+                accepted,
+                reason,
+                ..
+            } => self.queue.push_back(ChatEvent::MailboxRelay {
+                relay,
+                accepted,
+                reason,
+            }),
             MailboxEvent::DepositFailed { id, reason } => {
                 if let Some((peer, message)) = self.depositing.remove(&id) {
                     self.queue.push_back(ChatEvent::DepositFailed {

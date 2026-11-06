@@ -28,6 +28,15 @@ pub enum MailboxEvent {
         id: DepositId,
         reason: String,
     },
+    /// Diagnóstico: um relay respondeu ao depósito `id` (aceitou ou recusou, e por quê). Vem além de
+    /// `Deposited`/`DepositFailed`, que são o resultado agregado; `reason` é texto do relay (já
+    /// reduzido a uma linha curta). Backends sem relays não emitem.
+    RelayOutcome {
+        id: DepositId,
+        relay: String,
+        accepted: bool,
+        reason: String,
+    },
     /// Chegou algo para este device. `from` é afirmado pelo backend; quem de fato enviou é
     /// verificado na decifragem (credencial MLS), então um `from` falso vira `Dropped`.
     Retrieved {

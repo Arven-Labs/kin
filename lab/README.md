@@ -47,5 +47,5 @@ kin --data-dir /tmp/b --no-mdns --dial /ip4/127.0.0.1/tcp/4102/p2p/<peer-id-de-A
 2. Encerre A (`/quit`). Em B, digite `teste-1`: esperado `(na fila…)` e `(depositada na caixa postal: …)`.
 3. Encerre B. Suba A de novo só com `$R` (sem B no ar): esperado `peer: teste-1`.
 
-Se o passo 2 não imprimir `depositada`, todos os relays recusaram (`depósito recusado: motivo`). A CLI ainda
-não mostra qual relay aceitou (P23(g)).
+A CLI imprime uma linha por relay: `(relay wss://…: aceitou)` ou `(relay wss://…: recusou: motivo)`. Se o
+passo 2 não imprimir `depositada`, todos os relays recusaram (`depósito recusado: motivo`).

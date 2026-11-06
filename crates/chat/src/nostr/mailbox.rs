@@ -115,8 +115,22 @@ impl Shared {
 
     /// Um relay respondeu (ou falhou) a um depósito. `Deposited` sai na primeira aceitação;
     /// `DepositFailed` só quando todos os relays falharam.
-    pub(super) fn ack(&self, id: DepositId, accepted: bool, reason: &str) {
+    pub(super) fn ack(&self, id: DepositId, relay: &str, accepted: bool, reason: &str) {
         let mut inner = self.lock();
+        if !inner.pending.contains_key(&id) {
+            return;
+        }
+        // O motivo vem do relay (hostil): uma linha curta, sem caracteres de controle.
+        let reason = one_line(reason);
+        Self::emit(
+            &inner,
+            MailboxEvent::RelayOutcome {
+                id,
+                relay: relay.to_string(),
+                accepted,
+                reason: reason.clone(),
+            },
+        );
         let Some(pending) = inner.pending.get_mut(&id) else {
             return;
         };
@@ -126,7 +140,7 @@ impl Shared {
             pending.accepted = true;
             event = Some(MailboxEvent::Deposited { id });
         } else if !accepted {
-            pending.reason = reason.to_string();
+            pending.reason = reason;
         }
         if pending.remaining == 0 {
             if !pending.accepted {
@@ -169,7 +183,20 @@ impl Shared {
     }
 }
 
+/// Quantos caracteres do motivo de um relay se mantêm.
+const REASON_LIMIT: usize = 200;
+
+/// Reduz um texto vindo do relay a uma linha curta: caracteres de controle (quebras, escapes) viram
+/// espaço e o resto é cortado em `REASON_LIMIT`.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(REASON_LIMIT)
+        .collect()
+}
+
 struct Worker {
+    url: String,
     commands: UnboundedSender<Command>,
     task: JoinHandle<()>,
 }
@@ -250,7 +277,11 @@ impl Mailbox for NostrMailbox {
                 self.config.clone(),
                 receiver,
             ));
-            self.workers.push(Worker { commands, task });
+            self.workers.push(Worker {
+                url: url.to_string(),
+                commands,
+                task,
+            });
         }
     }
 
@@ -305,7 +336,8 @@ impl Mailbox for NostrMailbox {
                 event: event.clone(),
             };
             if worker.commands.unbounded_send(command).is_err() {
-                self.shared.ack(id, false, "o worker do relay encerrou");
+                self.shared
+                    .ack(id, &worker.url, false, "o worker do relay encerrou");
             }
         }
         id

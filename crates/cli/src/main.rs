@@ -343,6 +343,17 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
         ChatEvent::Deposited { message, .. } => {
             println!("(depositada na caixa postal: {})", short(&message));
         }
+        ChatEvent::MailboxRelay {
+            relay,
+            accepted,
+            reason,
+        } => {
+            if accepted {
+                println!("(relay {relay}: aceitou)");
+            } else {
+                println!("(relay {relay}: recusou: {reason})");
+            }
+        }
         ChatEvent::DepositFailed {
             message, reason, ..
         } => println!("(depósito recusado {}: {reason})", short(&message)),

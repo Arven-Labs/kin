@@ -30,11 +30,47 @@ fn attach(mailbox: &mut NostrMailbox) -> UnboundedReceiver<MailboxEvent> {
     rx
 }
 
-async fn next(rx: &mut UnboundedReceiver<MailboxEvent>) -> MailboxEvent {
+/// Próximo evento bruto, inclusive o diagnóstico por relay (`RelayOutcome`).
+async fn next_raw(rx: &mut UnboundedReceiver<MailboxEvent>) -> MailboxEvent {
     timeout(Duration::from_secs(5), rx.next())
         .await
         .expect("nenhum evento da caixa postal em 5 s")
         .expect("canal fechado")
+}
+
+/// Próximo evento que não é diagnóstico por relay: os testes de agregação ignoram os `RelayOutcome`.
+async fn next(rx: &mut UnboundedReceiver<MailboxEvent>) -> MailboxEvent {
+    loop {
+        let event = next_raw(rx).await;
+        if !matches!(event, MailboxEvent::RelayOutcome { .. }) {
+            return event;
+        }
+    }
+}
+
+/// Junta eventos brutos até ter `outcomes` resultados por relay; devolve (resultados, demais eventos).
+async fn collect_outcomes(
+    rx: &mut UnboundedReceiver<MailboxEvent>,
+    outcomes: usize,
+) -> (Vec<(String, bool, String)>, Vec<MailboxEvent>) {
+    let (mut found, mut others) = (Vec::new(), Vec::new());
+    while found.len() < outcomes {
+        match next_raw(rx).await {
+            MailboxEvent::RelayOutcome {
+                relay,
+                accepted,
+                reason,
+                ..
+            } => found.push((relay, accepted, reason)),
+            other => others.push(other),
+        }
+    }
+    (found, others)
+}
+
+/// A URL do relay pode voltar normalizada (barra final); compara sem ela.
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 async fn quiet(rx: &mut UnboundedReceiver<MailboxEvent>, ms: u64) {
@@ -422,4 +458,141 @@ async fn dropping_the_mailbox_closes_its_connections() {
     drop(mb);
 
     eventually("fechou", || relay.open_connections() == 0).await;
+}
+
+// 17
+#[tokio::test(flavor = "multi_thread")]
+async fn each_relay_reports_its_own_outcome_and_the_deposit_is_confirmed_once() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let refusing = FakeRelay::start(Policy::Reject("blocked: not in web of trust".into())).await;
+    let accepting = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&refusing.url, &accepting.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    let (outcomes, others) = collect_outcomes(&mut rx, 2).await;
+    let of = |url: &str| outcomes.iter().find(|(r, ..)| same_url(r, url)).unwrap();
+    assert!(
+        of(&accepting.url).1,
+        "o relay que aceitou deve constar como aceito"
+    );
+    let refused = of(&refusing.url);
+    assert!(!refused.1);
+    assert!(refused.2.contains("web of trust"), "motivo: {}", refused.2);
+    let deposited = others
+        .into_iter()
+        .chain(next_or_none(&mut rx).await)
+        .filter(|e| *e == MailboxEvent::Deposited { id })
+        .count();
+    assert_eq!(deposited, 1);
+}
+
+// 18
+#[tokio::test(flavor = "multi_thread")]
+async fn when_every_relay_refuses_each_outcome_is_reported_before_the_failure() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (r1, r2) = (
+        FakeRelay::start(Policy::Reject("blocked: a".into())).await,
+        FakeRelay::start(Policy::Reject("blocked: b".into())).await,
+    );
+    let mut mb = mailbox(&ana, &[&r1.url, &r2.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    let (outcomes, others) = collect_outcomes(&mut rx, 2).await;
+    assert!(outcomes.iter().all(|(_, accepted, _)| !accepted));
+    let reasons: Vec<&str> = outcomes.iter().map(|(.., r)| r.as_str()).collect();
+    assert!(reasons.contains(&"blocked: a") && reasons.contains(&"blocked: b"));
+    let failed = others
+        .into_iter()
+        .chain(next_or_none(&mut rx).await)
+        .any(|e| matches!(e, MailboxEvent::DepositFailed { id: got, .. } if got == id));
+    assert!(failed);
+}
+
+// 19
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_relay_and_a_silent_relay_report_why() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let dead = dead_url().await;
+    let silent = FakeRelay::start(Policy::Silent).await;
+    let mut mb = mailbox(&ana, &[&dead, &silent.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    eventually("conexão feita", || silent.accepted_connections() >= 1).await;
+
+    mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    let (outcomes, _) = collect_outcomes(&mut rx, 2).await;
+    let of = |url: &str| outcomes.iter().find(|(r, ..)| same_url(r, url)).unwrap();
+    assert!(!of(&dead).1 && of(&dead).2.contains("desconectado"));
+    assert!(!of(&silent.url).1 && of(&silent.url).2.contains("a tempo"));
+}
+
+// 20
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_refusal_reason_is_one_short_line() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let hostile = format!("blocked: x\nrelay: ok\r\u{1b}[31m{}", "y".repeat(500));
+    let relay = FakeRelay::start(Policy::Reject(hostile)).await;
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    let (outcomes, _) = collect_outcomes(&mut rx, 1).await;
+    let reason = &outcomes[0].2;
+    assert!(reason.starts_with("blocked: x"), "motivo: {reason}");
+    assert!(
+        reason.chars().all(|c| !c.is_control()),
+        "motivo: {reason:?}"
+    );
+    assert!(reason.chars().count() <= 200, "motivo: {reason}");
+}
+
+// 21
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_chat_surfaces_the_relay_outcome_next_to_the_deposit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let (mut a, mut b) = (pa.open(), pb.open());
+    a.set_mailbox(mailbox(&pa.device, &[&relay.url]));
+    connect(&mut a, &mut b).await;
+    drop(b);
+    until_disconnected(&mut a).await;
+
+    a.send(pb.peer_id(), "oi", None).unwrap();
+
+    let (mut deposited, mut outcome) = (false, None);
+    timeout(WAIT, async {
+        while !(deposited && outcome.is_some()) {
+            match a.next_event().await {
+                ChatEvent::Deposited { .. } => deposited = true,
+                ChatEvent::MailboxRelay {
+                    relay,
+                    accepted,
+                    reason,
+                } => outcome = Some((relay, accepted, reason)),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("faltou o depósito ou o resultado do relay");
+    let (url, accepted, _) = outcome.unwrap();
+    assert!(same_url(&url, &relay.url) && accepted);
+}
+
+/// Próximo evento bruto, se vier logo (o `Deposited` pode sair depois dos resultados por relay).
+async fn next_or_none(rx: &mut UnboundedReceiver<MailboxEvent>) -> Option<MailboxEvent> {
+    timeout(Duration::from_millis(300), rx.next())
+        .await
+        .ok()
+        .flatten()
 }
