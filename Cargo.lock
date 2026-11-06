@@ -1861,6 +1861,7 @@ name = "kin-chat"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "futures",
  "kin-crypto",
  "kin-identity",
  "kin-transport",
