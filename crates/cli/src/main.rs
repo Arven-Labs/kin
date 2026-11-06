@@ -332,6 +332,12 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
             let id = message.map_or_else(|| "handshake".into(), |m| short(&m));
             println!("(falha no envio {id}: {reason})");
         }
+        ChatEvent::Deposited { message, .. } => {
+            println!("(depositada na caixa postal: {})", short(&message));
+        }
+        ChatEvent::DepositFailed {
+            message, reason, ..
+        } => println!("(depósito recusado {}: {reason})", short(&message)),
         ChatEvent::Queued { message, .. } => {
             println!("(na fila, sai quando o peer conectar: {})", short(&message));
         }

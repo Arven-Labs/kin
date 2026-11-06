@@ -44,6 +44,9 @@ impl Outbox {
                  sent_at_ms INTEGER NOT NULL,
                  text TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS kin_outbox_peer ON kin_outbox (peer, seq);
+             CREATE TABLE IF NOT EXISTS kin_deposited (
+                 id BLOB PRIMARY KEY,
+                 peer TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_seen (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  peer TEXT NOT NULL,
@@ -103,11 +106,59 @@ impl Outbox {
         Ok(out)
     }
 
+    /// Tira a mensagem da fila (e a marca de depositada, se houver).
     pub(crate) fn remove(&self, id: &MessageId) -> Result<(), Error> {
+        for table in ["kin_outbox", "kin_deposited"] {
+            self.conn
+                .execute(
+                    &format!("DELETE FROM {table} WHERE id = ?1"),
+                    [&id.as_bytes()[..]],
+                )
+                .map_err(Error::storage)?;
+        }
+        Ok(())
+    }
+
+    /// Registra que a caixa postal aceitou a mensagem `id` para `peer`.
+    pub(crate) fn mark_deposited(&self, peer: &PeerId, id: &MessageId) -> Result<(), Error> {
         self.conn
-            .execute("DELETE FROM kin_outbox WHERE id = ?1", [&id.as_bytes()[..]])
+            .execute(
+                "INSERT OR IGNORE INTO kin_deposited (id, peer) VALUES (?1, ?2)",
+                params![&id.as_bytes()[..], peer.to_string()],
+            )
             .map_err(Error::storage)?;
         Ok(())
+    }
+
+    /// Quantas mensagens de `peer` estão depositadas e ainda na fila (sem ack direto).
+    pub(crate) fn deposited_count(&self, peer: &PeerId) -> Result<usize, Error> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM kin_deposited WHERE peer = ?1",
+                [peer.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+            .map_err(Error::storage)
+    }
+
+    /// Mensagens de `peer` na fila que ainda não foram depositadas, da mais antiga para a mais nova.
+    pub(crate) fn undeposited(&self, peer: &PeerId) -> Result<Vec<Message>, Error> {
+        let deposited: std::collections::HashSet<Vec<u8>> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM kin_deposited WHERE peer = ?1")
+                .map_err(Error::storage)?;
+            stmt.query_map([peer.to_string()], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(Error::storage)?
+                .collect::<Result<_, _>>()
+                .map_err(Error::storage)?
+        };
+        Ok(self
+            .entries(peer)?
+            .into_iter()
+            .filter(|m| !deposited.contains(&m.id.as_bytes()[..]))
+            .collect())
     }
 
     /// Registra que `peer` mandou a mensagem `id`; `false` se já tinha sido vista. Mantém só os

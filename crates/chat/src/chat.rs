@@ -6,8 +6,14 @@ use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Ex
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider};
 use kin_transport::{Multiaddr, NatStatus, Node, NodeConfig, NodeEvent, PeerId, SendId};
 
+use futures::StreamExt as _;
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::future::{self, Either};
+use futures::pin_mut;
+
 use crate::outbox::Outbox;
 use crate::wire::Envelope;
+use crate::{DepositId, Mailbox, MailboxEvent};
 use crate::{Error, Invite, Message, MessageId};
 
 /// O que o [`Chat`] avisa à aplicação.
@@ -61,6 +67,19 @@ pub enum ChatEvent {
         peer: PeerId,
         message: MessageId,
     },
+    /// A caixa postal aceitou a mensagem para o peer buscar depois. Não é entrega: a mensagem segue
+    /// na outbox e também sai direto quando o peer conectar (ele deduplica).
+    Deposited {
+        peer: PeerId,
+        message: MessageId,
+    },
+    /// A caixa postal recusou o depósito; a mensagem continua na outbox e será depositada de novo
+    /// no próximo envio ou conexão.
+    DepositFailed {
+        peer: PeerId,
+        message: MessageId,
+        reason: String,
+    },
     /// O peer confirmou o recebimento.
     Delivered {
         peer: PeerId,
@@ -95,6 +114,17 @@ const FUTURE_LIMIT: usize = 32;
 /// viraria `TooOld`, ignorado em silêncio.
 const SEND_WINDOW: usize = 1;
 
+/// Quantas mensagens por peer podem estar depositadas na caixa postal sem terem sido confirmadas
+/// (ainda na outbox). Sem ack do destinatário, o backend pode devolvê-las fora de ordem; o MLS só
+/// tolera 10 gerações fora de ordem (e o `chat` ignora `TooOld` em silêncio), então fica abaixo disso.
+const MAILBOX_WINDOW: usize = 8;
+
+/// De onde veio o próximo evento do laço de [`Chat::next_event`].
+enum Next {
+    Node(NodeEvent),
+    Mailbox(Option<MailboxEvent>),
+}
+
 /// Chat 1:1: liga o transporte (`kin-transport`) à conversa cifrada (`kin-crypto`).
 ///
 /// Uma conversa por peer; persistente com [`Chat::open`], em memória com [`Chat::new`]. O
@@ -115,6 +145,11 @@ pub struct Chat {
     connected: std::collections::HashSet<PeerId>,
     /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
     in_flight: HashMap<PeerId, std::collections::HashSet<MessageId>>,
+    /// Caixa postal opcional (3.1) e o canal por onde ela avisa o que acontece.
+    mailbox: Option<Box<dyn Mailbox>>,
+    mailbox_events: Option<UnboundedReceiver<MailboxEvent>>,
+    /// Depósitos pedidos e ainda sem resposta da caixa postal.
+    depositing: HashMap<DepositId, (PeerId, MessageId)>,
     /// Eventos já produzidos mas ainda não entregues, em ordem.
     queue: std::collections::VecDeque<ChatEvent>,
 }
@@ -174,6 +209,9 @@ impl Chat {
             outbox,
             connected: Default::default(),
             in_flight: HashMap::new(),
+            mailbox: None,
+            mailbox_events: None,
+            depositing: HashMap::new(),
             queue: Default::default(),
         })
     }
@@ -229,6 +267,16 @@ impl Chat {
         Ok(self.node.dial_peer(peer, invite.addrs().to_vec())?)
     }
 
+    /// Liga uma caixa postal (3.1): com o peer offline, as mensagens da outbox são cifradas e
+    /// depositadas nela, e o que ela entregar a este device entra como se tivesse vindo direto.
+    pub fn set_mailbox(&mut self, mailbox: impl Mailbox + 'static) {
+        let (events, receiver) = futures::channel::mpsc::unbounded();
+        let mut mailbox = Box::new(mailbox);
+        mailbox.attach(events);
+        self.mailbox = Some(mailbox);
+        self.mailbox_events = Some(receiver);
+    }
+
     /// Quantas mensagens esperam na outbox por este peer (ainda sem confirmação de entrega).
     pub fn queued(&self, peer: &PeerId) -> usize {
         self.outbox.entries(peer).map_or(0, |entries| entries.len())
@@ -276,13 +324,61 @@ impl Chat {
             .is_some_and(|flying| flying.contains(message))
     }
 
-    /// Envia o que está na outbox do peer, do mais antigo ao mais novo, até encher a janela
-    /// ([`SEND_WINDOW`]). Sem conexão, não faz nada. Cada mensagem é cifrada agora, então uma nova
-    /// tentativa sai com bytes diferentes; quem recebe deduplica pelo `MessageId`.
+    /// Com o peer conectado, envia o que está na outbox direto; sem conexão, deposita na caixa
+    /// postal (se houver uma ligada).
     fn flush(&mut self, peer: PeerId) {
-        if !self.connected.contains(&peer) {
+        if self.connected.contains(&peer) {
+            self.send_direct(peer);
+        } else {
+            self.deposit(peer);
+        }
+    }
+
+    /// Deposita na caixa postal as mensagens da outbox do peer que ainda não foram depositadas, da
+    /// mais antiga à mais nova, até [`MAILBOX_WINDOW`] (contando as depositadas e as pedidas). A
+    /// mensagem continua na outbox: só o ack do envio direto a tira.
+    fn deposit(&mut self, peer: PeerId) {
+        if self.mailbox.is_none() {
             return;
         }
+        let waiting = match self.outbox.undeposited(&peer) {
+            Ok(waiting) => waiting,
+            Err(e) => return self.drop_message(peer, e),
+        };
+        for message in waiting {
+            if self
+                .depositing
+                .values()
+                .any(|(p, m)| *p == peer && *m == message.id)
+            {
+                continue;
+            }
+            let asked = self.depositing.values().filter(|(p, _)| *p == peer).count();
+            let done = match self.outbox.deposited_count(&peer) {
+                Ok(done) => done,
+                Err(e) => return self.drop_message(peer, e),
+            };
+            if asked + done >= MAILBOX_WINDOW {
+                break;
+            }
+            let Some(conversation) = self.conversations.get_mut(&peer) else {
+                return;
+            };
+            let wire = match conversation.encrypt(&message.encode()) {
+                Ok(wire) => wire,
+                Err(e) => return self.drop_message(peer, e.into()),
+            };
+            if let Some(mailbox) = self.mailbox.as_mut() {
+                let id = mailbox.deposit(peer, Envelope::Mls(wire).encode());
+                self.depositing.insert(id, (peer, message.id));
+            }
+        }
+    }
+
+    /// Envia o que está na outbox do peer, do mais antigo ao mais novo, até encher a janela
+    /// ([`SEND_WINDOW`]). Cada mensagem é cifrada agora, então uma nova tentativa sai com bytes
+    /// diferentes; quem recebe deduplica pelo `MessageId`.
+    fn send_direct(&mut self, peer: PeerId) {
         let entries = match self.outbox.entries(&peer) {
             Ok(entries) => entries,
             Err(e) => return self.drop_message(peer, e),
@@ -314,8 +410,61 @@ impl Chat {
             if let Some(event) = self.queue.pop_front() {
                 return event;
             }
-            let event = self.node.next_event().await;
-            self.handle(event);
+            // O que a caixa postal já avisou vem antes de esperar a rede, para um nó ocupado não
+            // atrasá-la indefinidamente.
+            if let Some(Ok(event)) = self.mailbox_events.as_mut().map(|rx| rx.try_recv()) {
+                self.handle_mailbox(event);
+                continue;
+            }
+            let next = {
+                let node = self.node.next_event();
+                match self.mailbox_events.as_mut() {
+                    Some(events) => {
+                        let mail = events.next();
+                        pin_mut!(node, mail);
+                        match future::select(node, mail).await {
+                            Either::Left((event, _)) => Next::Node(event),
+                            Either::Right((event, _)) => Next::Mailbox(event),
+                        }
+                    }
+                    None => Next::Node(node.await),
+                }
+            };
+            match next {
+                Next::Node(event) => self.handle(event),
+                Next::Mailbox(Some(event)) => self.handle_mailbox(event),
+                // O backend largou o canal: sem ele não há mais o que escutar.
+                Next::Mailbox(None) => self.mailbox_events = None,
+            }
+        }
+    }
+
+    fn handle_mailbox(&mut self, event: MailboxEvent) {
+        match event {
+            MailboxEvent::Deposited { id } => {
+                if let Some((peer, message)) = self.depositing.remove(&id) {
+                    if let Err(e) = self.outbox.mark_deposited(&peer, &message) {
+                        self.drop_message(peer, e);
+                    }
+                    self.queue.push_back(ChatEvent::Deposited { peer, message });
+                }
+            }
+            MailboxEvent::DepositFailed { id, reason } => {
+                if let Some((peer, message)) = self.depositing.remove(&id) {
+                    self.queue.push_back(ChatEvent::DepositFailed {
+                        peer,
+                        message,
+                        reason,
+                    });
+                }
+            }
+            // Só mensagem MLS vem pela caixa postal. O handshake exige o Peer ID da conexão (P15),
+            // que aqui seria apenas o que o backend afirma, então nunca entra por este caminho.
+            MailboxEvent::Retrieved { from, blob } => match Envelope::decode(&blob) {
+                Ok(Envelope::Mls(wire)) => self.on_envelope(from, Envelope::Mls(wire)),
+                Ok(_) => self.drop_message(from, Error::Malformed),
+                Err(e) => self.drop_message(from, e),
+            },
         }
     }
 
@@ -332,6 +481,8 @@ impl Chat {
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
+                // O que ficou na fila sem poder sair direto vai para a caixa postal.
+                self.flush(peer);
             }
             NodeEvent::MessageReceived { peer, data } => match Envelope::decode(&data) {
                 Ok(envelope) => self.on_envelope(peer, envelope),
@@ -546,6 +697,7 @@ mod tests {
 
     use super::*;
     use crate::outbox::SEEN_LIMIT;
+    use crate::{MemoryMailbox, MemoryRelay};
 
     fn chat(identity: &StandaloneIdentity, device: &DeviceKey) -> Chat {
         Chat::new(
@@ -806,6 +958,176 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(bia.outbox.seen_count(&ana_peer).unwrap(), SEEN_LIMIT);
+    }
+
+    /// Espera até 2 s por um evento que o filtro aceita (o mailbox entrega por `next_event`).
+    async fn until<T>(chat: &mut Chat, mut pick: impl FnMut(ChatEvent) -> Option<T>) -> Option<T> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(found) = pick(chat.next_event().await) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    fn mls_of(blob: &[u8]) -> Vec<u8> {
+        match Envelope::decode(blob).unwrap() {
+            Envelope::Mls(wire) => wire,
+            other => panic!("esperava Mls, veio {other:?}"),
+        }
+    }
+
+    fn text_of(ana: &mut Conversation, blob: &[u8]) -> String {
+        match ana.decrypt(&mls_of(blob)).unwrap() {
+            Decrypted::Message { plaintext, .. } => Message::decode(&plaintext).unwrap().text,
+            other => panic!("esperava mensagem, veio {other:?}"),
+        }
+    }
+
+    /// 3.1: com o peer offline e uma caixa postal ligada, a mensagem é cifrada e depositada.
+    #[tokio::test]
+    async fn an_offline_send_with_a_mailbox_deposits_the_encrypted_message() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        let id = bia.send(ana_peer, "oi", None).unwrap();
+        let deposited = until(&mut bia, |e| match e {
+            ChatEvent::Deposited { message, .. } => Some(message),
+            _ => None,
+        })
+        .await;
+        assert_eq!(deposited, Some(id));
+
+        let deposits = relay.deposits();
+        assert_eq!(deposits.len(), 1);
+        assert_eq!(
+            (deposits[0].from, deposits[0].to),
+            (bia.peer_id(), ana_peer)
+        );
+        assert_eq!(text_of(&mut ana, &deposits[0].blob), "oi");
+        assert_eq!(bia.queued(&ana_peer), 1, "depositar não é entregar");
+    }
+
+    /// 3.1: com o peer conectado vale o caminho direto; a caixa postal não é usada.
+    #[tokio::test]
+    async fn a_connected_peer_gets_the_direct_path_not_the_mailbox() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+
+        bia.send(ana_peer, "direto", None).unwrap();
+        assert!(relay.deposits().is_empty());
+        assert_eq!(in_flight(&bia), 1);
+    }
+
+    /// 3.1: no máximo `MAILBOX_WINDOW` mensagens depositadas e ainda não confirmadas por peer.
+    #[tokio::test]
+    async fn deposits_stop_at_the_mailbox_window() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        for i in 0..MAILBOX_WINDOW + 2 {
+            bia.send(ana_peer, i.to_string(), None).unwrap();
+        }
+        assert_eq!(relay.deposits().len(), MAILBOX_WINDOW);
+        assert_eq!(bia.queued(&ana_peer), MAILBOX_WINDOW + 2);
+    }
+
+    /// 3.1: o que vem pela caixa postal é mostrado uma vez, mesmo se a mesma mensagem chegar direto.
+    #[tokio::test]
+    async fn a_retrieved_message_is_shown_once_even_if_it_also_arrives_directly() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        let message = Message::new("duas vias".into(), None);
+        let (via_mailbox, direct) = (
+            ana.encrypt(&message.encode()).unwrap(),
+            ana.encrypt(&message.encode()).unwrap(),
+        );
+        MemoryMailbox::new(&relay, ana_peer)
+            .deposit(bia.peer_id(), Envelope::Mls(via_mailbox).encode());
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        let got = until(&mut bia, |e| match e {
+            ChatEvent::Received { message, .. } => Some(message.text),
+            _ => None,
+        })
+        .await;
+        assert_eq!(got.as_deref(), Some("duas vias"));
+
+        bia.on_mls(ana_peer, &direct).unwrap();
+        assert!(received_texts(&events(&mut bia)).is_empty());
+    }
+
+    /// 3.1: depósito recusado é avisado, a mensagem continua na fila e é depositada depois.
+    #[tokio::test]
+    async fn a_refused_deposit_is_reported_and_retried_on_the_next_flush() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        relay.fail_deposits(true);
+        let first = bia.send(ana_peer, "a", None).unwrap();
+        let failed = until(&mut bia, |e| match e {
+            ChatEvent::DepositFailed { message, .. } => Some(message),
+            _ => None,
+        })
+        .await;
+        assert_eq!(failed, Some(first));
+        assert!(relay.deposits().is_empty());
+        assert_eq!(bia.queued(&ana_peer), 1);
+
+        relay.fail_deposits(false);
+        bia.send(ana_peer, "b", None).unwrap();
+        let texts: Vec<_> = relay
+            .deposits()
+            .iter()
+            .map(|d| text_of(&mut ana, &d.blob))
+            .collect();
+        assert_eq!(texts, ["a", "b"], "a recusada foi depositada primeiro");
+    }
+
+    /// 3.1: um `from` que não tem conversa com a gente não vira mensagem de ninguém.
+    #[tokio::test]
+    async fn a_retrieved_blob_from_an_unknown_sender_is_dropped() {
+        let (mut bia, mut ana, _ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        let stranger = DeviceKey::generate().peer_id();
+        MemoryMailbox::new(&relay, stranger).deposit(
+            bia.peer_id(),
+            Envelope::Mls(wire(&mut ana, "intruso")).encode(),
+        );
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        let dropped = until(&mut bia, |e| match e {
+            ChatEvent::Dropped { peer, .. } => Some(peer),
+            ChatEvent::Received { .. } => panic!("mensagem atribuída a quem não tem conversa"),
+            _ => None,
+        })
+        .await;
+        assert_eq!(dropped, Some(stranger));
+    }
+
+    /// 3.1: o handshake nunca entra pela caixa postal (exige o Peer ID da conexão, P15); só MLS.
+    #[tokio::test]
+    async fn a_handshake_envelope_from_the_mailbox_is_dropped() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        let stranger = DeviceKey::generate().peer_id();
+        MemoryMailbox::new(&relay, stranger).deposit(bia.peer_id(), Envelope::Hello.encode());
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        let dropped = until(&mut bia, |e| match e {
+            ChatEvent::Dropped { peer, .. } => Some(peer),
+            _ => None,
+        })
+        .await;
+        assert_eq!(dropped, Some(stranger));
     }
 
     /// P15: o KeyPackage legítimo de Bia, entregue por outro Peer ID, não vira conversa.

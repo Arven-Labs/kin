@@ -1,14 +1,91 @@
 //! Helpers compartilhados pelos testes de integração do chat.
 #![allow(dead_code)] // cada arquivo de teste usa só parte dos helpers
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kin_chat::{Chat, ChatEvent, Message};
-use kin_identity::{DeviceKey, IdentityId};
-use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, Protocol, RelayLimits};
+use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
+use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, Protocol, RelayLimits};
 use tokio::time::timeout;
 
 pub const WAIT: Duration = Duration::from_secs(20);
+
+/// Uma pessoa com identidade, device e banco próprios; pode "reiniciar" reabrindo o mesmo banco.
+pub struct Person {
+    pub identity: StandaloneIdentity,
+    pub device: DeviceKey,
+    pub db: PathBuf,
+}
+
+impl Person {
+    pub fn new(dir: &Path, name: &str) -> Self {
+        Self {
+            identity: StandaloneIdentity::generate(),
+            device: DeviceKey::generate(),
+            db: dir.join(format!("{name}.db")),
+        }
+    }
+
+    pub fn peer_id(&self) -> PeerId {
+        self.device.peer_id()
+    }
+
+    pub fn open(&self) -> Chat {
+        Chat::open(
+            &self.identity,
+            &self.device,
+            NodeConfig {
+                mdns: false,
+                ..Default::default()
+            },
+            &self.db,
+        )
+        .unwrap()
+    }
+}
+
+/// `a` escuta, `b` disca, e a conversa fica pronta nos dois lados.
+pub async fn connect(a: &mut Chat, b: &mut Chat) -> Multiaddr {
+    let addr = listen(a).await;
+    b.dial(addr.clone()).unwrap();
+    connect_until_ready(a, b).await;
+    addr
+}
+
+/// Dirige `a` até ele notar que um peer caiu.
+pub async fn until_disconnected(a: &mut Chat) {
+    timeout(
+        WAIT,
+        wait_for(a, |e| {
+            matches!(e, ChatEvent::PeerDisconnected(_)).then_some(())
+        }),
+    )
+    .await
+    .expect("a queda do peer não foi notada");
+}
+
+/// Dirige os dois até `a` confirmar `delivered` entregas e `b` receber `received` mensagens;
+/// devolve os textos recebidos por `b`, na ordem.
+pub async fn until_delivered(
+    a: &mut Chat,
+    b: &mut Chat,
+    delivered: usize,
+    received: usize,
+) -> Vec<String> {
+    let (mut acks, mut texts) = (0, Vec::new());
+    timeout(WAIT, async {
+        while acks < delivered || texts.len() < received {
+            tokio::select! {
+                e = a.next_event() => if matches!(e, ChatEvent::Delivered { .. }) { acks += 1 },
+                e = b.next_event() => if let ChatEvent::Received { message, .. } = e { texts.push(message.text) },
+            }
+        }
+    })
+    .await
+    .expect("as mensagens da fila não chegaram");
+    texts
+}
 
 /// Avança o chat até um evento que o filtro aceita; descarta os demais.
 pub async fn wait_for<T>(chat: &mut Chat, mut pick: impl FnMut(ChatEvent) -> Option<T>) -> T {

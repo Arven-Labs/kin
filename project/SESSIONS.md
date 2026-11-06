@@ -2,7 +2,7 @@
 
 > **Nota**: Este log foi criado junto com o projeto. As sessões serão registradas aqui conforme o trabalho avança.
 >
-> Última atualização: 2026-11-05 (Sessão 6)
+> Última atualização: 2026-11-05 (Sessão 7)
 
 ---
 
@@ -272,3 +272,31 @@
 - **Não verificado**: testes Rust no CI (não rodam lá); rede real entre máquinas; custo de esvaziar fila grande (uma ida e volta por mensagem);
   permissão 0600 do `outbox.db` sem teste; reenvio quando o envio falha com a conexão aberta (P19).
 - **Próximo passo**: PR 2 (3.1): trait de mailbox + backend em memória + `ChatEvent::Deposited`.
+
+---
+
+### 2026-11-05 — Sessão 7
+
+- **Objetivo**: Fase 3, etapa 3.1 (interface de mailbox), PR 2 de 2 depois da outbox (PR #3).
+- **Decisões do dono**: interface fica só com o store-and-forward (o envio direto libp2p fica fora); aceitou o
+  depósito recusado repetido só no próximo gatilho (sem temporizador) e o teto de 8 depositadas por peer.
+  Aprovou os testes pela tabela e o ADR 0003.
+- **Feito** (branch `fase3-mailbox`):
+  - `chat/src/mailbox.rs`: trait `Mailbox` (`attach` com canal de eventos, `deposit`), `MailboxEvent` e o backend
+    de referência em memória (`MemoryRelay`, `MemoryMailbox`), públicos.
+  - `chat`: `set_mailbox`; sem conexão, `flush` cifra e deposita (teto 8, marca persistente em `kin_deposited`
+    gravada só na confirmação); `next_event` escuta rede e mailbox; `Retrieved` entra pelo mesmo caminho do envio
+    direto, só se for mensagem MLS; `ChatEvent::Deposited` e `DepositFailed`; queda do peer manda a fila para a
+    caixa postal. `cli` trata os eventos novos. Helpers de teste (`Person`, `connect`...) foram para `tests/common`.
+  - ADR 0003; P21 em `PENDING.md`; 3.1 marcada em `PHASE.md`; `OVERVIEW.md`.
+- **Achados**: (1) a mutação "aceitar handshake pela caixa postal" **sobreviveu** a todos os testes: a regra que
+  evita contornar a amarração ao Peer ID (P15) não estava protegida. Escrevi
+  `a_handshake_envelope_from_the_mailbox_is_dropped` (ele entrou depois da tabela aprovada) e a mutação passou a ser
+  pega; (2) a confirmação do depósito sem gravar só é pega pelo teste de reinício, não pelos unitários.
+- **Verificado (local)**: `cargo test --workspace` 95 passando, 0 falhando; `clippy` sem avisos; `fmt` ok; os testes
+  de ponta a ponta (mailbox e outbox) passaram 100 de 100 rodadas. Mutações (teto, marca sem gravar, dedupe
+  desligada, handshake aceito): todas pegas e revertidas.
+- **Não verificado**: backend assíncrono real (cancel-safety, ordem, starvation sob carga); `Welcome` e
+  `KeyPackage` um a um pela caixa postal (o teste cobre `Hello`, mesmo ramo do código); varredura inicial (P21).
+- **Próximo passo**: 3.3, backend Nostr (NIP-17/59), que precisa antes de um spike: tamanho aceito pelos relays
+  para mensagens MLS e a chave secp256k1 do destinatário.
