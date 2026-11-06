@@ -4,7 +4,7 @@
 > Toda pendência encontrada em qualquer arquivo do projeto deve ser registrada aqui com um ID único.
 > Ao resolver uma, marcar como `✅ Resolvida` com a sessão em que foi corrigida.
 >
-> Última atualização: 2026-11-05 (Sessão 7)
+> Última atualização: 2026-11-06 (Sessão 8)
 
 ---
 
@@ -25,6 +25,7 @@
 | P19 | **Reenvio periódico da outbox** — hoje a mensagem só tenta de novo quando o peer conecta de novo ou quando um ack libera a fila. Se o envio falhar com a conexão ainda aberta (ex.: timeout de stream), ela fica parada até a próxima conexão. Precisa de temporizador com espera crescente | Fase 3.2 (Sessão 6, ADR 0002) | Média (antes de distribuir) |
 | P21 | **Gatilhos de depósito da caixa postal** — ao ligar o mailbox (`set_mailbox`), mensagens que já estavam na fila só são depositadas no próximo envio ou queda do peer (não há varredura inicial); um depósito recusado também só é repetido no próximo gatilho. Mesma família do P19; resolver junto com o reenvio periódico | Fase 3.1 (Sessão 7, ADR 0003) | Média (antes de distribuir) |
 | P20 | **Número de sequência por remetente no formato da mensagem (v2)** — hoje a ordem na fila vem de enviar um por vez (`SEND_WINDOW = 1`); sem sequência não dá para paralelizar nem ordenar na interface (`sent_at_ms` empata). Também resolveria detectar lacunas | Fase 3.2 (Sessão 6, ADR 0002) | Baixa (quando a fila grande ficar lenta ou na interface) |
+| P22 | **Avisos do RustSec que o Dependabot não lista** (`cargo audit`, 2026-11-06, depois do PR do rustls) — 5 vulnerabilidades: `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387, tempo variável em operação que deveria ser constant-time; puxado por `elliptic-curve`/`p256`), `ctutils` 0.4.3 (0385, máscara não constant-time; puxado por `digest` 0.11 → `curve25519-dalek` 5 / `ed25519-dalek` 3), `libcrux-kem` 0.0.9 (0330 e 0331, panic em seed/chave híbrida curta; **não apareceu no `cargo tree --locked -i`**, falta achar quem puxa), `rustls-webpki` 0.103.15 (0382, aceita intermediário não confiável; puxado por `libp2p-tls`). Mais 3 avisos de manutenção: `paste`, `proc-macro-error2`, `tokio` 1.53.2 (0386, `AsyncFd::new` unsound; puxado por `hickory-net`/`libp2p-dns`). **Não classificados** (alcançabilidade não lida); tocam criptografia, então cada correção pede confirmação (§4). Candidatos: `rustls-webpki` e `ctutils` parecem caber só no lockfile, os demais precisam de checagem | Triagem de dependências (Sessão 8) | Média (antes de distribuir) |
 | P6 | **D6 — Privacidade de metadados** — quanto entra no MVP vs Fase 7 | Spec original (Sessão 1) | Baixa |
 | P7 | **Nome definitivo** — `Kin` é provisório/"meio fixo"; pode mudar | Sessão 1 | Baixa |
 
