@@ -1,4 +1,4 @@
-use kin_identity::{DeviceCertificate, IdentityId, PeerId, ed25519_bytes};
+use kin_identity::{DeviceCertificate, IdentityId, NostrPublicKey, PeerId, ed25519_bytes};
 use openmls::prelude::{BasicCredential, Credential};
 
 use crate::{Error, Expected};
@@ -52,6 +52,11 @@ pub(crate) fn identity_of(credential: &Credential) -> Result<IdentityId, Error> 
 /// Lê o Peer ID de rede certificado numa credencial já validada pelo MLS.
 pub(crate) fn peer_of(credential: &Credential) -> Result<PeerId, Error> {
     Ok(parse(credential)?.network_peer_id())
+}
+
+/// Lê a chave Nostr certificada numa credencial já validada pelo MLS.
+pub(crate) fn nostr_of(credential: &Credential) -> Result<NostrPublicKey, Error> {
+    Ok(parse(credential)?.nostr_key)
 }
 
 fn parse(credential: &Credential) -> Result<DeviceCertificate, Error> {

@@ -57,6 +57,12 @@ impl DeviceKey {
         NostrPublicKey(self.nostr.x_only_public_key().0)
     }
 
+    /// Chave **secreta** Nostr do device, para o backend Nostr assinar e decifrar. Quem a recebe deve
+    /// tratá-la como segredo: nunca registrar, nunca serializar fora do `device.key`.
+    pub fn nostr_secret_bytes(&self) -> [u8; 32] {
+        self.nostr.secret_bytes()
+    }
+
     /// Acesso ao keypair para o transporte (libp2p) assinar o handshake.
     pub fn keypair(&self) -> &Keypair {
         &self.network

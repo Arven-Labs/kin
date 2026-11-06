@@ -8,6 +8,7 @@ mod error;
 mod invite;
 mod mailbox;
 mod message;
+pub mod nostr;
 mod outbox;
 mod wire;
 

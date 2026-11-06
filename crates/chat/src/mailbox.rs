@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use futures::channel::mpsc::UnboundedSender;
+use kin_identity::NostrPublicKey;
 use kin_transport::PeerId;
 
 /// Identifica um depósito, para casar com [`MailboxEvent::Deposited`] / [`MailboxEvent::DepositFailed`].
@@ -44,6 +45,11 @@ pub trait Mailbox {
 
     /// Deposita `blob` (bytes opacos, já cifrados) para `to`. O backend sabe como chegar até ele.
     fn deposit(&mut self, to: PeerId, blob: Vec<u8>) -> DepositId;
+
+    /// O `Chat` informa a chave Nostr de `peer`, lida do certificado dele (assinado pela identidade e
+    /// validado pelo MLS), sempre que uma conversa fica pronta ou é recarregada do banco. Backends que
+    /// endereçam por outra chave que não o Peer ID (Nostr, ADR 0004) guardam o par; os demais ignoram.
+    fn learn_peer(&mut self, _peer: PeerId, _nostr: NostrPublicKey) {}
 }
 
 /// Um depósito registrado pelo [`MemoryRelay`].
