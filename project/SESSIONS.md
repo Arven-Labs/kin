@@ -327,3 +327,12 @@
   espera o upstream. Detalhes e evidências no P22.
 - **Não verificado (P22)**: se `p256`/`ml-dsa` chegam a executar (o `Ciphersuite` fixo é Ed25519/X25519, mas não li o
   caminho dentro do `openmls`); `tokio::AsyncFd` dentro do `hickory-net`; testes Rust no CI (não rodam lá).
+- **Spike da 3.3 (só leitura; PR de docs `docs-spike-3-3`)**: o dono limitou a medição a NIP-11 (nada foi
+  publicado em relay). Tamanhos medidos com um teste temporário em `crypto`, apagado depois (`git status` limpo).
+  Resultado no ADR 0004 (proposto): mensagem MLS de app = texto + 145 B; o teto prático (~30 KB) vem do NIP-44
+  (64 KiB por camada, duas camadas no gift wrap), não dos relays (≥128 KB declarados). Nenhum relay da amostra
+  anuncia NIP-17; só o damus anuncia NIP-59. Proposta: chave secp256k1 própria no `DeviceCertificate` v3.
+- **Não verificado (spike)**: escrita real (relay guarda e serve kind 1059?), NIP-40 por relay, tamanhos do evento
+  são estimativa, lista de relays é amostra.
+- **Próximo passo**: decidir se faz o spike de escrita (publica eventos de teste com chave descartável em poucos
+  relays) e confirmar a opção B; depois o plano da 3.3 em PRs separados (certificado v3, backend).
