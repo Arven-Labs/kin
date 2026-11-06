@@ -286,6 +286,26 @@ impl Chat {
         mailbox.attach(events);
         self.mailbox = Some(mailbox);
         self.mailbox_events = Some(receiver);
+        // Conversas que já existem (recarregadas do banco) também precisam ser ensinadas ao backend.
+        let peers: Vec<PeerId> = self.conversations.keys().copied().collect();
+        for peer in peers {
+            self.teach_mailbox(peer);
+        }
+    }
+
+    /// Diz à caixa postal a chave Nostr do `peer`, lida do certificado dele (já validado pelo MLS).
+    fn teach_mailbox(&mut self, peer: PeerId) {
+        let Some(mailbox) = self.mailbox.as_mut() else {
+            return;
+        };
+        let nostr = self
+            .conversations
+            .get(&peer)
+            .and_then(|c| c.peer_nostr_keys().ok())
+            .and_then(|keys| keys.into_iter().next());
+        if let Some(nostr) = nostr {
+            mailbox.learn_peer(peer, nostr);
+        }
     }
 
     /// Quantas mensagens esperam na outbox por este peer (ainda sem confirmação de entrega).
@@ -601,6 +621,7 @@ impl Chat {
         self.device
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
+        self.teach_mailbox(peer);
         self.expected.remove(&peer);
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.

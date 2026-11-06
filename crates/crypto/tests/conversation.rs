@@ -51,6 +51,19 @@ fn pair() -> (Person, Person, Conversation, Conversation) {
     (ana, bia, conv_ana, conv_bia)
 }
 
+#[test]
+fn a_member_exposes_the_certified_nostr_key_of_the_other_members() {
+    let (ana, bia, c_ana, c_bia) = pair();
+    assert_eq!(
+        c_ana.peer_nostr_keys().unwrap(),
+        vec![bia.device.certificate().nostr_key]
+    );
+    assert_eq!(
+        c_bia.peer_nostr_keys().unwrap(),
+        vec![ana.device.certificate().nostr_key]
+    );
+}
+
 fn identity(p: &Person) -> Expected<'_> {
     Expected {
         identity: Some(&p.id),

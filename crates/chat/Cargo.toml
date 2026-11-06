@@ -13,6 +13,7 @@ workspace = true
 kin-identity.workspace = true
 kin-crypto.workspace = true
 kin-transport.workspace = true
+nostr.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
 futures.workspace = true

@@ -1,4 +1,4 @@
-use kin_identity::{IdentityId, PeerId};
+use kin_identity::{IdentityId, NostrPublicKey, PeerId};
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{
     GroupId, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
@@ -168,6 +168,16 @@ impl Conversation {
             .members()
             .filter(|m| m.index != own)
             .map(|m| credential::peer_of(&m.credential))
+            .collect()
+    }
+
+    /// Chaves Nostr certificadas dos outros membros, na mesma ordem de [`Self::peer_ids`].
+    pub fn peer_nostr_keys(&self) -> Result<Vec<NostrPublicKey>, Error> {
+        let own = self.group.own_leaf_index();
+        self.group
+            .members()
+            .filter(|m| m.index != own)
+            .map(|m| credential::nostr_of(&m.credential))
             .collect()
     }
 

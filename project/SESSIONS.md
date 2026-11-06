@@ -365,3 +365,21 @@
   sem mudança de comportamento nem de formato. `cargo test --workspace --locked` 102 passando sem editar nenhum teste;
   `clippy`, `fmt` ok; sem `secp256k1` duplicado; `cargo audit` com os mesmos 5 itens do P22. Efeito: o lockfile ganha
   `rand` 0.8.8 ao lado do 0.9.5. Não verificado: testes Rust no CI (não rodam lá).
+- **PR B (branch `nostr-wrap-protocol`)**: camada de protocolo do backend Nostr, sem rede. `kin_chat::nostr` (`wrap`,
+  `unwrap`, `Unwrapped`, `WrapError`, `MAX_BLOB` = 30.000): gift wrap kind 1059 → seal → rumor kind 14 com o blob em
+  base64; o `unwrap` herda do crate `nostr` as conferências de kind, assinaturas e autor do rumor = autor do seal, e
+  exige ainda rumor kind 14, base64 válido, blob ≤ teto e `content` do wrap ≤ 256 KiB antes de decifrar.
+  `DeviceKey::nostr_secret_bytes`, `Conversation::peer_nostr_keys`, `Mailbox::learn_peer` (padrão vazio) e o `Chat`
+  ensina a caixa postal ao fechar o handshake e ao ligá-la numa conversa recarregada. Dependência `nostr =0.45.7`
+  (`std`, `nip59`, `os-rng`): 13 diretas, 18 entradas novas no lockfile, `rand` 0.10 (terceira versão do `rand`).
+- **Achado na leitura do crate**: o `nostr` 0.45.7 estende o NIP-44 com prefixo de tamanho maior acima de 65.535
+  bytes. O teto de ~30 KB do ADR 0004 deixa de ser limite do protocolo e vira política nossa (ADR corrigido). O
+  crate sorteia o `created_at` do wrap até 2 dias no passado; um TTL (3.4) só faz sentido acima de 2 dias.
+- **Verificado (local)**: testes novos escritos antes (não compilavam: 22, 1 e 2 erros) e verdes depois; `cargo test
+  --workspace --locked` 117 passando, 0 falhando (eram 102); `clippy`, `fmt` ok; `cargo audit` com os mesmos 5 itens do
+  P22. Mutações pegas e revertidas: teto `>=`, rumor kind 14 não exigido, `content` do wrap sem teto antes de
+  decifrar, `learn_peer` ausente ao recarregar e ausente ao fechar o handshake.
+- **Não verificado**: testes Rust no CI (não rodam lá); a cripto NIP-44 é a do crate `nostr`, sem revisão minha; nenhum
+  relay real foi usado neste PR (sem rede); o crate `nostr` aceita eventos hostis só até onde os testes exercitam.
+- **Próximo passo**: PR C, `NostrMailbox` com websocket (`tokio-tungstenite`), vários relays e NIP-42, com plano
+  próprio (decisões abertas: lista padrão de relays, `since`, reconexão e backoff, `Deposited` com 1 de N relays).

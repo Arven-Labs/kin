@@ -21,6 +21,8 @@ libp2p-identity = { version = "0.3", features = ["ed25519", "peerid", "rand"] }
 thiserror = "2"
 # Chave Schnorr (BIP-340) do device para o backend Nostr (ADR 0004). libsecp256k1 em C, versão exata (cripto).
 secp256k1 = { version = "=0.30.0", default-features = false, features = ["std", "rand"] }
+# Protocolo Nostr (só tipos e cripto, sem rede): NIP-44/59 do gift wrap (ADR 0004). Versão exata (cripto).
+nostr = { version = "=0.45.7", default-features = false, features = ["std", "nip59", "os-rng"] }
 libp2p ={ version = "0.57", default-features = false, features = ["tokio", "tcp", "noise", "yamux", "mdns", "identify", "macros", "request-response", "relay", "dcutr", "autonat", "quic", "dns"] }
 openmls = "=0.9.0"
 openmls_rust_crypto = "=0.6.0"

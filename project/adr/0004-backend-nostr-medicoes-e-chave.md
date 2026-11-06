@@ -25,10 +25,13 @@ só de leitura (nenhum evento foi publicado) e a decisão proposta.
 | App, 1 KB | 1.171 | ~4,6 KB | 3,9× |
 | Commit | 673 | ~3,9 KB | 5,8× |
 | App, 16 KB | 16.535 | ~55 KB | 3,3× |
-| App, 48 KB | 49.303 | não cabe | NIP-44 estoura 64 KiB |
+| App, 48 KB | 49.303 | não cabe pela especificação | NIP-44 estoura 64 KiB |
 
-O teto prático é o **NIP-44**, não o relay: 65.535 bytes de texto puro por camada, e o gift wrap tem duas, cada uma
-com base64 e padding. Resulta em **~30 KB por mensagem MLS**.
+A especificação do NIP-44 limita o texto puro a 65.535 bytes por camada, e o gift wrap tem duas, cada uma com base64
+e padding; daí a estimativa de **~30 KB por mensagem MLS**. **Correção (PR do protocolo, Sessão 8):** lendo o crate
+`nostr` 0.45.7, ele estende o NIP-44 com um prefixo de tamanho maior acima de 65.535 bytes, então o limite do
+protocolo não se aplica a ele. Os ~30 KB passam a ser **política nossa** (`MAX_BLOB` = 30.000 bytes), mantida porque
+relays com web of trust já recusaram eventos de 16 KB, e porque não usamos a extensão (não padrão).
 
 **Relays públicos** (NIP-11, campo `limitation`; é o limite *declarado*): `relay.damus.io` e `relay.primal.net`
 1.000.000; `relay.snort.social` e `nostr.wine` 524.288 (este é pago e com escrita restrita); `nos.lol` e
@@ -39,8 +42,8 @@ com base64 e padding. Resulta em **~30 KB por mensagem MLS**.
 ## Decisão (proposta)
 
 1. **Gift wrap NIP-17/59** como previsto em D1, com o blob MLS em base64 no `content` do rumor.
-2. **Teto de ~30 KB por mensagem** no backend Nostr; acima disso, o `Mailbox` devolve `DepositFailed`. Fragmentação
-   (anexos) fica para a Fase 5, não para a 3.3.
+2. **Teto de 30.000 bytes por blob** (`MAX_BLOB`, política nossa) no backend Nostr; acima disso, o `Mailbox` devolve
+   `DepositFailed`. Fragmentação (anexos) fica para a Fase 5, não para a 3.3.
 3. **Chave do destinatário: opção B.** O device gera uma chave secp256k1 própria, incluída no `DeviceCertificate`
    (v3), assinada pela identidade. O backend resolve Peer ID → chave secp256k1 pelo certificado.
 4. **Tratar cada relay como poço que pode recusar.** A escrita foi medida (seção abaixo) e a política varia por relay
