@@ -301,3 +301,22 @@
   `KeyPackage` um a um pela caixa postal (o teste cobre `Hello`, mesmo ramo do código); varredura inicial (P21).
 - **Próximo passo**: 3.3, backend Nostr (NIP-17/59), que precisa antes de um spike: tamanho aceito pelos relays
   para mensagens MLS e a chave secp256k1 do destinatário.
+
+---
+
+### 2026-11-06 — Sessão 8
+
+- **Objetivo**: triagem dos alertas do Dependabot (`/dependencias kin`) e correção do que cabe só no lockfile.
+- **Alertas antes**: 4 abertos (#1 a #4), todos `rustls` 0.23.45, runtime, `Cargo.lock`, corrigido na 0.23.46.
+  Quem puxa: `libp2p-quic` (via `quinn`/`quinn-proto`) e `libp2p-tls`; nenhum crate do kin usa `rustls` direto.
+- **Classificação**: #1 (Brotli) **não alcançável**: `brotli` não está no `Cargo.lock` e o decoder vem desativado.
+  #2 (`Debug` da sessão), #3 (grupo de troca de chaves envenenado) e #4 (ECH rejeitado): **não verificados**.
+  O `libp2p-tls` 0.7.0 não menciona `ClientSessionStore` nem ECH, mas isso é indício, não prova. Nenhum foi dispensado.
+- **Feito** (branch `deps-rustls-0.23.46`): `cargo update -p rustls --precise 0.23.46`. O diff do lockfile mexe só no
+  `rustls` (versão e checksum) e na escolha de `getrandom` dele (0.4.3 → 0.3.4, que já estava no lockfile).
+- **Achado**: `cargo audit` lista 5 vulnerabilidades e 3 avisos de manutenção que o Dependabot não mostra. Registrados
+  no P22, sem corrigir (fora do escopo deste PR, tocam criptografia).
+- **Verificado (local)**: `cargo test --workspace --locked` sem falhas; `clippy` sem avisos; `fmt` ok.
+- **Alertas depois**: não medido. Só vale depois do merge, relendo a API na `main`. Esperado: 0.
+- **Não verificado**: alcançabilidade dos itens do P22; testes Rust no CI (não rodam lá); redes reais.
+- **Próximo passo**: reler os alertas na `main` depois do merge; classificar o P22; depois o spike da 3.3.
