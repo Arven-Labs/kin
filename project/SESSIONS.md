@@ -296,7 +296,8 @@
 - **Verificado (local)**: `cargo test --workspace` 95 passando, 0 falhando; `clippy` sem avisos; `fmt` ok; os testes
   de ponta a ponta (mailbox e outbox) passaram 100 de 100 rodadas. Mutações (teto, marca sem gravar, dedupe
   desligada, handshake aceito): todas pegas e revertidas.
-- **Não verificado**: backend assíncrono real (cancel-safety, ordem, starvation sob carga); `Welcome` e
+- **CI**: PR #4, `guard` verde (visto com `gh pr view`), `CLEAN` e `MERGEABLE`. É o único workflow do repo.
+- **Não verificado**: testes Rust no CI (não rodam lá); backend assíncrono real (cancel-safety, ordem, starvation sob carga); `Welcome` e
   `KeyPackage` um a um pela caixa postal (o teste cobre `Hello`, mesmo ramo do código); varredura inicial (P21).
 - **Próximo passo**: 3.3, backend Nostr (NIP-17/59), que precisa antes de um spike: tamanho aceito pelos relays
   para mensagens MLS e a chave secp256k1 do destinatário.
