@@ -19,6 +19,8 @@ pub enum Policy {
     Reject(String),
     /// Aceita a conexão e o `EVENT`, mas nunca responde.
     Silent,
+    /// Espera o atraso e só então aplica a política de dentro (relay lento, como o nos.lol real).
+    Slow(std::time::Duration, Box<Policy>),
 }
 
 #[derive(Default)]
@@ -185,8 +187,13 @@ async fn connection(
                 match msg.first().and_then(Value::as_str) {
                     Some("EVENT") => {
                         let Some(event) = msg.get(1).and_then(|v| Event::from_json(v.to_string()).ok()) else { continue };
-                        let policy = state.lock().unwrap().policy.clone().unwrap_or(Policy::Accept);
+                        let mut policy = state.lock().unwrap().policy.clone().unwrap_or(Policy::Accept);
+                        while let Policy::Slow(delay, inner) = policy {
+                            tokio::time::sleep(delay).await;
+                            policy = *inner;
+                        }
                         match policy {
+                            Policy::Slow(..) => unreachable!(),
                             Policy::Silent => {}
                             Policy::Reject(why) => {
                                 let _ = tx.send(Message::text(json!(["OK", event.id, false, why]).to_string())).await;

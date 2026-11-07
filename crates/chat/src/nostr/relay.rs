@@ -94,10 +94,21 @@ async fn session(
         return true;
     }
 
-    // Publicações à espera de `OK`: (prazo, id do evento, id do depósito).
-    let mut waiting: Vec<(Instant, EventId, DepositId)> = Vec::new();
+    // Publicações à espera de `OK`.
+    struct Waiting {
+        event_id: EventId,
+        deposit: DepositId,
+        /// Quando avisar que o relay está lento; `None` depois de avisar.
+        slow_at: Option<Instant>,
+        /// Quando contar o relay como falha.
+        deadline: Instant,
+    }
+    let mut waiting: Vec<Waiting> = Vec::new();
     let keep = loop {
-        let next_deadline = waiting.iter().map(|(at, ..)| *at).min();
+        let next_deadline = waiting
+            .iter()
+            .flat_map(|w| w.slow_at.into_iter().chain([w.deadline]))
+            .min();
         tokio::select! {
             incoming = stream.next() => {
                 let text = match incoming {
@@ -111,9 +122,9 @@ async fn session(
                 match message {
                     RelayMessage::Event { event, .. } => shared.on_event(&event),
                     RelayMessage::Ok { event_id, status, message } => {
-                        if let Some(at) = waiting.iter().position(|(_, id, _)| *id == event_id) {
-                            let (_, _, deposit) = waiting.swap_remove(at);
-                            shared.ack(deposit, url.as_str(), status, &message);
+                        if let Some(at) = waiting.iter().position(|w| w.event_id == event_id) {
+                            let done = waiting.swap_remove(at);
+                            shared.ack(done.deposit, url.as_str(), status, &message);
                         }
                     }
                     RelayMessage::Auth { challenge } => {
@@ -138,23 +149,35 @@ async fn session(
                         shared.ack(id, url.as_str(), false, "falha ao enviar ao relay");
                         break true;
                     }
-                    waiting.push((Instant::now() + config.ack_timeout, event_id, id));
+                    let now = Instant::now();
+                    waiting.push(Waiting {
+                        event_id,
+                        deposit: id,
+                        slow_at: Some(now + config.ack_timeout),
+                        deadline: now + config.ack_deadline,
+                    });
                 }
                 None => break false,
             },
             _ = async { sleep_until(next_deadline.unwrap()).await }, if next_deadline.is_some() => {
                 let now = Instant::now();
-                let (late, rest): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|(at, ..)| *at <= now);
+                let (late, rest): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|w| w.deadline <= now);
                 waiting = rest;
-                for (_, _, deposit) in late {
-                    shared.ack(deposit, url.as_str(), false, "o relay não respondeu a tempo");
+                for w in late {
+                    shared.ack(w.deposit, url.as_str(), false, "o relay não respondeu a tempo");
+                }
+                for w in &mut waiting {
+                    if w.slow_at.is_some_and(|at| at <= now) {
+                        w.slow_at = None;
+                        shared.slow(w.deposit, url.as_str());
+                    }
                 }
             }
         }
     };
-    for (_, _, deposit) in waiting {
+    for w in waiting {
         shared.ack(
-            deposit,
+            w.deposit,
             url.as_str(),
             false,
             "conexão perdida antes da resposta",

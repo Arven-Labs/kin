@@ -27,8 +27,12 @@ pub struct NostrConfig {
     /// Primeira espera antes de reconectar; dobra a cada falha até `backoff_max` (com jitter de ±20%).
     pub backoff_min: Duration,
     pub backoff_max: Duration,
-    /// Quanto esperar o `OK` de um relay depois de publicar.
+    /// Quanto esperar o `OK` de um relay antes de avisar que ele está lento (`RelaySlow`). Não é
+    /// falha: o depósito segue pendente e um `OK` tardio ainda conta.
     pub ack_timeout: Duration,
+    /// Quanto esperar o `OK` de um relay antes de contá-lo como falha. Deve ser maior que
+    /// `ack_timeout`. O nos.lol real levou 35 a 57 s (Sessão 11).
+    pub ack_deadline: Duration,
     /// Quanto do passado pedir ao assinar. O NIP-59 sorteia o `created_at` do gift wrap até 2 dias
     /// atrás para esconder o horário real; 3 dias cobrem isso com folga de relógio.
     pub since_window: Duration,
@@ -40,6 +44,7 @@ impl Default for NostrConfig {
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             ack_timeout: Duration::from_secs(10),
+            ack_deadline: Duration::from_secs(90),
             since_window: Duration::from_secs(3 * 24 * 3600),
         }
     }
@@ -153,6 +158,20 @@ impl Shared {
         }
         if let Some(event) = event {
             Self::emit(&inner, event);
+        }
+    }
+
+    /// O relay passou do `ack_timeout` sem responder ao depósito `id`. Só avisa; não conta como falha.
+    pub(super) fn slow(&self, id: DepositId, relay: &str) {
+        let inner = self.lock();
+        if inner.pending.contains_key(&id) {
+            Self::emit(
+                &inner,
+                MailboxEvent::RelaySlow {
+                    id,
+                    relay: relay.to_string(),
+                },
+            );
         }
     }
 
