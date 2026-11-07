@@ -29,6 +29,10 @@ struct State {
     reqs: Vec<Value>,
     policy: Option<Policy>,
     require_auth: bool,
+    /// Como o damus real: exige NIP-42, recusa todo `AUTH` e reenvia o mesmo desafio a cada `REQ`.
+    refuse_auth: bool,
+    /// Quantos `AUTH` o cliente mandou (em todas as conexões).
+    auths: usize,
 }
 
 pub struct FakeRelay {
@@ -78,6 +82,18 @@ impl FakeRelay {
     /// Exige NIP-42 antes de servir um `REQ`.
     pub fn require_auth(&self) {
         self.state.lock().unwrap().require_auth = true;
+    }
+
+    /// Exige NIP-42 mas recusa toda autenticação, reenviando o desafio a cada `REQ` negado.
+    pub fn refuse_auth(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.require_auth = true;
+        state.refuse_auth = true;
+    }
+
+    /// Quantos `AUTH` o relay recebeu.
+    pub fn auth_attempts(&self) -> usize {
+        self.state.lock().unwrap().auths
     }
 
     /// Guarda o evento e o entrega às assinaturas abertas (como se outro cliente o tivesse publicado).
@@ -217,6 +233,9 @@ async fn connection(
                         let wanted = filter.get("#p").and_then(Value::as_array).and_then(|a| a.first()).and_then(Value::as_str).map(str::to_owned);
                         if need_auth && (authed.is_none() || authed != wanted) {
                             let _ = tx.send(Message::text(json!(["CLOSED", sub, "auth-required: autentique-se"]).to_string())).await;
+                            if state.lock().unwrap().refuse_auth {
+                                let _ = tx.send(Message::text(json!(["AUTH", challenge]).to_string())).await;
+                            }
                             continue;
                         }
                         subs.retain(|(s, _)| *s != sub);
@@ -237,6 +256,12 @@ async fn connection(
                             && event.verify().is_ok()
                             && tag("challenge").as_deref() == Some(challenge.as_str())
                             && tag("relay").is_some_and(|r| r.trim_end_matches('/') == url.trim_end_matches('/'));
+                        let refuse = {
+                            let mut s = state.lock().unwrap();
+                            s.auths += 1;
+                            s.refuse_auth
+                        };
+                        let ok = ok && !refuse;
                         if ok { authed = Some(event.pubkey.to_hex()); }
                         let _ = tx.send(Message::text(json!(["OK", event.id, ok, if ok { "" } else { "auth inválido" }]).to_string())).await;
                     }

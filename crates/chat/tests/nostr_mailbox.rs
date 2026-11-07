@@ -751,6 +751,60 @@ async fn a_real_chat_surfaces_the_slow_relay_before_the_deposit() {
     assert_eq!(order, ["slow", "deposited"]);
 }
 
+// 29
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_refuses_our_auth_and_resends_the_same_challenge_is_answered_only_once() {
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.refuse_auth();
+    let ana = DeviceKey::generate();
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let _rx = attach(&mut mb);
+
+    sleep(Duration::from_millis(1500)).await;
+
+    // Antes da correção cada desafio repetido gerava um AUTH e um REQ novos, sem parar (257 voltas
+    // em ~90 s contra o damus real). Agora: 1 AUTH e, no máximo, o REQ inicial mais o do AUTH.
+    assert_eq!(
+        relay.auth_attempts(),
+        1,
+        "AUTH repetido para o mesmo desafio"
+    );
+    assert!(
+        relay.reqs().len() <= 2,
+        "REQ em laço: {} pedidos",
+        relay.reqs().len()
+    );
+}
+
+// 30
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_refuses_auth_still_accepts_deposits() {
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.refuse_auth();
+    let (_mb, mut rx) = deposit_to(&[&relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(600)).await;
+
+    assert_eq!(tags, ["accepted", "deposited"]);
+}
+
+// 31
+#[tokio::test(flavor = "multi_thread")]
+async fn after_a_reconnection_the_new_challenge_is_answered_once_again() {
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.refuse_auth();
+    let ana = DeviceKey::generate();
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let _rx = attach(&mut mb);
+    eventually("primeiro AUTH", || relay.auth_attempts() == 1).await;
+
+    relay.drop_connections();
+
+    eventually("AUTH da nova conexão", || relay.auth_attempts() == 2).await;
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(relay.auth_attempts(), 2, "AUTH repetido na nova conexão");
+}
+
 /// Próximo evento bruto, se vier logo (o `Deposited` pode sair depois dos resultados por relay).
 async fn next_or_none(rx: &mut UnboundedReceiver<MailboxEvent>) -> Option<MailboxEvent> {
     timeout(Duration::from_millis(300), rx.next())

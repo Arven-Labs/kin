@@ -104,6 +104,8 @@ async fn session(
         deadline: Instant,
     }
     let mut waiting: Vec<Waiting> = Vec::new();
+    // Último desafio NIP-42 respondido nesta conexão.
+    let mut answered: Option<String> = None;
     let keep = loop {
         let next_deadline = waiting
             .iter()
@@ -128,6 +130,13 @@ async fn session(
                         }
                     }
                     RelayMessage::Auth { challenge } => {
+                        // Cada desafio é respondido uma vez por conexão. Um relay que recusa a nossa
+                        // prova (o damus real: "relay needs serviceUrl to be configured") reenvia o mesmo
+                        // desafio a cada `REQ` negado; responder de novo vira um laço sem fim.
+                        if answered.as_deref() == Some(challenge.as_ref() as &str) {
+                            continue;
+                        }
+                        answered = Some(challenge.as_ref().to_string());
                         // NIP-42: prova que controlamos a chave Nostr e pede a assinatura de novo.
                         let auth = ClientAuthentication::new(challenge.as_ref(), url.clone())
                             .into_event_builder()
