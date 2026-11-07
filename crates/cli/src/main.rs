@@ -354,6 +354,9 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
                 println!("(relay {relay}: recusou: {reason})");
             }
         }
+        ChatEvent::MailboxRelaySlow { relay } => {
+            println!("(relay {relay}: demorando a responder, ainda esperando)");
+        }
         ChatEvent::DepositFailed {
             message, reason, ..
         } => println!("(depósito recusado {}: {reason})", short(&message)),

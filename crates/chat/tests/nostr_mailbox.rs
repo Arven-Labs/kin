@@ -18,7 +18,8 @@ fn fast() -> NostrConfig {
     NostrConfig {
         backoff_min: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
-        ack_timeout: Duration::from_secs(1),
+        ack_timeout: Duration::from_millis(300),
+        ack_deadline: Duration::from_secs(1),
         ..NostrConfig::default()
     }
 }
@@ -42,7 +43,10 @@ async fn next_raw(rx: &mut UnboundedReceiver<MailboxEvent>) -> MailboxEvent {
 async fn next(rx: &mut UnboundedReceiver<MailboxEvent>) -> MailboxEvent {
     loop {
         let event = next_raw(rx).await;
-        if !matches!(event, MailboxEvent::RelayOutcome { .. }) {
+        if !matches!(
+            event,
+            MailboxEvent::RelayOutcome { .. } | MailboxEvent::RelaySlow { .. }
+        ) {
             return event;
         }
     }
@@ -587,6 +591,164 @@ async fn a_real_chat_surfaces_the_relay_outcome_next_to_the_deposit() {
     .expect("faltou o depósito ou o resultado do relay");
     let (url, accepted, _) = outcome.unwrap();
     assert!(same_url(&url, &relay.url) && accepted);
+}
+
+/// Todos os eventos que chegam em `window`, resumidos em uma palavra cada (a ordem importa).
+async fn story(rx: &mut UnboundedReceiver<MailboxEvent>, window: Duration) -> Vec<String> {
+    let end = tokio::time::Instant::now() + window;
+    let mut tags = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout_at(end, rx.next()).await {
+        tags.push(match event {
+            MailboxEvent::RelaySlow { .. } => "slow".to_string(),
+            MailboxEvent::RelayOutcome { accepted: true, .. } => "accepted".to_string(),
+            MailboxEvent::RelayOutcome {
+                accepted: false,
+                reason,
+                ..
+            } => format!("rejected:{reason}"),
+            MailboxEvent::Deposited { .. } => "deposited".to_string(),
+            MailboxEvent::DepositFailed { .. } => "failed".to_string(),
+            MailboxEvent::Retrieved { .. } => "retrieved".to_string(),
+        });
+    }
+    tags
+}
+
+const TOO_LATE: &str = "rejected:o relay não respondeu a tempo";
+
+/// Um depósito de `ana` para `bia` em `urls`, já com a conexão feita; devolve o canal de eventos.
+async fn deposit_to(urls: &[&FakeRelay]) -> (NostrMailbox, UnboundedReceiver<MailboxEvent>) {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let addrs: Vec<&String> = urls.iter().map(|r| &r.url).collect();
+    let mut mb = mailbox(&ana, &addrs);
+    let rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    eventually("conexões feitas", || {
+        urls.iter().all(|r| r.accepted_connections() >= 1)
+    })
+    .await;
+    mb.deposit(bia.peer_id(), b"x".to_vec());
+    (mb, rx)
+}
+
+// 22
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_relay_that_accepts_after_the_slow_warning_still_confirms_the_deposit() {
+    let relay = FakeRelay::start(Policy::Slow(
+        Duration::from_millis(600),
+        Box::new(Policy::Accept),
+    ))
+    .await;
+    let (_mb, mut rx) = deposit_to(&[&relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(1800)).await;
+
+    assert_eq!(tags, ["slow", "accepted", "deposited"]);
+}
+
+// 23
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_relay_is_called_slow_first_and_only_fails_at_the_deadline() {
+    let relay = FakeRelay::start(Policy::Silent).await;
+    let (_mb, mut rx) = deposit_to(&[&relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(2000)).await;
+
+    assert_eq!(tags, ["slow", TOO_LATE, "failed"]);
+}
+
+// 24
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_answers_before_the_slow_warning_is_never_called_slow() {
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let (_mb, mut rx) = deposit_to(&[&relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(800)).await;
+
+    assert_eq!(tags, ["accepted", "deposited"]);
+}
+
+// 25
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_relay_that_refuses_fails_the_deposit_with_its_own_reason() {
+    let relay = FakeRelay::start(Policy::Slow(
+        Duration::from_millis(600),
+        Box::new(Policy::Reject("blocked: x".into())),
+    ))
+    .await;
+    let (_mb, mut rx) = deposit_to(&[&relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(1800)).await;
+
+    assert_eq!(tags, ["slow", "rejected:blocked: x", "failed"]);
+}
+
+// 26
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ok_after_the_deadline_is_ignored_and_does_not_resurrect_the_deposit() {
+    let relay = FakeRelay::start(Policy::Slow(
+        Duration::from_millis(1500),
+        Box::new(Policy::Accept),
+    ))
+    .await;
+    let (_mb, mut rx) = deposit_to(&[&relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(2600)).await;
+
+    assert_eq!(tags, ["slow", TOO_LATE, "failed"]);
+}
+
+// 27
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fast_relay_confirms_once_and_the_slow_one_is_still_reported_when_it_answers() {
+    let fast_relay = FakeRelay::start(Policy::Accept).await;
+    let slow_relay = FakeRelay::start(Policy::Slow(
+        Duration::from_millis(600),
+        Box::new(Policy::Accept),
+    ))
+    .await;
+    let (_mb, mut rx) = deposit_to(&[&fast_relay, &slow_relay]).await;
+
+    let tags = story(&mut rx, Duration::from_millis(1800)).await;
+
+    // O rápido aceita e confirma; o lento é chamado de lento e depois aceita; uma só confirmação.
+    assert_eq!(tags, ["accepted", "deposited", "slow", "accepted"]);
+}
+
+// 28
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_chat_surfaces_the_slow_relay_before_the_deposit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let relay = FakeRelay::start(Policy::Slow(
+        Duration::from_millis(600),
+        Box::new(Policy::Accept),
+    ))
+    .await;
+    let (mut a, mut b) = (pa.open(), pb.open());
+    a.set_mailbox(mailbox(&pa.device, &[&relay.url]));
+    connect(&mut a, &mut b).await;
+    drop(b);
+    until_disconnected(&mut a).await;
+
+    a.send(pb.peer_id(), "oi", None).unwrap();
+
+    let mut order = Vec::new();
+    timeout(WAIT, async {
+        while !order.contains(&"deposited") {
+            match a.next_event().await {
+                ChatEvent::MailboxRelaySlow { relay: url } => {
+                    assert!(same_url(&url, &relay.url));
+                    order.push("slow");
+                }
+                ChatEvent::Deposited { .. } => order.push("deposited"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("faltou o aviso de relay lento ou o depósito");
+    assert_eq!(order, ["slow", "deposited"]);
 }
 
 /// Próximo evento bruto, se vier logo (o `Deposited` pode sair depois dos resultados por relay).

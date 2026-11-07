@@ -37,6 +37,13 @@ pub enum MailboxEvent {
         accepted: bool,
         reason: String,
     },
+    /// Diagnóstico: o relay ainda não respondeu ao depósito `id` depois do `ack_timeout`. Não é
+    /// falha: o depósito segue pendente e uma resposta tardia ainda conta. Cada relay é avisado no
+    /// máximo uma vez por depósito; o resultado final vem em `RelayOutcome`.
+    RelaySlow {
+        id: DepositId,
+        relay: String,
+    },
     /// Chegou algo para este device. `from` é afirmado pelo backend; quem de fato enviou é
     /// verificado na decifragem (credencial MLS), então um `from` falso vira `Dropped`.
     Retrieved {
