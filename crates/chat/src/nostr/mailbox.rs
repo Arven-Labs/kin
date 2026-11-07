@@ -57,6 +57,9 @@ pub enum NostrError {
     InvalidRelayUrl(String),
     #[error("chave do device ilegível: {0}")]
     Key(String),
+    /// O arquivo de relays existe mas não deu para ler.
+    #[error("não consegui ler o arquivo de relays: {0}")]
+    RelayFile(String),
 }
 
 struct Pending {
@@ -274,7 +277,7 @@ impl NostrMailbox {
     }
 }
 
-fn parse_relay(url: &str) -> Result<RelayUrl, NostrError> {
+pub(super) fn parse_relay(url: &str) -> Result<RelayUrl, NostrError> {
     let parsed = RelayUrl::parse(url).map_err(|e| NostrError::InvalidRelayUrl(e.to_string()))?;
     if parsed.scheme() == RelayUrlScheme::Ws && !parsed.is_localhost() {
         return Err(NostrError::InvalidRelayUrl(format!(

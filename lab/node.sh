@@ -6,5 +6,6 @@ set -eu
 [ -n "${GATEWAY:-}" ] && ip route replace default via "$GATEWAY"
 rm -f /tmp/in
 mkfifo /tmp/in
+# O laboratório mede só a rede P2P: sem a caixa postal Nostr (que, por padrão, falaria com relays públicos).
 # shellcheck disable=SC2086
-exec kin $KIN_ARGS <> /tmp/in
+exec kin --no-nostr $KIN_ARGS <> /tmp/in

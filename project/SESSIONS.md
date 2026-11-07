@@ -492,6 +492,22 @@
     veio em 90 s.
   - Conclusão: primal e offchain são os relays que funcionam (depositam e devolvem, rápido, sem auth); o nos.lol é
     instável; o damus só aceita depósito. É 1 mensagem por relay: prova que funciona, não que é sempre confiável.
-- **Próximo passo**: decidir a lista de relays que o Kin usa (hoje não há padrão: vem de `--nostr-relay`; candidatos
-  primal e offchain, nos.lol opcional, damus fora ou só depósito); depois a 3.4 (replicar em N só ajuda se N relays
-  devolverem).
+- **Decisão do dono (relays por usuário)**: cada usuário configura os seus relays de entrada, com padrão embutido
+  (primal e offchain, substituível), e o remetente deposita nos relays do **contato**, aprendidos por uma mensagem de
+  controle dentro do MLS (não no convite). Plano em 2 PRs: (1) relays do próprio dispositivo; (2) relays de entrada
+  do contato (toca rede e parsing de dado externo: confirmar antes).
+- **Feito (PR 1, branch `relays-config`)**: `nostr::{DEFAULT_RELAYS, RelaySource, RelayChoice, parse_relay_list,
+  resolve_relays}` (`nostr/relay_list.rs`): `--nostr-relay` (repetível) > `<data-dir>/relays.txt` (uma URL por
+  linha, `#` comenta) > padrão. URL inválida é erro com o número da linha; arquivo sem nenhum relay é erro (não cai
+  no padrão); com flags o arquivo nem é lido; repetidos (inclusive `…/`) contam uma vez. A CLI passa a ligar a caixa
+  postal **sempre** (antes só com a flag), imprime a origem e a lista, e ganha `--no-nostr`. `lab/node.sh` sobe os
+  nós com `--no-nostr` (o laboratório mede só a rede P2P).
+- **Testes**: 13 novos (`tests/relay_list.rs`), escritos antes (não compilavam), verdes depois. Mutação pega e
+  revertida: ignorar as flags derruba 3 testes.
+- **Verificado (local)**: `cargo test --workspace --locked` 161 passando, 0 falhando (eram 148); clippy e fmt ok;
+  a CLI imprime a origem (`--nostr-relay`, `relays.txt`) e aborta com `linha 1` num arquivo quebrado; `--no-nostr`
+  não liga nada.
+- **Não verificado**: a CLI com o padrão embutido contra primal/offchain (não rodei); CI (testes Rust não rodam lá);
+  a CLI não tem teste automatizado (só as funções de `nostr`).
+- **Próximo passo**: PR 2 (relays de entrada do contato por mensagem MLS, com validação rígida da lista recebida) e
+  depois a 3.4.
