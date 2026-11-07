@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--accept LINK] [--relay ADDR]...
-//!     [--relay-count N] [--external-addr ADDR]... [--nostr-relay URL]... [--no-mdns]
+//!     [--relay-count N] [--external-addr ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns]
 //! kin --serve-relay [--listen ADDR] [--external-addr ADDR]... [--relay-max-bytes N]
 //!     [--relay-max-circuits N]
 //! ```
@@ -11,14 +11,16 @@
 //! endereço de circuito que o outro lado deve passar a `--dial`. `--serve-relay` sobe só um relay
 //! (sem chat). `/invite` imprime o seu link de convite (e um QR) e `--accept LINK` / `/accept LINK`
 //! abre o de outra pessoa: o link prova quem é e por onde alcançá-la. Na LAN, duas instâncias se acham sozinhas via mDNS.
-//! `--nostr-relay URL` (`wss://...`; `ws://` só para o próprio computador) liga a caixa postal Nostr: mensagens
-//! para quem está offline são depositadas nesses relays e buscadas ao voltar (só com conversa já fechada).
+//! A caixa postal Nostr fica sempre ligada: mensagens para quem está offline são depositadas nos relays e
+//! buscadas ao voltar (só com conversa já fechada). Os relays vêm de `--nostr-relay URL` (`wss://...`;
+//! `ws://` só para o próprio computador; repetível), senão de `<data-dir>/relays.txt` (uma URL por linha,
+//! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
 //! Linhas digitadas vão ao peer da conversa;
 //! `/r <id> texto` responde à mensagem `<id>` (thread); `/quit` sai.
 
 use std::path::{Path, PathBuf};
 
-use kin_chat::nostr::NostrMailbox;
+use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Invite, Message, MessageId};
 use kin_identity::{DeviceKey, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
@@ -33,6 +35,7 @@ struct Args {
     relay_count: Option<usize>,
     external_addrs: Vec<Multiaddr>,
     nostr_relays: Vec<String>,
+    no_nostr: bool,
     serve_relay: bool,
     relay_limits: RelayLimits,
     mdns: bool,
@@ -48,6 +51,7 @@ fn parse_args() -> Result<Args, String> {
         relay_count: None,
         external_addrs: Vec::new(),
         nostr_relays: Vec::new(),
+        no_nostr: false,
         serve_relay: false,
         relay_limits: RelayLimits::default(),
         mdns: true,
@@ -70,6 +74,7 @@ fn parse_args() -> Result<Args, String> {
                 .external_addrs
                 .push(value()?.parse().map_err(|e| format!("{e}"))?),
             "--nostr-relay" => args.nostr_relays.push(value()?),
+            "--no-nostr" => args.no_nostr = true,
             "--serve-relay" => args.serve_relay = true,
             "--relay-max-bytes" => {
                 args.relay_limits.max_circuit_bytes =
@@ -127,7 +132,7 @@ fn short(id: &MessageId) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -155,10 +160,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         chat.peer_id()
     );
-    if !args.nostr_relays.is_empty() {
+    if !args.no_nostr {
+        let choice = resolve_relays(&args.nostr_relays, &args.data_dir.join("relays.txt"))?;
+        let origin = match choice.source {
+            RelaySource::Flag => "--nostr-relay",
+            RelaySource::File => "relays.txt",
+            RelaySource::Default => "padrão embutido",
+        };
         // Dentro do runtime tokio: os workers dos relays sobem no `attach` de `set_mailbox`.
-        chat.set_mailbox(NostrMailbox::new(&device, &args.nostr_relays)?);
-        println!("caixa postal Nostr em {} relay(s)", args.nostr_relays.len());
+        chat.set_mailbox(NostrMailbox::new(&device, &choice.relays)?);
+        println!(
+            "caixa postal Nostr em {} relay(s) ({origin}): {}",
+            choice.relays.len(),
+            choice.relays.join(", ")
+        );
     }
 
     match args.listen {

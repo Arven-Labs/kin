@@ -38,7 +38,7 @@ públicos, que não dá para apagar**: use só mensagens de teste e peça autori
 terminais, com a CLI (`cargo build -p kin-cli`):
 
 ```bash
-R="--nostr-relay wss://nos.lol --nostr-relay wss://relay.damus.io"
+R="--nostr-relay wss://relay.primal.net --nostr-relay wss://offchain.pub"   # é o padrão; --nostr-relay ou relays.txt trocam
 kin --data-dir /tmp/a --listen /ip4/127.0.0.1/tcp/4102 --no-mdns $R           # A: anote o peer id
 kin --data-dir /tmp/b --no-mdns --dial /ip4/127.0.0.1/tcp/4102/p2p/<peer-id-de-A> $R   # B
 ```
