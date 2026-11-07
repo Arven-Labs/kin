@@ -459,5 +459,25 @@
   Mutação pega e revertida: prazo final voltando a `ack_timeout` derruba 7 testes.
 - **Não verificado**: contra relay real depois da mudança; CI (testes Rust não rodam lá); os 90 s vêm de 2 amostras;
   qual relay entregou a mensagem; se o damus exigiu NIP-42.
-- **Próximo passo**: rodar o roteiro real com a mudança (confirmar `demorando a responder` e depois `aceitou` no
-  nos.lol) e depois 3.4.
+- **Roteiro real com a mudança (autorizado pelo dono; 3 rodadas, com nos.lol e/ou damus)**:
+  - nos.lol + damus: damus `aceitou` em 0,2 s, `Deposited` na hora; nos.lol `demorando a responder` aos 10 s e
+    `recusou: o relay não respondeu a tempo` aos 90 s (desta vez não respondeu em 90 s; antes: 35 s e 57 s). O A
+    reiniciado não recebeu a mensagem em 20 s.
+  - só damus, 2 rodadas (45 s e 30 s de espera no A): `aceitou`, mas a mensagem **não volta** ao A.
+- **Causa no damus (instrumentação temporária, revertida)**: o damus exige NIP-42 para ler `kind 1059`
+  (`CLOSED ... auth-required`) e recusa a nossa prova (`OK false: relay needs serviceUrl to be configured before AUTH
+  can work`), reenviando o mesmo `AUTH`. Ele aceita publicar sem autenticar (por isso o `aceitou`), mas não serve a
+  leitura. As entregas anteriores vieram, portanto, do nos.lol (inferência).
+- **Bug nosso achado**: a cada `AUTH` do relay respondíamos e reenviávamos o `REQ`, sem limite: 257 voltas em ~90 s
+  contra o damus (uma a cada ~200 ms). Os testes não pegavam porque o relay falso aceitava o `AUTH` de primeira.
+- **Feito** (branch `auth-loop`): cada desafio NIP-42 é respondido uma vez por conexão (`answered` em
+  `nostr/relay.rs`); o mesmo desafio repetido é ignorado. Desafio novo, ou conexão nova, volta a ser respondido.
+- **Testes**: 3 novos (29 a 31 de `nostr_mailbox.rs`) e `FakeRelay::refuse_auth` (recusa o `AUTH` e reenvia o
+  desafio, como o damus). O 29 falhava antes por laço (72 `AUTH` em 1,5 s, esperado 1), o 31 também; o 30 (depósito
+  com relay que recusa o auth) já passava e fica como guarda.
+- **Verificado (local)**: `cargo test --workspace --locked` 148 passando, 0 falhando (eram 145); clippy e fmt ok.
+  Mutação pega e revertida: guarda do desafio repetido desligada derruba 29 e 31.
+- **Não verificado**: contra o damus real depois da correção (o laço deve sumir, mas a leitura continua recusada);
+  CI (testes Rust não rodam lá); o que o nos.lol faz na leitura (só o damus foi instrumentado).
+- **Próximo passo**: decidir o papel do damus (só depósito ou sair da lista) e achar outro relay que devolva
+  `kind 1059` sem NIP-42 quebrado; depois a 3.4 (replicar em N só ajuda se N relays devolverem).
