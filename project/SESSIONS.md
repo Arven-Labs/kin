@@ -435,3 +435,15 @@
   o evento não liga o resultado ao `MessageId` (só ao relay).
 - **Próximo passo**: rodar o roteiro real para ver o resultado por relay (publica em relays públicos, pede
   autorização) e depois 3.4.
+
+### 2026-11-07 — Sessão 11
+
+- **Objetivo**: rodar o roteiro real da Sessão 9 com a saída por relay (P23(f) e (g)), autorizado pelo dono.
+- **Roteiro** (A e B em diretórios temporários, TCP loopback; relays `wss://nos.lol` e `wss://relay.damus.io`): conversa
+  fechada; A encerrado; B envia `oi-offline-relay-outcome`; B encerrado; A reinicia só com os relays.
+- **Resultado**: `(relay wss://relay.damus.io: aceitou)`, `(depositada na caixa postal: c8740a22)` e
+  `(relay wss://nos.lol: recusou: o relay não respondeu a tempo)`. O A reiniciado recebeu
+  `[c8740a22] peer: oi-offline-relay-outcome`. O resultado por relay aparece com relay real (P23(g) confirmado).
+- **Não verificado**: uma única tentativa; se o timeout do nos.lol é lentidão passageira ou limite do relay (na
+  Sessão 9 ele funcionou); qual relay entregou a mensagem; se o damus exigiu NIP-42.
+- **Próximo passo**: investigar o timeout do nos.lol (valor do timeout no `NostrMailbox`, repetir o roteiro) e depois 3.4.
