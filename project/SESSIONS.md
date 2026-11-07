@@ -446,4 +446,18 @@
   `[c8740a22] peer: oi-offline-relay-outcome`. O resultado por relay aparece com relay real (P23(g) confirmado).
 - **Não verificado**: uma única tentativa; se o timeout do nos.lol é lentidão passageira ou limite do relay (na
   Sessão 9 ele funcionou); qual relay entregou a mensagem; se o damus exigiu NIP-42.
-- **Próximo passo**: investigar o timeout do nos.lol (valor do timeout no `NostrMailbox`, repetir o roteiro) e depois 3.4.
+- **Timeout do nos.lol (medido, só nos.lol, `ack_timeout` temporário de 60 s, 2 mensagens)**: `OK true` em ~57 s e
+  ~35 s, e o destinatário recebeu as duas. O relay não recusava: o `ack_timeout` de 10 s tratava lento como falha e
+  descartava o `OK` tardio. Instrumentação temporária revertida.
+- **Feito** (branch `relay-slow-ack`, PR #17): dois prazos por publicação. `ack_timeout` (10 s) só emite
+  `MailboxEvent::RelaySlow` / `ChatEvent::MailboxRelaySlow` (a CLI imprime `demorando a responder`); `ack_deadline`
+  (90 s, campo novo de `NostrConfig`) é quem conta o relay como falha. `OK` entre os dois conta normalmente.
+- **Testes**: 7 novos (22 a 28 de `nostr_mailbox.rs`), escritos antes (3 erros de compilação), verdes depois;
+  `Policy::Slow` no relay falso. `fast()` passou a `ack_timeout` 300 ms e `ack_deadline` 1 s; o helper `next` pula
+  `RelaySlow`; nenhum assert antigo mudou.
+- **Verificado (local)**: `cargo test --workspace --locked` 145 passando, 0 falhando (eram 138); clippy e fmt ok.
+  Mutação pega e revertida: prazo final voltando a `ack_timeout` derruba 7 testes.
+- **Não verificado**: contra relay real depois da mudança; CI (testes Rust não rodam lá); os 90 s vêm de 2 amostras;
+  qual relay entregou a mensagem; se o damus exigiu NIP-42.
+- **Próximo passo**: rodar o roteiro real com a mudança (confirmar `demorando a responder` e depois `aceitou` no
+  nos.lol) e depois 3.4.
