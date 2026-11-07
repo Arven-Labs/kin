@@ -479,5 +479,19 @@
   Mutação pega e revertida: guarda do desafio repetido desligada derruba 29 e 31.
 - **Não verificado**: contra o damus real depois da correção (o laço deve sumir, mas a leitura continua recusada);
   CI (testes Rust não rodam lá); o que o nos.lol faz na leitura (só o damus foi instrumentado).
-- **Próximo passo**: decidir o papel do damus (só depósito ou sair da lista) e achar outro relay que devolva
-  `kind 1059` sem NIP-42 quebrado; depois a 3.4 (replicar em N só ajuda se N relays devolverem).
+- **Quais relays leem e devolvem (autorizado pelo dono)**:
+  - NIP-11 (só leitura): nos.lol, damus, primal e offchain.pub rodam strfry; nostr.wine e inbox.nostr.wine são
+    pagos. O NIP-11 não diz se o relay serve `kind 1059`.
+  - Teste só de leitura (`REQ` de `kind 1059`, sem depositar; com a correção do laço): primal, offchain e nos.lol
+    respondem `EOSE` sem pedir auth; o damus continua em `AUTH` → `CLOSED auth-required` → `OK false`, agora sem
+    laço (6 linhas em 10 s, antes ~140 em 30 s).
+  - Ponta a ponta, um relay por rodada (A e B novos; B deposita, A reinicia só com aquele relay), 1 mensagem cada:
+    **primal**: `aceitou` em 0,26 s e a mensagem chegou 1,1 s após reiniciar; **offchain**: `aceitou` em 0,17 s e
+    chegou em 0,9 s; **nos.lol**: sem resposta ao depósito (só `demorando a responder` aos 10 s; o B saiu antes do
+    prazo final) e nada chegou em 40 s. Lembrete: no nos.lol, antes, o `OK` veio em 35 e 57 s, e noutra rodada não
+    veio em 90 s.
+  - Conclusão: primal e offchain são os relays que funcionam (depositam e devolvem, rápido, sem auth); o nos.lol é
+    instável; o damus só aceita depósito. É 1 mensagem por relay: prova que funciona, não que é sempre confiável.
+- **Próximo passo**: decidir a lista de relays que o Kin usa (hoje não há padrão: vem de `--nostr-relay`; candidatos
+  primal e offchain, nos.lol opcional, damus fora ou só depósito); depois a 3.4 (replicar em N só ajuda se N relays
+  devolverem).
