@@ -63,6 +63,13 @@ pub enum ChatEvent {
         sender: IdentityId,
         message: Message,
     },
+    /// Outro device meu enviou `message` a `to` (espelho multi-device, 3.5). Não é uma mensagem
+    /// recebida: é uma mensagem **minha**, para mostrar na conversa com `to`. `peer` é o device irmão.
+    SentElsewhere {
+        peer: PeerId,
+        to: IdentityId,
+        message: Message,
+    },
     /// A mensagem está na outbox esperando o peer: ele está offline ou o envio falhou. Sai sozinha
     /// quando ele conectar.
     Queued {
@@ -365,7 +372,7 @@ impl Chat {
             return Err(Error::NoConversation(peer));
         }
         let message = Message::new(text.into(), parent);
-        self.queue_and_flush(&[peer], &message)?;
+        self.queue_and_flush(&[(peer, None)], &message)?;
         Ok(message.id)
     }
 
@@ -376,9 +383,12 @@ impl Chat {
             .conversations
             .iter()
             .filter(|(_, conversation)| {
+                // Exatamente um outro membro. Um commit de membro pode ter levado outros ao grupo
+                // (o `crypto` aceita `Add` de credencial válida), e esse grupo não é "um device de
+                // `identity`": mandar texto em claro para ele vazaria para quem entrou.
                 conversation
                     .peers()
-                    .is_ok_and(|peers| peers.first() == Some(identity))
+                    .is_ok_and(|peers| peers.as_slice() == std::slice::from_ref(identity))
             })
             .map(|(peer, _)| *peer)
             .collect();
@@ -402,17 +412,36 @@ impl Chat {
             return Err(Error::UnknownIdentity(identity.to_base58()));
         }
         let message = Message::new(text.into(), parent);
-        self.queue_and_flush(&devices, &message)?;
+        let mut targets: Vec<(PeerId, Option<IdentityId>)> =
+            devices.into_iter().map(|peer| (peer, None)).collect();
+        // Espelho: meus outros devices recebem "enviei isto a `identity`" para mostrar na conversa.
+        // Para mim mesma não: o irmão já recebe a mensagem comum, e o espelho a duplicaria.
+        let own = self.device.identity().clone();
+        if *identity != own {
+            targets.extend(
+                self.devices_of(&own)
+                    .into_iter()
+                    .map(|peer| (peer, Some(identity.clone()))),
+            );
+        }
+        self.queue_and_flush(&targets, &message)?;
         Ok(message.id)
     }
 
-    /// Grava `message` na outbox de cada peer e só então tenta enviar; quem não saiu direto avisa
-    /// `Queued`.
-    fn queue_and_flush(&mut self, peers: &[PeerId], message: &Message) -> Result<(), Error> {
-        for peer in peers {
-            self.outbox.enqueue(peer, message)?;
+    /// Grava `message` na outbox de cada alvo e só então tenta enviar; quem não saiu direto avisa
+    /// `Queued`. O alvo com `Some(to)` é um espelho (ver [`Outbox::enqueue_mirror`]).
+    fn queue_and_flush(
+        &mut self,
+        targets: &[(PeerId, Option<IdentityId>)],
+        message: &Message,
+    ) -> Result<(), Error> {
+        for (peer, mirror_to) in targets {
+            match mirror_to {
+                Some(to) => self.outbox.enqueue_mirror(peer, message, to)?,
+                None => self.outbox.enqueue(peer, message)?,
+            }
         }
-        for &peer in peers {
+        for &(peer, _) in targets {
             self.flush(peer);
             if !self.is_in_flight(&peer, &message.id) {
                 self.queue.push_back(ChatEvent::Queued {
@@ -482,10 +511,14 @@ impl Chat {
             if asked + done >= MAILBOX_WINDOW {
                 break;
             }
+            let plaintext = match self.outgoing_plaintext(&peer, &message) {
+                Ok(plaintext) => plaintext,
+                Err(e) => return self.drop_message(peer, e),
+            };
             let Some(conversation) = self.conversations.get_mut(&peer) else {
                 return;
             };
-            let wire = match conversation.encrypt(&message.encode()) {
+            let wire = match conversation.encrypt(&plaintext) {
                 Ok(wire) => wire,
                 Err(e) => return self.drop_message(peer, e.into()),
             };
@@ -494,6 +527,19 @@ impl Chat {
                 self.depositing.insert(id, (peer, message.id));
             }
         }
+    }
+
+    /// O que se cifra para `peer` por esta entrada da outbox: a mensagem comum ou, se a entrada for
+    /// um espelho (3.5), o `Payload::Sent` com a identidade de destino.
+    fn outgoing_plaintext(&self, peer: &PeerId, message: &Message) -> Result<Vec<u8>, Error> {
+        Ok(match self.outbox.mirror_target(peer, &message.id)? {
+            Some(to) => Payload::Sent {
+                to,
+                message: message.clone(),
+            }
+            .encode(),
+            None => message.encode(),
+        })
     }
 
     /// Envia o que está na outbox do peer, do mais antigo ao mais novo, até encher a janela
@@ -512,10 +558,14 @@ impl Chat {
             if flying.contains(&message.id) {
                 continue;
             }
+            let plaintext = match self.outgoing_plaintext(&peer, &message) {
+                Ok(plaintext) => plaintext,
+                Err(e) => return self.drop_message(peer, e),
+            };
             let Some(conversation) = self.conversations.get_mut(&peer) else {
                 return;
             };
-            let wire = match conversation.encrypt(&message.encode()) {
+            let wire = match conversation.encrypt(&plaintext) {
                 Ok(wire) => wire,
                 Err(e) => return self.drop_message(peer, e.into()),
             };
@@ -802,9 +852,9 @@ impl Chat {
                         Ok(())
                     }
                     Payload::RelayList(relays) => self.on_relay_list(peer, &relays),
-                    // Multi-device (3.5): o formato já existe, o tratamento vem nas etapas 4 e 5.
-                    // Até lá, ignorar é seguro: nada é aceito nem enviado por causa deles.
-                    Payload::Sent { .. } | Payload::DeviceList(_) => Ok(()),
+                    Payload::Sent { to, message } => self.on_sent(peer, &sender, to, message),
+                    // A descoberta de devices vem na etapa 5; até lá, ignorar é seguro.
+                    Payload::DeviceList(_) => Ok(()),
                 }
             }
             Ok(Decrypted::EpochChanged) => {
@@ -821,6 +871,28 @@ impl Chat {
             Err(CryptoError::Duplicate | CryptoError::TooOld) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Um device irmão diz que enviou `message` a `to`. Só vale se quem **assinou esta mensagem**
+    /// (`sender`, o remetente autenticado pelo MLS) for da minha identidade. Não basta olhar a
+    /// composição do grupo: num grupo que cresceu por commit, o "outro membro" pode ser meu irmão
+    /// enquanto quem fala é um intruso. A reentrega é deduplicada pelo id.
+    fn on_sent(
+        &mut self,
+        peer: PeerId,
+        sender: &IdentityId,
+        to: IdentityId,
+        message: Message,
+    ) -> Result<(), Error> {
+        if sender != self.device.identity() {
+            return Err(Error::UnauthorizedMirror);
+        }
+        if !self.outbox.mark_seen(&peer, &message.id)? {
+            return Ok(());
+        }
+        self.queue
+            .push_back(ChatEvent::SentElsewhere { peer, to, message });
+        Ok(())
     }
 
     /// O contato anunciou onde recebe. Lista inválida é recusada inteira e a anterior fica.
@@ -1744,6 +1816,253 @@ mod tests {
         assert!(matches!(err, Error::UnknownIdentity(_)), "{err:?}");
         assert_eq!(bia.queued(&a1), 0);
         assert!(events(&mut bia).is_empty());
+    }
+
+    /// Bia com um device irmão (outro device da própria identidade) e um device da Ana.
+    struct Household {
+        bia: Chat,
+        bia_identity: IdentityId,
+        ana: IdentityId,
+        sibling: RawDevice,
+        ana_device: RawDevice,
+    }
+
+    fn household() -> Household {
+        let (bia_key, ana_key) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let mut bia = chat(&bia_key, &DeviceKey::generate());
+        let sibling = add_device_of(&mut bia, &bia_key);
+        let ana_device = add_device_of(&mut bia, &ana_key);
+        Household {
+            bia,
+            bia_identity: bia_key.id(),
+            ana: ana_key.id(),
+            sibling,
+            ana_device,
+        }
+    }
+
+    fn payload_of(raw: &mut Conversation, blob: &[u8]) -> Payload {
+        match raw.decrypt(&mls_of(blob)).unwrap() {
+            Decrypted::Message { plaintext, .. } => Payload::decode(&plaintext).unwrap(),
+            other => panic!("esperava mensagem, veio {other:?}"),
+        }
+    }
+
+    /// 3.5 etapa 4: ao enviar a um contato, cada device irmão recebe um espelho `Sent` com a MESMA
+    /// mensagem, e o device do contato recebe a mensagem comum.
+    #[tokio::test]
+    async fn send_to_mirrors_the_message_to_my_other_devices_and_sends_it_plain_to_the_contact() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut sibling_raw),
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        let id = bia.send_to(&ana, "oi, ana", None).unwrap();
+        for _ in 0..2 {
+            until(&mut bia, |e| {
+                matches!(e, ChatEvent::Deposited { .. }).then_some(())
+            })
+            .await
+            .expect("depósito confirmado");
+        }
+
+        let deposits = relay.deposits();
+        assert_eq!(deposits.len(), 2);
+        for deposit in &deposits {
+            if deposit.to == sibling {
+                let Payload::Sent { to, message } = payload_of(&mut sibling_raw, &deposit.blob)
+                else {
+                    panic!("o irmão deveria receber um espelho");
+                };
+                assert_eq!(
+                    (to, message.id, message.text),
+                    (ana.clone(), id, "oi, ana".into())
+                );
+            } else {
+                assert_eq!(deposit.to, ana_peer);
+                let Payload::Message(message) = payload_of(&mut ana_raw, &deposit.blob) else {
+                    panic!("a Ana deveria receber a mensagem comum");
+                };
+                assert_eq!(message.id, id);
+            }
+        }
+    }
+
+    /// 3.5 etapa 4: o espelho espera na outbox do irmão, marcado com a identidade de destino.
+    #[tokio::test]
+    async fn the_mirror_waits_in_the_siblings_outbox_marked_with_the_destination() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+
+        let id = bia.send_to(&ana, "oi", None).unwrap();
+
+        assert_eq!((bia.queued(&sibling), bia.queued(&ana_peer)), (1, 1));
+        assert_eq!(bia.outbox.mirror_target(&sibling, &id).unwrap(), Some(ana));
+        assert_eq!(bia.outbox.mirror_target(&ana_peer, &id).unwrap(), None);
+    }
+
+    /// 3.5 etapa 4: mensagem para a própria identidade ("notas para mim") não é espelhada: o irmão
+    /// já a recebe como mensagem comum, e um espelho a duplicaria.
+    #[tokio::test]
+    async fn sending_to_my_own_identity_is_not_mirrored() {
+        let Household {
+            mut bia,
+            bia_identity,
+            sibling: (sibling, _),
+            ..
+        } = household();
+
+        let id = bia.send_to(&bia_identity, "nota", None).unwrap();
+
+        assert_eq!(bia.queued(&sibling), 1, "uma cópia só");
+        assert_eq!(bia.outbox.mirror_target(&sibling, &id).unwrap(), None);
+        let queued = events(&mut bia)
+            .into_iter()
+            .filter(|e| matches!(e, ChatEvent::Queued { peer, .. } if *peer == sibling))
+            .count();
+        assert_eq!(queued, 1, "um aviso só, não um por alvo repetido");
+    }
+
+    /// 3.5 etapa 4: `send` a um device específico continua sendo só aquilo, sem espelho.
+    #[tokio::test]
+    async fn sending_to_a_single_device_does_not_mirror() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+
+        bia.send(ana_peer, "oi", None).unwrap();
+
+        assert_eq!(bia.queued(&sibling), 0);
+    }
+
+    /// 3.5 etapa 4: um espelho vindo de um device da MINHA identidade vira `SentElsewhere`, não
+    /// `Received`, e reentrega não duplica o evento.
+    #[tokio::test]
+    async fn a_mirror_from_my_own_device_becomes_sent_elsewhere_once() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let message = Message::new("oi, ana".into(), None);
+        let payload = Payload::Sent {
+            to: ana.clone(),
+            message: message.clone(),
+        };
+
+        for _ in 0..2 {
+            let wire = sibling_raw.encrypt(&payload.encode()).unwrap();
+            bia.on_mls(sibling, &wire).unwrap();
+        }
+
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::SentElsewhere {
+                peer: sibling,
+                to: ana,
+                message
+            }]
+        );
+    }
+
+    /// 3.5 etapa 4 (segurança): um espelho vindo de um device de OUTRA identidade é recusado. Senão
+    /// um contato poderia forjar "você enviou isto" no meu histórico.
+    #[tokio::test]
+    async fn a_mirror_from_another_identity_is_refused() {
+        let Household {
+            mut bia,
+            ana,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let forged = Payload::Sent {
+            to: ana,
+            message: Message::new("eu disse isso".into(), None),
+        };
+        let wire = ana_raw.encrypt(&forged.encode()).unwrap();
+
+        let err = bia.on_mls(ana_peer, &wire).unwrap_err();
+
+        assert!(matches!(err, Error::UnauthorizedMirror), "{err:?}");
+        assert!(events(&mut bia).is_empty());
+    }
+
+    /// Device cru de `identity` que ainda não está em nenhuma conversa, para ser adicionado por commit.
+    fn outsider(identity: &StandaloneIdentity) -> CryptoDevice {
+        let key = DeviceKey::generate();
+        CryptoDevice::new(identity, &key.public_key(), &key.nostr_public_key(), 1).unwrap()
+    }
+
+    /// 3.5 etapa 4 (segurança, achado da auditoria): num grupo que cresceu além de 2 membros, o
+    /// primeiro "outro membro" pode ser meu irmão enquanto quem fala é um intruso. A autoria vem do
+    /// remetente autenticado da mensagem, não da composição do grupo.
+    #[tokio::test]
+    async fn a_mirror_from_an_intruder_in_a_grown_group_is_refused() {
+        let (bia_key, evil_key) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let mut bia = chat(&bia_key, &DeviceKey::generate());
+        let (sibling, mut sibling_raw) = add_device_of(&mut bia, &bia_key);
+        let evil = outsider(&evil_key);
+        let added = sibling_raw
+            .invite(&evil.key_package().unwrap(), &Expected::default())
+            .unwrap();
+        bia.on_mls(sibling, &added.commit).unwrap();
+        let mut evil_raw = Conversation::join(&evil, &added.welcome, &Expected::default()).unwrap();
+        let forged = Payload::Sent {
+            to: StandaloneIdentity::generate().id(),
+            message: Message::new("eu disse isso".into(), None),
+        };
+        let wire = evil_raw.encrypt(&forged.encode()).unwrap();
+
+        let err = bia.on_mls(sibling, &wire).unwrap_err();
+
+        assert!(matches!(err, Error::UnauthorizedMirror), "{err:?}");
+        assert!(
+            !events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::SentElsewhere { .. }))
+        );
+    }
+
+    /// 3.5 etapa 4 (segurança): conversa que cresceu além de 2 membros não conta como "device da
+    /// identidade": o fan-out e o espelho não podem entregar texto em claro a quem entrou por commit.
+    #[tokio::test]
+    async fn a_conversation_grown_beyond_two_members_is_not_a_device_of_anyone() {
+        let (ana_key, evil_key) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let mut bia = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        let (ana_peer, mut ana_raw) = add_device_of(&mut bia, &ana_key);
+        let evil = outsider(&evil_key);
+        let added = ana_raw
+            .invite(&evil.key_package().unwrap(), &Expected::default())
+            .unwrap();
+        bia.on_mls(ana_peer, &added.commit).unwrap();
+
+        assert!(bia.devices_of(&ana_key.id()).is_empty());
+        let err = bia.send_to(&ana_key.id(), "segredo", None).unwrap_err();
+        assert!(matches!(err, Error::UnknownIdentity(_)), "{err:?}");
+        assert_eq!(bia.queued(&ana_peer), 0);
     }
 
     /// 3.5: sem caixa postal e offline, cada device vira um `Queued` (a aplicação vê os dois).

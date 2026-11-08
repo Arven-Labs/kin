@@ -333,6 +333,16 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
                 None => println!("[{}] peer: {text}", short(&id)),
             }
         }
+        // Espelho multi-device: mensagem que EU enviei de outro device (3.5).
+        ChatEvent::SentElsewhere { to, message, .. } => {
+            seen.push(message.id);
+            println!(
+                "[{}] eu → {}: {}",
+                short(&message.id),
+                to.to_base58(),
+                message.text
+            );
+        }
         ChatEvent::DialFailed { peer, reason } => {
             let who = peer.map_or_else(|| "?".into(), |p| p.to_string());
             println!("falha ao conectar a {who}: {reason}");

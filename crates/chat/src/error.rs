@@ -13,6 +13,9 @@ pub enum Error {
     /// Nenhum device conhecido dessa identidade tem conversa pronta (`Chat::send_to`).
     #[error("sem conversa com a identidade {0}")]
     UnknownIdentity(String),
+    /// Um espelho "enviei isto" (`Payload::Sent`) veio de um device que não é da minha identidade.
+    #[error("espelho recusado: o remetente não é um device desta identidade")]
+    UnauthorizedMirror,
     /// Link de convite ilegível, adulterado (assinatura inválida) ou de versão desconhecida; ou um
     /// convite para si mesmo.
     #[error("convite inválido")]
