@@ -2010,11 +2010,11 @@ mod tests {
         CryptoDevice::new(identity, &key.public_key(), &key.nostr_public_key(), 1).unwrap()
     }
 
-    /// 3.5 etapa 4 (segurança, achado da auditoria): num grupo que cresceu além de 2 membros, o
-    /// primeiro "outro membro" pode ser meu irmão enquanto quem fala é um intruso. A autoria vem do
-    /// remetente autenticado da mensagem, não da composição do grupo.
+    /// 3.5 (segurança, achado da auditoria): um commit que leva um intruso ao grupo é recusado pelo
+    /// `crypto`, então o espelho que o intruso fabrique (numa época que a Bia nunca alcança) não vira
+    /// `SentElsewhere`. Antes, o grupo crescia e `peers().first()` virava meu irmão.
     #[tokio::test]
-    async fn a_mirror_from_an_intruder_in_a_grown_group_is_refused() {
+    async fn an_intruders_mirror_never_shows_because_the_group_cannot_grow() {
         let (bia_key, evil_key) = (
             StandaloneIdentity::generate(),
             StandaloneIdentity::generate(),
@@ -2025,17 +2025,18 @@ mod tests {
         let added = sibling_raw
             .invite(&evil.key_package().unwrap(), &Expected::default())
             .unwrap();
-        bia.on_mls(sibling, &added.commit).unwrap();
-        let mut evil_raw = Conversation::join(&evil, &added.welcome, &Expected::default()).unwrap();
-        let forged = Payload::Sent {
-            to: StandaloneIdentity::generate().id(),
-            message: Message::new("eu disse isso".into(), None),
-        };
-        let wire = evil_raw.encrypt(&forged.encode()).unwrap();
-
-        let err = bia.on_mls(sibling, &wire).unwrap_err();
-
-        assert!(matches!(err, Error::UnauthorizedMirror), "{err:?}");
+        let refused = bia.on_mls(sibling, &added.commit).unwrap_err();
+        assert!(
+            matches!(refused, Error::Crypto(CryptoError::TooManyMembers)),
+            "{refused:?}"
+        );
+        // O intruso também não consegue entrar pelo Welcome do grupo de 3: sem ele não há quem
+        // assine um espelho forjado nesta conversa.
+        assert!(matches!(
+            Conversation::join(&evil, &added.welcome, &Expected::default()),
+            Err(CryptoError::TooManyMembers)
+        ));
+        assert_eq!(bia.conversations[&sibling].peers().unwrap().len(), 1);
         assert!(
             !events(&mut bia)
                 .iter()
@@ -2043,10 +2044,10 @@ mod tests {
         );
     }
 
-    /// 3.5 etapa 4 (segurança): conversa que cresceu além de 2 membros não conta como "device da
-    /// identidade": o fan-out e o espelho não podem entregar texto em claro a quem entrou por commit.
+    /// 3.5 (segurança): como o grupo não cresce, o fan-out continua indo só ao device certo, e quem
+    /// tentou entrar por commit não recebe texto em claro.
     #[tokio::test]
-    async fn a_conversation_grown_beyond_two_members_is_not_a_device_of_anyone() {
+    async fn the_fan_out_keeps_going_only_to_the_real_device_after_a_refused_growth() {
         let (ana_key, evil_key) = (
             StandaloneIdentity::generate(),
             StandaloneIdentity::generate(),
@@ -2057,12 +2058,12 @@ mod tests {
         let added = ana_raw
             .invite(&evil.key_package().unwrap(), &Expected::default())
             .unwrap();
-        bia.on_mls(ana_peer, &added.commit).unwrap();
+        assert!(bia.on_mls(ana_peer, &added.commit).is_err());
 
-        assert!(bia.devices_of(&ana_key.id()).is_empty());
-        let err = bia.send_to(&ana_key.id(), "segredo", None).unwrap_err();
-        assert!(matches!(err, Error::UnknownIdentity(_)), "{err:?}");
-        assert_eq!(bia.queued(&ana_peer), 0);
+        assert_eq!(bia.devices_of(&ana_key.id()), [ana_peer]);
+        bia.send_to(&ana_key.id(), "segredo", None).unwrap();
+        assert_eq!(bia.queued(&ana_peer), 1);
+        assert_eq!(bia.conversations[&ana_peer].peers().unwrap().len(), 1);
     }
 
     /// 3.5: sem caixa postal e offline, cada device vira um `Queued` (a aplicação vê os dois).
