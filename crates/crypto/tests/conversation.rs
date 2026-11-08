@@ -326,3 +326,48 @@ fn network_peer_expectations_are_enforced_on_invite_and_join() {
         Err(Error::UnexpectedPeer)
     ));
 }
+
+// 3.5 (achado da auditoria): a conversa é 1:1. Um membro não pode, por commit, levar outros ao grupo:
+// quem entrasse leria o que o dono do device envia por "conversa 1:1" (fan-out e espelho).
+
+#[test]
+fn a_commit_that_would_add_a_third_member_is_refused_and_changes_nothing() {
+    let (_ana, _bia, mut conv_ana, mut conv_bia) = pair();
+    let cleo = person();
+    let growth = conv_ana
+        .invite(&cleo.device.key_package().unwrap(), &Expected::default())
+        .unwrap();
+    let epoch = conv_bia.epoch();
+
+    let result = conv_bia.decrypt(&growth.commit);
+
+    assert!(matches!(result, Err(Error::TooManyMembers)), "{result:?}");
+    assert_eq!(conv_bia.epoch(), epoch, "a época não avançou");
+    assert_eq!(conv_bia.peers().unwrap().len(), 1, "continua 1:1");
+}
+
+#[test]
+fn a_welcome_into_a_group_of_three_is_refused() {
+    let (ana, bia) = (person(), person());
+    let cleo = person();
+    let mut conv = Conversation::create(&ana.device).unwrap();
+    conv.invite(&bia.device.key_package().unwrap(), &Expected::default())
+        .unwrap();
+    let to_cleo = conv
+        .invite(&cleo.device.key_package().unwrap(), &Expected::default())
+        .unwrap();
+
+    let result = Conversation::join(&cleo.device, &to_cleo.welcome, &Expected::default());
+
+    assert!(matches!(result, Err(Error::TooManyMembers)));
+}
+
+#[test]
+fn a_key_rotation_commit_is_still_accepted_between_the_two_members() {
+    let (_ana, _bia, mut conv_ana, mut conv_bia) = pair();
+    let commit = conv_ana.rotate_keys().unwrap();
+
+    let result = conv_bia.decrypt(&commit);
+
+    assert!(matches!(result, Ok(Decrypted::EpochChanged)), "{result:?}");
+}

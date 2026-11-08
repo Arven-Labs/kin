@@ -15,6 +15,8 @@ const OUT_OF_ORDER_TOLERANCE: u32 = 10;
 const MAX_FORWARD_DISTANCE: u32 = 2000;
 /// Épocas passadas mantidas para decifrar mensagens que chegam depois de um commit.
 const MAX_PAST_EPOCHS: usize = 3;
+/// A conversa é 1:1 até a Fase 5 (grupos): recebe-se commit ou Welcome que a deixe com mais que isto.
+const MAX_MEMBERS: usize = 2;
 
 fn config() -> MlsGroupCreateConfig {
     MlsGroupCreateConfig::builder()
@@ -111,6 +113,9 @@ impl Conversation {
             StagedWelcome::new_from_welcome(&inner.provider, config().join_config(), welcome, None)
                 .map_err(|_| Error::NotForThisDevice)?;
 
+        if staged.members().count() > MAX_MEMBERS {
+            return Err(Error::TooManyMembers);
+        }
         let own = staged.own_leaf_index();
         let (mut found_identity, mut found_both) = (
             inviter.identity.is_none(),
@@ -305,6 +310,10 @@ impl Conversation {
                 plaintext: m.into_bytes(),
             }),
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                // Antes de mesclar: o commit só é gravado se o grupo continuar com até 2 membros.
+                if self.group.members().count() + staged.add_proposals().count() > MAX_MEMBERS {
+                    return Err(Error::TooManyMembers);
+                }
                 for add in staged.add_proposals() {
                     let leaf = add.add_proposal().key_package().leaf_node();
                     credential::verify(

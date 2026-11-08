@@ -32,6 +32,10 @@ pub enum Error {
     /// Só o committer da conversa emite commits (P9); os demais propõem.
     #[error("só o committer da conversa pode emitir commits")]
     NotCommitter,
+    /// A conversa é 1:1 (no máximo 2 membros): um commit ou Welcome a levaria além disso. Quem
+    /// entrasse leria o que o dono de um device envia pensando falar com um contato (grupos: Fase 5).
+    #[error("a conversa não pode passar de 2 membros")]
+    TooManyMembers,
     /// Mensagem MLS que o Kin ainda não trata (propostas soltas, etc.).
     #[error("tipo de mensagem não suportado")]
     Unsupported,
