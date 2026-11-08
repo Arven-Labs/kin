@@ -1,8 +1,12 @@
 use std::path::Path;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use libp2p_identity::{Keypair, PublicKey};
 
 use crate::{DeviceCertificate, Error, IdentityId, IdentityProvider, NostrPublicKey, store};
+
+const PAIR_PREFIX: &str = "kin://pair/";
 
 /// Provedor padrão (D7): keypair Ed25519 gerado pelo Kin, sem conta e sem blockchain.
 pub struct StandaloneIdentity {
@@ -27,6 +31,29 @@ impl StandaloneIdentity {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         Ok(self.master.to_protobuf_encoding()?)
+    }
+
+    /// A chave mestra como link de pareamento (`kin://pair/` + base64url sem padding), para levar a
+    /// identidade a outro device (3.5, ADR 0006). **É o segredo inteiro**: quem vir o link é esta
+    /// identidade. Não há cifra de transporte; quem chama avisa o usuário e não registra o link em log.
+    pub fn to_pair_link(&self) -> Result<String, Error> {
+        Ok(format!(
+            "{PAIR_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(self.to_bytes()?)
+        ))
+    }
+
+    /// Lê um link de pareamento. Aceita espaço e quebra de linha nas pontas (vem de arquivo ou stdin).
+    /// Qualquer defeito vira [`Error::InvalidPairLink`], sem ecoar o conteúdo.
+    pub fn from_pair_link(link: &str) -> Result<Self, Error> {
+        let body = link
+            .trim()
+            .strip_prefix(PAIR_PREFIX)
+            .ok_or(Error::InvalidPairLink)?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(body)
+            .map_err(|_| Error::InvalidPairLink)?;
+        Self::from_bytes(&bytes).map_err(|_| Error::InvalidPairLink)
     }
 
     /// Grava a chave mestra em `path` (permissão 0600 em Unix). Não cifra em repouso (P13).

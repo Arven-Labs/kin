@@ -211,3 +211,72 @@ fn device_key_file_without_the_nostr_key_is_rejected() {
         .unwrap();
     assert!(DeviceKey::from_bytes(&old).is_err());
 }
+
+mod pair_link {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use kin_identity::{IdentityProvider, StandaloneIdentity};
+
+    fn link_of(bytes: &[u8]) -> String {
+        format!("kin://pair/{}", URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    #[test]
+    fn a_pair_link_restores_the_same_identity() {
+        let original = StandaloneIdentity::generate();
+
+        let restored =
+            StandaloneIdentity::from_pair_link(&original.to_pair_link().unwrap()).unwrap();
+
+        assert_eq!(restored.id(), original.id());
+        let signature = restored.sign(b"ola").unwrap();
+        assert!(original.id().public_key().verify(b"ola", &signature));
+    }
+
+    #[test]
+    fn whitespace_around_the_link_is_accepted() {
+        let original = StandaloneIdentity::generate();
+        let link = format!("  {}\r\n", original.to_pair_link().unwrap());
+
+        assert_eq!(
+            StandaloneIdentity::from_pair_link(&link).unwrap().id(),
+            original.id()
+        );
+    }
+
+    #[test]
+    fn malformed_links_are_rejected_without_echoing_their_content() {
+        let key = StandaloneIdentity::generate().to_bytes().unwrap();
+        let body = URL_SAFE_NO_PAD.encode(&key);
+        let secret_looking = "SEGREDOSEGREDOSEGREDO";
+        let cases = [
+            ("", "vazio"),
+            ("kin://pair/", "sem corpo"),
+            (&format!("kin://invite/{body}"), "prefixo de convite"),
+            (&format!("kin://PAIR/{body}"), "prefixo em maiúsculas"),
+            (&body, "sem prefixo"),
+            (&format!("kin://pair/{secret_looking}!!"), "base64 inválido"),
+            (&link_of(b"nao e uma chave"), "bytes que não são chave"),
+            (&link_of(&key[..key.len() - 1]), "chave truncada"),
+        ];
+
+        for (link, why) in cases {
+            let error = StandaloneIdentity::from_pair_link(link)
+                .err()
+                .unwrap_or_else(|| panic!("devia recusar: {why}"));
+            let text = format!("{error} {error:?}");
+            assert!(
+                !text.contains(secret_looking) && !text.contains(&body),
+                "vazou: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_never_holds_a_device_key() {
+        // O arquivo do device tem outro formato (versão + Nostr): não pode virar identidade.
+        let device = kin_identity::DeviceKey::generate().to_bytes().unwrap();
+
+        assert!(StandaloneIdentity::from_pair_link(&link_of(&device)).is_err());
+    }
+}
