@@ -10,6 +10,9 @@ pub enum Error {
     /// Ainda não há conversa E2EE com o peer (o handshake não terminou ou ele não está conectado).
     #[error("sem conversa com o peer {0}")]
     NoConversation(PeerId),
+    /// Nenhum device conhecido dessa identidade tem conversa pronta (`Chat::send_to`).
+    #[error("sem conversa com a identidade {0}")]
+    UnknownIdentity(String),
     /// Link de convite ilegível, adulterado (assinatura inválida) ou de versão desconhecida; ou um
     /// convite para si mesmo.
     #[error("convite inválido")]

@@ -365,15 +365,63 @@ impl Chat {
             return Err(Error::NoConversation(peer));
         }
         let message = Message::new(text.into(), parent);
-        self.outbox.enqueue(&peer, &message)?;
-        self.flush(peer);
-        if !self.is_in_flight(&peer, &message.id) {
-            self.queue.push_back(ChatEvent::Queued {
-                peer,
-                message: message.id,
-            });
-        }
+        self.queue_and_flush(&[peer], &message)?;
         Ok(message.id)
+    }
+
+    /// Devices da `identity` com conversa pronta, em ordem de Peer ID. Sai dos certificados das
+    /// conversas (a identidade do outro membro), então não há lista separada para ficar velha.
+    pub fn devices_of(&self, identity: &IdentityId) -> Vec<PeerId> {
+        let mut devices: Vec<PeerId> = self
+            .conversations
+            .iter()
+            .filter(|(_, conversation)| {
+                conversation
+                    .peers()
+                    .is_ok_and(|peers| peers.first() == Some(identity))
+            })
+            .map(|(peer, _)| *peer)
+            .collect();
+        devices.sort();
+        devices
+    }
+
+    /// Como [`Chat::send`], mas para uma identidade: a MESMA mensagem (mesmo `MessageId`, para
+    /// `parent` e deduplicação valerem entre devices) entra na fila de cada device dela que tem
+    /// conversa pronta, cada um cifrado na sua própria conversa. Cada device tem a sua entrega
+    /// (`Delivered`, `Queued`, depósito). Se gravar na outbox falhar no meio, as cópias já gravadas
+    /// continuam e saem no próximo gatilho; o erro é devolvido.
+    pub fn send_to(
+        &mut self,
+        identity: &IdentityId,
+        text: impl Into<String>,
+        parent: Option<MessageId>,
+    ) -> Result<MessageId, Error> {
+        let devices = self.devices_of(identity);
+        if devices.is_empty() {
+            return Err(Error::UnknownIdentity(identity.to_base58()));
+        }
+        let message = Message::new(text.into(), parent);
+        self.queue_and_flush(&devices, &message)?;
+        Ok(message.id)
+    }
+
+    /// Grava `message` na outbox de cada peer e só então tenta enviar; quem não saiu direto avisa
+    /// `Queued`.
+    fn queue_and_flush(&mut self, peers: &[PeerId], message: &Message) -> Result<(), Error> {
+        for peer in peers {
+            self.outbox.enqueue(peer, message)?;
+        }
+        for &peer in peers {
+            self.flush(peer);
+            if !self.is_in_flight(&peer, &message.id) {
+                self.queue.push_back(ChatEvent::Queued {
+                    peer,
+                    message: message.id,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn leave_flight(&mut self, peer: PeerId, message: &MessageId) {
@@ -1557,5 +1605,164 @@ mod tests {
 
         assert!(matches!(err, Error::Malformed), "{err:?}");
         assert!(taught.lock().unwrap().is_empty());
+    }
+
+    /// Adiciona a `bia` um device novo de `identity` (conversa pronta) e devolve o Peer ID dele e a
+    /// ponta crua da conversa, para ler o que a Bia cifrar.
+    fn add_device_of(bia: &mut Chat, identity: &StandaloneIdentity) -> (PeerId, Conversation) {
+        let device_key = DeviceKey::generate();
+        let device = CryptoDevice::new(
+            identity,
+            &device_key.public_key(),
+            &device_key.nostr_public_key(),
+            1,
+        )
+        .unwrap();
+        let mut raw = Conversation::create(&device).unwrap();
+        let invite = raw
+            .invite(&bia.device.key_package().unwrap(), &Expected::default())
+            .unwrap();
+        let joined =
+            Conversation::join(&bia.device, &invite.welcome, &Expected::default()).unwrap();
+        bia.conversations.insert(device_key.peer_id(), joined);
+        (device_key.peer_id(), raw)
+    }
+
+    fn message_of(raw: &mut Conversation, blob: &[u8]) -> Message {
+        match raw.decrypt(&mls_of(blob)).unwrap() {
+            Decrypted::Message { plaintext, .. } => Message::decode(&plaintext).unwrap(),
+            other => panic!("esperava mensagem, veio {other:?}"),
+        }
+    }
+
+    /// Bia conversa com 2 devices da Ana e 1 da Cléo; devolve também a identidade da Ana.
+    type RawDevice = (PeerId, Conversation);
+
+    fn bia_with_two_ana_devices_and_one_cleo() -> (Chat, IdentityId, [RawDevice; 2], RawDevice) {
+        let (ana, cleo) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let mut bia = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        let a1 = add_device_of(&mut bia, &ana);
+        let a2 = add_device_of(&mut bia, &ana);
+        let c1 = add_device_of(&mut bia, &cleo);
+        (bia, ana.id(), [a1, a2], c1)
+    }
+
+    /// 3.5: os devices de uma identidade saem das conversas (certificados), sem incluir os de outra.
+    #[tokio::test]
+    async fn devices_of_lists_exactly_the_devices_of_that_identity() {
+        let (bia, ana, [(a1, _), (a2, _)], (c1, _)) = bia_with_two_ana_devices_and_one_cleo();
+
+        let mut devices = bia.devices_of(&ana);
+        devices.sort();
+
+        let mut expected = vec![a1, a2];
+        expected.sort();
+        assert_eq!(devices, expected);
+        assert!(!devices.contains(&c1));
+    }
+
+    /// 3.5: identidade sem nenhuma conversa não tem devices.
+    #[tokio::test]
+    async fn devices_of_an_unknown_identity_is_empty() {
+        let (bia, _, _, _) = bia_with_two_ana_devices_and_one_cleo();
+
+        assert!(
+            bia.devices_of(&StandaloneIdentity::generate().id())
+                .is_empty()
+        );
+    }
+
+    /// 3.5: `send_to` põe a MESMA mensagem na fila de cada device da identidade e de mais ninguém.
+    #[tokio::test]
+    async fn send_to_queues_the_same_message_for_every_device_of_the_identity() {
+        let (mut bia, ana, [(a1, _), (a2, _)], (c1, _)) = bia_with_two_ana_devices_and_one_cleo();
+
+        let id = bia.send_to(&ana, "oi, ana", None).unwrap();
+
+        assert_eq!(
+            (bia.queued(&a1), bia.queued(&a2), bia.queued(&c1)),
+            (1, 1, 0)
+        );
+        for device in [a1, a2] {
+            let entries = bia.outbox.entries(&device).unwrap();
+            assert_eq!(entries[0].id, id, "mesmo MessageId nas duas cópias");
+            assert_eq!(entries[0].text, "oi, ana");
+        }
+    }
+
+    /// 3.5: com os devices offline e uma caixa postal, cada um recebe o próprio depósito, cifrado
+    /// na conversa dele, com o mesmo `MessageId` e o mesmo `parent`.
+    #[tokio::test]
+    async fn send_to_deposits_one_copy_per_device_with_the_same_id_and_parent() {
+        let (mut bia, ana, [(a1, mut raw1), (a2, mut raw2)], (c1, _)) =
+            bia_with_two_ana_devices_and_one_cleo();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+        let parent = Message::new("pai".into(), None).id;
+
+        let id = bia.send_to(&ana, "oi", Some(parent)).unwrap();
+        for _ in 0..2 {
+            until(&mut bia, |e| {
+                matches!(e, ChatEvent::Deposited { .. }).then_some(())
+            })
+            .await
+            .expect("depósito confirmado");
+        }
+
+        let deposits = relay.deposits();
+        let mut targets: Vec<_> = deposits.iter().map(|d| d.to).collect();
+        targets.sort();
+        let mut expected = vec![a1, a2];
+        expected.sort();
+        assert_eq!(
+            targets, expected,
+            "um depósito por device, nenhum para a Cléo"
+        );
+        assert!(!targets.contains(&c1));
+        for deposit in &deposits {
+            let raw = if deposit.to == a1 {
+                &mut raw1
+            } else {
+                &mut raw2
+            };
+            let message = message_of(raw, &deposit.blob);
+            assert_eq!((message.id, message.parent), (id, Some(parent)));
+        }
+    }
+
+    /// 3.5: sem conversa com a identidade, `send_to` falha e não enfileira nada.
+    #[tokio::test]
+    async fn send_to_an_identity_without_conversations_is_an_error() {
+        let (mut bia, _, [(a1, _), _], _) = bia_with_two_ana_devices_and_one_cleo();
+        let stranger = StandaloneIdentity::generate().id();
+
+        let err = bia.send_to(&stranger, "oi", None).unwrap_err();
+
+        assert!(matches!(err, Error::UnknownIdentity(_)), "{err:?}");
+        assert_eq!(bia.queued(&a1), 0);
+        assert!(events(&mut bia).is_empty());
+    }
+
+    /// 3.5: sem caixa postal e offline, cada device vira um `Queued` (a aplicação vê os dois).
+    #[tokio::test]
+    async fn send_to_reports_queued_once_per_offline_device() {
+        let (mut bia, ana, [(a1, _), (a2, _)], _) = bia_with_two_ana_devices_and_one_cleo();
+
+        let id = bia.send_to(&ana, "oi", None).unwrap();
+
+        let mut queued: Vec<_> = events(&mut bia)
+            .into_iter()
+            .filter_map(|e| match e {
+                ChatEvent::Queued { peer, message } if message == id => Some(peer),
+                _ => None,
+            })
+            .collect();
+        queued.sort();
+        let mut expected = vec![a1, a2];
+        expected.sort();
+        assert_eq!(queued, expected);
     }
 }
