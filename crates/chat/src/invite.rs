@@ -64,7 +64,8 @@ impl Invite {
         Self::decode(&bytes)
     }
 
-    fn encode(&self) -> Vec<u8> {
+    /// Os bytes do convite sem o prefixo nem base64 (o que `DeviceList` carrega por item).
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = vec![VERSION];
         put(&mut out, &self.certificate.to_bytes());
         out.push(self.addrs.len() as u8);
@@ -74,7 +75,8 @@ impl Invite {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+    /// Lê o formato de [`Self::encode`]; confere a assinatura do certificado.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut cur = bytes;
         if take_u8(&mut cur)? != VERSION {
             return Err(Error::InvalidInvite);
