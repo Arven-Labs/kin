@@ -17,6 +17,9 @@ pub enum Error {
     /// Bytes que não seguem o formato do Kin.
     #[error("mensagem malformada")]
     Malformed,
+    /// Lista de relays anunciada por um contato que não passa na validação.
+    #[error("lista de relays recusada: {0}")]
+    InvalidRelayList(String),
     /// Falha no banco da outbox.
     #[error("armazenamento: {0}")]
     Storage(String),

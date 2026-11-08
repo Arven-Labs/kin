@@ -10,6 +10,7 @@ mod mailbox;
 mod message;
 pub mod nostr;
 mod outbox;
+mod payload;
 mod wire;
 
 pub use chat::{Chat, ChatEvent};
