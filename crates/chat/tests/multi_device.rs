@@ -119,7 +119,7 @@ impl World {
         let b1_invite =
             world.chats[B1].invite(vec![addrs[B1].clone().with(Protocol::P2p(world.peers[B1]))]);
         let ana = world.ana.clone();
-        world.chats[B1].trust(ana);
+        world.chats[B1].trust(ana).unwrap();
         world.chats[A1].accept(&b1_invite).unwrap();
         world
     }

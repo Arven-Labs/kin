@@ -15,6 +15,8 @@
 //! buscadas ao voltar (só com conversa já fechada). Os relays vêm de `--nostr-relay URL` (`wss://...`;
 //! `ws://` só para o próprio computador; repetível), senão de `<data-dir>/relays.txt` (uma URL por linha,
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
+//! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
+//! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! Linhas digitadas vão ao peer da conversa;
 //! `/r <id> texto` responde à mensagem `<id>` (thread); `/quit` sai.
 
@@ -22,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Invite, Message, MessageId};
-use kin_identity::{DeviceKey, StandaloneIdentity};
+use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -192,11 +194,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut seen: Vec<MessageId> = Vec::new();
     let mut current: Option<PeerId> = None;
+    // Identidades vistas em `ConversationReady` nesta execução: `/trust` só aceita uma destas.
+    let mut met: Vec<(PeerId, IdentityId)> = Vec::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
     loop {
         tokio::select! {
-            event = chat.next_event() => on_event(event, &mut current, &mut seen),
+            event = chat.next_event() => on_event(event, &mut current, &mut seen, &mut met),
             line = lines.next_line() => {
                 let Some(line) = line? else { break };
                 let line = line.trim();
@@ -212,6 +216,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if let Some(link) = line.strip_prefix("/accept ") {
                     accept(&mut chat, link);
+                    continue;
+                }
+                if line == "/trust" || line.starts_with("/trust ") {
+                    trust(&mut chat, line.strip_prefix("/trust").unwrap_or("").trim(), current, &met);
                     continue;
                 }
                 let Some(peer) = current else {
@@ -281,6 +289,33 @@ fn accept(chat: &mut Chat, link: &str) {
     }
 }
 
+/// `/trust`: passa a confiar numa identidade que já completou o handshake nesta execução. Sem
+/// argumento, a da conversa atual; com argumento, a única cujo base58 começa com ele.
+fn trust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerId, IdentityId)]) {
+    let candidates: Vec<&IdentityId> = if prefix.is_empty() {
+        met.iter()
+            .filter(|(peer, _)| Some(*peer) == current)
+            .map(|(_, identity)| identity)
+            .collect()
+    } else {
+        let mut matches: Vec<&IdentityId> = met
+            .iter()
+            .map(|(_, identity)| identity)
+            .filter(|identity| identity.to_base58().starts_with(prefix))
+            .collect();
+        matches.dedup();
+        matches
+    };
+    match candidates.as_slice() {
+        [identity] => match chat.trust((*identity).clone()) {
+            Ok(()) => println!("(confio em {})", identity.to_base58()),
+            Err(e) => println!("(não consegui gravar a confiança: {e})"),
+        },
+        [] => println!("(nenhuma identidade conhecida assim; veja `conversa cifrada pronta`)"),
+        _ => println!("(prefixo ambíguo: digite mais caracteres)"),
+    }
+}
+
 /// Modo relay dedicado: só encaminha circuitos para os outros, sem chat.
 async fn serve_relay(args: &Args, device: &DeviceKey) -> Result<(), Box<dyn std::error::Error>> {
     let config = NodeConfig {
@@ -309,7 +344,12 @@ async fn serve_relay(args: &Args, device: &DeviceKey) -> Result<(), Box<dyn std:
     }
 }
 
-fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<MessageId>) {
+fn on_event(
+    event: ChatEvent,
+    current: &mut Option<PeerId>,
+    seen: &mut Vec<MessageId>,
+    met: &mut Vec<(PeerId, IdentityId)>,
+) {
     match event {
         ChatEvent::Listening(addr) => println!("escutando em {addr}"),
         ChatEvent::PeerConnected(peer) => println!("conectado a {peer}"),
@@ -321,6 +361,9 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
                 peer,
                 identity.to_base58()
             );
+            println!("(para aceitar este contato: /trust)");
+            met.retain(|(known, _)| *known != peer);
+            met.push((peer, identity));
             *current = Some(peer);
         }
         ChatEvent::Received { message, .. } => {

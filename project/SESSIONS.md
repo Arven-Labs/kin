@@ -644,3 +644,24 @@
   de quem convidou (sem isso a descoberta não age nesse lado); persistir a confiança; fechar o resto do P24.
 - **Próximo passo**: mesclar o #31; a CLI chamar `trust`; depois a etapa 6 (pareamento, que imprime a chave mestra em
   tela: confirmar o desenho antes).
+
+### 2026-11-08 — Sessão 16
+
+- **Objetivo**: P24, parte 1: a CLI chamar `trust` e a confiança persistir. Plan mode. **Decisões do dono**: `/trust`
+  explícito (conectar não basta, ADR 0006) e tabela `kin_trusted` no SQLite do `Chat`.
+- **Estado de entrada**: #31 já estava mesclado (o `OVERVIEW.md` ainda dizia "pronta para mesclar"; corrigido).
+- **Feito**: `outbox.rs` schema v3 (`kin_trusted`, aditivo) com `add_trusted`/`trusted_identities`; `Chat::trust` agora
+  grava, devolve `Result` e **anuncia o meu device aos devices já conectados da identidade** (o doc prometia isso, o código
+  só fazia `push`: sem isso o `/trust` depois do handshake seria inócuo); `Chat::open` carrega a confiança; CLI `/trust
+  [prefixo]` (sem argumento, o contato da conversa atual; com, o único prefixo base58 entre as identidades vistas em
+  `ConversationReady`; sem `from_base58`, não se inventa identidade). **Bug achado pelo teste novo**: o `ALTER TABLE ... to_identity`
+  rodava para qualquer banco antigo e quebraria a abertura de um banco v2 real no v3; corrigido com `version < 2`.
+- **Testes**: 4 novos (outbox: persistir sem duplicar, abrir banco v2; chat: reabrir mantém a confiança, confiar depois do
+  handshake anuncia só à identidade certa). Vermelho: não compilavam (API ausente). Depois: kin-chat 94 → 98 na lib, workspace
+  verde, clippy 0 avisos. Mutações pegas e revertidas: não gravar no `trust`, não carregar no `open`, não anunciar.
+- **Não verificado**: o `/trust` da CLI não tem teste automatizado nem roteiro manual com 2 processos; relay real/NAT; banco
+  v2 só simulado (tabela removida e versão rebaixada), nunca um `.outbox.db` real; o CI (`guard`) não roda testes Rust.
+- **Deslize do processo**: rodei `cargo fmt --all` (escreve em arquivos) contra a regra do `CLAUDE.md`; só formatou os testes
+  novos, visível no diff.
+- **Não feito**: pareamento (etapa 6), revogação, lista de contatos, o resto do P24.
+- **Próximo passo**: etapa 6 (pareamento; confirmar o desenho antes) ou o roteiro manual do `/trust`.
