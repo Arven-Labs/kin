@@ -1,0 +1,65 @@
+name: CI
+
+# Build, clippy e testes rodam aqui, não na máquina de desenvolvimento (ADR 0009 do workspace).
+# Roda em todo push na main, em todo PR e pelo botão "Run workflow". Sem filtro de caminho, de
+# propósito: o check `Rust (clippy and tests)` pode ser obrigatório na main, e um check que nem
+# dispara (PR só de docs) ficaria pendente para sempre e travaria o merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Um push novo na mesma ref cancela a rodada que ainda está em andamento.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental só ajuda quem recompila a mesma árvore; no CI só engorda o cache.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rust:
+    # O nome é o contexto do check no ruleset da main: não renomear sem atualizar o ruleset.
+    name: Rust (clippy and tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      # `clippy::all = "warn"` está no workspace; aqui warning reprova o PR.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        # Sem parar no primeiro crate que falha, para a rodada mostrar todas as falhas de uma vez.
+        # A saída também vai para um arquivo, para o passo seguinte listar o que falhou no resumo;
+        # `pipefail` (do `shell: bash`) mantém o status do `cargo test`.
+        shell: bash
+        run: cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
+
+      # Só LISTA o nome de cada teste que falhou e a linha do panic. Nada é escondido: o job continua vermelho.
+      - name: Failed tests
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Failed tests"
+            echo
+            echo '```'
+            grep -E '^test .* FAILED$|panicked at ' cargo-test.log | sort -u | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
