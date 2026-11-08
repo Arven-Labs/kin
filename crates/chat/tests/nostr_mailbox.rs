@@ -1156,6 +1156,14 @@ fn the_defaults_are_a_week_of_ttl_two_replicas_and_a_window_that_covers_the_time
     assert!(NostrMailbox::new(&DeviceKey::generate(), &["wss://a.example"]).is_ok());
 }
 
+// 45b (3.4 B)
+#[test]
+fn the_nostr_backend_declares_the_ttl_as_its_retention() {
+    let mb = mailbox(&DeviceKey::generate(), &["wss://a.example"]);
+
+    assert_eq!(mb.retention(), Some(fast().ttl));
+}
+
 // 46
 #[test]
 fn a_read_window_shorter_than_ttl_plus_two_days_is_refused() {
