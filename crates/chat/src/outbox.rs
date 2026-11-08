@@ -16,8 +16,9 @@ use crate::{Error, Message, MessageId};
 pub(crate) const SEEN_LIMIT: usize = 1024;
 
 /// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 etapa 1 (mensagem por
-/// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho).
-const SCHEMA_VERSION: i64 = 2;
+/// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho); 3 = P24 (tabela `kin_trusted`,
+/// aditiva: só `CREATE TABLE IF NOT EXISTS`).
+const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) struct Outbox {
     conn: Connection,
@@ -65,6 +66,8 @@ impl Outbox {
              CREATE TABLE IF NOT EXISTS kin_peer_relays (
                  peer TEXT PRIMARY KEY,
                  relays TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS kin_trusted (
+                 identity BLOB PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS kin_seen (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  peer TEXT NOT NULL,
@@ -135,7 +138,7 @@ impl Outbox {
         }
         // Versão 2: coluna nula `to_identity`, a marca do espelho multi-device. Só acrescenta; as linhas
         // antigas ficam nulas (envio comum). Banco sem tabelas já nasce com ela (ver `init`).
-        if has_old {
+        if has_old && version < 2 {
             tx.execute_batch("ALTER TABLE kin_outbox ADD COLUMN to_identity BLOB")
                 .map_err(Error::storage)?;
         }
@@ -242,6 +245,36 @@ impl Outbox {
                 sent_at_ms: sent_at_ms as u64,
                 text,
             });
+        }
+        Ok(out)
+    }
+
+    /// Grava que aceitei `identity` (protobuf da chave pública); repetir é inofensivo.
+    pub(crate) fn add_trusted(&self, identity: &IdentityId) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO kin_trusted (identity) VALUES (?1)",
+                params![identity.public_key().encode_protobuf()],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// As identidades aceitas. Linha que não decodifica é ignorada: vale menos confiar a menos.
+    pub(crate) fn trusted_identities(&self) -> Result<Vec<IdentityId>, Error> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT identity FROM kin_trusted")
+            .map_err(Error::storage)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(Error::storage)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let bytes = row.map_err(Error::storage)?;
+            if let Ok(key) = PublicKey::try_decode_protobuf(&bytes) {
+                out.push(IdentityId::new(key));
+            }
         }
         Ok(out)
     }
@@ -796,5 +829,49 @@ mod tests {
             1,
             "dados antigos intactos"
         );
+    }
+
+    // 13
+    #[test]
+    fn trusted_identities_survive_reopening_and_are_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (ana, bia) = (identity(), identity());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            assert!(outbox.trusted_identities().unwrap().is_empty());
+            outbox.add_trusted(&ana).unwrap();
+            outbox.add_trusted(&bia).unwrap();
+            outbox.add_trusted(&ana).unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        let mut got = outbox.trusted_identities().unwrap();
+        got.sort_by_key(IdentityId::to_base58);
+        let mut want = vec![ana, bia];
+        want.sort_by_key(IdentityId::to_base58);
+        assert_eq!(got, want);
+    }
+
+    // 14
+    #[test]
+    fn a_version_2_database_opens_gains_the_trusted_table_and_keeps_its_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let peer = peer();
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            deposited(&outbox, &peer, "antes", 100);
+            outbox
+                .conn
+                .execute_batch("DROP TABLE kin_trusted; PRAGMA user_version = 2;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert!(outbox.trusted_identities().unwrap().is_empty());
+        assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
     }
 }

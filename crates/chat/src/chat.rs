@@ -286,6 +286,7 @@ impl Chat {
         // A outbox fica num arquivo ao lado do banco do `crypto` (`a.db` → `a.outbox.db`).
         let outbox = Outbox::open(&db.with_extension("outbox.db"))?;
         let mut chat = Self::with_device(device, device_key, config, outbox)?;
+        chat.trusted = chat.outbox.trusted_identities()?;
         for (label, id) in chat.device.remembered()? {
             // Rótulo ou conversa que não carregam mais são ignorados: o handshake refaz.
             let Ok(peer) = label.parse::<PeerId>() else {
@@ -387,13 +388,32 @@ impl Chat {
         self.invite(addrs)
     }
 
-    /// Passa a confiar em `identity`: processo a lista de devices dela e anuncio a ela o meu convite.
-    /// `accept` já faz isto para o dono do convite aceito. Quem só conectou a mim não é aceito: o
-    /// aplicativo chama isto quando o usuário confirma o contato (ex.: ao ver `ConversationReady`).
-    pub fn trust(&mut self, identity: IdentityId) {
-        if !self.is_trusted(&identity) {
-            self.trusted.push(identity);
+    /// Passa a confiar em `identity`: processo a lista de devices dela e anuncio a ela o meu convite
+    /// (inclusive aos devices dela que já estão conectados: a lista só saía quando a conversa ficava
+    /// pronta). A confiança é gravada no banco e sobrevive a reiniciar. `accept` já faz isto para o
+    /// dono do convite aceito. Quem só conectou a mim não é aceito: o aplicativo chama isto quando o
+    /// usuário confirma o contato (ex.: ao ver `ConversationReady`).
+    pub fn trust(&mut self, identity: IdentityId) -> Result<(), Error> {
+        if self.is_trusted(&identity) {
+            return Ok(());
         }
+        self.outbox.add_trusted(&identity)?;
+        self.trusted.push(identity.clone());
+        let to_announce: Vec<PeerId> = self
+            .connected
+            .iter()
+            .copied()
+            .filter(|peer| {
+                self.conversations
+                    .get(peer)
+                    .and_then(|conversation| conversation.peers().ok())
+                    .is_some_and(|peers| peers.as_slice() == std::slice::from_ref(&identity))
+            })
+            .collect();
+        for peer in to_announce {
+            self.announce_devices(peer);
+        }
+        Ok(())
     }
 
     /// `identity` é a minha ou foi aceita?
@@ -447,7 +467,7 @@ impl Chat {
         if peer == self.peer_id() {
             return Err(Error::InvalidInvite);
         }
-        self.trust(invite.identity().clone());
+        self.trust(invite.identity().clone())?;
         self.expected.insert(peer, invite.identity().clone());
         Ok(self.node.dial_peer(peer, invite.addrs().to_vec())?)
     }
@@ -1016,7 +1036,7 @@ impl Chat {
             } else if from_sibling || device == peer {
                 // Device de contato repassado por um irmão, ou o convite que o contato anuncia de si.
                 if from_sibling {
-                    self.trust(owner.clone());
+                    self.trust(owner.clone())?;
                 }
                 learned |=
                     self.contact_devices.insert(device, invite.clone()).as_ref() != Some(&invite);
@@ -2157,7 +2177,7 @@ mod tests {
             ..
         } = household();
         let second = invite_for(&ana_key);
-        bia.trust(ana.clone());
+        bia.trust(ana.clone()).unwrap();
 
         let wire = device_list_wire(&mut ana_raw, vec![second.clone()]);
         bia.on_mls(ana_peer, &wire).unwrap();
@@ -2183,7 +2203,7 @@ mod tests {
             invite_for(&ana_key),
             invite_for(&StandaloneIdentity::generate()),
         );
-        bia.trust(ana_key.id());
+        bia.trust(ana_key.id()).unwrap();
 
         let wire = device_list_wire(&mut ana_raw, vec![genuine.clone(), stranger.clone()]);
         let err = bia.on_mls(ana_peer, &wire).unwrap_err();
@@ -2227,7 +2247,7 @@ mod tests {
         } = household();
         let claimed = invite_for(&ana_key);
         let cleo = StandaloneIdentity::generate().id();
-        bia.trust(ana_key.id());
+        bia.trust(ana_key.id()).unwrap();
         bia.expected.insert(claimed.peer_id(), cleo.clone());
 
         let wire = device_list_wire(&mut ana_raw, vec![claimed.clone()]);
@@ -2251,7 +2271,7 @@ mod tests {
             invite_for(&ana_key),
             invite_for(&ana_key),
         );
-        bia.trust(ana_key.id());
+        bia.trust(ana_key.id()).unwrap();
 
         for invite in [&first, &second] {
             let wire = device_list_wire(&mut ana_raw, vec![invite.clone()]);
@@ -2362,6 +2382,58 @@ mod tests {
         assert!(!bia.is_trusted(&StandaloneIdentity::generate().id()));
     }
 
+    /// P24: a confiança sobrevive a reabrir o `Chat` no mesmo banco.
+    #[tokio::test]
+    async fn trust_survives_reopening_the_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bia.db");
+        let (bia_key, bia_device) = (StandaloneIdentity::generate(), DeviceKey::generate());
+        let (ana, cleo) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        let config = || NodeConfig {
+            mdns: false,
+            ..Default::default()
+        };
+        {
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            bia.trust(ana.clone()).unwrap();
+        }
+
+        let bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+
+        assert!(bia.is_trusted(&ana));
+        assert!(!bia.is_trusted(&cleo));
+    }
+
+    /// P24: confiar DEPOIS de a conversa ficar pronta faz o anúncio que antes foi calado (a lista só
+    /// saía quando a conversa ficava pronta); confiar em outra identidade não anuncia a este peer.
+    #[tokio::test]
+    async fn trusting_after_the_conversation_is_ready_announces_my_device() {
+        let Household {
+            mut bia,
+            ana,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        bia.connected.insert(ana_peer);
+        bia.announce_devices(ana_peer);
+        assert!(
+            !bia.devices_announced.contains(&ana_peer),
+            "não aceita: nada"
+        );
+
+        bia.trust(StandaloneIdentity::generate().id()).unwrap();
+        assert!(
+            !bia.devices_announced.contains(&ana_peer),
+            "outra identidade"
+        );
+
+        bia.trust(ana).unwrap();
+        assert!(bia.devices_announced.contains(&ana_peer));
+    }
+
     /// 3.5 etapa 5 (privacidade, I4): irmão recebe a lista completa; contato aceito, só o meu
     /// convite; quem não aceitei, nada.
     #[tokio::test]
@@ -2380,7 +2452,7 @@ mod tests {
 
         assert_eq!(bia.device_list_for(&ana_peer), None, "não aceita: nada");
 
-        bia.trust(ana);
+        bia.trust(ana).unwrap();
         let to_contact = bia.device_list_for(&ana_peer).unwrap();
         assert_eq!(to_contact.len(), 1, "contato aceito: só o meu convite");
         assert_eq!(to_contact[0].peer_id(), bia.peer_id());
@@ -2399,7 +2471,7 @@ mod tests {
         let mut bia = chat(&bia_key, &DeviceKey::generate());
         let (sibling, _) = add_device_of(&mut bia, &bia_key);
         let (ana_peer, mut ana_raw, ana_own) = add_device_with_invite(&mut bia, &ana_key);
-        bia.trust(ana_key.id());
+        bia.trust(ana_key.id()).unwrap();
 
         let wire = device_list_wire(&mut ana_raw, vec![ana_own.clone()]);
         bia.on_mls(ana_peer, &wire).unwrap();
@@ -2486,7 +2558,7 @@ mod tests {
             ana_device: (ana_peer, mut ana_raw),
             ..
         } = household();
-        bia.trust(ana);
+        bia.trust(ana).unwrap();
         let device = DeviceKey::generate();
         let certificate = ana_key
             .authorize_device(
