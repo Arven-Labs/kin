@@ -145,6 +145,20 @@ const SEND_WINDOW: usize = 1;
 /// tolera 10 gerações fora de ordem (e o `chat` ignora `TooOld` em silêncio), então fica abaixo disso.
 const MAILBOX_WINDOW: usize = 8;
 
+/// Quantos endereços de cada device listado por um contato se tentam. Irmão (a minha identidade) não
+/// tem este limite. Limita a amplificação de uma lista hostil (auditoria I1).
+const CONTACT_DIAL_ADDRS: usize = 4;
+
+/// Endereços a tentar para um device listado: todos se o remetente é irmão, poucos se é contato.
+fn dial_addrs(addrs: &[Multiaddr], from_sibling: bool) -> Vec<Multiaddr> {
+    let limit = if from_sibling {
+        addrs.len()
+    } else {
+        CONTACT_DIAL_ADDRS
+    };
+    addrs.iter().take(limit).cloned().collect()
+}
+
 /// De onde veio o próximo evento do laço de [`Chat::next_event`].
 enum Next {
     Node(NodeEvent),
@@ -171,6 +185,15 @@ pub struct Chat {
     connected: std::collections::HashSet<PeerId>,
     /// Peers a quem já anunciamos nossos relays nesta conexão (zera ao desconectar).
     announced: std::collections::HashSet<PeerId>,
+    /// Peers a quem já anunciamos nossa lista de devices nesta conexão (3.5; zera ao desconectar).
+    devices_announced: std::collections::HashSet<PeerId>,
+    /// Contatos cuja lista de devices já disparou discagens nesta conexão (zera ao desconectar).
+    lists_acted: std::collections::HashSet<PeerId>,
+    /// Convites dos meus outros devices, como eles mesmos anunciaram (3.5). Só em memória: o endereço
+    /// envelhece, e cada irmão reanuncia ao conectar. É o que repasso aos contatos na `DeviceList`.
+    household: HashMap<PeerId, Invite>,
+    /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
+    advertised: Vec<Multiaddr>,
     /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
     in_flight: HashMap<PeerId, std::collections::HashSet<MessageId>>,
     /// Caixa postal opcional (3.1) e o canal por onde ela avisa o que acontece.
@@ -248,6 +271,10 @@ impl Chat {
             outbox,
             connected: Default::default(),
             announced: Default::default(),
+            devices_announced: Default::default(),
+            lists_acted: Default::default(),
+            household: HashMap::new(),
+            advertised: Vec::new(),
             in_flight: HashMap::new(),
             mailbox: None,
             mailbox_events: None,
@@ -294,6 +321,33 @@ impl Chat {
     /// escuta de IP global; ver `Node::shareable_addresses`). Vazio se ainda não há nenhum.
     pub fn shareable_invite(&self) -> Invite {
         self.invite(self.node.shareable_addresses())
+    }
+
+    /// Fixa os endereços que este device anuncia na lista de devices (IP fixo, port-forward, testes).
+    /// Vazio (o padrão) usa os do nó, os mesmos de [`Chat::shareable_invite`].
+    pub fn set_advertised_addrs(&mut self, addrs: Vec<Multiaddr>) {
+        self.advertised = addrs;
+    }
+
+    /// O convite deste device como vai na `DeviceList`.
+    fn own_invite(&self) -> Invite {
+        let addrs = if self.advertised.is_empty() {
+            self.node.shareable_addresses()
+        } else {
+            self.advertised.clone()
+        };
+        self.invite(addrs)
+    }
+
+    /// O que este device anuncia: o próprio convite (primeiro) e os dos irmãos que conhece, em ordem
+    /// de Peer ID, até o teto do codec.
+    fn device_list(&self) -> Vec<Invite> {
+        let mut siblings: Vec<&Invite> = self.household.values().collect();
+        siblings.sort_by_key(|invite| invite.peer_id());
+        std::iter::once(self.own_invite())
+            .chain(siblings.into_iter().cloned())
+            .take(crate::payload::MAX_DECODED_DEVICES)
+            .collect()
     }
 
     /// Aceita um convite: disca o dono dele e, no handshake, **exige** a identidade do convite.
@@ -661,12 +715,15 @@ impl Chat {
                 self.announce_if_ready(peer);
                 // Conversa recarregada do banco: os dois lados já a têm, então dá para anunciar já.
                 self.announce_relays(peer);
+                self.announce_devices(peer);
                 self.transmit(peer, &Envelope::Hello);
                 self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
                 self.announced.remove(&peer);
+                self.devices_announced.remove(&peer);
+                self.lists_acted.remove(&peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -775,6 +832,7 @@ impl Chat {
         // anuncia ao receber algo do outro (ver `on_mls`), porque o Welcome e esta mensagem seguem
         // por substreams diferentes e a ordem de chegada não é garantida.
         self.announce_relays(peer);
+        self.announce_devices(peer);
         Ok(())
     }
 
@@ -800,6 +858,100 @@ impl Chat {
             }
             Err(e) => self.drop_message(peer, e.into()),
         }
+    }
+
+    /// Anuncia ao `peer` os devices desta identidade (o meu e os dos meus irmãos), uma vez por
+    /// conexão, como mensagem de controle dentro do MLS, fora da outbox: se se perder, a próxima
+    /// conexão repete. Contato e irmão recebem a mesma lista.
+    fn announce_devices(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) || self.devices_announced.contains(&peer) {
+            return;
+        }
+        let list = self.device_list();
+        let Some(conversation) = self.conversations.get_mut(&peer) else {
+            return;
+        };
+        match conversation.encrypt(&Payload::DeviceList(list).encode()) {
+            Ok(wire) => {
+                self.devices_announced.insert(peer);
+                self.transmit(peer, &Envelope::Mls(wire));
+            }
+            Err(e) => self.drop_message(peer, e.into()),
+        }
+    }
+
+    /// Um device (já em conversa) listou os devices da identidade dele. Cada item tem de ser da MESMA
+    /// identidade de quem enviou (o `sender` autenticado pelo MLS), ou a lista inteira é recusada:
+    /// o certificado de cada item já foi conferido ao ler, então só devices genuínos dessa identidade
+    /// passam. O que ainda não tem conversa é discado, exigindo a identidade no handshake. Se quem
+    /// enviou é irmão, a lista também vira a minha "família", repassada aos contatos.
+    fn on_device_list(
+        &mut self,
+        peer: PeerId,
+        sender: &IdentityId,
+        invites: Vec<Invite>,
+    ) -> Result<(), Error> {
+        if invites.iter().any(|invite| invite.identity() != sender) {
+            return Err(Error::InvalidDeviceList(
+                "item de outra identidade".to_string(),
+            ));
+        }
+        let from_sibling = sender == self.device.identity();
+        // De um contato, só a primeira lista por conexão dispara discagens: cada lista pode trazer
+        // Peer IDs novos, então sem isto uma conexão geraria discagens sem fim (auditoria I1).
+        if !from_sibling && !self.lists_acted.insert(peer) {
+            return Ok(());
+        }
+        let me = self.peer_id();
+        let mut household_changed = false;
+        for invite in invites {
+            let device = invite.peer_id();
+            if device == me {
+                continue;
+            }
+            if from_sibling && self.household.get(&device) != Some(&invite) {
+                self.household.insert(device, invite.clone());
+                household_changed = true;
+            }
+            if self.conversations.contains_key(&device) {
+                continue;
+            }
+            // Não troca uma identidade que eu já exigi para esse Peer ID (por `accept`, por exemplo): o
+            // certificado não prova posse do device, então outra identidade poderia reivindicar o Peer
+            // ID alheio e travar o handshake dele (auditoria I3).
+            if self
+                .expected
+                .get(&device)
+                .is_some_and(|known| known != sender)
+            {
+                continue;
+            }
+            // Repetir o dial é inofensivo: o libp2p ignora quando já está discando ou conectado.
+            self.expected.insert(device, sender.clone());
+            if let Err(e) = self
+                .node
+                .dial_peer(device, dial_addrs(invite.addrs(), from_sibling))
+            {
+                self.queue.push_back(ChatEvent::DialFailed {
+                    peer: Some(device),
+                    reason: e.to_string(),
+                });
+            }
+        }
+        if household_changed {
+            // Um irmão novo (ou com endereço novo): quem já está conectado precisa saber.
+            self.devices_announced.clear();
+            let targets: Vec<PeerId> = self
+                .connected
+                .iter()
+                .copied()
+                .filter(|p| self.conversations.contains_key(p))
+                .collect();
+            for target in targets {
+                self.announce_devices(target);
+            }
+        }
+        Ok(())
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
@@ -835,8 +987,9 @@ impl Chat {
         match conversation.decrypt(wire) {
             Ok(Decrypted::Message { sender, plaintext }) => {
                 let payload = Payload::decode(&plaintext)?;
-                // O outro lado já tem a conversa: agora é seguro anunciar os nossos relays.
+                // O outro lado já tem a conversa: agora é seguro anunciar os nossos relays e devices.
                 self.announce_relays(peer);
+                self.announce_devices(peer);
                 match payload {
                     Payload::Message(message) => {
                         // Nova tentativa do remetente = outros bytes cifrados, o MLS não vê
@@ -853,8 +1006,7 @@ impl Chat {
                     }
                     Payload::RelayList(relays) => self.on_relay_list(peer, &relays),
                     Payload::Sent { to, message } => self.on_sent(peer, &sender, to, message),
-                    // A descoberta de devices vem na etapa 5; até lá, ignorar é seguro.
-                    Payload::DeviceList(_) => Ok(()),
+                    Payload::DeviceList(invites) => self.on_device_list(peer, &sender, invites),
                 }
             }
             Ok(Decrypted::EpochChanged) => {
@@ -1825,6 +1977,8 @@ mod tests {
         ana: IdentityId,
         sibling: RawDevice,
         ana_device: RawDevice,
+        bia_key: StandaloneIdentity,
+        ana_key: StandaloneIdentity,
     }
 
     fn household() -> Household {
@@ -1841,7 +1995,211 @@ mod tests {
             ana: ana_key.id(),
             sibling,
             ana_device,
+            bia_key,
+            ana_key,
         }
+    }
+
+    /// Convite de um device novo de `identity` (certificado válido) com um endereço de teste.
+    fn invite_for(identity: &StandaloneIdentity) -> Invite {
+        let device = DeviceKey::generate();
+        let certificate = identity
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1,
+            )
+            .unwrap();
+        Invite::new(
+            certificate,
+            vec!["/ip4/127.0.0.1/tcp/1".parse::<Multiaddr>().unwrap()],
+        )
+    }
+
+    fn device_list_wire(raw: &mut Conversation, invites: Vec<Invite>) -> Vec<u8> {
+        raw.encrypt(&Payload::DeviceList(invites).encode()).unwrap()
+    }
+
+    /// 3.5 etapa 5: a lista de devices de um contato faz este device discar o que ele ainda não
+    /// conhece, exigindo no handshake a identidade do contato.
+    #[tokio::test]
+    async fn a_contacts_device_list_makes_me_dial_her_unknown_device_expecting_her_identity() {
+        let Household {
+            mut bia,
+            ana,
+            ana_key,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let second = invite_for(&ana_key);
+
+        let wire = device_list_wire(&mut ana_raw, vec![second.clone()]);
+        bia.on_mls(ana_peer, &wire).unwrap();
+
+        assert_eq!(bia.expected.get(&second.peer_id()), Some(&ana));
+        assert!(
+            bia.household.is_empty(),
+            "lista de contato não vira família"
+        );
+    }
+
+    /// 3.5 etapa 5 (segurança): um item de OUTRA identidade recusa a lista inteira, e nada é discado.
+    /// Senão um contato me faria discar endereços de terceiros.
+    #[tokio::test]
+    async fn a_device_list_with_another_identitys_device_is_refused_whole() {
+        let Household {
+            mut bia,
+            ana_key,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let (genuine, stranger) = (
+            invite_for(&ana_key),
+            invite_for(&StandaloneIdentity::generate()),
+        );
+
+        let wire = device_list_wire(&mut ana_raw, vec![genuine.clone(), stranger.clone()]);
+        let err = bia.on_mls(ana_peer, &wire).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidDeviceList(_)), "{err:?}");
+        assert!(bia.expected.is_empty(), "nem o item legítimo é discado");
+    }
+
+    /// 3.5 etapa 5: a lista de um irmão é guardada (para eu repassá-la aos contatos), e ele também é
+    /// discado se for desconhecido; meu próprio device na lista é ignorado.
+    #[tokio::test]
+    async fn a_siblings_device_list_is_kept_as_my_household_and_skips_myself() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let third = invite_for(&bia_key);
+        let myself = bia.invite(vec![]);
+
+        let wire = device_list_wire(&mut sibling_raw, vec![third.clone(), myself]);
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(bia.household.get(&third.peer_id()), Some(&third));
+        assert_eq!(bia.household.len(), 1, "eu não entro na minha família");
+        assert!(bia.expected.contains_key(&third.peer_id()));
+        assert!(!bia.expected.contains_key(&bia.peer_id()));
+    }
+
+    /// 3.5 etapa 5 (auditoria I3): um item da lista não sobrescreve a identidade que EU já exigi para
+    /// aquele Peer ID (ex.: por `accept`). Senão uma identidade poderia reivindicar o Peer ID de um
+    /// device alheio e travar o handshake legítimo dele.
+    #[tokio::test]
+    async fn a_device_list_never_overwrites_an_identity_i_already_required() {
+        let Household {
+            mut bia,
+            ana_key,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let claimed = invite_for(&ana_key);
+        let cleo = StandaloneIdentity::generate().id();
+        bia.expected.insert(claimed.peer_id(), cleo.clone());
+
+        let wire = device_list_wire(&mut ana_raw, vec![claimed.clone()]);
+        bia.on_mls(ana_peer, &wire).unwrap();
+
+        assert_eq!(bia.expected.get(&claimed.peer_id()), Some(&cleo));
+    }
+
+    /// 3.5 etapa 5 (auditoria I1): de um contato (não irmão) só a primeira lista por conexão dispara
+    /// discagens; listas seguintes são ignoradas até a conexão cair. Limita a amplificação.
+    #[tokio::test]
+    async fn only_the_first_device_list_per_connection_from_a_contact_is_acted_on() {
+        let Household {
+            mut bia,
+            ana_key,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let (first, second, third) = (
+            invite_for(&ana_key),
+            invite_for(&ana_key),
+            invite_for(&ana_key),
+        );
+
+        for invite in [&first, &second] {
+            let wire = device_list_wire(&mut ana_raw, vec![invite.clone()]);
+            bia.on_mls(ana_peer, &wire).unwrap();
+        }
+        assert!(bia.expected.contains_key(&first.peer_id()));
+        assert!(!bia.expected.contains_key(&second.peer_id()), "2ª ignorada");
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        let wire = device_list_wire(&mut ana_raw, vec![third.clone()]);
+        bia.on_mls(ana_peer, &wire).unwrap();
+        assert!(bia.expected.contains_key(&third.peer_id()), "nova conexão");
+    }
+
+    /// 3.5 etapa 5 (auditoria I1): irmão não é limitado (é a minha própria identidade).
+    #[tokio::test]
+    async fn a_sibling_may_send_device_lists_repeatedly() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let (first, second) = (invite_for(&bia_key), invite_for(&bia_key));
+
+        for invite in [&first, &second] {
+            let wire = device_list_wire(&mut sibling_raw, vec![invite.clone()]);
+            bia.on_mls(sibling, &wire).unwrap();
+        }
+
+        assert!(bia.household.contains_key(&first.peer_id()));
+        assert!(bia.household.contains_key(&second.peer_id()));
+    }
+
+    /// 3.5 etapa 5 (auditoria I1): de um contato aceitam-se poucos endereços por device; de irmão, todos.
+    #[test]
+    fn a_contacts_device_gets_few_dial_addresses_and_a_siblings_gets_all() {
+        let addrs: Vec<Multiaddr> = (1..=10)
+            .map(|port| format!("/ip4/203.0.113.1/tcp/{port}").parse().unwrap())
+            .collect();
+
+        assert_eq!(dial_addrs(&addrs, false).len(), CONTACT_DIAL_ADDRS);
+        assert_eq!(dial_addrs(&addrs, false), addrs[..CONTACT_DIAL_ADDRS]);
+        assert_eq!(dial_addrs(&addrs, true), addrs);
+    }
+
+    /// 3.5 etapa 5: o que eu anuncio é o meu convite (primeiro) mais os irmãos que conheço.
+    #[tokio::test]
+    async fn my_device_list_is_my_invite_first_then_my_siblings() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let third = invite_for(&bia_key);
+        let wire = device_list_wire(&mut sibling_raw, vec![third.clone()]);
+        bia.on_mls(sibling, &wire).unwrap();
+
+        let list = bia.device_list();
+
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].peer_id(), bia.peer_id());
+        assert_eq!(list[1], third);
+    }
+
+    /// 3.5 etapa 5: os endereços anunciados podem ser fixados à mão (IP fixo, port-forward, teste).
+    #[tokio::test]
+    async fn advertised_addresses_override_the_nodes_own() {
+        let mut bia = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        assert!(bia.own_invite().addrs().is_empty());
+        let addr: Multiaddr = "/ip4/203.0.113.9/tcp/4001".parse().unwrap();
+
+        bia.set_advertised_addrs(vec![addr.clone()]);
+
+        assert_eq!(bia.own_invite().addrs(), [addr]);
     }
 
     fn payload_of(raw: &mut Conversation, blob: &[u8]) -> Payload {
