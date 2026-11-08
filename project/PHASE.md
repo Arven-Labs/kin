@@ -62,7 +62,7 @@ direta.
 **Etapas** (preliminares):
 - [x] 3.1 — Abstração de transporte de mailbox (trocar o backend sem mexer no resto) — Sessão 7, ADR 0003
 - [x] 3.2 — Outbox local (entrega na janela simultânea) — Sessão 6, ADR 0002
-- [x] 3.3 — Backend de mailbox de fallback: relays Nostr (NIP-17/59, conforme D1). Spikes de leitura e de escrita feitos e certificado v3 com a chave secp256k1 do device feito na Sessão 8 (ADR 0004, aceito); camada de protocolo sem rede feita (`kin_chat::nostr`, `Mailbox::learn_peer`); `NostrMailbox` com websocket, vários relays e NIP-42 feito contra relays falsos; CLI com `--nostr-relay` e roteiro com relay real (`nos.lol`, `relay.damus.io`) feitos na Sessão 9 (limites restantes no P23); relays de entrada por contato, anunciados por mensagem MLS e usados no depósito, feitos na Sessão 12 (falta rodar contra relay real)
+- [x] 3.3 — Backend de mailbox de fallback: relays Nostr (NIP-17/59, conforme D1). Spikes de leitura e de escrita feitos e certificado v3 com a chave secp256k1 do device feito na Sessão 8 (ADR 0004, aceito); camada de protocolo sem rede feita (`kin_chat::nostr`, `Mailbox::learn_peer`); `NostrMailbox` com websocket, vários relays e NIP-42 feito contra relays falsos; CLI com `--nostr-relay` e roteiro com relay real (`nos.lol`, `relay.damus.io`) feitos na Sessão 9 (limites restantes no P23); relays de entrada por contato, anunciados por mensagem MLS e usados no depósito, feitos na Sessão 12 e exercitados contra relay real (`offchain.pub`, 1 mensagem)
 - [ ] 3.4 — Replicação em N mailboxes com TTL
 - [ ] 3.5 — Multi-device (vários devices por identidade, sincronização)
 
