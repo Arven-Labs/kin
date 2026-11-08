@@ -581,7 +581,7 @@ impl Chat {
                 if let Some(Some(message)) = self.pending.remove(&id) {
                     // O ack fecha o ciclo: sai da fila e libera uma vaga na janela.
                     self.leave_flight(peer, &message);
-                    if let Err(e) = self.outbox.remove(&message) {
+                    if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
                     self.queue.push_back(ChatEvent::Delivered { peer, message });
@@ -1386,7 +1386,7 @@ mod tests {
     async fn an_acked_message_is_not_deposited_again() {
         let (mut bia, _ana, ana_peer, relay, id) =
             deposited_once(Some(std::time::Duration::ZERO)).await;
-        bia.outbox.remove(&id).unwrap();
+        bia.outbox.remove(&ana_peer, &id).unwrap();
 
         bia.flush(ana_peer);
 
