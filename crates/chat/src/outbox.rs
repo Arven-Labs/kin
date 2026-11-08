@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use kin_identity::{IdentityId, PublicKey};
 use kin_transport::PeerId;
 use rusqlite::{Connection, params};
 
@@ -14,8 +15,9 @@ use crate::{Error, Message, MessageId};
 /// Quantos ids de mensagem já vistas se lembra por peer; os mais antigos são esquecidos.
 pub(crate) const SEEN_LIMIT: usize = 1024;
 
-/// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 (mensagem por `(peer, id)`).
-const SCHEMA_VERSION: i64 = 1;
+/// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 etapa 1 (mensagem por
+/// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho).
+const SCHEMA_VERSION: i64 = 2;
 
 pub(crate) struct Outbox {
     conn: Connection,
@@ -48,6 +50,7 @@ impl Outbox {
                  parent BLOB,
                  sent_at_ms INTEGER NOT NULL,
                  text TEXT NOT NULL,
+                 to_identity BLOB,
                  UNIQUE (peer, id));
              CREATE INDEX IF NOT EXISTS kin_outbox_peer ON kin_outbox (peer, seq);
              CREATE TABLE IF NOT EXISTS kin_deposited (
@@ -91,7 +94,7 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         let tx = conn.unchecked_transaction().map_err(Error::storage)?;
-        if has_old {
+        if has_old && version < 1 {
             tx.execute_batch(
                 "-- Bancos anteriores à 3.4 podem não ter estas duas; o formato antigo basta para copiar.
                  CREATE TABLE IF NOT EXISTS kin_deposited (id BLOB PRIMARY KEY, peer TEXT NOT NULL);
@@ -130,6 +133,12 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         }
+        // Versão 2: coluna nula `to_identity`, a marca do espelho multi-device. Só acrescenta; as linhas
+        // antigas ficam nulas (envio comum). Banco sem tabelas já nasce com ela (ver `init`).
+        if has_old {
+            tx.execute_batch("ALTER TABLE kin_outbox ADD COLUMN to_identity BLOB")
+                .map_err(Error::storage)?;
+        }
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
             .map_err(Error::storage)?;
         tx.commit().map_err(Error::storage)
@@ -150,6 +159,59 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         Ok(())
+    }
+
+    /// Como [`Self::enqueue`], mas a entrada é um espelho (3.5): `peer` é um device meu e a mensagem
+    /// foi enviada a `to`. Na hora de sair, vai como `Payload::Sent` em vez de mensagem comum.
+    pub(crate) fn enqueue_mirror(
+        &self,
+        peer: &PeerId,
+        message: &Message,
+        to: &IdentityId,
+    ) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO kin_outbox (peer, id, parent, sent_at_ms, text, to_identity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    peer.to_string(),
+                    &message.id.as_bytes()[..],
+                    message.parent.as_ref().map(|p| p.as_bytes().to_vec()),
+                    message.sent_at_ms as i64,
+                    message.text,
+                    to.public_key().encode_protobuf(),
+                ],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// Para quem a mensagem `id` na fila de `peer` foi enviada, se a entrada for um espelho; `None`
+    /// para envio comum (ou se não existir). Uma identidade gravada que não decodifica é erro.
+    pub(crate) fn mirror_target(
+        &self,
+        peer: &PeerId,
+        id: &MessageId,
+    ) -> Result<Option<IdentityId>, Error> {
+        let stored: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT to_identity FROM kin_outbox WHERE peer = ?1 AND id = ?2",
+                params![peer.to_string(), &id.as_bytes()[..]],
+                |row| row.get(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .map_err(Error::storage)?;
+        stored
+            .map(|bytes| {
+                PublicKey::try_decode_protobuf(&bytes)
+                    .map(IdentityId::new)
+                    .map_err(|_| Error::Malformed)
+            })
+            .transpose()
     }
 
     /// Mensagens esperando por `peer`, da mais antiga para a mais nova.
@@ -351,7 +413,7 @@ fn message_id(bytes: &[u8]) -> Result<MessageId, Error> {
 
 #[cfg(test)]
 mod tests {
-    use kin_identity::DeviceKey;
+    use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
 
     use super::*;
 
@@ -580,6 +642,134 @@ mod tests {
 
         assert_eq!(outbox.entries(&peer).unwrap().len(), 1);
         assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
+    }
+
+    fn identity() -> IdentityId {
+        StandaloneIdentity::generate().id()
+    }
+
+    // 12
+    #[test]
+    fn a_mirror_entry_remembers_who_the_message_was_sent_to_and_a_plain_one_does_not() {
+        let (outbox, sibling, other) = (Outbox::memory().unwrap(), peer(), peer());
+        let (message, bia) = (Message::new("oi".into(), None), identity());
+
+        outbox.enqueue_mirror(&sibling, &message, &bia).unwrap();
+        outbox.enqueue(&other, &message).unwrap();
+
+        assert_eq!(
+            outbox.entries(&sibling).unwrap(),
+            std::slice::from_ref(&message)
+        );
+        assert_eq!(
+            outbox.mirror_target(&sibling, &message.id).unwrap(),
+            Some(bia)
+        );
+        assert_eq!(outbox.mirror_target(&other, &message.id).unwrap(), None);
+    }
+
+    // 13
+    #[test]
+    fn a_mirror_entry_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (sibling, message, bia) = (peer(), Message::new("oi".into(), None), identity());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.enqueue_mirror(&sibling, &message, &bia).unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert_eq!(
+            outbox.mirror_target(&sibling, &message.id).unwrap(),
+            Some(bia)
+        );
+    }
+
+    // 14
+    #[test]
+    fn a_3_5_step_1_database_keeps_its_entries_and_gains_the_mirror_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (old, message) = (peer(), Message::new("antiga".into(), None));
+        {
+            // Esquema da etapa 1 da 3.5 (versão 1): por (peer, id), ainda sem `to_identity`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE kin_outbox (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     peer TEXT NOT NULL,
+                     id BLOB NOT NULL,
+                     parent BLOB,
+                     sent_at_ms INTEGER NOT NULL,
+                     text TEXT NOT NULL,
+                     UNIQUE (peer, id));
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kin_outbox (peer, id, parent, sent_at_ms, text) VALUES (?1, ?2, NULL, ?3, ?4)",
+                params![
+                    old.to_string(),
+                    &message.id.as_bytes()[..],
+                    message.sent_at_ms as i64,
+                    message.text
+                ],
+            )
+            .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert_eq!(
+            outbox.entries(&old).unwrap(),
+            std::slice::from_ref(&message)
+        );
+        assert_eq!(outbox.mirror_target(&old, &message.id).unwrap(), None);
+        let (sibling, mirrored) = (peer(), Message::new("nova".into(), None));
+        outbox
+            .enqueue_mirror(&sibling, &mirrored, &identity())
+            .unwrap();
+        assert!(
+            outbox
+                .mirror_target(&sibling, &mirrored.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // 15
+    #[test]
+    fn a_pre_3_5_database_ends_up_able_to_hold_mirror_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE kin_outbox (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     peer TEXT NOT NULL,
+                     id BLOB NOT NULL UNIQUE,
+                     parent BLOB,
+                     sent_at_ms INTEGER NOT NULL,
+                     text TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+        let (sibling, message) = (peer(), Message::new("x".into(), None));
+
+        let outbox = Outbox::open(&path).unwrap();
+        outbox
+            .enqueue_mirror(&sibling, &message, &identity())
+            .unwrap();
+
+        assert!(
+            outbox
+                .mirror_target(&sibling, &message.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     // 6
