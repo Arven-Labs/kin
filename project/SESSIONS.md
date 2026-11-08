@@ -539,3 +539,30 @@
   prova confiabilidade. Não verificado: o sentido inverso (B offline recebendo via `primal`); só o log da CLI mostra
   que o depósito não foi ao `primal`, não consultei o relay.
 - **Próximo passo**: a 3.4 (replicação em N mailboxes com TTL).
+
+### 2026-11-07 — Sessão 13
+
+- **Objetivo**: 3.4, parte A: TTL e quórum de réplicas no `NostrMailbox` (sem mudar schema).
+- **Achado**: os depósitos não tinham expiração (ficavam nos relays para sempre) e o NIP-59 sorteia o `created_at` do
+  gift wrap até 2 dias para trás (`RANGE_RANDOM_TIMESTAMP_TWEAK = 0..172800`, lido no crate `nostr` 0.45.7). Com
+  `since_window` de 3 dias, uma mensagem só era pedida por ~1 dia no pior sorteio. Além disso, `Deposited` saía no primeiro
+  relay que aceitava.
+- **Decisões do dono**: TTL de 7 dias; depósito só conta com 2 aceites (ou todos, se houver menos relays); re-depósito por
+  idade em PR separado (parte B, mexe em schema).
+- **Feito** (branch `ttl-replicas`): `wrap_with_ttl` (a expiração NIP-40 é ancorada no `created_at` sorteado, então a
+  duração pedida ao crate é `ttl + 2 dias`); `NostrConfig::{ttl, min_replicas}` e `since_window` padrão de 10 dias;
+  `with_config` recusa `since_window < ttl + 2 dias` e `min_replicas = 0` (`NostrError::Config`); `Shared::ack` confirma no
+  quórum e, com aceites insuficientes, falha com "só N de M relays aceitaram (mínimo Q)"; `on_event` descarta gift wrap
+  com expiração vencida.
+- **Testes**: 14 novos (4 de `wrap`, 10 de `NostrMailbox`: quórum, TTL, configuração, expirados), escritos antes
+  (não compilavam), verdes depois. `fast()` fixa `min_replicas: 1` para os 38 testes antigos. **Um teste antigo mudou de
+  valor**: `the_subscription_asks_for_the_last_ten_days` (era `…three_days`, esperava 3 dias; agora 10), de propósito.
+- **Verificado (local)**: `cargo test --workspace --locked` 211 passando, 0 falhando (eram 197); clippy e fmt ok.
+  Mutações pegas e revertidas: `ttl` sem os +2 dias derruba 1 teste; quórum fixo em 1 derruba 3; não descartar expirados
+  derruba 1.
+- **Não verificado**: contra relay real (ver a tag `expiration` no evento publicado); a mutação de `since_window` (o teste
+  46 cobre, não mutei); CI (testes Rust não rodam lá); damus e outros relays sem NIP-40 ignoram a expiração.
+- **Limites**: um depósito com 1 de 2 aceites vira `DepositFailed` no `Chat` (a mensagem fica na outbox e tenta de novo no
+  próximo gatilho) mas já está num relay; `Deposited` demora até o relay mais lento (nos.lol: 35 a 90 s).
+- **Próximo passo**: parte B (re-depósito por idade, tabela `kin_deposit_times`, confirmar o schema antes) e ADR 0005
+  (TTL, quórum e relação TTL × `since_window`), que ainda não foi criado.
