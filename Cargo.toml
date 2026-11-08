@@ -2,6 +2,13 @@
 resolver = "3"
 members = ["crates/*"]
 
+[profile.dev]
+# Só tabelas de linha: backtraces e panics seguem com arquivo:linha, e os artefatos de debug ficam bem menores
+# (o target/ chegou a 50 GB com debug info completo e cache incremental).
+debug = "line-tables-only"
+# Sem cache incremental: ele só acelera quem recompila a mesma árvore e chegou a 16 GB em target/debug/incremental.
+incremental = false
+
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
