@@ -693,3 +693,31 @@
 - **Deslize do processo**: anexei os testes por heredoc no Bash (contra o `CLAUDE.md`); o diff está visível.
 - **Limite conhecido**: `--pair -` consome o stdin inteiro, então o laço de chat do mesmo processo encerra; usar arquivo.
 - **Próximo passo**: roteiro manual com 2 processos da mesma identidade; decidir se o `kin` ganha workflow de CI Rust.
+- **Fim da parte 2**: #35 mesclado. **Correção**: o `kin` **ganhou** CI Rust (`Rust (clippy and tests)`, #34) antes do #35
+  entrar, e o #35 passou nele (2m13s) e no `guard`; as frases acima sobre "sem CI Rust" valiam só até o #34.
+
+#### Sessão 16, parte 3: roteiro manual do pareamento (2 processos, loopback)
+
+Binário `target/debug/kin` compilado pelo dono (`!cargo build -p kin-cli`, ADR 0009); eu rodei o binário com chaves
+descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
+
+| Passo | Resultado |
+|---|---|
+| `/pair` sem confirmar | só o aviso, nada impresso |
+| `/pair confirmo` com a saída por pipe | recusado ("a saída não é um terminal") |
+| `/pair confirmo` num pseudo-terminal (`script`) | link de 103 caracteres |
+| B com `--pair ARQUIVO` em `--data-dir` novo | `identity.key` igual ao de A (`cmp`); `device.key` e Peer ID diferentes; 0600 |
+| `--pair` de novo em B | recusa; `sha1` do `identity.key` intacto |
+| `--pair` em dir com `mls.sqlite` | recusa; nada criado |
+| link com lixo, prefixo `kin://invite/`, arquivo de 20 KB | `InvalidPairLink` ×2 e "grande demais" |
+| B disca A | conversa cifrada pronta, **mesma identidade** nos dois lados; mensagem de B chega em A; "entregue" em B |
+| colar o link no chat (texto puro e `/r xx LINK`) | "não enviado: isto é um link de pareamento" nas duas |
+| `kin://pair` nos logs de A e B | 0 ocorrências |
+
+- **Não exercitado**: relay real e NAT (loopback); espelho `SentElsewhere` (precisa de um 3º device, um contato); caixa
+  postal Nostr; a descoberta `DeviceList` entre os dois irmãos não teve saída própria no log.
+- **Achado**: a CLI imprime "(para aceitar este contato: /trust)" também quando o outro lado é um irmão (mesma identidade),
+  que não precisa de `/trust`. Texto enganoso, sem efeito de segurança; correção é código e vai em PR separado.
+- **Resíduo**: `--pair` inválido deixa o `--data-dir` criado e vazio (`create_dir_all` antes de validar).
+- **Próximo passo**: roteiro com 3 devices (espelho e descoberta) e relay real; esconder a dica de `/trust` para irmãos; o
+  resto do P24.
