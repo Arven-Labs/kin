@@ -596,5 +596,7 @@
   gerações do MLS (a janela tolera 10 fora de ordem), então uma cópia antiga atrasada pode virar `TooOld` e ser ignorada,
   mas a cópia nova já entregou o mesmo `MessageId`, que o destinatário deduplica; mais gift wraps públicos por mensagem
   (no máximo ~2 por TTL).
-- **Próximo passo**: ADR 0005 (TTL, quórum, relação TTL × `since_window` e re-depósito), que ainda não foi criado, e a
-  3.5 (multi-device).
+- **ADR 0005** (branch `adr-0005`, pedido do dono no fim da sessão): TTL, quórum, relação TTL × `since_window` e
+  re-depósito, com as alternativas descartadas e o que segue em aberto (roteiro real da parte B, retenção real dos relays,
+  timer, `since` persistido).
+- **Próximo passo**: 3.5 (multi-device; toca identidade e MLS, começar em plan mode).
