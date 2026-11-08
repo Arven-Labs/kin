@@ -754,6 +754,9 @@ impl Chat {
                         Ok(())
                     }
                     Payload::RelayList(relays) => self.on_relay_list(peer, &relays),
+                    // Multi-device (3.5): o formato já existe, o tratamento vem nas etapas 4 e 5.
+                    // Até lá, ignorar é seguro: nada é aceito nem enviado por causa deles.
+                    Payload::Sent { .. } | Payload::DeviceList(_) => Ok(()),
                 }
             }
             Ok(Decrypted::EpochChanged) => {
