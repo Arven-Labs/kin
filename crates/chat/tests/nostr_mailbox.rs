@@ -8,7 +8,7 @@ use common::fake_relay::{FakeRelay, Policy, dead_url};
 use common::{Person, WAIT, connect, until_disconnected};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
-use kin_chat::nostr::{MAX_BLOB, NostrConfig, NostrMailbox, wrap};
+use kin_chat::nostr::{MAX_BLOB, NostrConfig, NostrError, NostrMailbox, wrap};
 use kin_chat::{Chat, ChatEvent, Mailbox, MailboxEvent};
 use kin_identity::DeviceKey;
 use nostr::prelude::*;
@@ -20,7 +20,17 @@ fn fast() -> NostrConfig {
         backoff_max: Duration::from_millis(200),
         ack_timeout: Duration::from_millis(300),
         ack_deadline: Duration::from_secs(1),
+        // Os testes antigos medem um relay de cada vez; o quórum tem testes próprios (`quorum`).
+        min_replicas: 1,
         ..NostrConfig::default()
+    }
+}
+
+/// Como `fast()`, mas exigindo `min` aceites antes de contar o depósito.
+fn quorum(min: usize) -> NostrConfig {
+    NostrConfig {
+        min_replicas: min,
+        ..fast()
     }
 }
 
@@ -363,7 +373,7 @@ async fn after_a_dropped_connection_the_worker_reconnects_and_resubscribes() {
 
 // 13
 #[tokio::test(flavor = "multi_thread")]
-async fn the_subscription_asks_for_the_last_three_days() {
+async fn the_subscription_asks_for_the_last_ten_days() {
     let bia = DeviceKey::generate();
     let relay = FakeRelay::start(Policy::Accept).await;
     let mut mb = mailbox(&bia, &[&relay.url]);
@@ -376,7 +386,9 @@ async fn the_subscription_asks_for_the_last_three_days() {
         .unwrap()
         .as_secs();
     let since = filter["since"].as_u64().expect("o REQ leva since");
-    let expected = now - 3 * 24 * 3600;
+    // 3.4: ttl (7 dias) + desvio do NIP-59 (2) + 1 dia de folga. Eram 3 dias, o que só achava
+    // mensagens depositadas havia menos de 1 dia no pior sorteio.
+    let expected = now - 10 * 24 * 3600;
     assert!(
         since.abs_diff(expected) <= 120,
         "since={since}, esperado ~{expected}"
@@ -972,6 +984,244 @@ async fn an_unreadable_contact_list_is_ignored_and_the_previous_one_stays() {
     assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
     eventually("depositou na lista anterior", || theirs.stored().len() == 1).await;
     assert!(own.stored().is_empty());
+}
+
+// 3.4: quórum de réplicas, TTL e janela de leitura.
+
+/// Eventos brutos até o primeiro `Deposited` ou `DepositFailed`; devolve (aceites vistos antes, esse evento).
+async fn until_verdict(rx: &mut UnboundedReceiver<MailboxEvent>) -> (usize, MailboxEvent) {
+    let mut accepted = 0;
+    loop {
+        match next_raw(rx).await {
+            MailboxEvent::RelayOutcome { accepted: true, .. } => accepted += 1,
+            verdict @ (MailboxEvent::Deposited { .. } | MailboxEvent::DepositFailed { .. }) => {
+                return (accepted, verdict);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn quorum_mailbox(device: &DeviceKey, urls: &[&str], min: usize) -> NostrMailbox {
+    NostrMailbox::with_config(device, urls, quorum(min)).unwrap()
+}
+
+// 39
+#[tokio::test(flavor = "multi_thread")]
+async fn with_two_replicas_required_the_deposit_waits_for_the_second_accept() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (fast_relay, slow_relay) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Slow(
+            Duration::from_millis(400),
+            Box::new(Policy::Accept),
+        ))
+        .await,
+    );
+    let mut mb = quorum_mailbox(&ana, &[&fast_relay.url, &slow_relay.url], 2);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    let (accepts_before, verdict) = until_verdict(&mut rx).await;
+    assert_eq!(verdict, MailboxEvent::Deposited { id });
+    assert_eq!(accepts_before, 2, "confirmou antes da segunda réplica");
+}
+
+// 40
+#[tokio::test(flavor = "multi_thread")]
+async fn one_accept_out_of_two_when_two_are_required_fails_and_says_how_many() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (good, bad) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Reject("blocked".into())).await,
+    );
+    let mut mb = quorum_mailbox(&ana, &[&good.url, &bad.url], 2);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    match until_verdict(&mut rx).await.1 {
+        MailboxEvent::DepositFailed { id: got, reason } => {
+            assert_eq!(got, id);
+            assert!(reason.contains("1 de 2"), "motivo: {reason}");
+            assert!(reason.contains("mínimo 2"), "motivo: {reason}");
+        }
+        other => panic!("esperava DepositFailed, veio {other:?}"),
+    }
+}
+
+// 41
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_configured_relay_satisfies_a_quorum_of_two() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let only = FakeRelay::start(Policy::Accept).await;
+    let mut mb = quorum_mailbox(&ana, &[&only.url], 2);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert_eq!(
+        until_verdict(&mut rx).await.1,
+        MailboxEvent::Deposited { id }
+    );
+}
+
+// 42
+#[tokio::test(flavor = "multi_thread")]
+async fn two_accepts_out_of_three_are_enough() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (a, b, c) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Reject("blocked".into())).await,
+    );
+    let mut mb = quorum_mailbox(&ana, &[&a.url, &b.url, &c.url], 2);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert_eq!(
+        until_verdict(&mut rx).await.1,
+        MailboxEvent::Deposited { id }
+    );
+}
+
+// 43
+#[tokio::test(flavor = "multi_thread")]
+async fn the_quorum_also_applies_to_the_contact_relays() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (good, bad) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Reject("blocked".into())).await,
+    );
+    let mut mb = quorum_mailbox(&ana, &["ws://127.0.0.1:1"], 2);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![good.url.clone(), bad.url.clone()]);
+
+    let failing = mb.deposit(bia.peer_id(), b"x".to_vec());
+    assert!(matches!(
+        until_verdict(&mut rx).await.1,
+        MailboxEvent::DepositFailed { id, .. } if id == failing
+    ));
+
+    mb.learn_relays(
+        bia.peer_id(),
+        vec![good.url.clone(), good.url.replace("127.0.0.1", "localhost")],
+    );
+    let passing = mb.deposit(bia.peer_id(), b"y".to_vec());
+    assert_eq!(
+        until_verdict(&mut rx).await.1,
+        MailboxEvent::Deposited { id: passing }
+    );
+}
+
+// 44
+#[tokio::test(flavor = "multi_thread")]
+async fn the_published_event_expires_after_at_least_the_ttl() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    mb.deposit(bia.peer_id(), b"x".to_vec());
+    next(&mut rx).await;
+
+    let event = relay.stored().remove(0);
+    let expiration = event.tags.expiration().expect("sem expiração");
+    let week = 7 * 24 * 3600;
+    assert!(
+        expiration.as_secs() >= Timestamp::now().as_secs() + week - 5,
+        "expira antes do TTL de 7 dias"
+    );
+}
+
+// 45
+#[test]
+fn the_defaults_are_a_week_of_ttl_two_replicas_and_a_window_that_covers_the_timestamp_tweak() {
+    let config = NostrConfig::default();
+
+    assert_eq!(config.ttl, Duration::from_secs(7 * 24 * 3600));
+    assert_eq!(config.min_replicas, 2);
+    assert!(
+        config.since_window >= config.ttl + Duration::from_secs(2 * 24 * 3600),
+        "a janela de leitura não cobre TTL + o desvio de 2 dias do NIP-59"
+    );
+    assert!(NostrMailbox::new(&DeviceKey::generate(), &["wss://a.example"]).is_ok());
+}
+
+// 46
+#[test]
+fn a_read_window_shorter_than_ttl_plus_two_days_is_refused() {
+    let config = NostrConfig {
+        ttl: Duration::from_secs(7 * 24 * 3600),
+        since_window: Duration::from_secs(8 * 24 * 3600),
+        ..NostrConfig::default()
+    };
+
+    let result = NostrMailbox::with_config(&DeviceKey::generate(), &["wss://a.example"], config);
+
+    assert!(matches!(result, Err(NostrError::Config(_))));
+}
+
+// 47
+#[test]
+fn zero_required_replicas_is_refused() {
+    let config = NostrConfig {
+        min_replicas: 0,
+        ..NostrConfig::default()
+    };
+
+    let result = NostrMailbox::with_config(&DeviceKey::generate(), &["wss://a.example"], config);
+
+    assert!(matches!(result, Err(NostrError::Config(_))));
+}
+
+// 48
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_gift_wrap_is_ignored_and_the_next_valid_one_arrives() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.inject(expired_wrap(&ana, &bia, b"vencida"));
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"valida").unwrap());
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: ana.peer_id(),
+            blob: b"valida".to_vec()
+        }
+    );
+    quiet(&mut rx, 500).await;
+}
+
+/// Gift wrap válido por fora, mas cuja expiração (NIP-40) já passou.
+fn expired_wrap(from: &DeviceKey, to: &DeviceKey, blob: &[u8]) -> Event {
+    use base64::Engine as _;
+    let keys = Keys::new(SecretKey::from_slice(&from.nostr_secret_bytes()).unwrap());
+    let rumor = UnsignedEvent::new(
+        keys.public_key(),
+        Timestamp::now(),
+        Kind::PrivateDirectMessage,
+        Vec::<Tag>::new(),
+        base64::engine::general_purpose::STANDARD.encode(blob),
+    );
+    nostr::nips::nip59::GiftWrapBuilder::new(
+        PublicKey::from_slice(&to.nostr_public_key().to_bytes()).unwrap(),
+        rumor,
+    )
+    .extra_tags([Tag::expiration(Timestamp::now() - 3600)])
+    .finalize(&keys)
+    .unwrap()
 }
 
 /// Próximo evento bruto, se vier logo (o `Deposited` pode sair depois dos resultados por relay).

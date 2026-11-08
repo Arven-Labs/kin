@@ -15,7 +15,7 @@ use nostr::prelude::*;
 use tokio::task::JoinHandle;
 
 use super::relay::{self, Command};
-use super::{MAX_BLOB, unwrap, wrap};
+use super::{MAX_BLOB, TIMESTAMP_TWEAK, unwrap, wrap_with_ttl};
 use crate::{DepositId, Mailbox, MailboxEvent};
 
 /// Quantos ids de evento já vistos se lembra; os mais antigos são esquecidos.
@@ -34,8 +34,15 @@ pub struct NostrConfig {
     /// `ack_timeout`. O nos.lol real levou 35 a 57 s (Sessão 11).
     pub ack_deadline: Duration,
     /// Quanto do passado pedir ao assinar. O NIP-59 sorteia o `created_at` do gift wrap até 2 dias
-    /// atrás para esconder o horário real; 3 dias cobrem isso com folga de relógio.
+    /// atrás para esconder o horário real, então a janela precisa cobrir `ttl` MAIS esse desvio
+    /// (`with_config` recusa menos que isso): senão o relay ainda tem o evento e nós não o pedimos.
     pub since_window: Duration,
+    /// Por quanto tempo o relay deve guardar o depósito (NIP-40, vida real ≥ `ttl`). Relays sem
+    /// NIP-40 (o damus) ignoram e guardam como quiserem.
+    pub ttl: Duration,
+    /// Quantos relays precisam aceitar para o depósito contar (`Deposited`). Com menos relays que
+    /// isso, vale o número de relays. Pelo menos 1.
+    pub min_replicas: usize,
 }
 
 impl Default for NostrConfig {
@@ -45,7 +52,10 @@ impl Default for NostrConfig {
             backoff_max: Duration::from_secs(60),
             ack_timeout: Duration::from_secs(10),
             ack_deadline: Duration::from_secs(90),
-            since_window: Duration::from_secs(3 * 24 * 3600),
+            // ttl (7 dias) + desvio do NIP-59 (2) + 1 dia de folga de relógio.
+            since_window: Duration::from_secs(10 * 24 * 3600),
+            ttl: Duration::from_secs(7 * 24 * 3600),
+            min_replicas: 2,
         }
     }
 }
@@ -60,12 +70,33 @@ pub enum NostrError {
     /// O arquivo de relays existe mas não deu para ler.
     #[error("não consegui ler o arquivo de relays: {0}")]
     RelayFile(String),
+    /// Combinação de tempos ou réplicas que perderia mensagens em silêncio.
+    #[error("configuração inválida: {0}")]
+    Config(String),
 }
 
 struct Pending {
+    /// Relays que ainda não responderam.
     remaining: usize,
-    accepted: bool,
+    total: usize,
+    accepted: usize,
+    /// Aceites necessários para contar o depósito (já limitado ao número de relays).
+    quorum: usize,
+    deposited: bool,
     reason: String,
+}
+
+impl Pending {
+    fn new(total: usize, min_replicas: usize) -> Self {
+        Self {
+            remaining: total,
+            total,
+            accepted: 0,
+            quorum: min_replicas.min(total),
+            deposited: false,
+            reason: String::new(),
+        }
+    }
 }
 
 struct Seen {
@@ -146,18 +177,27 @@ impl Shared {
         };
         pending.remaining -= 1;
         let mut event = None;
-        if accepted && !pending.accepted {
-            pending.accepted = true;
-            event = Some(MailboxEvent::Deposited { id });
-        } else if !accepted {
+        if accepted {
+            pending.accepted += 1;
+            if pending.accepted >= pending.quorum && !pending.deposited {
+                pending.deposited = true;
+                event = Some(MailboxEvent::Deposited { id });
+            }
+        } else {
             pending.reason = reason;
         }
         if pending.remaining == 0 {
-            if !pending.accepted {
-                event = Some(MailboxEvent::DepositFailed {
-                    id,
-                    reason: pending.reason.clone(),
-                });
+            if !pending.deposited {
+                // Nenhum aceite: o motivo do relay. Alguns, mas poucos: quantos foram.
+                let reason = if pending.accepted == 0 {
+                    pending.reason.clone()
+                } else {
+                    format!(
+                        "só {} de {} relays aceitaram (mínimo {})",
+                        pending.accepted, pending.total, pending.quorum
+                    )
+                };
+                event = Some(MailboxEvent::DepositFailed { id, reason });
             }
             inner.pending.remove(&id);
         }
@@ -184,6 +224,14 @@ impl Shared {
     /// não tiver sido entregue (o mesmo gift wrap chega de vários relays e a cada reconexão).
     pub(super) fn on_event(&self, event: &Event) {
         if event.kind != Kind::GiftWrap || self.lock().seen.ids.contains(&event.id) {
+            return;
+        }
+        // Um relay não deveria servir evento vencido (NIP-40), mas pode não implementar ou ser hostil.
+        if event
+            .tags
+            .expiration()
+            .is_some_and(|at| at <= Timestamp::now())
+        {
             return;
         }
         // Decifrar fora do lock: é a parte cara e o conteúdo é hostil.
@@ -249,6 +297,17 @@ impl NostrMailbox {
         relays: &[S],
         config: NostrConfig,
     ) -> Result<Self, NostrError> {
+        if config.min_replicas == 0 {
+            return Err(NostrError::Config(
+                "min_replicas precisa ser ao menos 1".into(),
+            ));
+        }
+        if config.since_window < config.ttl + TIMESTAMP_TWEAK {
+            return Err(NostrError::Config(
+                "since_window menor que ttl + 2 dias: mensagens ainda guardadas no relay não seriam pedidas"
+                    .into(),
+            ));
+        }
         let urls: Vec<String> = relays.iter().map(|u| u.as_ref().to_string()).collect();
         let relays = relays
             .iter()
@@ -341,7 +400,10 @@ impl Mailbox for NostrMailbox {
         };
         let wrapped = NostrPublicKey::from_bytes(&key)
             .map_err(|e| e.to_string())
-            .and_then(|key| wrap(&self.shared.device, &key, &blob).map_err(|e| e.to_string()));
+            .and_then(|key| {
+                wrap_with_ttl(&self.shared.device, &key, &blob, Some(self.config.ttl))
+                    .map_err(|e| e.to_string())
+            });
         let event = match wrapped {
             Ok(event) => event,
             Err(reason) => {
@@ -353,14 +415,10 @@ impl Mailbox for NostrMailbox {
         let theirs = self.shared.lock().peer_relays.get(&to).cloned();
         if let Some(theirs) = theirs {
             self.ephemeral.retain(|task| !task.is_finished());
-            self.shared.lock().pending.insert(
-                id,
-                Pending {
-                    remaining: theirs.len(),
-                    accepted: false,
-                    reason: String::new(),
-                },
-            );
+            self.shared
+                .lock()
+                .pending
+                .insert(id, Pending::new(theirs.len(), self.config.min_replicas));
             for url in theirs {
                 self.ephemeral.push(tokio::spawn(relay::publish_once(
                     url,
@@ -379,11 +437,7 @@ impl Mailbox for NostrMailbox {
 
         self.shared.lock().pending.insert(
             id,
-            Pending {
-                remaining: self.workers.len(),
-                accepted: false,
-                reason: String::new(),
-            },
+            Pending::new(self.workers.len(), self.config.min_replicas),
         );
         for worker in &self.workers {
             let command = Command::Publish {

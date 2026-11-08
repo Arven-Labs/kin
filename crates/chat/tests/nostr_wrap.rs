@@ -1,7 +1,7 @@
 //! Fase 3.3 (ADR 0004): embrulhar o blob MLS num gift wrap NIP-17/59 e abri-lo. Sem rede.
 //! Os eventos hostis são montados com o próprio crate `nostr`, nunca com JSON escrito à mão.
 
-use kin_chat::nostr::{MAX_BLOB, WrapError, unwrap, wrap};
+use kin_chat::nostr::{MAX_BLOB, WrapError, unwrap, wrap, wrap_with_ttl};
 use kin_identity::DeviceKey;
 use nostr::nips::nip59::GiftWrapBuilder;
 use nostr::prelude::*;
@@ -189,6 +189,70 @@ fn an_event_with_a_huge_content_is_refused_before_decrypting() {
         .finalize(&Keys::generate())
         .unwrap();
     assert!(matches!(unwrap(&bia, &huge), Err(WrapError::TooLarge)));
+}
+
+// 3.4: expiração NIP-40 no gift wrap.
+
+const DAY: u64 = 24 * 3600;
+
+fn expiration_of(event: &Event) -> Option<Timestamp> {
+    event.tags.expiration()
+}
+
+#[test]
+fn a_wrap_with_a_ttl_lives_at_least_the_ttl_even_with_the_worst_timestamp_tweak() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let ttl = std::time::Duration::from_secs(7 * DAY);
+
+    let event = wrap_with_ttl(&ana, &bia.nostr_public_key(), b"x", Some(ttl)).unwrap();
+
+    // A expiração é ancorada no `created_at` sorteado (até 2 dias atrás): a duração tem de somar os 2 dias.
+    let expiration = expiration_of(&event).expect("sem tag de expiração");
+    assert_eq!(
+        expiration.as_secs() - event.created_at.as_secs(),
+        9 * DAY,
+        "ttl + 2 dias"
+    );
+    assert!(
+        expiration.as_secs() >= Timestamp::now().as_secs() + 7 * DAY - 5,
+        "vive menos que o TTL"
+    );
+}
+
+#[test]
+fn a_wrap_without_a_ttl_has_no_expiration() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+
+    let event = wrap(&ana, &bia.nostr_public_key(), b"x").unwrap();
+
+    assert!(expiration_of(&event).is_none());
+}
+
+#[test]
+fn a_wrap_with_a_ttl_still_opens_for_the_recipient() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let ttl = std::time::Duration::from_secs(DAY);
+
+    let event = wrap_with_ttl(&ana, &bia.nostr_public_key(), b"guardada", Some(ttl)).unwrap();
+
+    let opened = unwrap(&bia, &event).unwrap();
+    assert_eq!(opened.blob, b"guardada");
+    assert_eq!(opened.sender, ana.nostr_public_key());
+}
+
+#[test]
+fn the_blob_cap_still_applies_with_a_ttl() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let ttl = std::time::Duration::from_secs(DAY);
+
+    let result = wrap_with_ttl(
+        &ana,
+        &bia.nostr_public_key(),
+        &vec![0; MAX_BLOB + 1],
+        Some(ttl),
+    );
+
+    assert!(matches!(result, Err(WrapError::TooLarge)));
 }
 
 fn base64_of(bytes: &[u8]) -> String {

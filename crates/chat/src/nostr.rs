@@ -9,6 +9,8 @@ mod mailbox;
 mod relay;
 mod relay_list;
 
+use std::time::Duration;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kin_identity::{DeviceKey, NostrPublicKey};
@@ -60,6 +62,21 @@ pub fn wrap(
     recipient: &NostrPublicKey,
     blob: &[u8],
 ) -> Result<Event, WrapError> {
+    wrap_with_ttl(sender, recipient, blob, None)
+}
+
+/// Desvio máximo que o NIP-59 aplica ao `created_at` do gift wrap (para esconder a hora real).
+pub const TIMESTAMP_TWEAK: Duration = Duration::from_secs(2 * 24 * 3600);
+
+/// Como [`wrap`], com expiração NIP-40 (`ttl`) no gift wrap. A expiração é ancorada no `created_at`
+/// sorteado (até [`TIMESTAMP_TWEAK`] no passado), então a duração pedida ao crate soma o desvio:
+/// assim o evento vive pelo menos `ttl` a contar de agora. Relays sem NIP-40 ignoram a tag.
+pub fn wrap_with_ttl(
+    sender: &DeviceKey,
+    recipient: &NostrPublicKey,
+    blob: &[u8],
+    ttl: Option<Duration>,
+) -> Result<Event, WrapError> {
     if blob.len() > MAX_BLOB {
         return Err(WrapError::TooLarge);
     }
@@ -72,9 +89,11 @@ pub fn wrap(
         Vec::<Tag>::new(),
         STANDARD.encode(blob),
     );
-    GiftWrapBuilder::new(receiver, rumor)
-        .finalize(&keys)
-        .map_err(WrapError::rejected)
+    let mut builder = GiftWrapBuilder::new(receiver, rumor);
+    if let Some(ttl) = ttl {
+        builder = builder.expiration(ttl + TIMESTAMP_TWEAK);
+    }
+    builder.finalize(&keys).map_err(WrapError::rejected)
 }
 
 /// Abre um gift wrap endereçado a `own`. O crate `nostr` confere o kind 1059, a assinatura do wrap e

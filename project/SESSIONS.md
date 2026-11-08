@@ -539,3 +539,39 @@
   prova confiabilidade. Não verificado: o sentido inverso (B offline recebendo via `primal`); só o log da CLI mostra
   que o depósito não foi ao `primal`, não consultei o relay.
 - **Próximo passo**: a 3.4 (replicação em N mailboxes com TTL).
+
+### 2026-11-07 — Sessão 13
+
+- **Objetivo**: 3.4, parte A: TTL e quórum de réplicas no `NostrMailbox` (sem mudar schema).
+- **Achado**: os depósitos não tinham expiração (ficavam nos relays para sempre) e o NIP-59 sorteia o `created_at` do
+  gift wrap até 2 dias para trás (`RANGE_RANDOM_TIMESTAMP_TWEAK = 0..172800`, lido no crate `nostr` 0.45.7). Com
+  `since_window` de 3 dias, uma mensagem só era pedida por ~1 dia no pior sorteio. Além disso, `Deposited` saía no primeiro
+  relay que aceitava.
+- **Decisões do dono**: TTL de 7 dias; depósito só conta com 2 aceites (ou todos, se houver menos relays); re-depósito por
+  idade em PR separado (parte B, mexe em schema).
+- **Feito** (branch `ttl-replicas`): `wrap_with_ttl` (a expiração NIP-40 é ancorada no `created_at` sorteado, então a
+  duração pedida ao crate é `ttl + 2 dias`); `NostrConfig::{ttl, min_replicas}` e `since_window` padrão de 10 dias;
+  `with_config` recusa `since_window < ttl + 2 dias` e `min_replicas = 0` (`NostrError::Config`); `Shared::ack` confirma no
+  quórum e, com aceites insuficientes, falha com "só N de M relays aceitaram (mínimo Q)"; `on_event` descarta gift wrap
+  com expiração vencida.
+- **Testes**: 14 novos (4 de `wrap`, 10 de `NostrMailbox`: quórum, TTL, configuração, expirados), escritos antes
+  (não compilavam), verdes depois. `fast()` fixa `min_replicas: 1` para os 38 testes antigos. **Um teste antigo mudou de
+  valor**: `the_subscription_asks_for_the_last_ten_days` (era `…three_days`, esperava 3 dias; agora 10), de propósito.
+- **Verificado (local)**: `cargo test --workspace --locked` 211 passando, 0 falhando (eram 197); clippy e fmt ok.
+  Mutações pegas e revertidas: `ttl` sem os +2 dias derruba 1 teste; quórum fixo em 1 derruba 3; não descartar expirados
+  derruba 1.
+- **Não verificado**: contra relay real (ver a tag `expiration` no evento publicado); a mutação de `since_window` (o teste
+  46 cobre, não mutei); CI (testes Rust não rodam lá); damus e outros relays sem NIP-40 ignoram a expiração.
+- **Limites**: um depósito com 1 de 2 aceites vira `DepositFailed` no `Chat` (a mensagem fica na outbox e tenta de novo no
+  próximo gatilho) mas já está num relay; `Deposited` demora até o relay mais lento (nos.lol: 35 a 90 s).
+- **Roteiro real (autorizado pelo dono; 2 rodadas com o binário da `ttl-replicas`)**: A com `--nostr-relay
+  wss://offchain.pub`, B com `wss://relay.primal.net`, TCP loopback, diretórios novos, mesmo roteiro da Sessão 12.
+  Rodada 1: o B depositou e o `offchain.pub` respondeu `recusou: Policy violated and pubkey is not in our web of trust.`
+  (a mensagem ficou na outbox, nada chegou ao A). Rodada 2, mesmo binário: `aceitou`, `depositada na caixa postal: c745cb67`
+  e o A reiniciado recebeu `[c745cb67] peer: oi-offline-ttl`. Conclusão (confiança média): a recusa é a política de web of
+  trust do `offchain.pub`, intermitente (o ADR 0004 já a tinha visto), e não a tag de expiração, que falharia sempre.
+  **Não verificado**: só 2 amostras; não rodei o binário da `main` para comparar; não consultei o relay para ver a tag
+  `expiration` no evento guardado (só que um relay real aceitou e devolveu o evento do código novo). Publicados 2 gift wraps
+  de teste no `offchain.pub` (o da rodada 1 foi recusado).
+- **Próximo passo**: parte B (re-depósito por idade, tabela `kin_deposit_times`, confirmar o schema antes) e ADR 0005
+  (TTL, quórum e relação TTL × `since_window`), que ainda não foi criado.
