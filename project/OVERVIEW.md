@@ -29,7 +29,7 @@ TruthID e o consome — não é um módulo de comunicação dentro do TruthID (i
 ```
 Fase 1 — Identidade local + conexão direta + chat 1:1 E2EE    [x] Feita (falta teste em redes reais)
 Fase 2 — Hole punching + relay + convite por QR/link          [x] Feita no laboratório de NAT (falta teste em redes reais)
-Fase 3 — Store-and-forward (mailbox) + multi-device           [~] Em andamento (3.1 interface de mailbox e 3.2 outbox feitas; faltam 3.3–3.5)
+Fase 3 — Store-and-forward (mailbox) + multi-device           [~] Em andamento (3.1 a 3.4 feitas; 3.5 multi-device: modelo, fan-out, espelho e limite de 2 membros na main; descoberta em PR #31 travada por P24; falta o pareamento)
 Fase 4 — Overlay: gossip + DHT + app-relay com limites        [ ] Pendente
 Fase 5 — Grupos/canais, arquivos, presença, notificações      [ ] Pendente
 Fase 6 — Chamadas WebRTC + TURN opt-in; relay empacotado      [ ] Pendente
@@ -37,8 +37,8 @@ Fase 7 — (opcional) Roteamento multi-hop / privado            [ ] Pendente
 Fase 8 — (opcional) Blockchain: registro, proof-of-relay      [ ] Pendente
 ```
 
-Próximo passo: Fase 3 (mensagens para quem está offline: outbox, relays Nostr, multi-device). Antes de
-distribuir: teste manual em redes reais, QUIC no laboratório (P17), P13/P16/P18. Detalhes em `PHASE.md`,
+Próximo passo: decidir as três questões de produto do P24 (consentimento, filtro de endereços, o que anunciar a
+estranhos), mesclar a descoberta (PR #31) e fazer o pareamento (3.5, etapa 6). Antes de distribuir: teste manual em redes reais, QUIC no laboratório (P17), P13/P16/P18. Detalhes em `PHASE.md`,
 `PENDING.md` e `SESSIONS.md`.
 
 ## O que existe hoje (Sessão 3)
