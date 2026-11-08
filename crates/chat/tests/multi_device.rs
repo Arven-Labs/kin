@@ -21,6 +21,7 @@ const B2: usize = 3;
 struct World {
     chats: [Chat; 4],
     peers: [PeerId; 4],
+    ana: IdentityId,
     bia: IdentityId,
     /// Todos os eventos vistos, com o índice do chat que os produziu.
     log: Vec<(usize, ChatEvent)>,
@@ -67,6 +68,7 @@ impl World {
         let world = Self {
             chats,
             peers,
+            ana: ana.id(),
             bia: bia.id(),
             log: Vec::new(),
         };
@@ -112,7 +114,13 @@ impl World {
         world
             .pump_until("irmãos conectados", |w| w.knows(A1, A2) && w.knows(B1, B2))
             .await;
-        world.chats[A1].dial(addrs[B1].clone()).unwrap();
+        // As duas casas se aceitam (consentimento): Bia compartilha um convite que Ana aceita, e Bia
+        // confirma Ana. Sem isto a descoberta não age (ninguém foi aceito).
+        let b1_invite =
+            world.chats[B1].invite(vec![addrs[B1].clone().with(Protocol::P2p(world.peers[B1]))]);
+        let ana = world.ana.clone();
+        world.chats[B1].trust(ana);
+        world.chats[A1].accept(&b1_invite).unwrap();
         world
     }
 
@@ -122,6 +130,47 @@ impl World {
         })
         .await;
     }
+
+    /// Dirige os quatro chats por `duration`, sem esperar nada em particular.
+    async fn settle(&mut self, duration: std::time::Duration) {
+        let run = async {
+            loop {
+                let (index, event) = {
+                    let futures = self
+                        .chats
+                        .iter_mut()
+                        .enumerate()
+                        .map(|(i, chat)| Box::pin(async move { (i, chat.next_event().await) }));
+                    select_all(futures).await.0
+                };
+                self.log.push((index, event));
+            }
+        };
+        let _ = timeout(duration, run).await;
+    }
+}
+
+/// Consentimento: se ninguém aceitou ninguém (só conectaram), a lista de devices não liga os outros
+/// pares, e as casas ficam com a única conversa que já existia.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_acceptance_the_discovery_connects_nobody_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut world, addrs) = World::new(dir.path()).await;
+    world.chats[A2].dial(addrs[A1].clone()).unwrap();
+    world.chats[B2].dial(addrs[B1].clone()).unwrap();
+    world
+        .pump_until("irmãos conectados", |w| w.knows(A1, A2) && w.knows(B1, B2))
+        .await;
+
+    // Conexão simples, sem `accept` nem `trust`.
+    world.chats[A1].dial(addrs[B1].clone()).unwrap();
+    world
+        .pump_until("A1 e B1 conversam", |w| w.knows(A1, B1) && w.knows(B1, A1))
+        .await;
+    world.settle(std::time::Duration::from_secs(4)).await;
+
+    assert!(!world.knows(A2, B1) && !world.knows(A1, B2) && !world.knows(A2, B2));
+    assert!(!world.knows(B2, A1) && !world.knows(B1, A2) && !world.knows(B2, A2));
 }
 
 /// A descoberta liga os pares que nunca se discaram, sem ninguém pedir.

@@ -611,9 +611,15 @@
   user_version`); #27 payloads `Sent` (tag 3) e `DeviceList` (tag 4); #28 `devices_of` e `send_to` (fan-out, mesmo
   `MessageId`); #29 espelho `Sent` para os devices irmãos, `SentElsewhere`, coluna `to_identity` (schema v2); #30 `crypto`
   recusa commit ou Welcome que leve a conversa a mais de 2 membros (`Error::TooManyMembers`).
-- **Em PR, não mesclar ainda**: #31 descoberta de devices (`announce_devices`, `on_device_list`, `household`,
-  `set_advertised_addrs`, teste de integração com 4 `Chat`). Travado por decisões de produto (P24). Este registro foi
-  posto na branch do #31, como pede o AGENTS.md §14.4.
+- **Em PR, pronto para mesclar**: #31 descoberta de devices (`announce_devices`, `on_device_list`, `household`,
+  `contact_devices`, `trust`, `set_advertised_addrs`, teste de integração com 4 `Chat`). Ficou travado por três decisões de
+  produto (P24); o dono as tomou no fim da sessão (consentimento só para identidades aceitas; filtro de endereços para
+  contato, irmão liberado; anúncio mínimo: irmão recebe tudo, contato aceito só o meu convite) e elas foram aplicadas no
+  próprio PR, com testes antes. Este registro foi posto na branch do #31, como pede o AGENTS.md §14.4.
+- **Achado ao aplicar as decisões**: o anúncio mínimo a contato (decisão 3) sozinho tornaria a descoberta entre casas
+  inútil, porque o contato nunca saberia dos outros devices. Solução: o device repassa a seus **irmãos** os convites dos
+  contatos que aceitou, e cada device fala uma vez com o contato; a convergência dos 4 devices continua válida
+  (teste de integração). Isto também faz a família compartilhar a confiança.
 - **Auditorias (agente `security-auditor`, só leitura)**: no #29 achou um **crítico**: o `crypto` aceitava `Add` de qualquer
   membro, então um contato podia levar outros ao grupo, forjar espelhos e entrar no fan-out (texto em claro e destino).
   Confirmado lendo o `decrypt` e com dois testes no `Chat` real que falhavam antes; corrigido na hora (autoria via
@@ -622,7 +628,9 @@
   os endereços e chaves dos meus devices; o certificado não prova posse do device (uma identidade pode reivindicar o Peer ID
   de outro e travar o handshake dele). Corrigido no #31: item não sobrescreve a identidade já exigida (I3), uma lista por
   conexão e 4 endereços por device vindos de contato (I1). O resto virou P24.
-- **Testes**: 224 → 272 passando, 0 falhando. Mutações pegas e revertidas em cada etapa (incluindo `remove` sem filtro de
+- **Testes**: 224 → 280 passando, 0 falhando. Na parte do consentimento, filtro e anúncio, desligar cada um derruba o seu
+  teste unitário; o teste de integração de consentimento sozinho não distingue qual lado (anunciar ou receber) barrou,
+  porque os dois barram. Mutações pegas e revertidas em cada etapa (incluindo `remove` sem filtro de
   peer, limite de 2 membros no `decrypt` e no `join`, identidade do item, discagem desligada, e cada limite do I1/I3). Duas
   mutações sobreviveram na primeira tentativa (teto de devices no codec; espelho para a própria identidade, escondido pelo
   `INSERT OR IGNORE`) e levaram a testes novos.
@@ -632,7 +640,7 @@
 - **Deslizes do processo** (registrados por honestidade): usei `sed -i`, `cat >>` e `cargo fmt` (que escrevem em arquivos)
   contra a regra do `CLAUDE.md` de editar só por `Edit`/`Write`: o efeito foi só formatação e testes, visível nos diffs, e
   avisei no momento. Um corpo de PR saiu com a URL de rodapé errada e foi corrigido.
-- **Não feito**: pareamento (etapa 6) e roteiro manual com 2 processos e relay real; fechamento do P24.
-- **Próximo passo**: o dono decide as três questões do P24 (consentimento, filtro de endereços, o que anunciar a
-  estranhos); aplicar; mesclar o #31; depois a etapa 6 (pareamento, que imprime a chave mestra em tela: confirmar o desenho
-  antes). Sugestão de ordem: começar pela decisão de consentimento, porque ela muda as outras duas.
+- **Não feito**: pareamento (etapa 6); roteiro manual com 2 processos e relay real; a CLI chamar `Chat::trust` para o lado
+  de quem convidou (sem isso a descoberta não age nesse lado); persistir a confiança; fechar o resto do P24.
+- **Próximo passo**: mesclar o #31; a CLI chamar `trust`; depois a etapa 6 (pareamento, que imprime a chave mestra em
+  tela: confirmar o desenho antes).
