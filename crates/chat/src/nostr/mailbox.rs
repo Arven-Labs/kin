@@ -92,6 +92,8 @@ struct Inner {
     events: Option<UnboundedSender<MailboxEvent>>,
     peers: HashMap<PeerId, [u8; 32]>,
     by_nostr: HashMap<[u8; 32], PeerId>,
+    /// Relays em que cada contato recebe (anunciados por ele, já validados pelo `Chat`).
+    peer_relays: HashMap<PeerId, Vec<RelayUrl>>,
     seen: Seen,
     pending: HashMap<DepositId, Pending>,
 }
@@ -226,8 +228,12 @@ struct Worker {
 pub struct NostrMailbox {
     shared: Arc<Shared>,
     relays: Vec<RelayUrl>,
+    /// As URLs como foram configuradas, para anunciar ao contato exatamente o que o usuário escreveu.
+    announced: Vec<String>,
     config: NostrConfig,
     workers: Vec<Worker>,
+    /// Publicações em relays de contatos (uma tarefa por relay e depósito); abortadas no `Drop`.
+    ephemeral: Vec<JoinHandle<()>>,
     next_id: u64,
 }
 
@@ -243,6 +249,7 @@ impl NostrMailbox {
         relays: &[S],
         config: NostrConfig,
     ) -> Result<Self, NostrError> {
+        let urls: Vec<String> = relays.iter().map(|u| u.as_ref().to_string()).collect();
         let relays = relays
             .iter()
             .map(|url| parse_relay(url.as_ref()))
@@ -260,6 +267,7 @@ impl NostrMailbox {
                 events: None,
                 peers: HashMap::new(),
                 by_nostr: HashMap::new(),
+                peer_relays: HashMap::new(),
                 seen: Seen {
                     order: VecDeque::new(),
                     ids: HashSet::new(),
@@ -270,8 +278,10 @@ impl NostrMailbox {
         Ok(Self {
             shared,
             relays,
+            announced: urls,
             config,
             workers: Vec::new(),
+            ephemeral: Vec::new(),
             next_id: 0,
         })
     }
@@ -339,6 +349,29 @@ impl Mailbox for NostrMailbox {
                 return id;
             }
         };
+        // Com a lista do contato, deposita só lá (é onde ele escuta), por conexões de uma publicação.
+        let theirs = self.shared.lock().peer_relays.get(&to).cloned();
+        if let Some(theirs) = theirs {
+            self.ephemeral.retain(|task| !task.is_finished());
+            self.shared.lock().pending.insert(
+                id,
+                Pending {
+                    remaining: theirs.len(),
+                    accepted: false,
+                    reason: String::new(),
+                },
+            );
+            for url in theirs {
+                self.ephemeral.push(tokio::spawn(relay::publish_once(
+                    url,
+                    self.shared.clone(),
+                    self.config.clone(),
+                    id,
+                    event.clone(),
+                )));
+            }
+            return id;
+        }
         if self.workers.is_empty() {
             fail("a caixa postal Nostr ainda não foi ligada");
             return id;
@@ -371,10 +404,28 @@ impl Mailbox for NostrMailbox {
         inner.peers.insert(peer, key);
         inner.by_nostr.insert(key, peer);
     }
+
+    fn relays(&self) -> Vec<String> {
+        self.announced.clone()
+    }
+
+    /// A política de segurança da lista (só `wss://`, sem IP, teto) é do `Chat`, que valida antes de
+    /// chamar. Aqui só se exige que as URLs se leiam; lista vazia ou ilegível mantém a anterior.
+    fn learn_relays(&mut self, peer: PeerId, relays: Vec<String>) {
+        let parsed: Result<Vec<_>, _> = relays.iter().map(|u| parse_relay(u)).collect();
+        if let Ok(parsed) = parsed
+            && !parsed.is_empty()
+        {
+            self.shared.lock().peer_relays.insert(peer, parsed);
+        }
+    }
 }
 
 impl Drop for NostrMailbox {
     fn drop(&mut self) {
+        for task in &self.ephemeral {
+            task.abort();
+        }
         for worker in &self.workers {
             worker.task.abort();
         }

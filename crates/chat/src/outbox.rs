@@ -47,6 +47,9 @@ impl Outbox {
              CREATE TABLE IF NOT EXISTS kin_deposited (
                  id BLOB PRIMARY KEY,
                  peer TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS kin_peer_relays (
+                 peer TEXT PRIMARY KEY,
+                 relays TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_seen (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  peer TEXT NOT NULL,
@@ -104,6 +107,35 @@ impl Outbox {
             });
         }
         Ok(out)
+    }
+
+    /// Grava os relays de entrada anunciados por `peer` (já validados); a última lista substitui a
+    /// anterior. Um relay por linha: URL validada não tem quebra de linha.
+    pub(crate) fn set_peer_relays(&self, peer: &PeerId, relays: &[String]) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO kin_peer_relays (peer, relays) VALUES (?1, ?2)",
+                params![peer.to_string(), relays.join("\n")],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    pub(crate) fn peer_relays(&self, peer: &PeerId) -> Result<Option<Vec<String>>, Error> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT relays FROM kin_peer_relays WHERE peer = ?1",
+                [peer.to_string()],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .map_err(Error::storage)?;
+        Ok(text.map(|t| t.lines().map(str::to_string).collect()))
     }
 
     /// Tira a mensagem da fila (e a marca de depositada, se houver).

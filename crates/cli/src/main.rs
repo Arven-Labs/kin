@@ -381,6 +381,9 @@ fn on_event(event: ChatEvent, current: &mut Option<PeerId>, seen: &mut Vec<Messa
         ChatEvent::Stale { peer } => {
             println!("(conversa com {peer} divergiu: faltam commits que não chegaram)");
         }
+        ChatEvent::PeerRelays { peer, relays } => {
+            println!("(relays de {peer}: {})", relays.join(", "));
+        }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
     }
 }

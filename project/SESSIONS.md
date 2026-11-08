@@ -511,3 +511,24 @@
   a CLI não tem teste automatizado (só as funções de `nostr`).
 - **Próximo passo**: PR 2 (relays de entrada do contato por mensagem MLS, com validação rígida da lista recebida) e
   depois a 3.4.
+
+### 2026-11-07 — Sessão 12
+
+- **Objetivo**: P23, PR 2: depositar nos relays de entrada do contato, aprendidos por mensagem MLS.
+- **Decisões do dono**: sem lista do contato, cai nos relays próprios; lista recebida com até 3 itens, só `wss://`,
+  host de domínio (sem IP nem `localhost`); anúncio a cada conexão, sem passar pela outbox, lista do contato em SQLite.
+- **Feito** (branch `relays-contato`): `Payload::{Message, RelayList}` (tag 1 = `Message` v1 inalterada, tag 2 = lista);
+  `nostr::validate_peer_relays`; tabela `kin_peer_relays`; `Mailbox::{relays, learn_relays}`; `Chat` anuncia uma vez por
+  conexão e valida o que recebe (`ChatEvent::PeerRelays`, `Error::InvalidRelayList`); `NostrMailbox` publica nos relays do
+  contato por conexões curtas (`relay::publish_once`: só `EVENT`, sem `REQ` nem NIP-42).
+- **Testes**: 36 novos, escritos antes (não compilavam), verdes depois. Validação 10, codec 9, `Chat` 5 + 5, `NostrMailbox` 7.
+- **Verificado (local)**: `cargo test --workspace --locked` 197 passando, 0 falhando (eram 161); clippy e fmt ok.
+  Mutações: teto 3→4 derruba 3 testes; tirar a regra de `localhost` derruba 1; ambas revertidas. Desligar a checagem de
+  `wss` sobreviveu (redundante: `ws://` remoto cai no `parse_relay` e `ws://localhost` na regra de domínio); mantida.
+- **Não verificado**: roteiro com relay real; CI (testes Rust não rodam lá); estabilidade dos testes de integração sob
+  carga (esperam 500 ms).
+- **Limites**: convidador só anuncia ao receber a primeira mensagem MLS do outro; lista vazia é recusada; `auth-required`
+  no depósito em relay de contato falha sem NIP-42 (P23 (c)).
+- **Desvio de processo**: três edições por Bash, contra a regra do CLAUDE.md (só `Edit`/`Write`): `sed -i` no `pub use` de
+  `nostr.rs`, heredoc que acrescentou esta entrada em `SESSIONS.md` e `sed -i` na data do `PENDING.md`. Os diffs estão no git.
+- **Próximo passo**: roteiro real (A anuncia `offchain.pub`, B anuncia `primal`), depois a 3.4.

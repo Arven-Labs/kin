@@ -62,6 +62,67 @@ pub(super) async fn run(
     }
 }
 
+/// Publica um evento num relay do CONTATO e encerra: conecta, manda o `EVENT`, espera o `OK` (com o
+/// aviso de lentidão em `ack_timeout` e a falha em `ack_deadline`) e fecha. Só escreve: não assina nada
+/// nem responde NIP-42, porque o host foi escolhido pelo contato e não deve ganhar uma conexão
+/// duradoura nem uma prova da nossa chave. Resultado sempre por `Shared::ack`, exatamente uma vez.
+pub(super) async fn publish_once(
+    url: RelayUrl,
+    shared: Arc<Shared>,
+    config: NostrConfig,
+    id: DepositId,
+    event: Event,
+) {
+    let started = Instant::now();
+    let Ok(Some(socket)) = timeout(config.ack_deadline, connect(&url)).await else {
+        shared.ack(id, url.as_str(), false, "relay inalcançável");
+        return;
+    };
+    let (mut sink, mut stream) = socket.split();
+    let event_id = event.id;
+    if send(&mut sink, &ClientMessage::event(event)).await.is_err() {
+        shared.ack(id, url.as_str(), false, "falha ao enviar ao relay");
+        return;
+    }
+    let slow_at = started + config.ack_timeout;
+    let deadline = started + config.ack_deadline;
+    let mut warned = false;
+    loop {
+        let wake = if warned {
+            deadline
+        } else {
+            slow_at.min(deadline)
+        };
+        tokio::select! {
+            incoming = stream.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(RelayMessage::Ok { event_id: got, status, message }) =
+                        serde_json::from_str::<RelayMessage>(text.as_str())
+                        && got == event_id
+                    {
+                        shared.ack(id, url.as_str(), status, &message);
+                        let _ = sink.close().await;
+                        return;
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => {
+                    shared.ack(id, url.as_str(), false, "conexão perdida antes da resposta");
+                    return;
+                }
+            },
+            _ = sleep_until(wake) => {
+                if Instant::now() >= deadline {
+                    shared.ack(id, url.as_str(), false, "o relay não respondeu a tempo");
+                    return;
+                }
+                warned = true;
+                shared.slow(id, url.as_str());
+            }
+        }
+    }
+}
+
 async fn connect(url: &RelayUrl) -> Option<Socket> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))

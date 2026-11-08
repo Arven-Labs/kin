@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::Path;
 
+use nostr::prelude::RelayUrlScheme;
+
 use super::mailbox::{NostrError, parse_relay};
 
 /// Relays usados quando o usuário não configurou nada. Medidos na Sessão 11: depositam e devolvem em
@@ -47,6 +49,55 @@ pub fn parse_relay_list(text: &str) -> Result<Vec<String>, NostrError> {
         }
     }
     Ok(relays)
+}
+
+/// Quantos relays de um contato se aceitam. Cada depósito abre uma conexão por relay, e quem escolhe
+/// o host é o contato: o teto limita a amplificação.
+pub const MAX_PEER_RELAYS: usize = 3;
+
+/// Tamanho máximo de uma URL anunciada por um contato (bytes).
+const MAX_PEER_URL: usize = 200;
+
+/// Valida a lista de relays que um contato anunciou. É entrada hostil: o MLS prova quem mandou, não
+/// que os hosts são seguros, e é o NOSSO cliente que vai conectar neles. Regras: de 1 a
+/// [`MAX_PEER_RELAYS`] itens; só `wss://`; host é nome de domínio (sem IP literal nem `localhost`);
+/// sem credenciais na URL; no máximo 200 bytes; repetidos contam uma vez. Qualquer item ruim recusa a
+/// lista inteira (quem chama mantém a anterior).
+pub fn validate_peer_relays(relays: &[String]) -> Result<Vec<String>, NostrError> {
+    let bad = |why: String| NostrError::InvalidRelayUrl(why);
+    if relays.is_empty() {
+        return Err(bad("lista vazia".into()));
+    }
+    let mut seen = HashSet::new();
+    let mut accepted = Vec::new();
+    for url in relays {
+        if url.len() > MAX_PEER_URL {
+            return Err(bad("URL grande demais".into()));
+        }
+        let parsed = parse_relay(url)?;
+        if parsed.scheme() != RelayUrlScheme::Wss {
+            return Err(bad(format!("{url}: só wss:// vale")));
+        }
+        if parsed.domain().is_none() || parsed.is_localhost() {
+            return Err(bad(format!("{url}: o host precisa ser um nome de domínio")));
+        }
+        let authority = url.split_once("://").map_or("", |(_, rest)| rest);
+        let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.contains('@') {
+            return Err(bad(format!("{url}: credenciais na URL")));
+        }
+        let key = parsed
+            .to_string()
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        if seen.insert(key) {
+            accepted.push(url.clone());
+        }
+    }
+    if accepted.len() > MAX_PEER_RELAYS {
+        return Err(bad(format!("mais de {MAX_PEER_RELAYS} relays")));
+    }
+    Ok(accepted)
 }
 
 fn with_line(error: NostrError, line: usize) -> NostrError {

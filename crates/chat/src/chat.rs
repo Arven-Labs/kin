@@ -11,7 +11,9 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::future::{self, Either};
 use futures::pin_mut;
 
+use crate::nostr::validate_peer_relays;
 use crate::outbox::Outbox;
+use crate::payload::Payload;
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
 use crate::{Error, Invite, Message, MessageId};
@@ -108,6 +110,11 @@ pub enum ChatEvent {
     Stale {
         peer: PeerId,
     },
+    /// O peer anunciou onde recebe (lista já validada); os depósitos para ele passam a ir para lá.
+    PeerRelays {
+        peer: PeerId,
+        relays: Vec<String>,
+    },
     /// Algo do peer foi descartado (malformado, de outra conversa, etc.).
     Dropped {
         peer: PeerId,
@@ -155,6 +162,8 @@ pub struct Chat {
     outbox: Outbox,
     /// Peers com ao menos uma conexão de rede aberta (`PeerConnected` até `PeerDisconnected`).
     connected: std::collections::HashSet<PeerId>,
+    /// Peers a quem já anunciamos nossos relays nesta conexão (zera ao desconectar).
+    announced: std::collections::HashSet<PeerId>,
     /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
     in_flight: HashMap<PeerId, std::collections::HashSet<MessageId>>,
     /// Caixa postal opcional (3.1) e o canal por onde ela avisa o que acontece.
@@ -231,6 +240,7 @@ impl Chat {
             future: HashMap::new(),
             outbox,
             connected: Default::default(),
+            announced: Default::default(),
             in_flight: HashMap::new(),
             mailbox: None,
             mailbox_events: None,
@@ -305,6 +315,10 @@ impl Chat {
                 .and_then(|keys| keys.into_iter().next())
             {
                 mailbox.learn_peer(*peer, nostr);
+            }
+            // Onde o contato recebe, guardado de uma sessão anterior.
+            if let Ok(Some(relays)) = self.outbox.peer_relays(peer) {
+                mailbox.learn_relays(*peer, relays);
             }
         }
         mailbox.attach(events);
@@ -538,11 +552,14 @@ impl Chat {
                 self.connected.insert(peer);
                 self.queue.push_back(ChatEvent::PeerConnected(peer));
                 self.announce_if_ready(peer);
+                // Conversa recarregada do banco: os dois lados já a têm, então dá para anunciar já.
+                self.announce_relays(peer);
                 self.transmit(peer, &Envelope::Hello);
                 self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.announced.remove(&peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -646,7 +663,36 @@ impl Chat {
                 peer: Some(&peer),
             },
         )?;
-        self.ready(peer, conversation)
+        self.ready(peer, conversation)?;
+        // Quem entra por Welcome anuncia primeiro: o convidador já tem a conversa. O convidador só
+        // anuncia ao receber algo do outro (ver `on_mls`), porque o Welcome e esta mensagem seguem
+        // por substreams diferentes e a ordem de chegada não é garantida.
+        self.announce_relays(peer);
+        Ok(())
+    }
+
+    /// Anuncia ao `peer` os relays em que este device recebe, uma vez por conexão. Mensagem de
+    /// controle dentro do MLS, fora da outbox: se se perder, a próxima conexão repete.
+    fn announce_relays(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) || self.announced.contains(&peer) {
+            return;
+        }
+        let Some(relays) = self.mailbox.as_ref().map(|m| m.relays()) else {
+            return;
+        };
+        if relays.is_empty() {
+            return;
+        }
+        let Some(conversation) = self.conversations.get_mut(&peer) else {
+            return;
+        };
+        match conversation.encrypt(&Payload::RelayList(relays).encode()) {
+            Ok(wire) => {
+                self.announced.insert(peer);
+                self.transmit(peer, &Envelope::Mls(wire));
+            }
+            Err(e) => self.drop_message(peer, e.into()),
+        }
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
@@ -681,18 +727,25 @@ impl Chat {
             .ok_or(Error::NoConversation(peer))?;
         match conversation.decrypt(wire) {
             Ok(Decrypted::Message { sender, plaintext }) => {
-                let message = Message::decode(&plaintext)?;
-                // Nova tentativa do remetente = outros bytes cifrados, o MLS não vê repetição;
-                // quem identifica a mesma mensagem é o `MessageId`.
-                if !self.outbox.mark_seen(&peer, &message.id)? {
-                    return Ok(());
+                let payload = Payload::decode(&plaintext)?;
+                // O outro lado já tem a conversa: agora é seguro anunciar os nossos relays.
+                self.announce_relays(peer);
+                match payload {
+                    Payload::Message(message) => {
+                        // Nova tentativa do remetente = outros bytes cifrados, o MLS não vê
+                        // repetição; quem identifica a mesma mensagem é o `MessageId`.
+                        if !self.outbox.mark_seen(&peer, &message.id)? {
+                            return Ok(());
+                        }
+                        self.queue.push_back(ChatEvent::Received {
+                            peer,
+                            sender,
+                            message,
+                        });
+                        Ok(())
+                    }
+                    Payload::RelayList(relays) => self.on_relay_list(peer, &relays),
                 }
-                self.queue.push_back(ChatEvent::Received {
-                    peer,
-                    sender,
-                    message,
-                });
-                Ok(())
             }
             Ok(Decrypted::EpochChanged) => {
                 self.replay_future(peer);
@@ -708,6 +761,21 @@ impl Chat {
             Err(CryptoError::Duplicate | CryptoError::TooOld) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// O contato anunciou onde recebe. Lista inválida é recusada inteira e a anterior fica.
+    fn on_relay_list(&mut self, peer: PeerId, relays: &[String]) -> Result<(), Error> {
+        let relays =
+            validate_peer_relays(relays).map_err(|e| Error::InvalidRelayList(e.to_string()))?;
+        self.outbox.set_peer_relays(&peer, &relays)?;
+        self.queue.push_back(ChatEvent::PeerRelays {
+            peer,
+            relays: relays.clone(),
+        });
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            mailbox.learn_relays(peer, relays);
+        }
+        Ok(())
     }
 
     /// Guarda uma mensagem de época futura, sem repetir a mesma e dentro do teto [`FUTURE_LIMIT`].
@@ -1230,5 +1298,132 @@ mod tests {
         // Vindo da própria Bia, o mesmo pacote é aceito.
         ana.on_key_package(dev_b.peer_id(), &bia_kp).unwrap();
         assert!(ana.is_ready(&dev_b.peer_id()));
+    }
+
+    /// Caixa postal que só anota as listas de relays que o `Chat` lhe ensina.
+    type Learned = std::sync::Arc<std::sync::Mutex<Vec<(PeerId, Vec<String>)>>>;
+
+    struct Taught(Learned);
+
+    impl Mailbox for Taught {
+        fn attach(&mut self, _events: futures::channel::mpsc::UnboundedSender<MailboxEvent>) {}
+
+        fn deposit(&mut self, _to: PeerId, _blob: Vec<u8>) -> DepositId {
+            DepositId(0)
+        }
+
+        fn learn_relays(&mut self, peer: PeerId, relays: Vec<String>) {
+            self.0.lock().unwrap().push((peer, relays));
+        }
+    }
+
+    fn taught_bia() -> (Chat, Conversation, PeerId, Learned) {
+        let (mut bia, ana, ana_peer) = bia_and_raw_ana();
+        let taught = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        bia.set_mailbox(Taught(taught.clone()));
+        (bia, ana, ana_peer, taught)
+    }
+
+    fn relay_list_wire(ana: &mut Conversation, relays: &[&str]) -> Vec<u8> {
+        let relays = relays.iter().map(|s| (*s).to_string()).collect();
+        ana.encrypt(&Payload::RelayList(relays).encode()).unwrap()
+    }
+
+    /// P23: uma lista válida do contato é guardada, ensinada à caixa postal e não vira mensagem.
+    #[tokio::test]
+    async fn a_valid_relay_list_is_stored_taught_and_not_shown_as_a_message() {
+        let (mut bia, mut ana, ana_peer, taught) = taught_bia();
+        let wire = relay_list_wire(&mut ana, &["wss://a.example", "wss://b.example"]);
+
+        bia.on_mls(ana_peer, &wire).unwrap();
+
+        let expected = vec!["wss://a.example".to_string(), "wss://b.example".to_string()];
+        assert_eq!(*taught.lock().unwrap(), [(ana_peer, expected.clone())]);
+        assert_eq!(
+            bia.outbox.peer_relays(&ana_peer).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::PeerRelays {
+                peer: ana_peer,
+                relays: expected
+            }]
+        );
+    }
+
+    /// P23: lista hostil (host local, itens demais, lixo) é recusada e nada muda.
+    #[tokio::test]
+    async fn a_hostile_relay_list_is_refused_and_changes_nothing() {
+        for hostile in [
+            vec!["ws://localhost:7777"],
+            vec!["wss://127.0.0.1"],
+            vec![
+                "wss://a.example",
+                "wss://b.example",
+                "wss://c.example",
+                "wss://d.example",
+            ],
+            vec![],
+        ] {
+            let (mut bia, mut ana, ana_peer, taught) = taught_bia();
+            let wire = relay_list_wire(&mut ana, &hostile);
+
+            assert!(bia.on_mls(ana_peer, &wire).is_err(), "aceitou {hostile:?}");
+
+            assert!(taught.lock().unwrap().is_empty(), "ensinou {hostile:?}");
+            assert_eq!(bia.outbox.peer_relays(&ana_peer).unwrap(), None);
+        }
+    }
+
+    /// P23: uma lista inválida depois de uma válida não apaga a válida.
+    #[tokio::test]
+    async fn a_bad_list_after_a_good_one_keeps_the_good_one() {
+        let (mut bia, mut ana, ana_peer, taught) = taught_bia();
+        let good = relay_list_wire(&mut ana, &["wss://a.example"]);
+        let bad = relay_list_wire(&mut ana, &["ws://localhost:7777"]);
+
+        bia.on_mls(ana_peer, &good).unwrap();
+        assert!(bia.on_mls(ana_peer, &bad).is_err());
+
+        assert_eq!(taught.lock().unwrap().len(), 1);
+        assert_eq!(
+            bia.outbox.peer_relays(&ana_peer).unwrap(),
+            Some(vec!["wss://a.example".to_string()])
+        );
+    }
+
+    /// P23: a última lista válida vence a anterior.
+    #[tokio::test]
+    async fn the_latest_valid_list_replaces_the_previous_one() {
+        let (mut bia, mut ana, ana_peer, taught) = taught_bia();
+        let first = relay_list_wire(&mut ana, &["wss://velho.example"]);
+        let second = relay_list_wire(&mut ana, &["wss://novo.example"]);
+
+        bia.on_mls(ana_peer, &first).unwrap();
+        bia.on_mls(ana_peer, &second).unwrap();
+
+        assert_eq!(
+            taught.lock().unwrap().last().unwrap().1,
+            ["wss://novo.example"]
+        );
+        assert_eq!(
+            bia.outbox.peer_relays(&ana_peer).unwrap(),
+            Some(vec!["wss://novo.example".to_string()])
+        );
+    }
+
+    /// P23: o payload de controle truncado é malformado, não pânico.
+    #[tokio::test]
+    async fn a_truncated_relay_list_payload_is_malformed() {
+        let (mut bia, mut ana, ana_peer, taught) = taught_bia();
+        let mut plaintext = Payload::RelayList(vec!["wss://a.example".into()]).encode();
+        plaintext.truncate(plaintext.len() - 3);
+        let wire = ana.encrypt(&plaintext).unwrap();
+
+        let err = bia.on_mls(ana_peer, &wire).unwrap_err();
+
+        assert!(matches!(err, Error::Malformed), "{err:?}");
+        assert!(taught.lock().unwrap().is_empty());
     }
 }

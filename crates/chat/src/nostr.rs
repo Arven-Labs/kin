@@ -16,7 +16,10 @@ use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
 use nostr::prelude::*;
 
 pub use mailbox::{NostrConfig, NostrError, NostrMailbox};
-pub use relay_list::{DEFAULT_RELAYS, RelayChoice, RelaySource, parse_relay_list, resolve_relays};
+pub use relay_list::{
+    DEFAULT_RELAYS, MAX_PEER_RELAYS, RelayChoice, RelaySource, parse_relay_list, resolve_relays,
+    validate_peer_relays,
+};
 
 /// Teto de um blob MLS (bytes) por mensagem. Política nossa, não limite do protocolo: relays com web
 /// of trust já recusaram eventos de 16 KB nos testes (ADR 0004).

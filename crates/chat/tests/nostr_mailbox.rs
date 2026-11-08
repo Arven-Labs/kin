@@ -805,6 +805,175 @@ async fn after_a_reconnection_the_new_challenge_is_answered_once_again() {
     assert_eq!(relay.auth_attempts(), 2, "AUTH repetido na nova conexão");
 }
 
+// 32 (P23 PR 2)
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_contact_relays_known_the_deposit_goes_only_there() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (own, theirs) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Accept).await,
+    );
+    let mut mb = mailbox(&ana, &[&own.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![theirs.url.clone()]);
+
+    let id = mb.deposit(bia.peer_id(), b"para os relays dela".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+    eventually("o relay do contato guarda o evento", || {
+        theirs.stored().len() == 1
+    })
+    .await;
+    sleep(Duration::from_millis(200)).await;
+    assert!(own.stored().is_empty(), "depositou no relay próprio");
+}
+
+// 33
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_contact_list_the_deposit_falls_back_to_the_own_relays() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let own = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&own.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    let id = mb.deposit(bia.peer_id(), b"sem lista".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+    eventually("o relay próprio guarda o evento", || {
+        own.stored().len() == 1
+    })
+    .await;
+}
+
+// 34
+#[tokio::test(flavor = "multi_thread")]
+async fn contact_relays_that_are_all_down_fail_the_deposit_without_falling_back() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let own = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&own.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![dead_url().await]);
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::DepositFailed { id: got, .. } if got == id
+    ));
+    sleep(Duration::from_millis(200)).await;
+    assert!(own.stored().is_empty(), "caiu no relay próprio");
+}
+
+// 35
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_relay_that_refuses_is_reported_and_one_that_accepts_confirms() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (refusing, accepting) = (
+        FakeRelay::start(Policy::Reject("blocked: not in web of trust".into())).await,
+        FakeRelay::start(Policy::Accept).await,
+    );
+    let mut mb = mailbox(&ana, &["ws://127.0.0.1:1"]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(
+        bia.peer_id(),
+        vec![refusing.url.clone(), accepting.url.clone()],
+    );
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    let (outcomes, others) = collect_outcomes(&mut rx, 2).await;
+    let refused = outcomes
+        .iter()
+        .find(|o| same_url(&o.0, &refusing.url))
+        .unwrap();
+    assert!(
+        !refused.1 && refused.2.contains("web of trust"),
+        "{refused:?}"
+    );
+    let accepted = outcomes
+        .iter()
+        .find(|o| same_url(&o.0, &accepting.url))
+        .unwrap();
+    assert!(accepted.1);
+    assert!(
+        others.contains(&MailboxEvent::Deposited { id })
+            || next(&mut rx).await == MailboxEvent::Deposited { id }
+    );
+}
+
+// 36
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connection_to_a_contact_relay_only_publishes_and_then_closes() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let theirs = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &["ws://127.0.0.1:1"]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![theirs.url.clone()]);
+
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+    eventually("conexão encerrada", || theirs.open_connections() == 0).await;
+    assert_eq!(theirs.accepted_connections(), 1);
+    assert!(
+        theirs.reqs().is_empty(),
+        "assinou eventos no relay do contato"
+    );
+}
+
+// 37
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_contact_relay_warns_as_slow_then_fails_at_the_deadline() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let silent = FakeRelay::start(Policy::Silent).await;
+    let mut mb = mailbox(&ana, &["ws://127.0.0.1:1"]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![silent.url.clone()]);
+
+    let started = Instant::now();
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert!(matches!(
+        next_raw(&mut rx).await,
+        MailboxEvent::RelaySlow { id: got, .. } if got == id
+    ));
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::DepositFailed { id: got, .. } if got == id
+    ));
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "não esperou o prazo"
+    );
+}
+
+// 38
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_contact_list_is_ignored_and_the_previous_one_stays() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (own, theirs) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Accept).await,
+    );
+    let mut mb = mailbox(&ana, &[&own.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![theirs.url.clone()]);
+
+    mb.learn_relays(bia.peer_id(), vec!["isso nao e url".to_string()]);
+    let id = mb.deposit(bia.peer_id(), b"x".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+    eventually("depositou na lista anterior", || theirs.stored().len() == 1).await;
+    assert!(own.stored().is_empty());
+}
+
 /// Próximo evento bruto, se vier logo (o `Deposited` pode sair depois dos resultados por relay).
 async fn next_or_none(rx: &mut UnboundedReceiver<MailboxEvent>) -> Option<MailboxEvent> {
     timeout(Duration::from_millis(300), rx.next())

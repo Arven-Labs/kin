@@ -66,6 +66,15 @@ pub trait Mailbox {
     /// validado pelo MLS), sempre que uma conversa fica pronta ou é recarregada do banco. Backends que
     /// endereçam por outra chave que não o Peer ID (Nostr, ADR 0004) guardam o par; os demais ignoram.
     fn learn_peer(&mut self, _peer: PeerId, _nostr: NostrPublicKey) {}
+
+    /// Relays em que ESTE device recebe (o `Chat` os anuncia a cada contato). Vazio = nada a anunciar.
+    fn relays(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// O `Chat` informa onde `peer` recebe: lista já validada (`nostr::validate_peer_relays`), vinda
+    /// de uma mensagem dele dentro do MLS ou recarregada do banco. A última lista substitui a anterior.
+    fn learn_relays(&mut self, _peer: PeerId, _relays: Vec<String>) {}
 }
 
 /// Um depósito registrado pelo [`MemoryRelay`].
