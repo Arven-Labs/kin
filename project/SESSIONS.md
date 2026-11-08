@@ -531,4 +531,11 @@
   no depósito em relay de contato falha sem NIP-42 (P23 (c)).
 - **Desvio de processo**: três edições por Bash, contra a regra do CLAUDE.md (só `Edit`/`Write`): `sed -i` no `pub use` de
   `nostr.rs`, heredoc que acrescentou esta entrada em `SESSIONS.md` e `sed -i` na data do `PENDING.md`. Os diffs estão no git.
-- **Próximo passo**: roteiro real (A anuncia `offchain.pub`, B anuncia `primal`), depois a 3.4.
+- **Roteiro real (autorizado pelo dono; 1 rodada)**: A com `--nostr-relay wss://offchain.pub`, B com `wss://relay.primal.net`,
+  TCP loopback, diretórios novos. Cada um imprimiu os relays do outro (`(relays de …: wss://relay.primal.net)` no A,
+  `wss://offchain.pub` no B). A encerrado; B enviou `oi-offline-relays-do-contato`: `(relay wss://offchain.pub: aceitou)` e
+  `(depositada na caixa postal: 7aee9c20)`, sem tentativa no `primal`. A reiniciado só com `offchain.pub` recebeu
+  `[7aee9c20] peer: oi-offline-relays-do-contato` em menos de 15 s. Prova o PR 2 contra relay real; é 1 mensagem, não
+  prova confiabilidade. Não verificado: o sentido inverso (B offline recebendo via `primal`); só o log da CLI mostra
+  que o depósito não foi ao `primal`, não consultei o relay.
+- **Próximo passo**: a 3.4 (replicação em N mailboxes com TTL).
