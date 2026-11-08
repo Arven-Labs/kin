@@ -402,8 +402,17 @@ impl Chat {
     /// mais antiga à mais nova, até [`MAILBOX_WINDOW`] (contando as depositadas e as pedidas). A
     /// mensagem continua na outbox: só o ack do envio direto a tira.
     fn deposit(&mut self, peer: PeerId) {
-        if self.mailbox.is_none() {
+        let Some(mailbox) = self.mailbox.as_ref() else {
             return;
+        };
+        // O relay guarda por `retention`: o que foi depositado há mais da metade disso e segue sem ack
+        // volta para a fila de depósito, antes de o relay esquecê-lo.
+        if let Some(retention) = mailbox.retention()
+            && let Err(e) = self
+                .outbox
+                .expire_deposits(&peer, now_secs().saturating_sub(retention.as_secs() / 2))
+        {
+            return self.drop_message(peer, e);
         }
         let waiting = match self.outbox.undeposited(&peer) {
             Ok(waiting) => waiting,
@@ -507,7 +516,7 @@ impl Chat {
         match event {
             MailboxEvent::Deposited { id } => {
                 if let Some((peer, message)) = self.depositing.remove(&id) {
-                    if let Err(e) = self.outbox.mark_deposited(&peer, &message) {
+                    if let Err(e) = self.outbox.mark_deposited(&peer, &message, now_secs()) {
                         self.drop_message(peer, e);
                     }
                     self.queue.push_back(ChatEvent::Deposited { peer, message });
@@ -1298,6 +1307,126 @@ mod tests {
         // Vindo da própria Bia, o mesmo pacote é aceito.
         ana.on_key_package(dev_b.peer_id(), &bia_kp).unwrap();
         assert!(ana.is_ready(&dev_b.peer_id()));
+    }
+
+    /// `MemoryMailbox` que declara por quanto tempo o backend guarda um depósito (como o Nostr com TTL).
+    struct Retaining(MemoryMailbox, Option<std::time::Duration>);
+
+    impl Mailbox for Retaining {
+        fn attach(&mut self, events: futures::channel::mpsc::UnboundedSender<MailboxEvent>) {
+            self.0.attach(events);
+        }
+
+        fn deposit(&mut self, to: PeerId, blob: Vec<u8>) -> DepositId {
+            self.0.deposit(to, blob)
+        }
+
+        fn retention(&self) -> Option<std::time::Duration> {
+            self.1
+        }
+    }
+
+    /// Bia com Ana offline e uma caixa postal de retenção `keep`; uma mensagem já depositada e confirmada.
+    async fn deposited_once(
+        keep: Option<std::time::Duration>,
+    ) -> (Chat, Conversation, PeerId, MemoryRelay, MessageId) {
+        let (mut bia, ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(Retaining(MemoryMailbox::new(&relay, bia.peer_id()), keep));
+        let id = bia.send(ana_peer, "oi", None).unwrap();
+        until(&mut bia, |e| {
+            matches!(e, ChatEvent::Deposited { .. }).then_some(())
+        })
+        .await;
+        assert_eq!(relay.deposits().len(), 1);
+        (bia, ana, ana_peer, relay, id)
+    }
+
+    /// 3.4 B: depósito velho demais (sem ack) volta a ser depositado no próximo gatilho.
+    #[tokio::test]
+    async fn a_stale_unacked_deposit_is_deposited_again_on_the_next_flush() {
+        let (mut bia, mut ana, ana_peer, relay, _) =
+            deposited_once(Some(std::time::Duration::ZERO)).await;
+
+        bia.flush(ana_peer);
+
+        let deposits = relay.deposits();
+        assert_eq!(deposits.len(), 2);
+        assert_eq!(text_of(&mut ana, &deposits[0].blob), "oi");
+        assert_eq!(text_of(&mut ana, &deposits[1].blob), "oi");
+        assert_ne!(
+            deposits[0].blob, deposits[1].blob,
+            "outro gift wrap, outros bytes"
+        );
+    }
+
+    /// 3.4 B: depósito novo não é repetido.
+    #[tokio::test]
+    async fn a_fresh_deposit_is_not_repeated() {
+        let (mut bia, _ana, ana_peer, relay, _) =
+            deposited_once(Some(std::time::Duration::from_secs(7 * 24 * 3600))).await;
+
+        bia.flush(ana_peer);
+
+        assert_eq!(relay.deposits().len(), 1);
+    }
+
+    /// 3.4 B: backend sem retenção declarada (memória) nunca re-deposita.
+    #[tokio::test]
+    async fn a_backend_without_retention_never_deposits_again() {
+        let (mut bia, _ana, ana_peer, relay, _) = deposited_once(None).await;
+
+        bia.flush(ana_peer);
+
+        assert_eq!(relay.deposits().len(), 1);
+    }
+
+    /// 3.4 B: mensagem confirmada (ack) sai da fila e não é mais depositada.
+    #[tokio::test]
+    async fn an_acked_message_is_not_deposited_again() {
+        let (mut bia, _ana, ana_peer, relay, id) =
+            deposited_once(Some(std::time::Duration::ZERO)).await;
+        bia.outbox.remove(&id).unwrap();
+
+        bia.flush(ana_peer);
+
+        assert_eq!(relay.deposits().len(), 1);
+    }
+
+    /// 3.4 B: o re-depósito respeita a janela da caixa postal e a ordem (mais antigas primeiro).
+    #[tokio::test]
+    async fn redeposits_respect_the_mailbox_window_and_the_order() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        bia.set_mailbox(Retaining(
+            MemoryMailbox::new(&relay, bia.peer_id()),
+            Some(std::time::Duration::ZERO),
+        ));
+        for i in 0..MAILBOX_WINDOW + 2 {
+            bia.send(ana_peer, i.to_string(), None).unwrap();
+        }
+        for _ in 0..MAILBOX_WINDOW {
+            until(&mut bia, |e| {
+                matches!(e, ChatEvent::Deposited { .. }).then_some(())
+            })
+            .await;
+        }
+        assert_eq!(relay.deposits().len(), MAILBOX_WINDOW);
+
+        bia.flush(ana_peer);
+
+        let deposits = relay.deposits();
+        assert_eq!(
+            deposits.len(),
+            2 * MAILBOX_WINDOW,
+            "no máximo uma janela por rodada"
+        );
+        let again: Vec<String> = deposits[MAILBOX_WINDOW..]
+            .iter()
+            .map(|d| text_of(&mut ana, &d.blob))
+            .collect();
+        let expected: Vec<String> = (0..MAILBOX_WINDOW).map(|i| i.to_string()).collect();
+        assert_eq!(again, expected);
     }
 
     /// Caixa postal que só anota as listas de relays que o `Chat` lhe ensina.

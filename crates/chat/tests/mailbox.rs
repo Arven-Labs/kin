@@ -5,7 +5,8 @@ mod common;
 use std::time::Duration;
 
 use common::{Person, WAIT, connect, settle, until_delivered, until_disconnected};
-use kin_chat::{Chat, ChatEvent, MemoryMailbox, MemoryRelay};
+use kin_chat::{Chat, ChatEvent, DepositId, Mailbox, MailboxEvent, MemoryMailbox, MemoryRelay};
+use kin_transport::PeerId;
 use tokio::time::timeout;
 
 /// Dirige `chat` até ele anunciar `count` depósitos aceitos.
@@ -76,6 +77,59 @@ async fn deposited_messages_arrive_through_the_mailbox_and_are_not_repeated_on_c
             .iter()
             .any(|e| matches!(e, ChatEvent::Received { .. }))
     );
+}
+
+/// Caixa postal em memória que declara guardar por `keep`, como o backend Nostr com TTL.
+struct Retaining(MemoryMailbox, Duration);
+
+impl Mailbox for Retaining {
+    fn attach(&mut self, events: futures::channel::mpsc::UnboundedSender<MailboxEvent>) {
+        self.0.attach(events);
+    }
+
+    fn deposit(&mut self, to: PeerId, blob: Vec<u8>) -> DepositId {
+        self.0.deposit(to, blob)
+    }
+
+    fn retention(&self) -> Option<Duration> {
+        Some(self.1)
+    }
+}
+
+/// 3.4 B: a hora do depósito sobrevive ao reinício. Com retenção de 4 s, depósitos de até ~2 s não se
+/// repetem; passados 3,5 s, um reinício seguido de um envio os deposita de novo.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deposit_older_than_half_the_retention_is_redone_after_a_restart() {
+    let keep = Duration::from_secs(4);
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let (mut a, mut b) = (pa.open(), pb.open());
+    connect(&mut a, &mut b).await;
+    let relay = MemoryRelay::default();
+    a.set_mailbox(Retaining(MemoryMailbox::new(&relay, pa.peer_id()), keep));
+    drop(b);
+    until_disconnected(&mut a).await;
+    a.send(pb.peer_id(), "um", None).unwrap();
+    a.send(pb.peer_id(), "dois", None).unwrap();
+    until_deposited(&mut a, 2).await;
+    drop(a);
+
+    // Reinício logo em seguida: nada é velho, só a nova é depositada.
+    let mut a = pa.open();
+    a.set_mailbox(Retaining(MemoryMailbox::new(&relay, pa.peer_id()), keep));
+    a.send(pb.peer_id(), "tres", None).unwrap();
+    until_deposited(&mut a, 1).await;
+    assert_eq!(relay.deposits().len(), 3);
+    drop(a);
+
+    // Passada mais da metade da retenção: as três voltam, na ordem, mais a nova.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let mut a = pa.open();
+    a.set_mailbox(Retaining(MemoryMailbox::new(&relay, pa.peer_id()), keep));
+    a.send(pb.peer_id(), "quatro", None).unwrap();
+    until_deposited(&mut a, 4).await;
+
+    assert_eq!(relay.deposits().len(), 7, "3 repetidas + a nova");
 }
 
 /// Reiniciar o remetente não redeposita o que já foi depositado.

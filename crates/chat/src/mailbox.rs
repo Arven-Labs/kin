@@ -67,6 +67,13 @@ pub trait Mailbox {
     /// endereçam por outra chave que não o Peer ID (Nostr, ADR 0004) guardam o par; os demais ignoram.
     fn learn_peer(&mut self, _peer: PeerId, _nostr: NostrPublicKey) {}
 
+    /// Por quanto tempo o backend guarda um depósito. `Some` faz o `Chat` re-depositar a mensagem ainda
+    /// sem ack quando o depósito passa de metade disso (antes de o backend esquecê-la). `None`: o
+    /// backend não esquece (a memória) ou não informa, e nunca se re-deposita.
+    fn retention(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Relays em que ESTE device recebe (o `Chat` os anuncia a cada contato). Vazio = nada a anunciar.
     fn relays(&self) -> Vec<String> {
         Vec::new()

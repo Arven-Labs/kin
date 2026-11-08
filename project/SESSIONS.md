@@ -575,3 +575,26 @@
   de teste no `offchain.pub` (o da rodada 1 foi recusado).
 - **Próximo passo**: parte B (re-depósito por idade, tabela `kin_deposit_times`, confirmar o schema antes) e ADR 0005
   (TTL, quórum e relação TTL × `since_window`), que ainda não foi criado.
+
+### 2026-11-08 — Sessão 14
+
+- **Objetivo**: 3.4, parte B: re-depositar a mensagem sem ack antes de o relay expirá-la.
+- **Decisões do dono**: schema confirmado (tabela nova e aditiva `kin_deposit_times`, sem tocar as existentes);
+  depósitos de antes da 3.4 (sem hora) nunca são re-depositados; limite `ttl/2`.
+- **Feito** (branch `redeposito`): `kin_deposit_times (id, at_secs)` em `Outbox::init`; `mark_deposited(peer, id, now)`
+  grava a hora; `expire_deposits(peer, cutoff)` devolve à fila de depósito os depósitos com hora `<= cutoff` (sem
+  linha de hora, nunca); `remove` limpa a hora; `Mailbox::retention()` (None por padrão; `NostrMailbox` devolve o
+  `ttl`); `Chat::deposit` expira os depósitos com mais de `retention/2` antes de depositar, e o caminho normal
+  (janela `MAILBOX_WINDOW`, mais antigas primeiro) faz o resto.
+- **Testes**: 13 novos, escritos antes (não compilavam), verdes depois: 6 da outbox, 5 do `Chat`, 1 de integração com
+  reinício (retenção de 4 s, dorme 3,5 s) e 1 do `NostrMailbox`.
+- **Verificado (local)**: `cargo test --workspace --locked` 224 passando, 0 falhando (eram 211); clippy e fmt ok.
+  Mutações pegas e revertidas: `<=` → `<` derruba 2; `remove` sem limpar a hora derruba 1; ignorar a retenção derruba 3.
+- **Não verificado**: contra relay real (a parte B não foi exercitada fora dos testes); CI (testes Rust não rodam lá); o
+  teste de integração depende de tempo real (3,5 s de espera) e pode oscilar sob carga.
+- **Limites**: sem timer, a idade só é avaliada nos gatilhos que já chamam `deposit` (P19/P21); cada re-depósito consome
+  gerações do MLS (a janela tolera 10 fora de ordem), então uma cópia antiga atrasada pode virar `TooOld` e ser ignorada,
+  mas a cópia nova já entregou o mesmo `MessageId`, que o destinatário deduplica; mais gift wraps públicos por mensagem
+  (no máximo ~2 por TTL).
+- **Próximo passo**: ADR 0005 (TTL, quórum, relação TTL × `since_window` e re-depósito), que ainda não foi criado, e a
+  3.5 (multi-device).

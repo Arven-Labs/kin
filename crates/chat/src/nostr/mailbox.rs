@@ -463,6 +463,10 @@ impl Mailbox for NostrMailbox {
         self.announced.clone()
     }
 
+    fn retention(&self) -> Option<Duration> {
+        Some(self.config.ttl)
+    }
+
     /// A política de segurança da lista (só `wss://`, sem IP, teto) é do `Chat`, que valida antes de
     /// chamar. Aqui só se exige que as URLs se leiam; lista vazia ou ilegível mantém a anterior.
     fn learn_relays(&mut self, peer: PeerId, relays: Vec<String>) {
