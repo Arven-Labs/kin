@@ -14,6 +14,9 @@ use crate::{Error, Message, MessageId};
 /// Quantos ids de mensagem já vistas se lembra por peer; os mais antigos são esquecidos.
 pub(crate) const SEEN_LIMIT: usize = 1024;
 
+/// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 (mensagem por `(peer, id)`).
+const SCHEMA_VERSION: i64 = 1;
+
 pub(crate) struct Outbox {
     conn: Connection,
 }
@@ -34,22 +37,28 @@ impl Outbox {
     }
 
     fn init(conn: Connection) -> Result<Self, Error> {
+        conn.execute_batch("PRAGMA journal_mode = WAL;")
+            .map_err(Error::storage)?;
+        Self::migrate(&conn)?;
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             CREATE TABLE IF NOT EXISTS kin_outbox (
+            "CREATE TABLE IF NOT EXISTS kin_outbox (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  peer TEXT NOT NULL,
-                 id BLOB NOT NULL UNIQUE,
+                 id BLOB NOT NULL,
                  parent BLOB,
                  sent_at_ms INTEGER NOT NULL,
-                 text TEXT NOT NULL);
+                 text TEXT NOT NULL,
+                 UNIQUE (peer, id));
              CREATE INDEX IF NOT EXISTS kin_outbox_peer ON kin_outbox (peer, seq);
              CREATE TABLE IF NOT EXISTS kin_deposited (
-                 id BLOB PRIMARY KEY,
-                 peer TEXT NOT NULL);
+                 peer TEXT NOT NULL,
+                 id BLOB NOT NULL,
+                 PRIMARY KEY (peer, id));
              CREATE TABLE IF NOT EXISTS kin_deposit_times (
-                 id BLOB PRIMARY KEY,
-                 at_secs INTEGER NOT NULL);
+                 peer TEXT NOT NULL,
+                 id BLOB NOT NULL,
+                 at_secs INTEGER NOT NULL,
+                 PRIMARY KEY (peer, id));
              CREATE TABLE IF NOT EXISTS kin_peer_relays (
                  peer TEXT PRIMARY KEY,
                  relays TEXT NOT NULL);
@@ -61,6 +70,69 @@ impl Outbox {
         )
         .map_err(Error::storage)?;
         Ok(Self { conn })
+    }
+
+    /// Leva um banco da 3.4 (versão 0) ao esquema da 3.5: a mesma mensagem lógica pode esperar por
+    /// vários devices, então `id` deixa de ser único sozinho e passa a ser por `(peer, id)`. SQLite não
+    /// troca constraint no lugar: renomeia, recria, copia e apaga, tudo numa transação (se falhar, volta
+    /// ao estado anterior). Banco novo, sem tabelas, só recebe a versão.
+    fn migrate(conn: &Connection) -> Result<(), Error> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(Error::storage)?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let has_old: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'kin_outbox'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Error::storage)?;
+        let tx = conn.unchecked_transaction().map_err(Error::storage)?;
+        if has_old {
+            tx.execute_batch(
+                "-- Bancos anteriores à 3.4 podem não ter estas duas; o formato antigo basta para copiar.
+                 CREATE TABLE IF NOT EXISTS kin_deposited (id BLOB PRIMARY KEY, peer TEXT NOT NULL);
+                 CREATE TABLE IF NOT EXISTS kin_deposit_times (id BLOB PRIMARY KEY, at_secs INTEGER NOT NULL);
+                 DROP INDEX IF EXISTS kin_outbox_peer;
+                 ALTER TABLE kin_outbox RENAME TO kin_outbox_v0;
+                 ALTER TABLE kin_deposited RENAME TO kin_deposited_v0;
+                 ALTER TABLE kin_deposit_times RENAME TO kin_deposit_times_v0;
+                 CREATE TABLE kin_outbox (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     peer TEXT NOT NULL,
+                     id BLOB NOT NULL,
+                     parent BLOB,
+                     sent_at_ms INTEGER NOT NULL,
+                     text TEXT NOT NULL,
+                     UNIQUE (peer, id));
+                 CREATE TABLE kin_deposited (
+                     peer TEXT NOT NULL,
+                     id BLOB NOT NULL,
+                     PRIMARY KEY (peer, id));
+                 CREATE TABLE kin_deposit_times (
+                     peer TEXT NOT NULL,
+                     id BLOB NOT NULL,
+                     at_secs INTEGER NOT NULL,
+                     PRIMARY KEY (peer, id));
+                 INSERT INTO kin_outbox (seq, peer, id, parent, sent_at_ms, text)
+                     SELECT seq, peer, id, parent, sent_at_ms, text FROM kin_outbox_v0;
+                 INSERT INTO kin_deposited (peer, id) SELECT peer, id FROM kin_deposited_v0;
+                 -- A hora não tinha peer: vem do depósito correspondente. Hora sem depósito já era órfã.
+                 INSERT INTO kin_deposit_times (peer, id, at_secs)
+                     SELECT d.peer, t.id, t.at_secs FROM kin_deposit_times_v0 t
+                     JOIN kin_deposited_v0 d ON d.id = t.id;
+                 DROP TABLE kin_outbox_v0;
+                 DROP TABLE kin_deposited_v0;
+                 DROP TABLE kin_deposit_times_v0;",
+            )
+            .map_err(Error::storage)?;
+        }
+        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .map_err(Error::storage)?;
+        tx.commit().map_err(Error::storage)
     }
 
     pub(crate) fn enqueue(&self, peer: &PeerId, message: &Message) -> Result<(), Error> {
@@ -141,13 +213,14 @@ impl Outbox {
         Ok(text.map(|t| t.lines().map(str::to_string).collect()))
     }
 
-    /// Tira a mensagem da fila (e a marca de depositada, se houver).
-    pub(crate) fn remove(&self, id: &MessageId) -> Result<(), Error> {
+    /// Tira a mensagem da fila de `peer` (e a marca de depositada, se houver). A cópia da mesma
+    /// mensagem que espera por outro device fica.
+    pub(crate) fn remove(&self, peer: &PeerId, id: &MessageId) -> Result<(), Error> {
         for table in ["kin_outbox", "kin_deposited", "kin_deposit_times"] {
             self.conn
                 .execute(
-                    &format!("DELETE FROM {table} WHERE id = ?1"),
-                    [&id.as_bytes()[..]],
+                    &format!("DELETE FROM {table} WHERE peer = ?1 AND id = ?2"),
+                    params![peer.to_string(), &id.as_bytes()[..]],
                 )
                 .map_err(Error::storage)?;
         }
@@ -164,14 +237,14 @@ impl Outbox {
     ) -> Result<(), Error> {
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO kin_deposited (id, peer) VALUES (?1, ?2)",
-                params![&id.as_bytes()[..], peer.to_string()],
+                "INSERT OR IGNORE INTO kin_deposited (peer, id) VALUES (?1, ?2)",
+                params![peer.to_string(), &id.as_bytes()[..]],
             )
             .map_err(Error::storage)?;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO kin_deposit_times (id, at_secs) VALUES (?1, ?2)",
-                params![&id.as_bytes()[..], now as i64],
+                "INSERT OR REPLACE INTO kin_deposit_times (peer, id, at_secs) VALUES (?1, ?2, ?3)",
+                params![peer.to_string(), &id.as_bytes()[..], now as i64],
             )
             .map_err(Error::storage)?;
         Ok(())
@@ -185,16 +258,16 @@ impl Outbox {
             .conn
             .execute(
                 "DELETE FROM kin_deposited WHERE peer = ?1
-                 AND id IN (SELECT id FROM kin_deposit_times WHERE at_secs <= ?2)",
+                 AND id IN (SELECT id FROM kin_deposit_times WHERE peer = ?1 AND at_secs <= ?2)",
                 params![peer.to_string(), cutoff as i64],
             )
             .map_err(Error::storage)?;
         // Horas sem depósito correspondente (acabaram de expirar) não servem mais.
         self.conn
             .execute(
-                "DELETE FROM kin_deposit_times WHERE at_secs <= ?1
-                 AND id NOT IN (SELECT id FROM kin_deposited)",
-                [cutoff as i64],
+                "DELETE FROM kin_deposit_times WHERE peer = ?1 AND at_secs <= ?2
+                 AND id NOT IN (SELECT id FROM kin_deposited WHERE peer = ?1)",
+                params![peer.to_string(), cutoff as i64],
             )
             .map_err(Error::storage)?;
         Ok(expired)
@@ -362,7 +435,7 @@ mod tests {
         let id = deposited(&outbox, &peer, "x", 100);
         assert_eq!(time_rows(&outbox), 1);
 
-        outbox.remove(&id).unwrap();
+        outbox.remove(&peer, &id).unwrap();
 
         assert_eq!(time_rows(&outbox), 0);
         assert_eq!(outbox.expire_deposits(&peer, 1000).unwrap(), 0);
@@ -379,6 +452,134 @@ mod tests {
 
         assert_eq!(waiting(&outbox, &ana), ["da ana"]);
         assert!(waiting(&outbox, &bia).is_empty());
+    }
+
+    /// Mesma mensagem lógica (mesmo `MessageId`) enfileirada para dois devices.
+    fn same_message_for(outbox: &Outbox, peers: [&PeerId; 2]) -> Message {
+        let message = Message::new("para todos".into(), None);
+        for peer in peers {
+            outbox.enqueue(peer, &message).unwrap();
+        }
+        message
+    }
+
+    // 7
+    #[test]
+    fn the_same_message_id_can_wait_for_two_devices() {
+        let (outbox, b1, b2) = (Outbox::memory().unwrap(), peer(), peer());
+
+        let message = same_message_for(&outbox, [&b1, &b2]);
+
+        assert_eq!(outbox.entries(&b1).unwrap(), std::slice::from_ref(&message));
+        assert_eq!(outbox.entries(&b2).unwrap(), [message]);
+    }
+
+    // 8
+    #[test]
+    fn an_ack_from_one_device_leaves_the_copy_for_the_other() {
+        let (outbox, b1, b2) = (Outbox::memory().unwrap(), peer(), peer());
+        let message = same_message_for(&outbox, [&b1, &b2]);
+        outbox.mark_deposited(&b1, &message.id, 100).unwrap();
+        outbox.mark_deposited(&b2, &message.id, 100).unwrap();
+
+        outbox.remove(&b1, &message.id).unwrap();
+
+        assert!(outbox.entries(&b1).unwrap().is_empty());
+        assert_eq!(outbox.deposited_count(&b1).unwrap(), 0);
+        assert_eq!(outbox.entries(&b2).unwrap(), [message]);
+        assert_eq!(outbox.deposited_count(&b2).unwrap(), 1);
+        assert_eq!(time_rows(&outbox), 1, "a hora do b2 continua");
+    }
+
+    // 9
+    #[test]
+    fn a_deposit_for_one_device_does_not_count_for_the_other() {
+        let (outbox, b1, b2) = (Outbox::memory().unwrap(), peer(), peer());
+        let message = same_message_for(&outbox, [&b1, &b2]);
+
+        outbox.mark_deposited(&b1, &message.id, 100).unwrap();
+
+        assert!(waiting(&outbox, &b1).is_empty());
+        assert_eq!(waiting(&outbox, &b2), ["para todos"]);
+        assert_eq!(outbox.expire_deposits(&b2, 1000).unwrap(), 0);
+        assert_eq!(outbox.expire_deposits(&b1, 1000).unwrap(), 1);
+    }
+
+    // 10
+    #[test]
+    fn a_database_from_before_3_5_keeps_its_data_and_accepts_the_same_id_for_another_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (old, other) = (peer(), peer());
+        let message = Message::new("antiga".into(), None);
+        {
+            // Esquema da 3.4: `id` único na tabela inteira e PK só por `id`.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE kin_outbox (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     peer TEXT NOT NULL,
+                     id BLOB NOT NULL UNIQUE,
+                     parent BLOB,
+                     sent_at_ms INTEGER NOT NULL,
+                     text TEXT NOT NULL);
+                 CREATE TABLE kin_deposited (id BLOB PRIMARY KEY, peer TEXT NOT NULL);
+                 CREATE TABLE kin_deposit_times (id BLOB PRIMARY KEY, at_secs INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kin_outbox (peer, id, parent, sent_at_ms, text) VALUES (?1, ?2, NULL, ?3, ?4)",
+                params![
+                    old.to_string(),
+                    &message.id.as_bytes()[..],
+                    message.sent_at_ms as i64,
+                    message.text
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kin_deposited (id, peer) VALUES (?1, ?2)",
+                params![&message.id.as_bytes()[..], old.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO kin_deposit_times (id, at_secs) VALUES (?1, 100)",
+                params![&message.id.as_bytes()[..]],
+            )
+            .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert_eq!(
+            outbox.entries(&old).unwrap(),
+            std::slice::from_ref(&message)
+        );
+        assert_eq!(outbox.deposited_count(&old).unwrap(), 1);
+        assert_eq!(
+            outbox.expire_deposits(&old, 100).unwrap(),
+            1,
+            "a hora migrou junto"
+        );
+        outbox.enqueue(&other, &message).unwrap();
+        assert_eq!(outbox.entries(&other).unwrap(), [message]);
+    }
+
+    // 11
+    #[test]
+    fn opening_twice_does_not_migrate_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let peer = peer();
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            deposited(&outbox, &peer, "x", 100);
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert_eq!(outbox.entries(&peer).unwrap().len(), 1);
+        assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
     }
 
     // 6
