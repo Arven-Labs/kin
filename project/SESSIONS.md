@@ -564,5 +564,14 @@
   46 cobre, não mutei); CI (testes Rust não rodam lá); damus e outros relays sem NIP-40 ignoram a expiração.
 - **Limites**: um depósito com 1 de 2 aceites vira `DepositFailed` no `Chat` (a mensagem fica na outbox e tenta de novo no
   próximo gatilho) mas já está num relay; `Deposited` demora até o relay mais lento (nos.lol: 35 a 90 s).
+- **Roteiro real (autorizado pelo dono; 2 rodadas com o binário da `ttl-replicas`)**: A com `--nostr-relay
+  wss://offchain.pub`, B com `wss://relay.primal.net`, TCP loopback, diretórios novos, mesmo roteiro da Sessão 12.
+  Rodada 1: o B depositou e o `offchain.pub` respondeu `recusou: Policy violated and pubkey is not in our web of trust.`
+  (a mensagem ficou na outbox, nada chegou ao A). Rodada 2, mesmo binário: `aceitou`, `depositada na caixa postal: c745cb67`
+  e o A reiniciado recebeu `[c745cb67] peer: oi-offline-ttl`. Conclusão (confiança média): a recusa é a política de web of
+  trust do `offchain.pub`, intermitente (o ADR 0004 já a tinha visto), e não a tag de expiração, que falharia sempre.
+  **Não verificado**: só 2 amostras; não rodei o binário da `main` para comparar; não consultei o relay para ver a tag
+  `expiration` no evento guardado (só que um relay real aceitou e devolveu o evento do código novo). Publicados 2 gift wraps
+  de teste no `offchain.pub` (o da rodada 1 foi recusado).
 - **Próximo passo**: parte B (re-depósito por idade, tabela `kin_deposit_times`, confirmar o schema antes) e ADR 0005
   (TTL, quórum e relação TTL × `since_window`), que ainda não foi criado.
