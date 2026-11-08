@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 libp2p-identity.workspace = true
 secp256k1.workspace = true
 thiserror.workspace = true

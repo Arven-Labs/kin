@@ -17,6 +17,9 @@
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
+//! Segundo device da mesma identidade: `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
+//! `kin://pair/...`; no device novo, `--pair ARQUIVO` (ou `-` para stdin) a importa na primeira execução
+//! e recusa se já houver identidade. É o segredo inteiro, sem cifra: use só em terminal privado.
 //! Linhas digitadas vão ao peer da conversa;
 //! `/r <id> texto` responde à mensagem `<id>` (thread); `/quit` sai.
 
@@ -24,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Invite, Message, MessageId};
-use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
+use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -33,6 +36,7 @@ struct Args {
     listen: Option<Multiaddr>,
     dial: Option<Multiaddr>,
     accept: Option<String>,
+    pair: Option<String>,
     relays: Vec<Multiaddr>,
     relay_count: Option<usize>,
     external_addrs: Vec<Multiaddr>,
@@ -49,6 +53,7 @@ fn parse_args() -> Result<Args, String> {
         listen: None,
         dial: None,
         accept: None,
+        pair: None,
         relays: Vec::new(),
         relay_count: None,
         external_addrs: Vec::new(),
@@ -66,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
             "--listen" => args.listen = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--dial" => args.dial = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--accept" => args.accept = Some(value()?),
+            "--pair" => args.pair = Some(value()?),
             "--relay-count" => {
                 args.relay_count = Some(value()?.parse().map_err(|e| format!("{e}"))?);
             }
@@ -94,10 +100,41 @@ fn parse_args() -> Result<Args, String> {
 
 /// Carrega a identidade e a chave de device do diretório, criando-as na primeira execução.
 /// Sem cifra em repouso (P13): só para desenvolvimento.
-fn load_keys(dir: &Path) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+///
+/// `pair` (de `--pair`, ADR 0006): o link `kin://pair/...` de outro device desta identidade, lido de
+/// um arquivo (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com
+/// `identity.key` já existente falha, em vez de sobrescrever uma identidade. O device continua com
+/// `device.key` próprio, gerado aqui.
+fn load_keys(
+    dir: &Path,
+    pair: Option<&str>,
+) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
     let identity_path = dir.join("identity.key");
     let device_path = dir.join("device.key");
+    if let Some(source) = pair {
+        if identity_path.exists() {
+            return Err(
+                "já existe identity.key neste --data-dir: --pair não sobrescreve uma identidade"
+                    .into(),
+            );
+        }
+        // Estado MLS e outbox pertencem à identidade que os criou; com outra identidade, o `Chat`
+        // abriria conversas que não são dela.
+        if dir.join("mls.sqlite").exists() {
+            return Err(
+                "este --data-dir já tem estado (mls.sqlite) de outra identidade: use um diretório novo"
+                    .into(),
+            );
+        }
+        let text = read_pair_link(source)?;
+        let imported = StandaloneIdentity::from_pair_link(&text)?;
+        write_private(&identity_path, &imported.to_bytes()?)?;
+        println!("identidade importada: {}", imported.id().to_base58());
+        if source != "-" {
+            println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
+        }
+    }
     let identity = if identity_path.exists() {
         StandaloneIdentity::load(&identity_path)?
     } else {
@@ -115,15 +152,41 @@ fn load_keys(dir: &Path) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std:
     Ok((identity, device))
 }
 
+/// Lê o link de pareamento de um arquivo ou do stdin (`-`, até o EOF: o chat do mesmo processo não
+/// recebe mais linhas). Teto de 4 KiB (o link tem ~100 caracteres) contra arquivo gigante ou
+/// `/dev/zero`.
+fn read_pair_link(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    const LIMIT: u64 = 4096;
+    let mut text = String::new();
+    let read = if source == "-" {
+        std::io::stdin().take(LIMIT).read_to_string(&mut text)?
+    } else {
+        std::fs::File::open(source)?
+            .take(LIMIT)
+            .read_to_string(&mut text)?
+    };
+    if read as u64 >= LIMIT {
+        return Err("link de pareamento grande demais".into());
+    }
+    Ok(text)
+}
+
+/// Cria `path` (falha se existir) com 0600 e grava `bytes`. Se a escrita falhar, apaga o arquivo
+/// parcial: um segredo truncado travaria o próximo `--pair` ("já existe") e a abertura normal.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(bytes)
+        .open(path)?;
+    if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn short(id: &MessageId) -> String {
@@ -138,7 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         e
     })?;
-    let (identity, device) = load_keys(&args.data_dir)?;
+    let (identity, device) = load_keys(&args.data_dir, args.pair.as_deref())?;
     if args.serve_relay {
         return serve_relay(&args, &device).await;
     }
@@ -214,12 +277,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print_invite(&chat);
                     continue;
                 }
+                if line == "/pair" || line == "/pair confirmo" {
+                    print_pair(&identity, line == "/pair confirmo");
+                    continue;
+                }
                 if let Some(link) = line.strip_prefix("/accept ") {
                     accept(&mut chat, link);
                     continue;
                 }
                 if line == "/trust" || line.starts_with("/trust ") {
                     trust(&mut chat, line.strip_prefix("/trust").unwrap_or("").trim(), current, &met);
+                    continue;
+                }
+                // A chave mestra nunca vai a um contato por engano (ex.: Ctrl+V do link de pareamento).
+                if line.contains("kin://pair/") {
+                    println!("(não enviado: isto é um link de pareamento, a sua chave mestra)");
                     continue;
                 }
                 let Some(peer) = current else {
@@ -272,6 +344,44 @@ fn print_invite(chat: &Chat) {
         Err(e) => println!("(não deu para gerar o QR: {e})"),
     }
     println!("convite: {link}");
+}
+
+/// `/pair`: mostra o link de pareamento (a chave mestra!) e o QR, só depois de `/pair confirmo`. O
+/// segredo vai só para a tela: nada de log nem de arquivo.
+fn print_pair(identity: &StandaloneIdentity, confirmed: bool) {
+    if !confirmed {
+        println!(
+            "(isto mostra a CHAVE MESTRA: quem vir o link ou o QR é esta identidade e não há revogação.\n \
+             Use só em terminal privado, passe o link ao outro device por arquivo ou stdin e limpe a tela.\n \
+             Para continuar: /pair confirmo)"
+        );
+        return;
+    }
+    // Saída redirecionada (`> log`, `| tee`, supervisor) gravaria a chave mestra em disco.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        println!("(recusado: a saída não é um terminal, o link iria para um arquivo ou pipe)");
+        return;
+    }
+    let link = match identity.to_pair_link() {
+        Ok(link) => link,
+        Err(e) => {
+            println!("(não deu para gerar o link: {e})");
+            return;
+        }
+    };
+    match qrcode::QrCode::new(link.as_bytes()) {
+        Ok(code) => println!(
+            "{}",
+            code.render::<qrcode::render::unicode::Dense1x2>()
+                .quiet_zone(true)
+                .build()
+        ),
+        Err(e) => println!("(não deu para gerar o QR: {e})"),
+    }
+    println!("pareamento: {link}");
+    println!(
+        "(no outro device: kin --data-dir NOVO --pair ARQUIVO, com o link no arquivo ou `-` para stdin)"
+    );
 }
 
 /// Abre um link de convite: disca o dono e exige a identidade do convite.

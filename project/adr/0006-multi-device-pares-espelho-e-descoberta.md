@@ -43,8 +43,11 @@ precisa que uma mensagem a uma identidade chegue em todos os devices dela e apar
      identidade viram `contact_devices`; tudo o que não tem conversa é discado, exigindo a identidade dona do item.
 6. **`Chat::set_advertised_addrs`** (API pública): fixa os endereços anunciados (IP fixo, port-forward, testes); vazio usa
    `Node::shareable_addresses`, que nunca devolve loopback.
-7. **Pareamento**: copiar a chave mestra por link/QR (`kin://pair/...`), sem cifra de transporte inventada. **Não
-   implementado** (etapa 6).
+7. **Pareamento**: copiar a chave mestra por link/QR (`kin://pair/...`), sem cifra de transporte inventada. **Implementado
+   na Sessão 16** (etapa 6): `StandaloneIdentity::to_pair_link`/`from_pair_link`; na CLI, `/pair` (só imprime depois de
+   `/pair confirmo`) e `--pair ARQUIVO` (ou `-`), que importa na primeira execução e recusa se já existir
+   `identity.key`. O link nunca vai por argv. É o segredo inteiro, em claro, sem revogação; a alternativa maior (enviar
+   a chave pelo canal MLS depois de confirmar um código curto, sem o segredo aparecer em tela) ficou como evolução.
 
 ## Alternativas descartadas
 
@@ -107,4 +110,4 @@ precisa que uma mensagem a uma identidade chegue em todos os devices dela e apar
    conhecida é aceita em silêncio.
 4. **Certificado sem prova de posse do device** (a identidade assina as chaves, o device não assina nada): mudança de
    cripto, só com confirmação (AGENTS.md §4).
-5. **Pareamento (etapa 6)** e o roteiro manual com 2 processos da mesma identidade e relay real.
+5. ~~Pareamento (etapa 6)~~ (feito na Sessão 16) e o roteiro manual com 2 processos da mesma identidade e relay real.

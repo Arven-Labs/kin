@@ -665,3 +665,31 @@
   novos, visível no diff.
 - **Não feito**: pareamento (etapa 6), revogação, lista de contatos, o resto do P24.
 - **Próximo passo**: etapa 6 (pareamento; confirmar o desenho antes) ou o roteiro manual do `/trust`.
+- **Fim da sessão 16**: #32 mesclado (`guard` verde; os testes não rodavam no CI, só localmente).
+
+#### Sessão 16, parte 2: pareamento (3.5, etapa 6)
+
+- **Decisão do dono** (plan mode): link `kin://pair/` com a chave mestra em claro, por arquivo ou stdin, com cuidados (ADR
+  0006 decisão 7); a versão pelo canal MLS com código de confirmação ficou como evolução.
+- **Feito**: `StandaloneIdentity::to_pair_link`/`from_pair_link` (erro `InvalidPairLink` sem ecoar o conteúdo; dependência
+  `base64`, já no workspace); CLI `/pair` (só imprime depois de `/pair confirmo`) e `--pair ARQUIVO|-` (importa na primeira
+  execução, `create_new` 0600, recusa se já houver `identity.key`, nunca por argv).
+- **Testes**: 4 novos em `crates/identity/tests/identity.rs` (ida e volta preserva a identidade; espaço e `\r\n` aceitos;
+  links malformados recusados sem vazar; arquivo de device não vira identidade). Rodados **pelo dono** com `!` (ADR 0009):
+  `kin-identity` 19 passam, `kin-cli` compila sem avisos. O vermelho antes da implementação **não foi mostrado**
+  (testes escritos sem poder rodar). Mutação pega e revertida: aceitar link sem o prefixo `kin://pair/` derrubou o teste de
+  links malformados.
+- **Auditoria (`security-auditor`, só leitura)**: nenhum crítico. Importantes, corrigidos: (1) colar o link `kin://pair/` no
+  REPL com conversa ativa o enviaria ao contato como mensagem: a CLI agora recusa qualquer linha que o contenha; (2)
+  `write_private` deixava `identity.key` truncado se a escrita falhasse, travando o próximo `--pair`: agora apaga o parcial
+  e dá `sync_all`. Sugestões feitas: teto de 4 KiB na leitura do link; `/pair confirmo` recusa se a saída não é terminal;
+  aviso para apagar o arquivo do link; `--pair` recusa `--data-dir` que já tem `mls.sqlite` (estado de outra identidade).
+  Não feitas: `create_dir_all` antes de validar (inofensivo) e zeroize (o projeto não usa).
+- **Depois das correções**: o dono rodou `cargo test -p kin-identity -p kin-cli` (19 passam, `kin-cli` compila) e
+  `cargo clippy -p kin-identity -p kin-cli --all-targets` (sem avisos).
+- **Não verificado**: `/pair` e `--pair` (e as guardas da auditoria: recusa do link no chat, terminal, teto, `mls.sqlite`)
+  sem teste automatizado nem roteiro com 2 processos; mutações só do prefixo (a validação
+  Ed25519 é do `from_bytes` já existente); o `kin` não tem CI Rust, então nada disto roda no CI.
+- **Deslize do processo**: anexei os testes por heredoc no Bash (contra o `CLAUDE.md`); o diff está visível.
+- **Limite conhecido**: `--pair -` consome o stdin inteiro, então o laço de chat do mesmo processo encerra; usar arquivo.
+- **Próximo passo**: roteiro manual com 2 processos da mesma identidade; decidir se o `kin` ganha workflow de CI Rust.

@@ -2100,6 +2100,7 @@ dependencies = [
 name = "kin-identity"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "libp2p-identity",
  "secp256k1",
  "tempfile",
