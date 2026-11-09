@@ -48,10 +48,12 @@ async fn count_routes(node: &mut Node, peer: PeerId, window: Duration) -> usize 
 }
 
 /// P25: o mDNS devolve um endereço por interface e por transporte (tcp e quic). Discar um por um abre
-/// várias conexões ao mesmo peer e estoura o teto por peer (`max_established_per_peer`), o que nega
-/// conexões e perde requisições em voo. Um dial por peer deixa no máximo uma conexão por sentido.
+/// várias conexões ao mesmo peer e estoura o teto por peer (`max_established_per_peer`, 4), o que nega
+/// conexões e perde requisições em voo. Um dial por peer, com todos os endereços, deixa uma conexão por
+/// sentido, e às vezes uma a mais (o libp2p tenta os endereços em paralelo e dois podem completar).
+/// Antes eram 5, acima do teto; o teste protege a folga: no máximo 3.
 #[tokio::test(flavor = "multi_thread")]
-async fn mdns_discovery_opens_at_most_one_connection_per_direction() {
+async fn mdns_discovery_stays_below_the_per_peer_connection_cap() {
     let key_a = DeviceKey::generate();
     let key_b = DeviceKey::generate();
     let (id_a, id_b) = (key_a.peer_id(), key_b.peer_id());
@@ -73,6 +75,6 @@ async fn mdns_discovery_opens_at_most_one_connection_per_direction() {
         count_routes(&mut b, id_a, window)
     );
 
-    assert!(routes_a <= 2, "a abriu/recebeu {routes_a} conexões com b");
-    assert!(routes_b <= 2, "b abriu/recebeu {routes_b} conexões com a");
+    assert!(routes_a <= 3, "a abriu/recebeu {routes_a} conexões com b");
+    assert!(routes_b <= 3, "b abriu/recebeu {routes_b} conexões com a");
 }
