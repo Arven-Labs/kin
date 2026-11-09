@@ -1400,7 +1400,7 @@ impl Chat {
     /// outro lado ignora a duplicata (`on_welcome`). Reenviar os mesmos bytes não gasta outro
     /// `KeyPackage` nem muda a época.
     fn resend_handshake(&mut self, peer: PeerId, envelope: Envelope) {
-        let needs_no_conversation = !matches!(envelope, Envelope::Welcome(_));
+        let needs_no_conversation = !matches!(envelope, Envelope::Mls(_));
         if !self.connected.contains(&peer)
             || (needs_no_conversation && self.conversations.contains_key(&peer))
         {
