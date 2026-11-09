@@ -803,3 +803,21 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Não verificado**: o `update` de um item já presente com o mapa cheio (o `Invite` não permite trocar o endereço sem o
   certificado); comportamento do timer em carga real; os números (8 e 5 s) em uso real.
 - **Próximo passo**: frescor e remoção de `household`/`contact_devices`; a dica de `/trust` para irmãos; roteiro com 3 devices.
+
+### 2026-11-09 — Sessão 18
+
+#### Frescor de `household` e `contact_devices` (P24)
+
+- **Decisões do dono** (plan mode): escopo só do frescor (sem a dica de `/trust` nem o roteiro de 3 devices); o frescor vem da
+  falha de discagem (sem TTL, sem remoção em `PeerDisconnected`).
+- **Feito** (`crates/chat/src/chat.rs`, PR #42): `forget_unreachable(peer)` apaga a entrada de `household` e `contact_devices` quando
+  o `DialFailed` é de um device sem conversa e sem conexão; chamado no braço `NodeEvent::DialFailed` e na falha síncrona do
+  `dial_peer` em `on_device_list`. Um irmão que reanuncie o item o traz de volta.
+- **Testes**: 3 novos em `chat::tests`. No CI antes da implementação, 2 falharam, cada um na asserção certa; o terceiro (o que a
+  falha NÃO apaga) passou já, por ser guarda contra apagar demais. Verdes depois. 3 mutações em branches temporárias
+  (PRs #43 a #45, fechados e apagados), todas pegas: sem a checagem de conversa e sem a de conexão (o teste do que fica) e só
+  `household` limpo (o teste dos dois mapas). Na terceira rodada falhou também `chats_find_each_other_via_mdns_and_talk`, o mesmo
+  flaky de mDNS da Sessão 17, ainda não investigado.
+- **Não verificado**: comportamento com relay e rede reais; se um irmão que reanuncia sempre o mesmo item morto causa discagem
+  repetida (limitado pelo intervalo de 5 s, sem medição).
+- **Próximo passo**: a dica de `/trust` para irmãos; roteiro com 3 devices; investigar o flaky de mDNS.
