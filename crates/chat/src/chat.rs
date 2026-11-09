@@ -901,7 +901,6 @@ impl Chat {
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
-                self.handshake_retries.retain(|(p, _), _| *p != peer);
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
                 self.lists_acted.remove(&peer);
