@@ -1401,9 +1401,7 @@ impl Chat {
     /// `KeyPackage` nem muda a época.
     fn resend_handshake(&mut self, peer: PeerId, envelope: Envelope) {
         let needs_no_conversation = !matches!(envelope, Envelope::Welcome(_));
-        if !self.connected.contains(&peer)
-            || (needs_no_conversation && self.conversations.contains_key(&peer))
-        {
+        if needs_no_conversation && self.conversations.contains_key(&peer) {
             return;
         }
         let retries = self
