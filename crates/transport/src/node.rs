@@ -292,14 +292,27 @@ impl Node {
     /// sair espera por ela (até 10 s) em vez de falhar.
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), Error> {
         let circuit = is_circuit(&addr);
-        self.start_dial(DialOpts::from(addr), circuit)
+        let opts = if circuit {
+            DialOpts::from(addr)
+        } else {
+            DialOpts::unknown_peer_id()
+                .address(addr)
+                .allocate_new_port()
+                .build()
+        };
+        self.start_dial(opts, circuit)
     }
 
     /// Conecta ao peer `peer` tentando vários endereços de uma vez (ex.: os de um convite). A conexão
     /// só vale se o outro lado provar ter esse Peer ID. Se já houver conexão, não faz nada.
     pub fn dial_peer(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) -> Result<(), Error> {
         let circuit = addrs.iter().any(is_circuit);
-        let opts = DialOpts::peer_id(peer).addresses(addrs).build();
+        let opts = DialOpts::peer_id(peer).addresses(addrs);
+        let opts = if circuit {
+            opts.build()
+        } else {
+            opts.allocate_new_port().build()
+        };
         self.start_dial(opts, circuit)
     }
 
@@ -406,9 +419,12 @@ impl Node {
                         }
                         first.get_or_insert((peer, addrs[0].clone()));
                         // Falha ao discar aqui não é fatal: o mDNS reanuncia depois.
-                        let _ = self
-                            .swarm
-                            .dial(DialOpts::peer_id(peer).addresses(addrs).build());
+                        let _ = self.swarm.dial(
+                            DialOpts::peer_id(peer)
+                                .addresses(addrs)
+                                .allocate_new_port()
+                                .build(),
+                        );
                     }
                     if let Some((peer, addr)) = first {
                         return NodeEvent::PeerDiscovered(peer, addr);
