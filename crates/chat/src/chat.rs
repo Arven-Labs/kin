@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Expected};
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider};
@@ -149,6 +149,15 @@ const MAILBOX_WINDOW: usize = 8;
 /// tem este limite. Limita a amplificação de uma lista hostil (auditoria I1).
 const CONTACT_DIAL_ADDRS: usize = 4;
 
+/// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
+/// `expected`). É o mesmo teto da lista do codec: a lista que sai já corta nesse número, então guardar
+/// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
+const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
+
+/// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
+/// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
+const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
+
 /// Endereços a tentar para um device listado: só os que passam em [`dialable`], todos se o remetente
 /// é irmão e poucos se é contato.
 fn dial_addrs(addrs: &[Multiaddr], from_sibling: bool) -> Vec<Multiaddr> {
@@ -238,6 +247,12 @@ pub struct Chat {
     /// Convites de devices de contatos aceitos, como eles mesmos anunciaram ou como um irmão repassou.
     /// Só em memória. Vão para os meus irmãos, para que eles também achem o contato.
     contact_devices: HashMap<PeerId, Invite>,
+    /// Quando anunciei a lista de devices a cada irmão por causa de algo aprendido (limite de taxa).
+    last_sibling_announce: HashMap<PeerId, Instant>,
+    /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
+    sibling_pending: std::collections::HashSet<PeerId>,
+    /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
+    sibling_announce_gap: Duration,
     /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
     advertised: Vec<Multiaddr>,
     /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
@@ -323,6 +338,9 @@ impl Chat {
             household: HashMap::new(),
             trusted: Vec::new(),
             contact_devices: HashMap::new(),
+            last_sibling_announce: HashMap::new(),
+            sibling_pending: Default::default(),
+            sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
             advertised: Vec::new(),
             in_flight: HashMap::new(),
             mailbox: None,
@@ -2412,6 +2430,182 @@ mod tests {
 
         assert!(bia.household.contains_key(&first.peer_id()));
         assert!(bia.household.contains_key(&second.peer_id()));
+    }
+
+    fn feed_list(bia: &mut Chat, peer: PeerId, raw: &mut Conversation, invites: &[Invite]) {
+        let wire = device_list_wire(raw, invites.to_vec());
+        bia.on_mls(peer, &wire).unwrap();
+    }
+
+    /// P24: `household` guarda no máximo `MAX_KNOWN_DEVICES`; o Peer ID novo além disso é ignorado por
+    /// inteiro (nem entra em `expected`, nem é discado), e quem já está continua lá.
+    #[tokio::test]
+    async fn my_household_stops_growing_at_the_cap_and_ignores_the_extra_device() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES)
+            .map(|_| invite_for(&bia_key))
+            .collect();
+
+        for chunk in invites.chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+        let extra = invites[MAX_KNOWN_DEVICES].peer_id();
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        assert!(!bia.household.contains_key(&extra), "o 9º foi ignorado");
+        assert!(!bia.expected.contains_key(&extra), "e não é discado");
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        assert!(bia.household.contains_key(&invites[0].peer_id()));
+    }
+
+    /// P24: o mesmo teto vale para os devices de contatos repassados por um irmão.
+    #[tokio::test]
+    async fn contact_devices_stop_growing_at_the_cap() {
+        let Household {
+            mut bia,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let cleo = StandaloneIdentity::generate();
+        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES).map(|_| invite_for(&cleo)).collect();
+
+        for chunk in invites.chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+
+        let extra = invites[MAX_KNOWN_DEVICES].peer_id();
+        assert_eq!(bia.contact_devices.len(), MAX_KNOWN_DEVICES);
+        assert!(!bia.contact_devices.contains_key(&extra));
+        assert!(!bia.expected.contains_key(&extra));
+    }
+
+    /// P24: `expected` também tem teto contra listas de contato em conexões sucessivas; mas o `accept`
+    /// (decisão explícita do usuário) nunca é cortado por ele.
+    #[tokio::test]
+    async fn expected_stops_growing_at_the_cap_but_accept_is_never_refused() {
+        let Household {
+            mut bia,
+            ana_key,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        bia.trust(ana_key.id()).unwrap();
+
+        for _ in 0..2 {
+            let invites: Vec<Invite> = (0..MAX_KNOWN_DEVICES)
+                .map(|_| invite_for(&ana_key))
+                .collect();
+            feed_list(&mut bia, ana_peer, &mut ana_raw, &invites);
+            bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        }
+        assert_eq!(bia.expected.len(), MAX_KNOWN_DEVICES);
+
+        let wanted = invite_for(&StandaloneIdentity::generate());
+        bia.accept(&wanted).unwrap();
+        assert!(bia.expected.contains_key(&wanted.peer_id()));
+    }
+
+    /// P24: discagem que falhou libera a vaga em `expected`; falha sem peer não mexe em nada.
+    #[tokio::test]
+    async fn a_failed_dial_frees_its_slot_in_expected() {
+        let Household {
+            mut bia,
+            ana,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let other = PeerId::random();
+        bia.expected.insert(ana_peer, ana.clone());
+        bia.expected.insert(other, ana);
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: None,
+            reason: "sem peer".to_string(),
+        });
+        assert_eq!(bia.expected.len(), 2, "sem peer, nada a limpar");
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(other),
+            reason: "fora do ar".to_string(),
+        });
+        assert!(!bia.expected.contains_key(&other));
+        assert!(bia.expected.contains_key(&ana_peer), "só o peer que falhou");
+    }
+
+    /// P24: re-anúncio ao irmão tem intervalo mínimo; o que chega dentro dele fica pendente e sai no
+    /// próximo evento depois do prazo, sem perder a atualização.
+    #[tokio::test]
+    async fn re_announcing_to_a_sibling_is_rate_limited_and_the_rest_waits() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        bia.connected.insert(sibling);
+        bia.sibling_announce_gap = Duration::from_secs(3600);
+        let sent = |bia: &Chat| bia.pending.len();
+        let listening = || NodeEvent::Listening("/ip4/127.0.0.1/tcp/1".parse().unwrap());
+
+        let before = sent(&bia);
+        feed_list(&mut bia, sibling, &mut raw, &[invite_for(&bia_key)]);
+        assert_eq!(sent(&bia), before + 1, "o 1º aprendizado anuncia na hora");
+        assert!(bia.sibling_pending.is_empty());
+
+        feed_list(&mut bia, sibling, &mut raw, &[invite_for(&bia_key)]);
+        assert_eq!(sent(&bia), before + 1, "dentro do intervalo: nada sai");
+        assert!(bia.sibling_pending.contains(&sibling));
+        assert_eq!(bia.household.len(), 2, "mas o aprendido não se perde");
+
+        bia.handle(listening());
+        assert!(bia.sibling_pending.contains(&sibling), "prazo não passou");
+        assert_eq!(sent(&bia), before + 1);
+
+        bia.sibling_announce_gap = Duration::ZERO;
+        bia.handle(listening());
+        assert!(bia.sibling_pending.is_empty());
+        assert_eq!(sent(&bia), before + 2, "o pendente saiu");
+    }
+
+    /// P24: envio de controle (handshake/anúncio, sem mensagem na outbox) que falha libera os anúncios
+    /// do peer para o próximo gatilho; falha de mensagem de chat não mexe neles.
+    #[tokio::test]
+    async fn a_failed_control_send_lets_the_announcements_repeat() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        bia.announced.insert(ana_peer);
+        bia.devices_announced.insert(ana_peer);
+
+        bia.transmit(ana_peer, &Envelope::Hello);
+        let chat_id = *bia.pending.keys().next().unwrap();
+        bia.pending
+            .insert(chat_id, Some(MessageId::from_bytes([7; 16])));
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id: chat_id,
+            reason: "x".to_string(),
+        });
+        assert!(bia.announced.contains(&ana_peer), "mensagem de chat");
+        assert!(bia.devices_announced.contains(&ana_peer));
+
+        bia.transmit(ana_peer, &Envelope::Hello);
+        let control_id = *bia.pending.keys().next().unwrap();
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id: control_id,
+            reason: "x".to_string(),
+        });
+        assert!(!bia.announced.contains(&ana_peer));
+        assert!(!bia.devices_announced.contains(&ana_peer));
     }
 
     /// 3.5 etapa 5 (auditoria I1): de um contato aceitam-se poucos endereços por device; de irmão, todos.
