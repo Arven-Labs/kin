@@ -777,3 +777,29 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
   maior que 4096 (documentado, não imposto).
 - **Próximo passo**: tetos do `chat` (`household`, `contact_devices`, `expected` e limpeza em `DialFailed`, taxa do
   re-anúncio) ou a dica de `/trust` para irmãos.
+
+### 2026-11-08 — Sessão 17
+
+#### Tetos e taxa no chat (P24)
+
+- **Decisões do dono** (plan mode): teto cheio ignora o Peer ID novo (sem expulsão por idade); `expected` é limpo também em
+  `DialFailed`; re-anúncio a irmão com intervalo mínimo e pendência; schema futuro vira erro em PR separado; a lista repete
+  quando o envio de controle falha; a fila de eventos do `Node` só foi documentada.
+- **Feito** (`crates/chat/src/chat.rs`): `MAX_KNOWN_DEVICES = 8` para `household`, `contact_devices` e `expected`
+  (`has_room`; o `accept` não passa por ele); `DialFailed` (e falha síncrona do dial) apaga a entrada de `expected`;
+  `re_announce_to_sibling` com `SIBLING_ANNOUNCE_MIN = 5 s`, pendentes em `sibling_pending`, descarregados em `handle` e por um
+  timer em `next_event` (`Next::Tick`); `SendFailed` de controle zera `announced` e `devices_announced`.
+  `crates/chat/Cargo.toml`: feature `time` do `tokio` (já no workspace; sem mudança no `Cargo.lock`).
+- **Desvio do plano (achado pelo CI)**: o plano previa a pendência sem timer, descarregada no próximo evento. Os dois testes de
+  integração de `multi_device` quebraram (as casas não convergiam numa rede quieta). Entrou o timer, o que custou a feature
+  `time`. Sem ele, o risco "aceito" do plano era na verdade um defeito.
+- **Testes**: 6 novos em `chat::tests`. Vermelho no CI antes da implementação (6 falhas, cada uma na asserção certa; um teste
+  foi corrigido porque contava o anúncio do `on_mls`), verde depois. 5 mutações em branches temporárias, todas pegas e
+  apagadas: `<` por `<=` no teto (3 testes), sem a limpeza em `DialFailed`, intervalo sempre vencido, sem o `remove` em
+  `SendFailed`, sem o timer (`multi_device`). O `chats_find_each_other_via_mdns_and_talk` falhou em 3 das 5 rodadas mutantes e
+  passou nas verdes: provável flaky de mDNS no CI, não investigado.
+- **PR separado** (`p24-schema-futuro`): `Outbox::migrate` recusa `user_version` maior que o conhecido, com teste vermelho e depois
+  verde.
+- **Não verificado**: o `update` de um item já presente com o mapa cheio (o `Invite` não permite trocar o endereço sem o
+  certificado); comportamento do timer em carga real; os números (8 e 5 s) em uso real.
+- **Próximo passo**: frescor e remoção de `household`/`contact_devices`; a dica de `/trust` para irmãos; roteiro com 3 devices.
