@@ -20,6 +20,17 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// aditiva: só `CREATE TABLE IF NOT EXISTS`).
 const SCHEMA_VERSION: i64 = 3;
 
+/// O que uma entrada da outbox é (ver [`Outbox::entry_kind`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    /// Mensagem comum para o device do peer.
+    Plain,
+    /// Espelho 3.5: "enviei isto a esta identidade", para um device irmão.
+    Mirror(IdentityId),
+    /// Não há entrada com esse peer e id (já saiu da fila).
+    Missing,
+}
+
 pub(crate) struct Outbox {
     conn: Connection,
 }
@@ -189,32 +200,42 @@ impl Outbox {
         Ok(())
     }
 
-    /// Para quem a mensagem `id` na fila de `peer` foi enviada, se a entrada for um espelho; `None`
-    /// para envio comum (ou se não existir). Uma identidade gravada que não decodifica é erro.
-    pub(crate) fn mirror_target(
-        &self,
-        peer: &PeerId,
-        id: &MessageId,
-    ) -> Result<Option<IdentityId>, Error> {
-        let stored: Option<Vec<u8>> = self
+    /// O que é a entrada `id` na fila de `peer`: envio comum, espelho (com a identidade de destino) ou
+    /// inexistente. Uma identidade gravada que não decodifica é erro (`Malformed`), nunca `Plain`.
+    pub(crate) fn entry_kind(&self, peer: &PeerId, id: &MessageId) -> Result<EntryKind, Error> {
+        let row: Option<Option<Vec<u8>>> = self
             .conn
             .query_row(
                 "SELECT to_identity FROM kin_outbox WHERE peer = ?1 AND id = ?2",
                 params![peer.to_string(), &id.as_bytes()[..]],
                 |row| row.get(0),
             )
+            .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 other => Err(other),
             })
             .map_err(Error::storage)?;
-        stored
-            .map(|bytes| {
+        Ok(match row {
+            None => EntryKind::Missing,
+            Some(None) => EntryKind::Plain,
+            Some(Some(bytes)) => EntryKind::Mirror(
                 PublicKey::try_decode_protobuf(&bytes)
                     .map(IdentityId::new)
-                    .map_err(|_| Error::Malformed)
-            })
-            .transpose()
+                    .map_err(|_| Error::Malformed)?,
+            ),
+        })
+    }
+
+    /// Só para teste: grava um destino que não decodifica na entrada (banco corrompido).
+    #[cfg(test)]
+    pub(crate) fn corrupt_destination(&self, peer: &PeerId, id: &MessageId) {
+        self.conn
+            .execute(
+                "UPDATE kin_outbox SET to_identity = X'00FF' WHERE peer = ?1 AND id = ?2",
+                params![peer.to_string(), &id.as_bytes()[..]],
+            )
+            .unwrap();
     }
 
     /// Mensagens esperando por `peer`, da mais antiga para a mais nova.
@@ -695,10 +716,52 @@ mod tests {
             std::slice::from_ref(&message)
         );
         assert_eq!(
-            outbox.mirror_target(&sibling, &message.id).unwrap(),
-            Some(bia)
+            outbox.entry_kind(&sibling, &message.id).unwrap(),
+            EntryKind::Mirror(bia)
         );
-        assert_eq!(outbox.mirror_target(&other, &message.id).unwrap(), None);
+        assert_eq!(
+            outbox.entry_kind(&other, &message.id).unwrap(),
+            EntryKind::Plain
+        );
+    }
+
+    // 16
+    #[test]
+    fn an_entry_that_does_not_exist_is_missing_not_plain() {
+        let (outbox, peer) = (Outbox::memory().unwrap(), peer());
+        let message = Message::new("oi".into(), None);
+
+        assert_eq!(
+            outbox.entry_kind(&peer, &message.id).unwrap(),
+            EntryKind::Missing
+        );
+        outbox.enqueue(&peer, &message).unwrap();
+        assert_eq!(
+            outbox.entry_kind(&peer, &message.id).unwrap(),
+            EntryKind::Plain
+        );
+        outbox.remove(&peer, &message.id).unwrap();
+        assert_eq!(
+            outbox.entry_kind(&peer, &message.id).unwrap(),
+            EntryKind::Missing
+        );
+    }
+
+    // 17
+    #[test]
+    fn a_stored_destination_that_does_not_decode_is_an_error_not_plain() {
+        let (outbox, sibling) = (Outbox::memory().unwrap(), peer());
+        let message = Message::new("oi".into(), None);
+        outbox
+            .enqueue_mirror(&sibling, &message, &identity())
+            .unwrap();
+
+        outbox.corrupt_destination(&sibling, &message.id);
+
+        assert!(matches!(
+            outbox.entry_kind(&sibling, &message.id),
+            Err(Error::Malformed)
+        ));
     }
 
     // 13
@@ -715,8 +778,8 @@ mod tests {
         let outbox = Outbox::open(&path).unwrap();
 
         assert_eq!(
-            outbox.mirror_target(&sibling, &message.id).unwrap(),
-            Some(bia)
+            outbox.entry_kind(&sibling, &message.id).unwrap(),
+            EntryKind::Mirror(bia)
         );
     }
 
@@ -759,17 +822,18 @@ mod tests {
             outbox.entries(&old).unwrap(),
             std::slice::from_ref(&message)
         );
-        assert_eq!(outbox.mirror_target(&old, &message.id).unwrap(), None);
+        assert_eq!(
+            outbox.entry_kind(&old, &message.id).unwrap(),
+            EntryKind::Plain
+        );
         let (sibling, mirrored) = (peer(), Message::new("nova".into(), None));
         outbox
             .enqueue_mirror(&sibling, &mirrored, &identity())
             .unwrap();
-        assert!(
-            outbox
-                .mirror_target(&sibling, &mirrored.id)
-                .unwrap()
-                .is_some()
-        );
+        assert!(matches!(
+            outbox.entry_kind(&sibling, &mirrored.id).unwrap(),
+            EntryKind::Mirror(_)
+        ));
     }
 
     // 15
@@ -797,12 +861,10 @@ mod tests {
             .enqueue_mirror(&sibling, &message, &identity())
             .unwrap();
 
-        assert!(
-            outbox
-                .mirror_target(&sibling, &message.id)
-                .unwrap()
-                .is_some()
-        );
+        assert!(matches!(
+            outbox.entry_kind(&sibling, &message.id).unwrap(),
+            EntryKind::Mirror(_)
+        ));
     }
 
     // 6

@@ -12,7 +12,7 @@ use futures::future::{self, Either};
 use futures::pin_mut;
 
 use crate::nostr::validate_peer_relays;
-use crate::outbox::Outbox;
+use crate::outbox::{EntryKind, Outbox};
 use crate::payload::Payload;
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
@@ -677,7 +677,8 @@ impl Chat {
                 break;
             }
             let plaintext = match self.outgoing_plaintext(&peer, &message) {
-                Ok(plaintext) => plaintext,
+                Ok(Some(plaintext)) => plaintext,
+                Ok(None) => continue,
                 Err(e) => return self.drop_message(peer, e),
             };
             let Some(conversation) = self.conversations.get_mut(&peer) else {
@@ -695,16 +696,32 @@ impl Chat {
     }
 
     /// O que se cifra para `peer` por esta entrada da outbox: a mensagem comum ou, se a entrada for
-    /// um espelho (3.5), o `Payload::Sent` com a identidade de destino.
-    fn outgoing_plaintext(&self, peer: &PeerId, message: &Message) -> Result<Vec<u8>, Error> {
-        Ok(match self.outbox.mirror_target(peer, &message.id)? {
-            Some(to) => Payload::Sent {
-                to,
-                message: message.clone(),
+    /// um espelho (3.5), o `Payload::Sent` com a identidade de destino. `Ok(None)` = não há o que
+    /// enviar e quem chama segue para a próxima entrada: a entrada já sumiu, ou o destino gravado está
+    /// corrompido (nunca será enviável: é apagada e avisada com `Dropped`, para não travar a fila
+    /// inteira do peer). `Err` só para falha do banco.
+    fn outgoing_plaintext(
+        &mut self,
+        peer: &PeerId,
+        message: &Message,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        match self.outbox.entry_kind(peer, &message.id) {
+            Ok(EntryKind::Plain) => Ok(Some(message.encode())),
+            Ok(EntryKind::Mirror(to)) => Ok(Some(
+                Payload::Sent {
+                    to,
+                    message: message.clone(),
+                }
+                .encode(),
+            )),
+            Ok(EntryKind::Missing) => Ok(None),
+            Err(Error::Malformed) => {
+                self.outbox.remove(peer, &message.id)?;
+                self.drop_message(*peer, Error::Malformed);
+                Ok(None)
             }
-            .encode(),
-            None => message.encode(),
-        })
+            Err(e) => Err(e),
+        }
     }
 
     /// Envia o que está na outbox do peer, do mais antigo ao mais novo, até encher a janela
@@ -724,7 +741,8 @@ impl Chat {
                 continue;
             }
             let plaintext = match self.outgoing_plaintext(&peer, &message) {
-                Ok(plaintext) => plaintext,
+                Ok(Some(plaintext)) => plaintext,
+                Ok(None) => continue,
                 Err(e) => return self.drop_message(peer, e),
             };
             let Some(conversation) = self.conversations.get_mut(&peer) else {
@@ -845,12 +863,20 @@ impl Chat {
             },
             NodeEvent::MessageDelivered { peer, id } => {
                 if let Some(Some(message)) = self.pending.remove(&id) {
-                    // O ack fecha o ciclo: sai da fila e libera uma vaga na janela.
+                    // O ack fecha o ciclo: sai da fila e libera uma vaga na janela. Só o ack de um
+                    // device do destinatário é "entregue": o de um irmão (espelho) só libera a fila.
+                    // O tipo tem de ser lido ANTES do `remove`, que apaga a linha.
+                    let mirror = matches!(
+                        self.outbox.entry_kind(&peer, &message),
+                        Ok(EntryKind::Mirror(_))
+                    );
                     self.leave_flight(peer, &message);
                     if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
-                    self.queue.push_back(ChatEvent::Delivered { peer, message });
+                    if !mirror {
+                        self.queue.push_back(ChatEvent::Delivered { peer, message });
+                    }
                     self.flush(peer);
                 }
             }
@@ -1168,6 +1194,11 @@ impl Chat {
     ) -> Result<(), Error> {
         if sender != self.device.identity() {
             return Err(Error::UnauthorizedMirror);
+        }
+        // `send_to` nunca espelha para a minha própria identidade (o irmão já recebe a mensagem
+        // comum): um espelho assim vem de um irmão defeituoso ou hostil.
+        if to == *self.device.identity() {
+            return Err(Error::Malformed);
         }
         if !self.outbox.mark_seen(&peer, &message.id)? {
             return Ok(());
@@ -2642,8 +2673,116 @@ mod tests {
         let id = bia.send_to(&ana, "oi", None).unwrap();
 
         assert_eq!((bia.queued(&sibling), bia.queued(&ana_peer)), (1, 1));
-        assert_eq!(bia.outbox.mirror_target(&sibling, &id).unwrap(), Some(ana));
-        assert_eq!(bia.outbox.mirror_target(&ana_peer, &id).unwrap(), None);
+        assert_eq!(
+            bia.outbox.entry_kind(&sibling, &id).unwrap(),
+            EntryKind::Mirror(ana)
+        );
+        assert_eq!(
+            bia.outbox.entry_kind(&ana_peer, &id).unwrap(),
+            EntryKind::Plain
+        );
+    }
+
+    /// P24: o ack de um device IRMÃO (espelho) só libera a fila: quem diz "entregue" é o device do
+    /// destinatário. O ack do device do contato continua emitindo `Delivered`.
+    #[tokio::test]
+    async fn a_siblings_ack_frees_the_queue_without_reporting_delivery() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        bia.handle(NodeEvent::PeerConnected(sibling));
+        let id = bia.send_to(&ana, "oi", None).unwrap();
+        events(&mut bia);
+
+        bia.handle(NodeEvent::MessageDelivered {
+            peer: sibling,
+            id: first_in_flight(&bia),
+        });
+
+        assert_eq!(bia.queued(&sibling), 0, "saiu da fila");
+        let after_sibling = events(&mut bia);
+        assert!(
+            !after_sibling
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "irmão não é entrega: {after_sibling:?}"
+        );
+
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        bia.handle(NodeEvent::MessageDelivered {
+            peer: ana_peer,
+            id: first_in_flight(&bia),
+        });
+        assert!(
+            events(&mut bia).contains(&ChatEvent::Delivered {
+                peer: ana_peer,
+                message: id
+            }),
+            "o contato entrega"
+        );
+    }
+
+    /// P24: uma entrada de espelho com destino corrompido não trava a fila do peer: é apagada, avisada
+    /// com `Dropped`, e a próxima mensagem sai.
+    #[tokio::test]
+    async fn a_corrupt_mirror_entry_is_dropped_and_does_not_block_the_queue() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        let broken = bia.send_to(&ana, "quebrada", None).unwrap();
+        let healthy = bia.send_to(&ana, "boa", None).unwrap();
+        bia.outbox.corrupt_destination(&sibling, &broken);
+        events(&mut bia);
+
+        bia.handle(NodeEvent::PeerConnected(sibling));
+
+        let all = events(&mut bia);
+        assert!(
+            all.iter()
+                .any(|e| matches!(e, ChatEvent::Dropped { peer, .. } if *peer == sibling)),
+            "avisa: {all:?}"
+        );
+        assert_eq!(
+            bia.outbox.entry_kind(&sibling, &broken).unwrap(),
+            EntryKind::Missing,
+            "a entrada ruim foi apagada"
+        );
+        assert_eq!(bia.queued(&sibling), 1, "só a boa resta");
+        assert_eq!(in_flight(&bia), 1, "e ela já saiu");
+        assert_eq!(bia.in_flight[&sibling].iter().next(), Some(&healthy));
+    }
+
+    /// P24: um espelho "para a minha própria identidade" nunca sai de um irmão honesto (`send_to` o
+    /// pula); se chegar, é defeito ou ataque e não vira `SentElsewhere`.
+    #[tokio::test]
+    async fn a_mirror_addressed_to_my_own_identity_is_refused() {
+        let Household {
+            mut bia,
+            bia_identity,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let payload = Payload::Sent {
+            to: bia_identity,
+            message: Message::new("para mim".into(), None),
+        };
+        let wire = sibling_raw.encrypt(&payload.encode()).unwrap();
+
+        let err = bia.on_mls(sibling, &wire).unwrap_err();
+
+        assert!(matches!(err, Error::Malformed), "{err:?}");
+        assert!(
+            !events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::SentElsewhere { .. }))
+        );
     }
 
     /// 3.5 etapa 4: mensagem para a própria identidade ("notas para mim") não é espelhada: o irmão
@@ -2660,7 +2799,10 @@ mod tests {
         let id = bia.send_to(&bia_identity, "nota", None).unwrap();
 
         assert_eq!(bia.queued(&sibling), 1, "uma cópia só");
-        assert_eq!(bia.outbox.mirror_target(&sibling, &id).unwrap(), None);
+        assert_eq!(
+            bia.outbox.entry_kind(&sibling, &id).unwrap(),
+            EntryKind::Plain
+        );
         let queued = events(&mut bia)
             .into_iter()
             .filter(|e| matches!(e, ChatEvent::Queued { peer, .. } if *peer == sibling))

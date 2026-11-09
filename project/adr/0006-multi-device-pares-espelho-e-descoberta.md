@@ -104,10 +104,12 @@ precisa que uma mensagem a uma identidade chegue em todos os devices dela e apar
    swarm, `DialFailed` enche a fila de eventos, `Node::deferred` sem teto); `household` sem teto, frescor nem remoção;
    `expected` sem teto e só limpo em `ready`; re-anúncio sem limite de taxa; uma transmissão que falha não repete a lista
    na conexão.
-3. **Espelho e recibo:** o `Delivered` do irmão usa o mesmo `MessageId` e a CLI imprime "entregue" mesmo com o device do
-   contato offline; `mirror_target` confunde "sem linha" com "não é espelho", e um `to_identity` corrompido trava a fila
-   daquele peer; o `ALTER TABLE` do schema v2 não é idempotente em banco híbrido, e versão de schema maior que a
-   conhecida é aceita em silêncio.
+3. **Espelho e recibo** (**corrigido na Sessão 16**, exceto o que está dito): o ack de um irmão não emite mais `Delivered`
+   (só libera a fila; `Delivered` = chegou a um device do destinatário); `mirror_target` virou `entry_kind` (`Plain`,
+   `Mirror`, `Missing`); uma entrada com `to_identity` corrompido é apagada e avisada com `Dropped` em vez de travar a fila
+   do peer; `on_sent` recusa espelho cujo destino é a minha identidade. **Ainda aberto**: o `kin_seen` compartilhado entre
+   `Message` e `Sent` (separar pede schema v4), o `ALTER TABLE` do schema v2 em banco híbrido (sem teste) e a versão de
+   schema maior que a conhecida, aceita em silêncio.
 4. **Certificado sem prova de posse do device** (a identidade assina as chaves, o device não assina nada): mudança de
    cripto, só com confirmação (AGENTS.md §4).
 5. ~~Pareamento (etapa 6)~~ (feito na Sessão 16) e o roteiro manual com 2 processos da mesma identidade e relay real.

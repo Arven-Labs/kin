@@ -721,3 +721,20 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Resíduo**: `--pair` inválido deixa o `--data-dir` criado e vazio (`create_dir_all` antes de validar).
 - **Próximo passo**: roteiro com 3 devices (espelho e descoberta) e relay real; esconder a dica de `/trust` para irmãos; o
   resto do P24.
+
+#### Sessão 16, parte 4: espelho e recibo (P24)
+
+- **Decisões do dono** (plan mode): o ack de um irmão não emite `Delivered`; entrada de espelho corrompida é apagada e
+  avisada com `Dropped`; o `kin_seen` compartilhado fica para um PR próprio (schema v4).
+- **Feito**: `Outbox::mirror_target` virou `entry_kind` (`EntryKind::{Plain, Mirror, Missing}`; destino que não decodifica
+  continua `Err(Malformed)`); `outgoing_plaintext` pula entrada sumida e apaga+avisa a corrompida, em vez de `return`
+  (que parava a fila inteira do peer, nos dois laços: envio direto e depósito); `MessageDelivered` lê o tipo antes do
+  `remove` e não emite `Delivered` para espelho; `on_sent` recusa `to` igual à minha identidade.
+- **Testes**: 5 novos (`chat`: ack do irmão sem `Delivered` e do contato com; entrada corrompida não trava a fila; espelho
+  para mim mesmo recusado; `outbox`: `Missing` não é `Plain`; destino corrompido é erro). Rodados pelo dono (ADR 0009):
+  `kin-chat --lib` 98 → 103 passam e clippy sem avisos. O vermelho antes da implementação **não foi mostrado** (a
+  implementação veio antes da primeira execução). Três mutações pegas e revertidas, cada uma pelo teste certo: `Delivered`
+  sempre emitido, entrada corrompida voltando a travar a fila, checagem do `to` removida.
+- **Não verificado**: ponta a ponta com 3 devices reais e relay real; o texto "entregue" na CLI para espelho não foi
+  exercitado no binário; o caminho do depósito (`Mailbox`) com entrada corrompida não tem teste próprio (só o envio direto).
+- **Próximo passo**: `kin_seen` separado (schema v4); depois tetos de abuso (fatia B) e a dica de `/trust`.
