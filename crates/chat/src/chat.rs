@@ -156,7 +156,7 @@ const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
 /// Quantas vezes se reenvia cada mensagem de handshake (`Hello`, `KeyPackage`, `Welcome`) a um peer
 /// por conexão quando o envio falha (P25). A conta é por tipo.
-const MAX_HANDSHAKE_RETRIES: u8 = 3;
+const MAX_HANDSHAKE_RETRIES: u8 = 103;
 
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
