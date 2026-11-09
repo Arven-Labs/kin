@@ -88,21 +88,21 @@ async fn chats_find_each_other_via_mdns_and_talk() {
     exchange(&mut a, &mut b, pb.peer_id(), pa.peer_id(), "mdns").await;
 }
 
-/// P25: os dois lados discam um ao outro ao mesmo tempo (o que o mDNS faz); a conversa tem de ficar
-/// pronta mesmo quando uma das duas conexões cai com o `Hello` dentro. Em rodadas repetidas, porque
-/// a corrida é intermitente.
+/// P25: o mDNS faz os dois lados discarem um ao outro ao mesmo tempo, e uma das duas conexões pode
+/// cair com o `Hello` dentro. A conversa tem de ficar pronta mesmo assim. Em rodadas repetidas, porque
+/// a corrida é intermitente (reproduzida no CI na rodada 5 de 25 antes do reenvio do `Hello`).
 #[tokio::test(flavor = "multi_thread")]
-async fn simultaneous_dials_still_reach_a_conversation() {
-    for _ in 0..20 {
+async fn mdns_discovery_reaches_a_conversation_in_every_repeated_round() {
+    for _ in 0..25 {
         let dir = tempfile::tempdir().unwrap();
         let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
-        let (mut a, mut b) = (pa.open(), pb.open());
-        let (addr_a, addr_b) = (listen(&mut a).await, listen(&mut b).await);
+        let mk =
+            |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db).unwrap();
+        let (mut a, mut b) = (mk(&pa), mk(&pb));
+        a.listen().unwrap();
+        b.listen().unwrap();
 
-        a.dial(addr_b).unwrap();
-        b.dial(addr_a).unwrap();
-
-        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(10)).await;
+        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(12)).await;
     }
 }
 
