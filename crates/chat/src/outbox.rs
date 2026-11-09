@@ -123,7 +123,14 @@ impl Outbox {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(Error::storage)?;
-        if version >= SCHEMA_VERSION {
+        // Versão futura (o app foi rebaixado): este código não conhece o esquema, então recusa em vez de
+        // ler ou gravar errado. Não toca no banco.
+        if version > SCHEMA_VERSION {
+            return Err(Error::storage(format!(
+                "outbox schema v{version} is newer than this build supports (v{SCHEMA_VERSION})"
+            )));
+        }
+        if version == SCHEMA_VERSION {
             return Ok(());
         }
         let has_old: bool = conn
@@ -729,6 +736,29 @@ mod tests {
 
         assert_eq!(outbox.entries(&peer).unwrap().len(), 1);
         assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
+    }
+
+    /// P24: banco de uma versão futura (downgrade do app) não abre em silêncio: este código não conhece
+    /// o esquema e poderia ler ou gravar errado. O banco fica intocado.
+    #[test]
+    fn a_database_from_a_newer_schema_is_refused_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        drop(Outbox::open(&path).unwrap());
+        let future = SCHEMA_VERSION + 1;
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!("PRAGMA user_version = {future};"))
+            .unwrap();
+
+        let result = Outbox::open(&path);
+
+        assert!(matches!(result, Err(Error::Storage(_))), "recusa");
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, future, "a versão não foi rebaixada");
     }
 
     fn identity() -> IdentityId {
