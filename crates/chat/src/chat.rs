@@ -977,7 +977,6 @@ impl Chat {
             return;
         }
         self.household.remove(peer);
-        self.contact_devices.remove(peer);
     }
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
