@@ -75,32 +75,21 @@ fn has_dropped(events: &[ChatEvent]) -> bool {
 
 /// 1. Duas instâncias se acham sozinhas na LAN e conversam, sem ninguém discar.
 ///
-/// Repetido em rodadas (P25): o mDNS faz os dois lados discarem um ao outro ao mesmo tempo, e uma das
-/// duas conexões pode cair com o `Hello` dentro; a falha é intermitente (~1 em 6 no CI), então uma
-/// rodada só não a pega. Tem de ser UM teste só: dois testes de mDNS no mesmo binário rodam em
-/// paralelo no mesmo host e descobrem os chats um do outro.
+/// Tem de ser o ÚNICO teste de mDNS deste binário e rodar uma rodada só: dois testes de mDNS em
+/// paralelo no mesmo host descobrem os chats um do outro, e rodadas seguidas no mesmo processo
+/// discam os peers mortos das rodadas anteriores (o mDNS os anuncia até o TTL expirar).
 #[tokio::test(flavor = "multi_thread")]
 async fn chats_find_each_other_via_mdns_and_talk() {
-    for round in 0..25 {
-        let dir = tempfile::tempdir().unwrap();
-        let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
-        let mk =
-            |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db).unwrap();
-        let (mut a, mut b) = (mk(&pa), mk(&pb));
-        a.listen().unwrap();
-        b.listen().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let mk = |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db).unwrap();
+    let (mut a, mut b) = (mk(&pa), mk(&pb));
+    a.listen().unwrap();
+    b.listen().unwrap();
 
-        // Mesmo prazo do teste de mDNS do transporte (lan.rs).
-        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(30)).await;
-        exchange(
-            &mut a,
-            &mut b,
-            pb.peer_id(),
-            pa.peer_id(),
-            &format!("mdns {round}"),
-        )
-        .await;
-    }
+    // Mesmo prazo do teste de mDNS do transporte (lan.rs).
+    connect_until_ready_within(&mut a, &mut b, Duration::from_secs(30)).await;
+    exchange(&mut a, &mut b, pb.peer_id(), pa.peer_id(), "mdns").await;
 }
 
 /// 2. Com a outbox (3.2), enviar a um peer que caiu deixa a mensagem na fila (`Queued`), nunca
