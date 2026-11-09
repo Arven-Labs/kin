@@ -120,7 +120,7 @@ async fn dial_with_wrong_peer_id_is_rejected() {
 /// porque a falha é estocástica.
 #[tokio::test(flavor = "multi_thread")]
 async fn simultaneous_tcp_dial_connects_both_ways() {
-    const ROUNDS: usize = 10;
+    const ROUNDS: usize = 50;
     for round in 0..ROUNDS {
         let (key_a, key_b) = (DeviceKey::generate(), DeviceKey::generate());
         let (mut a, mut b) = (node(&key_a), node(&key_b));
