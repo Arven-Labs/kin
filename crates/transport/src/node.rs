@@ -393,8 +393,18 @@ impl Node {
                         if self.swarm.is_connected(&peer) {
                             continue;
                         }
+                        // Porta de origem nova (P25 c): o padrão do libp2p disca da porta de escuta, e
+                        // quando os dois lados se descobrem juntos (o normal no mDNS) os sockets têm o
+                        // mesmo par de portas, viram um TCP simultaneous open e o Noise falha (medido:
+                        // 40 a 79% das rodadas em loopback; com porta nova, 0 em 800). O reuso de porta
+                        // só serve para furar NAT, e na LAN não há NAT.
                         // Falha ao discar aqui não é fatal: o mDNS reanuncia depois.
-                        let _ = self.swarm.dial(addr.clone());
+                        let _ = self.swarm.dial(
+                            DialOpts::unknown_peer_id()
+                                .address(addr.clone())
+                                .allocate_new_port()
+                                .build(),
+                        );
                         first.get_or_insert((peer, addr));
                     }
                     if let Some((peer, addr)) = first {
