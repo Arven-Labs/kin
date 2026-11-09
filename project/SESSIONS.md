@@ -821,3 +821,17 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Não verificado**: comportamento com relay e rede reais; se um irmão que reanuncia sempre o mesmo item morto causa discagem
   repetida (limitado pelo intervalo de 5 s, sem medição).
 - **Próximo passo**: a dica de `/trust` para irmãos; roteiro com 3 devices; investigar o flaky de mDNS.
+
+#### Diagnóstico do flaky de mDNS (P25)
+
+- **Medido antes**: `chats_find_each_other_via_mdns_and_talk` falhou em ~8 das ~60 últimas rodadas do `ci.yml` (inclusive de
+  mutação, sem relação com o código); o irmão do transporte (`transport/tests/lan.rs`) nunca. O painel só dizia `Elapsed`.
+- **Feito** (PR separado, só testes): `connect_until_ready_within` passa a falhar com os eventos vistos por `a` e `b`. Um loop
+  temporário (PR #46, fechado) repetiu o cenário 25 vezes e travou na rodada 5.
+- **Achado** (run 42622173934): os dois lados têm `PeerConnected` e depois `SendFailed { message: None, "Connection was closed
+  before a response was received" }`; um deles tem também `DialFailed "Dial error"`. O `Hello` se perde numa conexão que cai e
+  nada o reenvia. **Isolado**: onde trava (`Hello` sem reenvio). **Não isolado**: por que a conexão cai (dial simultâneo é a
+  hipótese; falta provar com log do transporte). Ruído do loop: os eventos mostram discagens a Peer IDs das rodadas anteriores
+  (mDNS ainda os anunciava), então a taxa dentro do loop pode diferir da do teste isolado.
+- **Não feito**: a correção (vira o P25, plano próprio).
+- **Próximo passo**: plano da correção do P25; depois a dica de `/trust` e o roteiro de 3 devices.
