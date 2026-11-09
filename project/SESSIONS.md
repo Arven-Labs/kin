@@ -878,3 +878,16 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
   por outro teste de mDNS em paralelo.
 - **Não verificado**: 3 ou mais devices na mesma LAN; `Welcome` perdido por outra causa; o P19.
 - **Próximo passo**: acompanhar o CI; P25 (c) com `allocate_new_port` fora do `lab/`; dica de `/trust`; roteiro de 3 devices.
+
+#### P25 (c): dial TCP simultâneo com porta nova (PR #51)
+
+- **Decisões do dono** (plan mode): porta nova só nos dials sem circuito (`Node::dial`, `dial_peer`, mDNS); circuito relay e DCUtR
+  seguem com reuso. Prova por teste de integração estatístico.
+- **Feito** (`crates/transport/src/node.rs`): `allocate_new_port()` nesses três pontos. O relay é discado por `listen_on(circuito)`,
+  fora de `start_dial`, então o reuso do hole punching não mudou.
+- **Teste**: `simultaneous_tcp_dial_connects_both_ways`. A versão de 10 rodadas **passou sem a correção** (não provava nada); com 50
+  rodadas falhou na rodada 1 no CI sem a correção, e com ela passou 5 de 5 execuções (250 rodadas). Mutação (condição invertida em
+  `dial_peer`) pega; a primeira versão da mutação (dois ramos iguais) não passou no clippy e foi refeita.
+- **Não verificado**: o `lab/` de NAT (não roda no CI); o braço mDNS não tem teste próprio; evidência estatística, sem repro
+  determinístico.
+- **Próximo passo**: P25 (d) (`KeyPackage`/`Welcome` perdidos); dica de `/trust`; roteiro de 3 devices; rodar o `lab/` no PR.
