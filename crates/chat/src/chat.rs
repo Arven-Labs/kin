@@ -960,11 +960,24 @@ impl Chat {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
                     self.expected.remove(&peer);
+                    self.forget_unreachable(&peer);
                 }
                 self.queue.push_back(ChatEvent::DialFailed { peer, reason });
             }
             NodeEvent::PeerDiscovered(..) | NodeEvent::PeerIdentified { .. } => {}
         }
+    }
+
+    /// A discagem a `peer` falhou: esquece o convite dele em `household` e `contact_devices`, o que
+    /// libera a vaga do teto e o tira da lista que repasso. Só se não há conversa nem conexão com ele:
+    /// com qualquer das duas ele é alcançável e a falha é só de um endereço velho. Se um irmão
+    /// reanunciar o item, ele volta.
+    fn forget_unreachable(&mut self, peer: &PeerId) {
+        if self.conversations.contains_key(peer) || self.connected.contains(peer) {
+            return;
+        }
+        self.household.remove(peer);
+        self.contact_devices.remove(peer);
     }
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
@@ -1151,6 +1164,7 @@ impl Chat {
             self.expected.insert(device, owner);
             if let Err(e) = self.node.dial_peer(device, addrs) {
                 self.expected.remove(&device);
+                self.forget_unreachable(&device);
                 self.queue.push_back(ChatEvent::DialFailed {
                     peer: Some(device),
                     reason: e.to_string(),
