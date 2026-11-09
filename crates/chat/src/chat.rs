@@ -2557,6 +2557,8 @@ mod tests {
         let sent = |bia: &Chat| bia.pending.len();
         let listening = || NodeEvent::Listening("/ip4/127.0.0.1/tcp/1".parse().unwrap());
 
+        // Anuncia antes: assim o `on_mls` não anuncia por conta própria e só o re-anúncio é contado.
+        bia.announce_devices(sibling);
         let before = sent(&bia);
         feed_list(&mut bia, sibling, &mut raw, &[invite_for(&bia_key)]);
         assert_eq!(sent(&bia), before + 1, "o 1º aprendizado anuncia na hora");
