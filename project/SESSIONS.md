@@ -858,3 +858,23 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
   (P25 c); comportamento com rede real.
 - **Próximo passo**: acompanhar o CI por alguns PRs (se o flaky voltar, o painel de eventos mostra onde); investigar P25 (c); a dica
   de `/trust`; roteiro de 3 devices.
+
+#### P25 (c) e a causa dominante do flaky de mDNS (PR #50)
+
+- **Experimento descartável** (transporte, loopback, dial TCP simultâneo): reuso de porta (padrão) falhou em 3 de 4 execuções de 200
+  rodadas (40 a 79% das rodadas; 2% e 0% nas outras), porta nova **0 em 800**. A primeira versão (10 rodadas) passou por sorte e quase
+  me fez descartar a hipótese certa: amostra pequena demais.
+- **O flaky continuava** (2 de 8 no CI depois do `Hello` e da porta nova), com `Route` ×5 e `Dial error` nos dumps. Lendo o código:
+  `Discovered` dava um `swarm.dial(addr)` por endereço (tcp e quic em cada interface), até 5 conexões ao mesmo peer contra o teto
+  `max_established_per_peer = 4`. As excedentes eram negadas e as requisições em voo se perdiam (`Hello`, `Welcome`, mensagem de chat
+  que vira `Queued`).
+- **Feito** (`crates/transport/src/node.rs`, PR #50): um dial por peer com todos os endereços (`DialOpts::peer_id(..).addresses(..)`).
+  O tie-break "só um lado disca" foi descartado: o mDNS do libp2p é assimétrico e o par com o mais novo de maior ID ficaria sem
+  conexão. Porta nova no dial do mDNS (PR #49) foi fechada: o um-dial-por-peer a torna desnecessária ali.
+- **Evidência**: 16 de 17 execuções do CI sem falha do teste de mDNS (antes ≈25%). O teste de contagem de conexões que escrevi ficou
+  vermelho antes (5 conexões) e verde depois, mas falhou 1 de 17 com a correção (4 conexões) e foi **removido** do PR. Sem teste
+  determinístico do fix: a prova é estatística.
+- **Errei no caminho**: tratei o "17 de 17" do #48 como sinal de cura e não era; li o diagnóstico do #46 sobre um teste contaminado
+  por outro teste de mDNS em paralelo.
+- **Não verificado**: 3 ou mais devices na mesma LAN; `Welcome` perdido por outra causa; o P19.
+- **Próximo passo**: acompanhar o CI; P25 (c) com `allocate_new_port` fora do `lab/`; dica de `/trust`; roteiro de 3 devices.
