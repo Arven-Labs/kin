@@ -107,9 +107,12 @@ precisa que uma mensagem a uma identidade chegue em todos os devices dela e apar
 3. **Espelho e recibo** (**corrigido na Sessão 16**, exceto o que está dito): o ack de um irmão não emite mais `Delivered`
    (só libera a fila; `Delivered` = chegou a um device do destinatário); `mirror_target` virou `entry_kind` (`Plain`,
    `Mirror`, `Missing`); uma entrada com `to_identity` corrompido é apagada e avisada com `Dropped` em vez de travar a fila
-   do peer; `on_sent` recusa espelho cujo destino é a minha identidade. **Ainda aberto**: o `kin_seen` compartilhado entre
-   `Message` e `Sent` (separar pede schema v4), o `ALTER TABLE` do schema v2 em banco híbrido (sem teste) e a versão de
-   schema maior que a conhecida, aceita em silêncio.
+   do peer; `on_sent` recusa espelho cujo destino é a minha identidade. O `kin_seen` foi separado (schema v4, tabela
+   `kin_seen_mirror`, `SeenKind { Message, Mirror }`): cada tipo tem a sua memória de ids, com teto próprio de 1024 por
+   peer; espelhos não expulsam mais ids de mensagens comuns nem se confundem com uma mensagem de mesmo id. Os ids de espelho
+   já gravados em `kin_seen` antes do v4 não foram migrados (não há marca que os distinga): um espelho reentregue logo
+   após o upgrade pode aparecer uma vez a mais. **Ainda aberto**: o `ALTER TABLE` do schema v2 em banco híbrido (sem
+   teste) e a versão de schema maior que a conhecida, aceita em silêncio.
 4. **Certificado sem prova de posse do device** (a identidade assina as chaves, o device não assina nada): mudança de
    cripto, só com confirmação (AGENTS.md §4).
 5. ~~Pareamento (etapa 6)~~ (feito na Sessão 16) e o roteiro manual com 2 processos da mesma identidade e relay real.

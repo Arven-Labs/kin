@@ -12,7 +12,7 @@ use futures::future::{self, Either};
 use futures::pin_mut;
 
 use crate::nostr::validate_peer_relays;
-use crate::outbox::{EntryKind, Outbox};
+use crate::outbox::{EntryKind, Outbox, SeenKind};
 use crate::payload::Payload;
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
@@ -1150,7 +1150,10 @@ impl Chat {
                     Payload::Message(message) => {
                         // Nova tentativa do remetente = outros bytes cifrados, o MLS não vê
                         // repetição; quem identifica a mesma mensagem é o `MessageId`.
-                        if !self.outbox.mark_seen(&peer, &message.id)? {
+                        if !self
+                            .outbox
+                            .mark_seen(&peer, &message.id, SeenKind::Message)?
+                        {
                             return Ok(());
                         }
                         self.queue.push_back(ChatEvent::Received {
@@ -1200,7 +1203,10 @@ impl Chat {
         if to == *self.device.identity() {
             return Err(Error::Malformed);
         }
-        if !self.outbox.mark_seen(&peer, &message.id)? {
+        if !self
+            .outbox
+            .mark_seen(&peer, &message.id, SeenKind::Mirror)?
+        {
             return Ok(());
         }
         self.queue
@@ -1535,7 +1541,78 @@ mod tests {
             bia.on_mls(ana_peer, &wire(&mut ana, &i.to_string()))
                 .unwrap();
         }
-        assert_eq!(bia.outbox.seen_count(&ana_peer).unwrap(), SEEN_LIMIT);
+        assert_eq!(
+            bia.outbox.seen_count(&ana_peer, SeenKind::Message).unwrap(),
+            SEEN_LIMIT
+        );
+    }
+
+    /// P24: espelhos não gastam a memória de mensagens comuns do mesmo peer. Antes, `SEEN_LIMIT + 5`
+    /// espelhos expulsavam o id de `M`, e `M` reentregue aparecia de novo.
+    #[tokio::test]
+    async fn many_mirrors_do_not_make_an_old_message_reappear() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let old = Message::new("antiga".into(), None);
+        let old_wire = sibling_raw.encrypt(&old.encode()).unwrap();
+        bia.on_mls(sibling, &old_wire).unwrap();
+        for i in 0..SEEN_LIMIT + 5 {
+            let mirror = Payload::Sent {
+                to: ana.clone(),
+                message: Message::new(i.to_string(), None),
+            };
+            let wire = sibling_raw.encrypt(&mirror.encode()).unwrap();
+            bia.on_mls(sibling, &wire).unwrap();
+        }
+        events(&mut bia);
+
+        let again = sibling_raw.encrypt(&old.encode()).unwrap();
+        bia.on_mls(sibling, &again).unwrap();
+
+        assert!(
+            received_texts(&events(&mut bia)).is_empty(),
+            "a mensagem antiga reapareceu"
+        );
+        assert_eq!(
+            bia.outbox.seen_count(&sibling, SeenKind::Mirror).unwrap(),
+            SEEN_LIMIT,
+            "o teto vale para os espelhos também"
+        );
+    }
+
+    /// P24: um espelho e uma mensagem com o MESMO `MessageId` do mesmo peer são coisas diferentes:
+    /// os dois aparecem (antes, o segundo era descartado como repetição).
+    #[tokio::test]
+    async fn a_mirror_and_a_message_sharing_an_id_are_both_shown() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let message = Message::new("mesmo id".into(), None);
+        let plain = sibling_raw.encrypt(&message.encode()).unwrap();
+        let mirror = Payload::Sent {
+            to: ana.clone(),
+            message: message.clone(),
+        };
+        let mirrored = sibling_raw.encrypt(&mirror.encode()).unwrap();
+
+        bia.on_mls(sibling, &plain).unwrap();
+        bia.on_mls(sibling, &mirrored).unwrap();
+
+        let all = events(&mut bia);
+        assert_eq!(received_texts(&all), ["mesmo id"]);
+        assert!(
+            all.iter().any(
+                |e| matches!(e, ChatEvent::SentElsewhere { message: m, .. } if m.id == message.id)
+            ),
+            "o espelho também aparece: {all:?}"
+        );
     }
 
     /// Espera até 2 s por um evento que o filtro aceita (o mailbox entrega por `next_event`).
