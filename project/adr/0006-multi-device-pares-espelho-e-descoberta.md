@@ -100,8 +100,11 @@ precisa que uma mensagem a uma identidade chegue em todos os devices dela e apar
 ## Em aberto
 
 1. **Persistir a confiança** (hoje `trusted` é só memória) e ter uma lista de contatos de verdade (liga com D5 e P11).
-2. **Limites que sobraram:** quem controla uma identidade gera Peer IDs novos a cada mensagem (sem `ConnectionLimits` no
-   swarm, `DialFailed` enche a fila de eventos, `Node::deferred` sem teto); `household` sem teto, frescor nem remoção;
+2. **Limites que sobraram:** quem controla uma identidade gera Peer IDs novos a cada mensagem. **Transporte, corrigido na
+   Sessão 16:** `NodeConfig.connection_limits` (`ConnectionLimits`; padrão de cliente 256 no total, 128 de entrada, 32
+   entradas pendentes, 32 discagens pendentes, 4 por peer; padrão de relay 4096/4096/256/32/8), os relays configurados
+   ficam fora do teto (bypass) e `Node::deferred` tem teto de 64 dials. **Ainda aberto, no `chat`:** `household` sem teto,
+   frescor nem remoção;
    `expected` sem teto e só limpo em `ready`; re-anúncio sem limite de taxa; uma transmissão que falha não repete a lista
    na conexão.
 3. **Espelho e recibo** (**corrigido na Sessão 16**, exceto o que está dito): o ack de um irmão não emite mais `Delivered`

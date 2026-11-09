@@ -10,8 +10,8 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, identify, identity::Keypair, mdns,
-    noise, relay, tcp, yamux,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, connection_limits, dcutr, identify,
+    identity::Keypair, mdns, noise, relay, tcp, yamux,
 };
 
 use crate::codec::{MessageCodec, PROTOCOL};
@@ -21,10 +21,16 @@ use crate::{Error, NodeConfig};
 /// Quanto esperar a reserva no relay antes de discar um circuito mesmo assim.
 const RELAY_WAIT: Duration = Duration::from_secs(10);
 
+/// Quantos dials de circuito podem esperar a reserva no relay ao mesmo tempo. Passou disso, o dial
+/// falha na hora em vez de a fila crescer sem limite.
+const MAX_DEFERRED: usize = 64;
+
 const PROTOCOL_VERSION: &str = concat!("/kin/", env!("CARGO_PKG_VERSION"));
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    /// Tetos de conexão (ver [`crate::ConnectionLimits`]); primeiro, para negar antes dos demais.
+    limits: connection_limits::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     messages: request_response::Behaviour<MessageCodec>,
@@ -158,6 +164,9 @@ impl Node {
                     },
                 );
                 Ok(Behaviour {
+                    limits: connection_limits::Behaviour::new(
+                        config.effective_connection_limits().into(),
+                    ),
                     mdns: mdns.into(),
                     identify,
                     messages,
@@ -181,8 +190,17 @@ impl Node {
         for addr in &config.external_addrs {
             node.swarm.add_external_address(addr.clone());
         }
+        node.bypass_relays();
         node.fill_relays();
         Ok(node)
+    }
+
+    /// Os relays configurados ficam fora dos tetos de conexão: um nó cheio de estranhos não pode ficar
+    /// sem falar com o próprio relay (perderia a alcançabilidade em silêncio).
+    fn bypass_relays(&mut self) {
+        for stat in self.relays.stats() {
+            self.swarm.behaviour_mut().limits.bypass_peer_id(&stat.peer);
+        }
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -202,6 +220,7 @@ impl Node {
     /// outros peers discam `Node::circuit_address(addr)`.
     pub fn add_relay(&mut self, addr: Multiaddr) -> Result<(), Error> {
         self.relays.add(addr)?;
+        self.bypass_relays();
         self.awaiting_relay |= self.relays.active() == 0;
         self.fill_relays();
         Ok(())
@@ -286,6 +305,9 @@ impl Node {
 
     fn start_dial(&mut self, opts: DialOpts, circuit: bool) -> Result<(), Error> {
         if circuit && self.awaiting_relay {
+            if self.deferred.len() >= MAX_DEFERRED {
+                return Err(Error::Dial("fila de discagens adiadas cheia".into()));
+            }
             self.deferred.push(opts);
             self.deferred_deadline
                 .get_or_insert_with(|| tokio::time::Instant::now() + RELAY_WAIT);
