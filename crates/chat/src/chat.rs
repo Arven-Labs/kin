@@ -2913,15 +2913,150 @@ mod tests {
         only_pending(&bia);
     }
 
-    /// P25: só o `Hello` é reenviado; outro envio de controle que falha não vira reenvio.
+    /// P25: só o handshake (`Hello`, `KeyPackage`, `Welcome`) é reenviado; outro envio de controle
+    /// (mensagem MLS de anúncio) que falha não vira reenvio.
     #[tokio::test]
-    async fn a_failed_non_hello_control_send_is_not_resent() {
+    async fn a_failed_mls_control_send_is_not_resent() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.connected.insert(peer);
+        bia.transmit(peer, &Envelope::Mls(vec![1]));
+        let id = only_pending(&bia);
+
+        fail_send(&mut bia, peer, id);
+
+        assert!(bia.pending.is_empty());
+    }
+
+    /// P25 (d): o `KeyPackage` que falha com o peer conectado e sem conversa é reenviado (sem ele o
+    /// convidador espera para sempre).
+    #[tokio::test]
+    async fn a_failed_key_package_is_resent_while_connected_without_a_conversation() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
         bia.connected.insert(peer);
         bia.transmit(peer, &Envelope::KeyPackage(vec![1]));
+        let first = only_pending(&bia);
+
+        fail_send(&mut bia, peer, first);
+
+        assert_ne!(only_pending(&bia), first, "é um envio novo");
+    }
+
+    /// P25 (d): sem conexão, ou com a conversa já feita, o `KeyPackage` não é reenviado.
+    #[tokio::test]
+    async fn a_failed_key_package_is_not_resent_without_a_connection_or_with_a_conversation() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let gone = PeerId::random();
+        bia.transmit(gone, &Envelope::KeyPackage(vec![1]));
+        let id = only_pending(&bia);
+        fail_send(&mut bia, gone, id);
+        assert!(bia.pending.is_empty(), "peer desconectado: sem reenvio");
+
+        bia.connected.insert(ana_peer);
+        bia.transmit(ana_peer, &Envelope::KeyPackage(vec![1]));
+        let id = only_pending(&bia);
+        fail_send(&mut bia, ana_peer, id);
+        assert!(bia.pending.is_empty(), "já há conversa: sem reenvio");
+    }
+
+    /// P25 (d): o `Welcome` que falha com o peer conectado é reenviado. Quem o manda já tem a
+    /// conversa (`ready`), então a conversa existente NÃO impede o reenvio.
+    #[tokio::test]
+    async fn a_failed_welcome_is_resent_while_connected_even_with_a_conversation() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        bia.connected.insert(ana_peer);
+        bia.transmit(ana_peer, &Envelope::Welcome(vec![1]));
+        let first = only_pending(&bia);
+
+        fail_send(&mut bia, ana_peer, first);
+
+        assert_ne!(only_pending(&bia), first, "é um envio novo");
+    }
+
+    /// P25 (d): sem conexão, o `Welcome` não é reenviado.
+    #[tokio::test]
+    async fn a_failed_welcome_is_not_resent_without_a_connection() {
+        let Household { mut bia, .. } = household();
+        let gone = PeerId::random();
+        bia.transmit(gone, &Envelope::Welcome(vec![1]));
         let id = only_pending(&bia);
 
+        fail_send(&mut bia, gone, id);
+
+        assert!(bia.pending.is_empty());
+    }
+
+    /// P25 (d): `KeyPackage` e `Welcome` também páram em 3 reenvios por conexão, e reconectar zera.
+    #[tokio::test]
+    async fn key_package_and_welcome_resends_stop_at_three_per_connection() {
+        for envelope in [Envelope::KeyPackage(vec![1]), Envelope::Welcome(vec![1])] {
+            let Household { mut bia, .. } = household();
+            let peer = PeerId::random();
+            bia.connected.insert(peer);
+            bia.transmit(peer, &envelope);
+
+            for _ in 0..3 {
+                let id = only_pending(&bia);
+                fail_send(&mut bia, peer, id);
+            }
+            let last = only_pending(&bia);
+            fail_send(&mut bia, peer, last);
+            assert!(
+                bia.pending.is_empty(),
+                "{envelope:?}: o 4º que falha não é reenviado"
+            );
+
+            bia.handle(NodeEvent::PeerDisconnected(peer));
+            bia.connected.insert(peer);
+            bia.transmit(peer, &envelope);
+            let id = only_pending(&bia);
+            fail_send(&mut bia, peer, id);
+            only_pending(&bia);
+        }
+    }
+
+    /// P25 (d): o teto é por tipo. Gastar as 3 tentativas do `Hello` não tira as do `KeyPackage`
+    /// nem as do `Welcome`.
+    #[tokio::test]
+    async fn the_resend_cap_is_per_kind_of_handshake_message() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(peer));
+        for _ in 0..4 {
+            let id = only_pending(&bia);
+            fail_send(&mut bia, peer, id);
+        }
+        assert!(bia.pending.is_empty(), "o Hello esgotou as 3 tentativas");
+
+        for envelope in [Envelope::KeyPackage(vec![1]), Envelope::Welcome(vec![1])] {
+            bia.transmit(peer, &envelope);
+            let id = only_pending(&bia);
+            fail_send(&mut bia, peer, id);
+            assert_eq!(bia.pending.len(), 1, "{envelope:?} ainda tem as suas");
+            let again = only_pending(&bia);
+            bia.pending.remove(&again);
+        }
+    }
+
+    /// P25 (d): o ack do `Welcome` encerra o envio; uma falha tardia do mesmo id não reenvia.
+    #[tokio::test]
+    async fn a_delivered_welcome_is_not_resent_by_a_late_failure() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.connected.insert(peer);
+        bia.transmit(peer, &Envelope::Welcome(vec![1]));
+        let id = only_pending(&bia);
+
+        bia.handle(NodeEvent::MessageDelivered { peer, id });
         fail_send(&mut bia, peer, id);
 
         assert!(bia.pending.is_empty());
