@@ -308,10 +308,10 @@ impl Node {
     pub fn dial_peer(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) -> Result<(), Error> {
         let circuit = addrs.iter().any(is_circuit);
         let opts = DialOpts::peer_id(peer).addresses(addrs);
-        let opts = if circuit {
+        let opts = if !circuit {
             opts.build()
         } else {
-            opts.build()
+            opts.allocate_new_port().build()
         };
         self.start_dial(opts, circuit)
     }
