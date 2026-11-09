@@ -2801,6 +2801,95 @@ mod tests {
         assert!(!bia.devices_announced.contains(&ana_peer));
     }
 
+    /// O único envio em voo de `bia` (o `Hello` que o `PeerConnected` acabou de mandar).
+    fn only_pending(bia: &Chat) -> SendId {
+        assert_eq!(bia.pending.len(), 1, "esperava só o Hello em voo");
+        *bia.pending.keys().next().unwrap()
+    }
+
+    fn fail_send(bia: &mut Chat, peer: PeerId, id: SendId) {
+        bia.handle(NodeEvent::SendFailed {
+            peer,
+            id,
+            reason: "Connection was closed before a response was received".to_string(),
+        });
+    }
+
+    /// P25: o `Hello` que falha com o peer ainda conectado e sem conversa é reenviado (a outra conexão
+    /// do dial simultâneo segue de pé; sem isto os dois esperam para sempre).
+    #[tokio::test]
+    async fn a_failed_hello_is_resent_while_the_peer_is_connected_without_a_conversation() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(peer));
+        let first = only_pending(&bia);
+
+        fail_send(&mut bia, peer, first);
+
+        let second = only_pending(&bia);
+        assert_ne!(second, first, "é um envio novo");
+    }
+
+    /// P25: sem conexão com o peer, ou com a conversa já feita, não há o que reenviar.
+    #[tokio::test]
+    async fn a_failed_hello_is_not_resent_without_a_connection_or_with_a_conversation() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let gone = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(gone));
+        let id = only_pending(&bia);
+        bia.handle(NodeEvent::PeerDisconnected(gone));
+        fail_send(&mut bia, gone, id);
+        assert!(bia.pending.is_empty(), "peer desconectado: sem reenvio");
+
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let id = only_pending(&bia);
+        fail_send(&mut bia, ana_peer, id);
+        assert!(bia.pending.is_empty(), "já há conversa: sem reenvio");
+    }
+
+    /// P25: no máximo 3 reenvios por conexão; reconectar zera a conta.
+    #[tokio::test]
+    async fn hello_resends_stop_at_three_per_connection_and_reset_on_reconnect() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(peer));
+
+        for _ in 0..3 {
+            let id = only_pending(&bia);
+            fail_send(&mut bia, peer, id);
+        }
+        let last = only_pending(&bia);
+        fail_send(&mut bia, peer, last);
+        assert!(
+            bia.pending.is_empty(),
+            "o 4º envio que falha não é reenviado"
+        );
+
+        bia.handle(NodeEvent::PeerDisconnected(peer));
+        bia.handle(NodeEvent::PeerConnected(peer));
+        let id = only_pending(&bia);
+        fail_send(&mut bia, peer, id);
+        only_pending(&bia);
+    }
+
+    /// P25: só o `Hello` é reenviado; outro envio de controle que falha não vira reenvio.
+    #[tokio::test]
+    async fn a_failed_non_hello_control_send_is_not_resent() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.connected.insert(peer);
+        bia.transmit(peer, &Envelope::KeyPackage(vec![1]));
+        let id = only_pending(&bia);
+
+        fail_send(&mut bia, peer, id);
+
+        assert!(bia.pending.is_empty());
+    }
+
     /// 3.5 etapa 5 (auditoria I1): de um contato aceitam-se poucos endereços por device; de irmão, todos.
     #[test]
     fn a_contacts_device_gets_few_dial_addresses_and_a_siblings_gets_all() {

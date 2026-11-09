@@ -88,6 +88,24 @@ async fn chats_find_each_other_via_mdns_and_talk() {
     exchange(&mut a, &mut b, pb.peer_id(), pa.peer_id(), "mdns").await;
 }
 
+/// P25: os dois lados discam um ao outro ao mesmo tempo (o que o mDNS faz); a conversa tem de ficar
+/// pronta mesmo quando uma das duas conexões cai com o `Hello` dentro. Em rodadas repetidas, porque
+/// a corrida é intermitente.
+#[tokio::test(flavor = "multi_thread")]
+async fn simultaneous_dials_still_reach_a_conversation() {
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+        let (mut a, mut b) = (pa.open(), pb.open());
+        let (addr_a, addr_b) = (listen(&mut a).await, listen(&mut b).await);
+
+        a.dial(addr_b).unwrap();
+        b.dial(addr_a).unwrap();
+
+        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(10)).await;
+    }
+}
+
 /// 2. Com a outbox (3.2), enviar a um peer que caiu deixa a mensagem na fila (`Queued`), nunca
 /// `Delivered`, e não a perde.
 #[tokio::test(flavor = "multi_thread")]
