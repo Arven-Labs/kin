@@ -74,6 +74,10 @@ fn has_dropped(events: &[ChatEvent]) -> bool {
 }
 
 /// 1. Duas instâncias se acham sozinhas na LAN e conversam, sem ninguém discar.
+///
+/// Tem de ser o ÚNICO teste de mDNS deste binário e rodar uma rodada só: dois testes de mDNS em
+/// paralelo no mesmo host descobrem os chats um do outro, e rodadas seguidas no mesmo processo
+/// discam os peers mortos das rodadas anteriores (o mDNS os anuncia até o TTL expirar).
 #[tokio::test(flavor = "multi_thread")]
 async fn chats_find_each_other_via_mdns_and_talk() {
     let dir = tempfile::tempdir().unwrap();

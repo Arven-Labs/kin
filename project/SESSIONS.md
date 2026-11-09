@@ -835,3 +835,26 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
   (mDNS ainda os anunciava), então a taxa dentro do loop pode diferir da do teste isolado.
 - **Não feito**: a correção (vira o P25, plano próprio).
 - **Próximo passo**: plano da correção do P25; depois a dica de `/trust` e o roteiro de 3 devices.
+
+#### Correção do P25: reenviar o `Hello` (PR #48)
+
+- **Decisão do dono** (plan mode): reenviar o `Hello` quando o envio falha (descartados: só o menor Peer ID disca no mDNS; reenviar
+  numa 2ª conexão).
+- **Feito** (`crates/chat/src/chat.rs`): `send_hello` registra o id em `hellos`; `SendFailed` de um `Hello` chama `resend_hello`, que
+  reenvia se o peer está em `connected` e sem conversa, até `MAX_HELLO_RETRIES = 3` por conexão (`hello_retries`, zerado em
+  `PeerDisconnected`); `MessageDelivered` tira o id de `hellos`.
+- **Testes**: 4 novos em `chat::tests`; no CI antes da implementação 2 falharam (os de reenvio e de teto), 2 passaram (guardas),
+  todos verdes depois. 4 mutações em branches descartáveis, todas pegas: sem a checagem de conectado, sem a de conversa (o teste de
+  "não reenviar"), teto 103 e sem o zerar ao desconectar (o teste de teto). A primeira versão da mutação do teto não compilou no
+  clippy e foi refeita.
+- **O que deu errado no caminho** (vale lembrar): (1) o teste de integração de dial TCP simultâneo ficou vermelho antes **e** depois,
+  porque falha por outro motivo (`Handshake failed: input error`, sem `PeerConnected`); foi descartado como prova da correção.
+  (2) um segundo teste de mDNS no mesmo binário rodava em paralelo e descobria os chats do primeiro, poluindo-o; (3) repetir rodadas
+  de mDNS no mesmo processo disca peers mortos das rodadas anteriores. Por isso o teste ficou como o original (1 rodada, único de
+  mDNS no binário), com painel de eventos em `connect_until_ready_within` e `receive_while_driving`.
+- **Evidência de que o flaky sumiu**: 17 de 17 execuções do CI verdes (2 lotes em branches descartáveis, uma por runner), contra ~13%
+  de falha antes. Fraca: ~9% de chance de ser sorte.
+- **Não verificado**: causa raiz exata (dial simultâneo é hipótese); `KeyPackage`/`Welcome` perdidos; o dial TCP simultâneo
+  (P25 c); comportamento com rede real.
+- **Próximo passo**: acompanhar o CI por alguns PRs (se o flaky voltar, o painel de eventos mostra onde); investigar P25 (c); a dica
+  de `/trust`; roteiro de 3 devices.

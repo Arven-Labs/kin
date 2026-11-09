@@ -180,11 +180,26 @@ pub async fn receive_while_driving(
     receiver: &mut Chat,
     sender: &mut Chat,
 ) -> (IdentityId, Message) {
-    timeout(WAIT, async {
-        tokio::select! { r = next_received(receiver) => r, _ = drive(sender) => unreachable!() }
+    let (mut seen_receiver, mut seen_sender) = (Vec::new(), Vec::new());
+    let result = timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                e = receiver.next_event() => match e {
+                    ChatEvent::Received { sender, message, .. } => return (sender, message),
+                    other => seen_receiver.push(other),
+                },
+                e = sender.next_event() => seen_sender.push(e),
+            }
+        }
     })
-    .await
-    .expect("sem mensagem")
+    .await;
+    // No prazo estourado, os eventos de cada lado mostram onde a mensagem parou.
+    match result {
+        Ok(received) => received,
+        Err(_) => panic!(
+            "sem mensagem\neventos de quem recebe: {seen_receiver:#?}\neventos de quem envia: {seen_sender:#?}"
+        ),
+    }
 }
 
 /// Sobe um nó relay em segundo plano e devolve o endereço dele (com `/p2p/<id>`).

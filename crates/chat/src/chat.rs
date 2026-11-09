@@ -154,6 +154,9 @@ const CONTACT_DIAL_ADDRS: usize = 4;
 /// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
 const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
+/// Quantas vezes se reenvia o `Hello` a um peer por conexão quando o envio falha (P25).
+const MAX_HELLO_RETRIES: u8 = 3;
+
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
 const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
@@ -231,6 +234,10 @@ pub struct Chat {
     device: CryptoDevice,
     conversations: HashMap<PeerId, Conversation>,
     pending: HashMap<SendId, Option<MessageId>>,
+    /// Envios em voo que são `Hello`: só estes são reenviados quando falham (P25).
+    hellos: std::collections::HashSet<SendId>,
+    /// Quantas vezes reenviei o `Hello` a cada peer nesta conexão (zera ao desconectar).
+    hello_retries: HashMap<PeerId, u8>,
     /// Identidade exigida de cada peer discado por convite (`accept`), até a conversa ficar pronta.
     expected: HashMap<PeerId, IdentityId>,
     /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
@@ -335,6 +342,8 @@ impl Chat {
             device,
             conversations: HashMap::new(),
             pending: HashMap::new(),
+            hellos: Default::default(),
+            hello_retries: HashMap::new(),
             expected: HashMap::new(),
             future: HashMap::new(),
             outbox,
@@ -885,11 +894,12 @@ impl Chat {
                 // Conversa recarregada do banco: os dois lados já a têm, então dá para anunciar já.
                 self.announce_relays(peer);
                 self.announce_devices(peer);
-                self.transmit(peer, &Envelope::Hello);
+                self.send_hello(peer);
                 self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.hello_retries.remove(&peer);
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
                 self.lists_acted.remove(&peer);
@@ -904,6 +914,7 @@ impl Chat {
                 Err(e) => self.drop_message(peer, e),
             },
             NodeEvent::MessageDelivered { peer, id } => {
+                self.hellos.remove(&id);
                 if let Some(Some(message)) = self.pending.remove(&id) {
                     // O ack fecha o ciclo: sai da fila e libera uma vaga na janela. Só o ack de um
                     // device do destinatário é "entregue": o de um irmão (espelho) só libera a fila.
@@ -923,6 +934,7 @@ impl Chat {
                 }
             }
             NodeEvent::SendFailed { peer, id, reason } => {
+                let was_hello = self.hellos.remove(&id);
                 match self.pending.remove(&id).flatten() {
                     // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
                     Some(message) => {
@@ -933,6 +945,9 @@ impl Chat {
                     // anúncios podem ter se perdido, então liberam o próximo gatilho (`on_mls`, algo
                     // aprendido). Sem reenvio imediato: se o envio seguir falhando, não vira laço.
                     None => {
+                        if was_hello {
+                            self.resend_hello(peer);
+                        }
                         self.announced.remove(&peer);
                         self.devices_announced.remove(&peer);
                         self.queue.push_back(ChatEvent::SendFailed {
@@ -1368,6 +1383,28 @@ impl Chat {
                 self.drop_message(peer, e);
             }
         }
+    }
+
+    fn send_hello(&mut self, peer: PeerId) {
+        let id = self.node.send(peer, Envelope::Hello.encode());
+        self.pending.insert(id, None);
+        self.hellos.insert(id);
+    }
+
+    /// O `Hello` falhou (P25): com dois discos simultâneos uma das conexões cai levando o `Hello`, e o
+    /// peer segue conectado pela outra, então nada mais dispara o handshake. Reenvia enquanto ele
+    /// estiver conectado e sem conversa, no máximo [`MAX_HELLO_RETRIES`] vezes por conexão: o `Hello`
+    /// é idempotente (`on_hello` ignora quem já tem conversa) e o teto impede laço.
+    fn resend_hello(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) || self.conversations.contains_key(&peer) {
+            return;
+        }
+        let retries = self.hello_retries.entry(peer).or_insert(0);
+        if *retries >= MAX_HELLO_RETRIES {
+            return;
+        }
+        *retries += 1;
+        self.send_hello(peer);
     }
 
     fn transmit(&mut self, peer: PeerId, envelope: &Envelope) {
@@ -2799,6 +2836,95 @@ mod tests {
         });
         assert!(!bia.announced.contains(&ana_peer));
         assert!(!bia.devices_announced.contains(&ana_peer));
+    }
+
+    /// O único envio em voo de `bia` (o `Hello` que o `PeerConnected` acabou de mandar).
+    fn only_pending(bia: &Chat) -> SendId {
+        assert_eq!(bia.pending.len(), 1, "esperava só o Hello em voo");
+        *bia.pending.keys().next().unwrap()
+    }
+
+    fn fail_send(bia: &mut Chat, peer: PeerId, id: SendId) {
+        bia.handle(NodeEvent::SendFailed {
+            peer,
+            id,
+            reason: "Connection was closed before a response was received".to_string(),
+        });
+    }
+
+    /// P25: o `Hello` que falha com o peer ainda conectado e sem conversa é reenviado (a outra conexão
+    /// do dial simultâneo segue de pé; sem isto os dois esperam para sempre).
+    #[tokio::test]
+    async fn a_failed_hello_is_resent_while_the_peer_is_connected_without_a_conversation() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(peer));
+        let first = only_pending(&bia);
+
+        fail_send(&mut bia, peer, first);
+
+        let second = only_pending(&bia);
+        assert_ne!(second, first, "é um envio novo");
+    }
+
+    /// P25: sem conexão com o peer, ou com a conversa já feita, não há o que reenviar.
+    #[tokio::test]
+    async fn a_failed_hello_is_not_resent_without_a_connection_or_with_a_conversation() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let gone = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(gone));
+        let id = only_pending(&bia);
+        bia.handle(NodeEvent::PeerDisconnected(gone));
+        fail_send(&mut bia, gone, id);
+        assert!(bia.pending.is_empty(), "peer desconectado: sem reenvio");
+
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let id = only_pending(&bia);
+        fail_send(&mut bia, ana_peer, id);
+        assert!(bia.pending.is_empty(), "já há conversa: sem reenvio");
+    }
+
+    /// P25: no máximo 3 reenvios por conexão; reconectar zera a conta.
+    #[tokio::test]
+    async fn hello_resends_stop_at_three_per_connection_and_reset_on_reconnect() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(peer));
+
+        for _ in 0..3 {
+            let id = only_pending(&bia);
+            fail_send(&mut bia, peer, id);
+        }
+        let last = only_pending(&bia);
+        fail_send(&mut bia, peer, last);
+        assert!(
+            bia.pending.is_empty(),
+            "o 4º envio que falha não é reenviado"
+        );
+
+        bia.handle(NodeEvent::PeerDisconnected(peer));
+        bia.handle(NodeEvent::PeerConnected(peer));
+        let id = only_pending(&bia);
+        fail_send(&mut bia, peer, id);
+        only_pending(&bia);
+    }
+
+    /// P25: só o `Hello` é reenviado; outro envio de controle que falha não vira reenvio.
+    #[tokio::test]
+    async fn a_failed_non_hello_control_send_is_not_resent() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.connected.insert(peer);
+        bia.transmit(peer, &Envelope::KeyPackage(vec![1]));
+        let id = only_pending(&bia);
+
+        fail_send(&mut bia, peer, id);
+
+        assert!(bia.pending.is_empty());
     }
 
     /// 3.5 etapa 5 (auditoria I1): de um contato aceitam-se poucos endereços por device; de irmão, todos.
