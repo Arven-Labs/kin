@@ -738,3 +738,20 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Não verificado**: ponta a ponta com 3 devices reais e relay real; o texto "entregue" na CLI para espelho não foi
   exercitado no binário; o caminho do depósito (`Mailbox`) com entrada corrompida não tem teste próprio (só o envio direto).
 - **Próximo passo**: `kin_seen` separado (schema v4); depois tetos de abuso (fatia B) e a dica de `/trust`.
+
+#### Sessão 16, parte 5: `kin_seen` separado (P24, schema v4)
+
+- **Problema**: `kin_seen` (1024 ids por peer) servia a `Payload::Message` e ao espelho `Payload::Sent`: um irmão que
+  espelha muito expulsava ids de mensagens comuns (a mensagem reentregue reaparecia) e um espelho de mesmo `MessageId`
+  de uma mensagem já vista era descartado.
+- **Decisão** (plano aprovado): tabela nova `kin_seen_mirror` (aditiva, schema v4) em vez de coluna `kind` com chave
+  composta (mudar a chave no SQLite exige recriar a tabela); mesmo teto 1024 para os dois; `SeenKind { Message, Mirror }`
+  em vez de nome de tabela solto. Não migrei os ids de espelho já gravados em `kin_seen` (sem marca): um espelho reentregue
+  logo após o upgrade pode aparecer uma vez a mais.
+- **Testes**: 4 novos (`chat`: espelhos em massa não fazem uma mensagem antiga reaparecer e o teto vale para espelho;
+  espelho e mensagem com o mesmo id aparecem os dois; `outbox`: tipos independentes cada um com seu teto; banco v3 abre em
+  v4 conservando os ids vistos). Rodados pelo dono (ADR 0009): `kin-chat --lib` 103 → 107 passam, clippy sem avisos.
+  **Vermelho provado por mutação** (o dono rodou): fazer `Mirror` usar a tabela `kin_seen` (o comportamento antigo) derrubou
+  os 3 testes de separação; revertido. A mutação não foi rodada contra o teste de migração v3→v4.
+- **Não verificado**: banco v3 de verdade (só simulado: tabela removida e versão rebaixada); ponta a ponta com 3 devices.
+- **Próximo passo**: tetos de abuso (fatia B, números a decidir com o dono) ou a dica de `/trust` para irmãos.

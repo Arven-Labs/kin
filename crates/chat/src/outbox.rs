@@ -17,8 +17,29 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 
 /// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 etapa 1 (mensagem por
 /// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho); 3 = P24 (tabela `kin_trusted`,
-/// aditiva: só `CREATE TABLE IF NOT EXISTS`).
-const SCHEMA_VERSION: i64 = 3;
+/// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva).
+const SCHEMA_VERSION: i64 = 4;
+
+/// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
+/// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
+/// mesmo id de uma mensagem ser descartado como repetição.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeenKind {
+    /// `Payload::Message`.
+    Message,
+    /// `Payload::Sent` (o espelho 3.5).
+    Mirror,
+}
+
+impl SeenKind {
+    /// Nome fixo da tabela: nunca vem de fora, então entra no SQL sem risco de injeção.
+    fn table(self) -> &'static str {
+        match self {
+            Self::Message => "kin_seen",
+            Self::Mirror => "kin_seen_mirror",
+        }
+    }
+}
 
 /// O que uma entrada da outbox é (ver [`Outbox::entry_kind`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -80,6 +101,11 @@ impl Outbox {
              CREATE TABLE IF NOT EXISTS kin_trusted (
                  identity BLOB PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS kin_seen (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 peer TEXT NOT NULL,
+                 id BLOB NOT NULL,
+                 UNIQUE (peer, id));
+             CREATE TABLE IF NOT EXISTS kin_seen_mirror (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  peer TEXT NOT NULL,
                  id BLOB NOT NULL,
@@ -420,14 +446,19 @@ impl Outbox {
             .collect())
     }
 
-    /// Registra que `peer` mandou a mensagem `id`; `false` se já tinha sido vista. Mantém só os
-    /// [`SEEN_LIMIT`] ids mais recentes de cada peer.
-    pub(crate) fn mark_seen(&self, peer: &PeerId, id: &MessageId) -> Result<bool, Error> {
-        let peer = peer.to_string();
+    /// Registra que `peer` mandou `id` (do tipo `kind`); `false` se já tinha sido visto. Mantém só os
+    /// [`SEEN_LIMIT`] ids mais recentes de cada peer, em cada tipo.
+    pub(crate) fn mark_seen(
+        &self,
+        peer: &PeerId,
+        id: &MessageId,
+        kind: SeenKind,
+    ) -> Result<bool, Error> {
+        let (peer, table) = (peer.to_string(), kind.table());
         let inserted = self
             .conn
             .execute(
-                "INSERT OR IGNORE INTO kin_seen (peer, id) VALUES (?1, ?2)",
+                &format!("INSERT OR IGNORE INTO {table} (peer, id) VALUES (?1, ?2)"),
                 params![peer, &id.as_bytes()[..]],
             )
             .map_err(Error::storage)?;
@@ -437,9 +468,11 @@ impl Outbox {
         // Apaga do (SEEN_LIMIT+1)º mais novo para trás; se não houver tantos, a subconsulta é NULL.
         self.conn
             .execute(
-                "DELETE FROM kin_seen WHERE peer = ?1 AND seq <= (
-                     SELECT seq FROM kin_seen WHERE peer = ?1
-                     ORDER BY seq DESC LIMIT 1 OFFSET ?2)",
+                &format!(
+                    "DELETE FROM {table} WHERE peer = ?1 AND seq <= (
+                         SELECT seq FROM {table} WHERE peer = ?1
+                         ORDER BY seq DESC LIMIT 1 OFFSET ?2)"
+                ),
                 params![peer, SEEN_LIMIT as i64],
             )
             .map_err(Error::storage)?;
@@ -447,10 +480,10 @@ impl Outbox {
     }
 
     #[cfg(test)]
-    pub(crate) fn seen_count(&self, peer: &PeerId) -> Result<usize, Error> {
+    pub(crate) fn seen_count(&self, peer: &PeerId, kind: SeenKind) -> Result<usize, Error> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM kin_seen WHERE peer = ?1",
+                &format!("SELECT COUNT(*) FROM {} WHERE peer = ?1", kind.table()),
                 [peer.to_string()],
                 |row| row.get::<_, i64>(0),
             )
@@ -935,5 +968,58 @@ mod tests {
 
         assert!(outbox.trusted_identities().unwrap().is_empty());
         assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
+    }
+
+    // 18
+    #[test]
+    fn message_and_mirror_ids_are_remembered_separately_each_with_its_own_cap() {
+        let (outbox, peer) = (Outbox::memory().unwrap(), peer());
+        let shared = Message::new("mesmo id".into(), None).id;
+
+        assert!(outbox.mark_seen(&peer, &shared, SeenKind::Message).unwrap());
+        assert!(
+            outbox.mark_seen(&peer, &shared, SeenKind::Mirror).unwrap(),
+            "o mesmo id em outro tipo não é repetição"
+        );
+        assert!(!outbox.mark_seen(&peer, &shared, SeenKind::Message).unwrap());
+        assert!(!outbox.mark_seen(&peer, &shared, SeenKind::Mirror).unwrap());
+
+        for i in 0..SEEN_LIMIT + 5 {
+            let id = Message::new(i.to_string(), None).id;
+            outbox.mark_seen(&peer, &id, SeenKind::Mirror).unwrap();
+        }
+        assert_eq!(
+            outbox.seen_count(&peer, SeenKind::Mirror).unwrap(),
+            SEEN_LIMIT
+        );
+        assert_eq!(
+            outbox.seen_count(&peer, SeenKind::Message).unwrap(),
+            1,
+            "os espelhos não tocam nas mensagens"
+        );
+    }
+
+    // 19
+    #[test]
+    fn a_version_3_database_opens_gains_the_mirror_seen_table_and_keeps_its_seen_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (peer, id) = (peer(), Message::new("vista".into(), None).id);
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            assert!(outbox.mark_seen(&peer, &id, SeenKind::Message).unwrap());
+            outbox
+                .conn
+                .execute_batch("DROP TABLE kin_seen_mirror; PRAGMA user_version = 3;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert_eq!(outbox.seen_count(&peer, SeenKind::Mirror).unwrap(), 0);
+        assert!(
+            !outbox.mark_seen(&peer, &id, SeenKind::Message).unwrap(),
+            "o que já tinha sido visto continua visto"
+        );
     }
 }
