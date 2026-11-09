@@ -123,7 +123,14 @@ impl Outbox {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(Error::storage)?;
-        if version >= SCHEMA_VERSION {
+        // Versão futura (o app foi rebaixado): este código não conhece o esquema, então recusa em vez de
+        // ler ou gravar errado. Não toca no banco.
+        if version > SCHEMA_VERSION {
+            return Err(Error::storage(format!(
+                "outbox schema v{version} is newer than this build supports (v{SCHEMA_VERSION})"
+            )));
+        }
+        if version == SCHEMA_VERSION {
             return Ok(());
         }
         let has_old: bool = conn
