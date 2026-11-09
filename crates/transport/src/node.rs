@@ -388,14 +388,27 @@ impl Node {
                     return NodeEvent::Listening(address);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    let mut first = None;
+                    // O mDNS devolve um endereço por interface e por transporte (tcp e quic). Um dial por
+                    // endereço abria até 5 conexões ao mesmo peer e estourava o teto por peer
+                    // (`max_established_per_peer`), que nega conexões e perde requisições em voo (P25).
+                    // Um dial por peer, com todos os endereços, fica com a primeira que conectar.
+                    let mut peers: Vec<(PeerId, Vec<Multiaddr>)> = Vec::new();
                     for (peer, addr) in list {
+                        match peers.iter_mut().find(|(known, _)| *known == peer) {
+                            Some((_, addrs)) => addrs.push(addr),
+                            None => peers.push((peer, vec![addr])),
+                        }
+                    }
+                    let mut first = None;
+                    for (peer, addrs) in peers {
                         if self.swarm.is_connected(&peer) {
                             continue;
                         }
+                        first.get_or_insert((peer, addrs[0].clone()));
                         // Falha ao discar aqui não é fatal: o mDNS reanuncia depois.
-                        let _ = self.swarm.dial(addr.clone());
-                        first.get_or_insert((peer, addr));
+                        let _ = self
+                            .swarm
+                            .dial(DialOpts::peer_id(peer).addresses(addrs).build());
                     }
                     if let Some((peer, addr)) = first {
                         return NodeEvent::PeerDiscovered(peer, addr);
