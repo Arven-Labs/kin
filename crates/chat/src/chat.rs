@@ -217,6 +217,8 @@ fn dialable(addr: &Multiaddr, from_sibling: bool) -> bool {
 enum Next {
     Node(NodeEvent),
     Mailbox(Option<MailboxEvent>),
+    /// O prazo de um re-anúncio pendente a irmão chegou (sem evento de rede).
+    Tick,
 }
 
 /// Chat 1:1: liga o transporte (`kin-transport`) à conversa cifrada (`kin-crypto`).
@@ -793,9 +795,14 @@ impl Chat {
                 self.handle_mailbox(event);
                 continue;
             }
-            let next = {
-                let node = self.node.next_event();
-                match self.mailbox_events.as_mut() {
+            // Com re-anúncio pendente (P24), acorda no prazo mesmo sem tráfego: sem isto a lista ficaria
+            // parada numa rede quieta e os irmãos nunca convergiriam.
+            let wake = self.sibling_wake_in();
+            let node = &mut self.node;
+            let mailbox_events = self.mailbox_events.as_mut();
+            let waiting = async {
+                let node = node.next_event();
+                match mailbox_events {
                     Some(events) => {
                         let mail = events.next();
                         pin_mut!(node, mail);
@@ -807,7 +814,15 @@ impl Chat {
                     None => Next::Node(node.await),
                 }
             };
+            let next = match wake {
+                Some(delay) => match tokio::time::timeout(delay, waiting).await {
+                    Ok(next) => next,
+                    Err(_) => Next::Tick,
+                },
+                None => waiting.await,
+            };
             match next {
+                Next::Tick => self.flush_sibling_pending(),
                 Next::Node(event) => self.handle(event),
                 Next::Mailbox(Some(event)) => self.handle_mailbox(event),
                 // O backend largou o canal: sem ele não há mais o que escutar.
@@ -1173,6 +1188,15 @@ impl Chat {
         } else {
             self.sibling_pending.insert(target);
         }
+    }
+
+    /// Quanto falta para o primeiro re-anúncio pendente vencer (`None` sem pendência).
+    fn sibling_wake_in(&self) -> Option<Duration> {
+        self.sibling_pending
+            .iter()
+            .filter_map(|target| self.last_sibling_announce.get(target))
+            .map(|last| self.sibling_announce_gap.saturating_sub(last.elapsed()))
+            .min()
     }
 
     /// Anuncia aos irmãos pendentes cujo prazo já passou; os que ainda esperam voltam à pendência.
