@@ -960,11 +960,24 @@ impl Chat {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
                     self.expected.remove(&peer);
+                    self.forget_unreachable(&peer);
                 }
                 self.queue.push_back(ChatEvent::DialFailed { peer, reason });
             }
             NodeEvent::PeerDiscovered(..) | NodeEvent::PeerIdentified { .. } => {}
         }
+    }
+
+    /// A discagem a `peer` falhou: esquece o convite dele em `household` e `contact_devices`, o que
+    /// libera a vaga do teto e o tira da lista que repasso. Só se não há conversa nem conexão com ele:
+    /// com qualquer das duas ele é alcançável e a falha é só de um endereço velho. Se um irmão
+    /// reanunciar o item, ele volta.
+    fn forget_unreachable(&mut self, peer: &PeerId) {
+        if self.conversations.contains_key(peer) || self.connected.contains(peer) {
+            return;
+        }
+        self.household.remove(peer);
+        self.contact_devices.remove(peer);
     }
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
@@ -1151,6 +1164,7 @@ impl Chat {
             self.expected.insert(device, owner);
             if let Err(e) = self.node.dial_peer(device, addrs) {
                 self.expected.remove(&device);
+                self.forget_unreachable(&device);
                 self.queue.push_back(ChatEvent::DialFailed {
                     peer: Some(device),
                     reason: e.to_string(),
@@ -2619,6 +2633,100 @@ mod tests {
         });
         assert!(!bia.expected.contains_key(&other));
         assert!(bia.expected.contains_key(&ana_peer), "só o peer que falhou");
+    }
+
+    /// P24 (frescor): discagem que falhou a um device de `household` ou de `contact_devices`, sem
+    /// conversa e sem conexão, apaga a entrada; o item some também da lista que repasso.
+    #[tokio::test]
+    async fn a_failed_dial_forgets_an_unreachable_device_in_both_maps() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let cleo = StandaloneIdentity::generate();
+        let (mine, hers) = (invite_for(&bia_key), invite_for(&cleo));
+        feed_list(&mut bia, sibling, &mut raw, &[mine.clone(), hers.clone()]);
+        assert!(bia.household.contains_key(&mine.peer_id()));
+        assert!(bia.contact_devices.contains_key(&hers.peer_id()));
+
+        for invite in [&mine, &hers] {
+            bia.handle(NodeEvent::DialFailed {
+                peer: Some(invite.peer_id()),
+                reason: "fora do ar".to_string(),
+            });
+        }
+
+        assert!(bia.household.is_empty());
+        assert!(bia.contact_devices.is_empty());
+        let forwarded: Vec<PeerId> = bia.device_list().iter().map(Invite::peer_id).collect();
+        assert_eq!(forwarded, vec![bia.peer_id()], "só o meu próprio convite");
+    }
+
+    /// P24 (frescor): o que a falha NÃO apaga: device com conversa, device conectado, falha sem peer
+    /// e peer que não está nos mapas.
+    #[tokio::test]
+    async fn a_failed_dial_keeps_devices_that_have_a_conversation_or_a_connection() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let connected = invite_for(&bia_key);
+        bia.household.insert(sibling, invite_for(&bia_key));
+        bia.contact_devices.insert(ana_peer, invite_for(&bia_key));
+        bia.household.insert(connected.peer_id(), connected.clone());
+        bia.connected.insert(connected.peer_id());
+
+        for peer in [
+            Some(sibling),
+            Some(ana_peer),
+            Some(connected.peer_id()),
+            None,
+        ] {
+            bia.handle(NodeEvent::DialFailed {
+                peer,
+                reason: "fora do ar".to_string(),
+            });
+        }
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(PeerId::random()),
+            reason: "desconhecido".to_string(),
+        });
+
+        assert_eq!(bia.household.len(), 2, "com conversa e conectado ficam");
+        assert_eq!(bia.contact_devices.len(), 1, "com conversa fica");
+    }
+
+    /// P24 (frescor): com o mapa cheio, a falha libera a vaga e um Peer ID novo passa a caber.
+    #[tokio::test]
+    async fn a_failed_dial_frees_a_slot_in_a_full_household() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES)
+            .map(|_| invite_for(&bia_key))
+            .collect();
+        feed_list(&mut bia, sibling, &mut raw, &invites[..MAX_KNOWN_DEVICES]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+        let newcomer = invites[MAX_KNOWN_DEVICES].peer_id();
+        assert!(!bia.household.contains_key(&newcomer), "cheio: ignorado");
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(invites[0].peer_id()),
+            reason: "fora do ar".to_string(),
+        });
+        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        assert!(bia.household.contains_key(&newcomer));
+        assert!(!bia.household.contains_key(&invites[0].peer_id()));
     }
 
     /// P24: re-anúncio ao irmão tem intervalo mínimo; o que chega dentro dele fica pendente e sai no
