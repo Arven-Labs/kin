@@ -36,10 +36,10 @@ async fn count_routes(node: &mut Node, peer: PeerId, window: Duration) -> usize 
     let mut routes = 0;
     let _ = timeout(window, async {
         loop {
-            if let NodeEvent::PeerRoute { peer: from, .. } = node.next_event().await {
-                if from == peer {
-                    routes += 1;
-                }
+            if let NodeEvent::PeerRoute { peer: from, .. } = node.next_event().await
+                && from == peer
+            {
+                routes += 1;
             }
         }
     })
