@@ -152,6 +152,7 @@ const CONTACT_DIAL_ADDRS: usize = 4;
 /// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
 /// `expected`). É o mesmo teto da lista do codec: a lista que sai já corta nesse número, então guardar
 /// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
+#[allow(dead_code)] // esqueleto: some quando a implementação usar
 const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
@@ -248,10 +249,13 @@ pub struct Chat {
     /// Só em memória. Vão para os meus irmãos, para que eles também achem o contato.
     contact_devices: HashMap<PeerId, Invite>,
     /// Quando anunciei a lista de devices a cada irmão por causa de algo aprendido (limite de taxa).
+    #[allow(dead_code)] // esqueleto: some quando a implementação usar
     last_sibling_announce: HashMap<PeerId, Instant>,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
+    #[allow(dead_code)] // esqueleto: some quando a implementação usar
     sibling_pending: std::collections::HashSet<PeerId>,
     /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
+    #[allow(dead_code)] // esqueleto: some quando a implementação usar
     sibling_announce_gap: Duration,
     /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
     advertised: Vec<Multiaddr>,
