@@ -973,7 +973,7 @@ impl Chat {
     /// com qualquer das duas ele é alcançável e a falha é só de um endereço velho. Se um irmão
     /// reanunciar o item, ele volta.
     fn forget_unreachable(&mut self, peer: &PeerId) {
-        if self.conversations.contains_key(peer) || self.connected.contains(peer) {
+        if self.connected.contains(peer) {
             return;
         }
         self.household.remove(peer);
