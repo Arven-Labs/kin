@@ -139,7 +139,7 @@ pub async fn connect_until_ready_within(
 ) -> (Vec<ChatEvent>, Vec<ChatEvent>) {
     let (mut ready_a, mut ready_b) = (false, false);
     let (mut seen_a, mut seen_b) = (Vec::new(), Vec::new());
-    timeout(limit, async {
+    let result = timeout(limit, async {
         while !(ready_a && ready_b) {
             tokio::select! {
                 e = a.next_event() => if matches!(e, ChatEvent::ConversationReady { .. }) { ready_a = true } else { seen_a.push(e) },
@@ -147,8 +147,12 @@ pub async fn connect_until_ready_within(
             }
         }
     })
-    .await
-    .expect("conversa não ficou pronta");
+    .await;
+    // No prazo estourado, o que cada lado viu mostra onde o handshake travou.
+    assert!(
+        result.is_ok(),
+        "conversa não ficou pronta (a pronto: {ready_a}, b pronto: {ready_b})\neventos de a: {seen_a:#?}\neventos de b: {seen_b:#?}"
+    );
     (seen_a, seen_b)
 }
 

@@ -88,6 +88,23 @@ async fn chats_find_each_other_via_mdns_and_talk() {
     exchange(&mut a, &mut b, pb.peer_id(), pa.peer_id(), "mdns").await;
 }
 
+/// TEMPORÁRIO (diagnóstico do flaky do teste 1; não mesclar): repete o cenário e, na primeira falha,
+/// `connect_until_ready_within` imprime os eventos vistos por cada lado.
+#[tokio::test(flavor = "multi_thread")]
+async fn mdns_loop() {
+    for round in 0..25 {
+        let dir = tempfile::tempdir().unwrap();
+        let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+        let mk =
+            |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db).unwrap();
+        let (mut a, mut b) = (mk(&pa), mk(&pb));
+        a.listen().unwrap();
+        b.listen().unwrap();
+        eprintln!("rodada {round}");
+        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(12)).await;
+    }
+}
+
 /// 2. Com a outbox (3.2), enviar a um peer que caiu deixa a mensagem na fila (`Queued`), nunca
 /// `Delivered`, e não a perde.
 #[tokio::test(flavor = "multi_thread")]
