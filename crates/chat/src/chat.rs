@@ -152,12 +152,16 @@ const CONTACT_DIAL_ADDRS: usize = 4;
 /// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
 /// `expected`). É o mesmo teto da lista do codec: a lista que sai já corta nesse número, então guardar
 /// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
-#[allow(dead_code)] // esqueleto: some quando a implementação usar
 const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
 const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
+
+/// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
+fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
+    map.contains_key(key) || map.len() < MAX_KNOWN_DEVICES
+}
 
 /// Endereços a tentar para um device listado: só os que passam em [`dialable`], todos se o remetente
 /// é irmão e poucos se é contato.
@@ -249,13 +253,10 @@ pub struct Chat {
     /// Só em memória. Vão para os meus irmãos, para que eles também achem o contato.
     contact_devices: HashMap<PeerId, Invite>,
     /// Quando anunciei a lista de devices a cada irmão por causa de algo aprendido (limite de taxa).
-    #[allow(dead_code)] // esqueleto: some quando a implementação usar
     last_sibling_announce: HashMap<PeerId, Instant>,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
-    #[allow(dead_code)] // esqueleto: some quando a implementação usar
     sibling_pending: std::collections::HashSet<PeerId>,
     /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
-    #[allow(dead_code)] // esqueleto: some quando a implementação usar
     sibling_announce_gap: Duration,
     /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
     advertised: Vec<Multiaddr>,
@@ -858,6 +859,8 @@ impl Chat {
     }
 
     fn handle(&mut self, event: NodeEvent) {
+        // Sem timer: o re-anúncio que caiu no intervalo mínimo sai no primeiro evento depois do prazo.
+        self.flush_sibling_pending();
         match event {
             NodeEvent::Listening(addr) => self.queue.push_back(ChatEvent::Listening(addr)),
             NodeEvent::PeerConnected(peer) => {
@@ -875,6 +878,8 @@ impl Chat {
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
                 self.lists_acted.remove(&peer);
+                self.last_sibling_announce.remove(&peer);
+                self.sibling_pending.remove(&peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -909,12 +914,18 @@ impl Chat {
                         self.leave_flight(peer, &message);
                         self.queue.push_back(ChatEvent::Queued { peer, message });
                     }
-                    // Handshake: sem outbox, quem decide é a aplicação.
-                    None => self.queue.push_back(ChatEvent::SendFailed {
-                        peer,
-                        message: None,
-                        reason,
-                    }),
+                    // Handshake ou anúncio (controle): sem outbox, quem decide é a aplicação. Os
+                    // anúncios podem ter se perdido, então liberam o próximo gatilho (`on_mls`, algo
+                    // aprendido). Sem reenvio imediato: se o envio seguir falhando, não vira laço.
+                    None => {
+                        self.announced.remove(&peer);
+                        self.devices_announced.remove(&peer);
+                        self.queue.push_back(ChatEvent::SendFailed {
+                            peer,
+                            message: None,
+                            reason,
+                        });
+                    }
                 }
             }
             NodeEvent::PeerRoute { peer, relayed } => {
@@ -931,6 +942,10 @@ impl Chat {
                 self.queue.push_back(ChatEvent::HolePunch { peer, result });
             }
             NodeEvent::DialFailed { peer, reason } => {
+                // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
+                if let Some(peer) = peer {
+                    self.expected.remove(&peer);
+                }
                 self.queue.push_back(ChatEvent::DialFailed { peer, reason });
             }
             NodeEvent::PeerDiscovered(..) | NodeEvent::PeerIdentified { .. } => {}
@@ -1079,10 +1094,18 @@ impl Chat {
                 continue;
             }
             let owner = invite.identity().clone();
+            // Teto de cada mapa (P24): Peer ID novo com o mapa cheio é ignorado por inteiro (nem
+            // guardado, nem discado); quem já está segue sendo atualizado.
             if from_sibling && owner == *self.device.identity() {
+                if !has_room(&self.household, &device) {
+                    continue;
+                }
                 learned |= self.household.insert(device, invite.clone()).as_ref() != Some(&invite);
             } else if from_sibling || device == peer {
                 // Device de contato repassado por um irmão, ou o convite que o contato anuncia de si.
+                if !has_room(&self.contact_devices, &device) {
+                    continue;
+                }
                 if from_sibling {
                     self.trust(owner.clone())?;
                 }
@@ -1106,9 +1129,13 @@ impl Chat {
             {
                 continue;
             }
+            if !has_room(&self.expected, &device) {
+                continue;
+            }
             // Repetir o dial é inofensivo: o libp2p ignora quando já está discando ou conectado.
             self.expected.insert(device, owner);
             if let Err(e) = self.node.dial_peer(device, addrs) {
+                self.expected.remove(&device);
                 self.queue.push_back(ChatEvent::DialFailed {
                     peer: Some(device),
                     reason: e.to_string(),
@@ -1125,11 +1152,39 @@ impl Chat {
                 .filter(|p| self.is_sibling(p))
                 .collect();
             for target in siblings {
-                self.devices_announced.remove(&target);
-                self.announce_devices(target);
+                self.re_announce_to_sibling(target);
             }
         }
         Ok(())
+    }
+
+    /// Re-anuncia a lista a um irmão, no máximo uma vez por `sibling_announce_gap`. Dentro do
+    /// intervalo, marca o irmão como pendente (o que se aprendeu já está guardado, só o anúncio espera).
+    fn re_announce_to_sibling(&mut self, target: PeerId) {
+        let due = self
+            .last_sibling_announce
+            .get(&target)
+            .is_none_or(|last| last.elapsed() >= self.sibling_announce_gap);
+        if due {
+            self.sibling_pending.remove(&target);
+            self.last_sibling_announce.insert(target, Instant::now());
+            self.devices_announced.remove(&target);
+            self.announce_devices(target);
+        } else {
+            self.sibling_pending.insert(target);
+        }
+    }
+
+    /// Anuncia aos irmãos pendentes cujo prazo já passou; os que ainda esperam voltam à pendência.
+    fn flush_sibling_pending(&mut self) {
+        if self.sibling_pending.is_empty() {
+            return;
+        }
+        for target in std::mem::take(&mut self.sibling_pending) {
+            if self.connected.contains(&target) && self.is_sibling(&target) {
+                self.re_announce_to_sibling(target);
+            }
+        }
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
