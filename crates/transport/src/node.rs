@@ -311,7 +311,7 @@ impl Node {
         let opts = if circuit {
             opts.build()
         } else {
-            opts.allocate_new_port().build()
+            opts.build()
         };
         self.start_dial(opts, circuit)
     }
