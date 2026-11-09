@@ -755,3 +755,25 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
   os 3 testes de separação; revertido. A mutação não foi rodada contra o teste de migração v3→v4.
 - **Não verificado**: banco v3 de verdade (só simulado: tabela removida e versão rebaixada); ponta a ponta com 3 devices.
 - **Próximo passo**: tetos de abuso (fatia B, números a decidir com o dono) ou a dica de `/trust` para irmãos.
+
+#### Sessão 16, parte 6: tetos de abuso no transporte (P24)
+
+- **Decisões do dono** (plan mode): transporte primeiro (a frente do `chat` é o PR seguinte); números **moderados**.
+- **Feito**: `ConnectionLimits` (struct própria em `config.rs`, no padrão de `RelayLimits`) em `NodeConfig.connection_limits`
+  (`None` = padrão do papel): cliente 256 no total, 128 de entrada, 32 entradas pendentes, 32 discagens pendentes, 4 por
+  peer; relay 4096/4096/256/32/8. `Node` ganhou `libp2p::connection_limits::Behaviour` (já reexportado pelo libp2p 0.57,
+  sem mudança em `Cargo.toml`/`Cargo.lock`); os relays configurados entram na lista de bypass (em `Node::new` e `add_relay`);
+  `Node::deferred` tem teto `MAX_DEFERRED = 64` (o 65º dial adiado devolve `Err`).
+- **Testes**: 6 novos (2 de unidade em `config.rs`; 4 em `tests/limits.rs`: controle sem teto, 2º cliente recusado com teto de
+  entrada 1, relay configurado fora do teto com `max_established = 0`, 65º dial adiado falha). Rodados pelo dono (ADR 0009):
+  `kin-transport` inteiro verde e clippy do workspace sem avisos. Três mutações pegas e revertidas, cada uma pelo teste certo:
+  sem bypass, `MAX_DEFERRED = 1000`, limite de entrada ignorado. O vermelho sem a implementação não foi mostrado: a
+  implementação veio antes da primeira execução.
+- **Desvio do plano**: o teste do limite **por peer** ficou de fora: a API do `Node` não abre duas conexões do mesmo peer de
+  forma determinística (o libp2p ignora um dial a quem já está conectado). O número (4) está configurado e passa direto
+  pelo libp2p, **sem teste nosso**.
+- **Não verificado**: carga real (milhares de conexões), relay público, NAT; a calibragem dos números em uso real (um nó com
+  muitos contatos conectados ao mesmo tempo pode esbarrar nos 128 de entrada); `ulimit -n` do processo de relay precisa ser
+  maior que 4096 (documentado, não imposto).
+- **Próximo passo**: tetos do `chat` (`household`, `contact_devices`, `expected` e limpeza em `DialFailed`, taxa do
+  re-anúncio) ou a dica de `/trust` para irmãos.
