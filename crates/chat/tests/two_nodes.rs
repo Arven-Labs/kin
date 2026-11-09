@@ -74,26 +74,14 @@ fn has_dropped(events: &[ChatEvent]) -> bool {
 }
 
 /// 1. Duas instâncias se acham sozinhas na LAN e conversam, sem ninguém discar.
+///
+/// Repetido em rodadas (P25): o mDNS faz os dois lados discarem um ao outro ao mesmo tempo, e uma das
+/// duas conexões pode cair com o `Hello` dentro; a falha é intermitente (~1 em 6 no CI), então uma
+/// rodada só não a pega. Tem de ser UM teste só: dois testes de mDNS no mesmo binário rodam em
+/// paralelo no mesmo host e descobrem os chats um do outro.
 #[tokio::test(flavor = "multi_thread")]
 async fn chats_find_each_other_via_mdns_and_talk() {
-    let dir = tempfile::tempdir().unwrap();
-    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
-    let mk = |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db).unwrap();
-    let (mut a, mut b) = (mk(&pa), mk(&pb));
-    a.listen().unwrap();
-    b.listen().unwrap();
-
-    // Mesmo prazo do teste de mDNS do transporte (lan.rs).
-    connect_until_ready_within(&mut a, &mut b, Duration::from_secs(30)).await;
-    exchange(&mut a, &mut b, pb.peer_id(), pa.peer_id(), "mdns").await;
-}
-
-/// P25: o mDNS faz os dois lados discarem um ao outro ao mesmo tempo, e uma das duas conexões pode
-/// cair com o `Hello` dentro. A conversa tem de ficar pronta mesmo assim. Em rodadas repetidas, porque
-/// a corrida é intermitente (reproduzida no CI na rodada 5 de 25 antes do reenvio do `Hello`).
-#[tokio::test(flavor = "multi_thread")]
-async fn mdns_discovery_reaches_a_conversation_in_every_repeated_round() {
-    for _ in 0..25 {
+    for round in 0..25 {
         let dir = tempfile::tempdir().unwrap();
         let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
         let mk =
@@ -102,7 +90,16 @@ async fn mdns_discovery_reaches_a_conversation_in_every_repeated_round() {
         a.listen().unwrap();
         b.listen().unwrap();
 
-        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(12)).await;
+        // Mesmo prazo do teste de mDNS do transporte (lan.rs).
+        connect_until_ready_within(&mut a, &mut b, Duration::from_secs(30)).await;
+        exchange(
+            &mut a,
+            &mut b,
+            pb.peer_id(),
+            pa.peer_id(),
+            &format!("mdns {round}"),
+        )
+        .await;
     }
 }
 
