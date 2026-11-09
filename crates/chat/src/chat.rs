@@ -1408,7 +1408,7 @@ impl Chat {
         }
         let retries = self
             .handshake_retries
-            .entry((peer, std::mem::discriminant(&envelope)))
+            .entry((peer, std::mem::discriminant(&Envelope::Hello)))
             .or_insert(0);
         if *retries >= MAX_HANDSHAKE_RETRIES {
             return;
