@@ -114,6 +114,33 @@ async fn dial_with_wrong_peer_id_is_rejected() {
     );
 }
 
+/// P25 (c): dois nós que discam um ao outro ao mesmo tempo. Com o dial reusando a porta de escuta, os dois
+/// sockets ficam com o mesmo par de portas (TCP simultaneous open) e o Noise quebra
+/// (`Handshake failed: input error`); medido em 40 a 79% das rodadas em loopback. Repete várias rodadas
+/// porque a falha é estocástica.
+#[tokio::test(flavor = "multi_thread")]
+async fn simultaneous_tcp_dial_connects_both_ways() {
+    const ROUNDS: usize = 50;
+    for round in 0..ROUNDS {
+        let (key_a, key_b) = (DeviceKey::generate(), DeviceKey::generate());
+        let (mut a, mut b) = (node(&key_a), node(&key_b));
+        let addr_a = listen_loopback(&mut a).await;
+        let addr_b = listen_loopback(&mut b).await;
+
+        a.dial_peer(key_b.peer_id(), vec![addr_b]).unwrap();
+        b.dial_peer(key_a.peer_id(), vec![addr_a]).unwrap();
+
+        timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                until_connected(&mut a, key_b.peer_id()),
+                until_connected(&mut b, key_a.peer_id())
+            )
+        })
+        .await
+        .unwrap_or_else(|_| panic!("rodada {round}: os dois nós não se conectaram"));
+    }
+}
+
 /// Um convite traz vários endereços; basta um funcionar, e o Peer ID é conferido.
 #[tokio::test(flavor = "multi_thread")]
 async fn dial_peer_tries_all_addresses_and_connects_through_the_good_one() {
