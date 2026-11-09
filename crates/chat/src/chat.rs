@@ -154,6 +154,9 @@ const CONTACT_DIAL_ADDRS: usize = 4;
 /// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
 const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
+/// Quantas vezes se reenvia o `Hello` a um peer por conexão quando o envio falha (P25).
+const MAX_HELLO_RETRIES: u8 = 3;
+
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
 const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
@@ -231,6 +234,10 @@ pub struct Chat {
     device: CryptoDevice,
     conversations: HashMap<PeerId, Conversation>,
     pending: HashMap<SendId, Option<MessageId>>,
+    /// Envios em voo que são `Hello`: só estes são reenviados quando falham (P25).
+    hellos: std::collections::HashSet<SendId>,
+    /// Quantas vezes reenviei o `Hello` a cada peer nesta conexão (zera ao desconectar).
+    hello_retries: HashMap<PeerId, u8>,
     /// Identidade exigida de cada peer discado por convite (`accept`), até a conversa ficar pronta.
     expected: HashMap<PeerId, IdentityId>,
     /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
@@ -335,6 +342,8 @@ impl Chat {
             device,
             conversations: HashMap::new(),
             pending: HashMap::new(),
+            hellos: Default::default(),
+            hello_retries: HashMap::new(),
             expected: HashMap::new(),
             future: HashMap::new(),
             outbox,
@@ -885,11 +894,12 @@ impl Chat {
                 // Conversa recarregada do banco: os dois lados já a têm, então dá para anunciar já.
                 self.announce_relays(peer);
                 self.announce_devices(peer);
-                self.transmit(peer, &Envelope::Hello);
+                self.send_hello(peer);
                 self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.hello_retries.remove(&peer);
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
                 self.lists_acted.remove(&peer);
@@ -904,6 +914,7 @@ impl Chat {
                 Err(e) => self.drop_message(peer, e),
             },
             NodeEvent::MessageDelivered { peer, id } => {
+                self.hellos.remove(&id);
                 if let Some(Some(message)) = self.pending.remove(&id) {
                     // O ack fecha o ciclo: sai da fila e libera uma vaga na janela. Só o ack de um
                     // device do destinatário é "entregue": o de um irmão (espelho) só libera a fila.
@@ -923,6 +934,7 @@ impl Chat {
                 }
             }
             NodeEvent::SendFailed { peer, id, reason } => {
+                let was_hello = self.hellos.remove(&id);
                 match self.pending.remove(&id).flatten() {
                     // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
                     Some(message) => {
@@ -933,6 +945,9 @@ impl Chat {
                     // anúncios podem ter se perdido, então liberam o próximo gatilho (`on_mls`, algo
                     // aprendido). Sem reenvio imediato: se o envio seguir falhando, não vira laço.
                     None => {
+                        if was_hello {
+                            self.resend_hello(peer);
+                        }
                         self.announced.remove(&peer);
                         self.devices_announced.remove(&peer);
                         self.queue.push_back(ChatEvent::SendFailed {
@@ -1368,6 +1383,28 @@ impl Chat {
                 self.drop_message(peer, e);
             }
         }
+    }
+
+    fn send_hello(&mut self, peer: PeerId) {
+        let id = self.node.send(peer, Envelope::Hello.encode());
+        self.pending.insert(id, None);
+        self.hellos.insert(id);
+    }
+
+    /// O `Hello` falhou (P25): com dois discos simultâneos uma das conexões cai levando o `Hello`, e o
+    /// peer segue conectado pela outra, então nada mais dispara o handshake. Reenvia enquanto ele
+    /// estiver conectado e sem conversa, no máximo [`MAX_HELLO_RETRIES`] vezes por conexão: o `Hello`
+    /// é idempotente (`on_hello` ignora quem já tem conversa) e o teto impede laço.
+    fn resend_hello(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) || self.conversations.contains_key(&peer) {
+            return;
+        }
+        let retries = self.hello_retries.entry(peer).or_insert(0);
+        if *retries >= MAX_HELLO_RETRIES {
+            return;
+        }
+        *retries += 1;
+        self.send_hello(peer);
     }
 
     fn transmit(&mut self, peer: PeerId, envelope: &Envelope) {
