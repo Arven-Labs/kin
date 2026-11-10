@@ -204,7 +204,7 @@ fn insert_bounded(
     }
     let victim = map.keys().filter(|k| !protected.contains(k)).min().copied();
     match victim {
-        Some(victim) if protected.contains(&key) || victim < key => {
+        Some(victim) if protected.contains(&key) || victim > key => {
             map.remove(&victim);
             map.insert(key, invite);
             Inserted::Changed
