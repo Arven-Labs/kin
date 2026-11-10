@@ -17,8 +17,10 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 
 /// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 etapa 1 (mensagem por
 /// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho); 3 = P24 (tabela `kin_trusted`,
-/// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva).
-const SCHEMA_VERSION: i64 = 4;
+/// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva);
+/// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva). Um build antigo
+/// recusa o banco v5 (ver `migrate`): não há downgrade.
+const SCHEMA_VERSION: i64 = 5;
 
 /// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
 /// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
@@ -99,6 +101,8 @@ impl Outbox {
                  peer TEXT PRIMARY KEY,
                  relays TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_trusted (
+                 identity BLOB PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS kin_distrusted (
                  identity BLOB PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS kin_seen (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,7 +319,6 @@ impl Outbox {
     }
 
     /// Deixa de confiar em `identity` (apaga de `kin_trusted`); repetir é inofensivo.
-    #[allow(dead_code)] // stub: some quando o Chat passar a usar
     pub(crate) fn remove_trusted(&self, identity: &IdentityId) -> Result<(), Error> {
         self.conn
             .execute(
@@ -328,7 +331,6 @@ impl Outbox {
 
     /// Grava que desconfio de `identity` (lista negra que vence a confiança herdada de um irmão);
     /// repetir é inofensivo.
-    #[allow(dead_code)] // stub
     pub(crate) fn add_distrusted(&self, identity: &IdentityId) -> Result<(), Error> {
         self.conn
             .execute(
@@ -340,7 +342,6 @@ impl Outbox {
     }
 
     /// Tira `identity` da lista negra (o usuário voltou a confiar de propósito); repetir é inofensivo.
-    #[allow(dead_code)] // stub
     pub(crate) fn remove_distrusted(&self, identity: &IdentityId) -> Result<(), Error> {
         self.conn
             .execute(
@@ -352,7 +353,6 @@ impl Outbox {
     }
 
     /// As identidades desconfiadas. Linha que não decodifica é ignorada (como em `trusted_identities`).
-    #[allow(dead_code)] // stub
     pub(crate) fn distrusted_identities(&self) -> Result<Vec<IdentityId>, Error> {
         let mut statement = self
             .conn

@@ -308,7 +308,6 @@ pub struct Chat {
     trusted: Vec<IdentityId>,
     /// Identidades de que desconfio (`untrust`): a confiança que um irmão repassa não as aceita de volta;
     /// só `trust`/`accept` explícitos as tiram daqui. Gravadas no banco (`kin_distrusted`).
-    #[allow(dead_code)] // stub
     distrusted: Vec<IdentityId>,
     /// Convites de devices de contatos aceitos, como eles mesmos anunciaram ou como um irmão repassou.
     /// Só em memória. Vão para os meus irmãos, para que eles também achem o contato.
@@ -368,6 +367,10 @@ impl Chat {
         let outbox = Outbox::open(&db.with_extension("outbox.db"))?;
         let mut chat = Self::with_device(device, device_key, config, outbox)?;
         chat.trusted = chat.outbox.trusted_identities()?;
+        chat.distrusted = chat.outbox.distrusted_identities()?;
+        // A desconfiança vence: se um `untrust` caiu no meio (gravou a lista negra e não apagou a
+        // confiança), a identidade não volta a ser confiada ao reabrir.
+        chat.trusted.retain(|t| !chat.distrusted.contains(t));
         for (label, id) in chat.device.remembered()? {
             // Rótulo ou conversa que não carregam mais são ignorados: o handshake refaz.
             let Ok(peer) = label.parse::<PeerId>() else {
@@ -484,6 +487,11 @@ impl Chat {
         if self.is_trusted(&identity) {
             return Ok(());
         }
+        // Confiar de propósito tira a identidade da lista negra do `untrust`.
+        if self.is_distrusted(&identity) {
+            self.outbox.remove_distrusted(&identity)?;
+            self.distrusted.retain(|distrusted| *distrusted != identity);
+        }
         self.outbox.add_trusted(&identity)?;
         self.trusted.push(identity.clone());
         let to_announce: Vec<PeerId> = self
@@ -503,13 +511,30 @@ impl Chat {
         Ok(())
     }
 
-    /// Deixa de confiar em `identity` (stub: ainda não faz nada).
-    pub fn untrust(&mut self, _identity: &IdentityId) -> Result<(), Error> {
+    /// Deixa de confiar em `identity`: para de processar a lista de devices dela e de anunciar-lhe o meu
+    /// convite, esquece os devices dela em `contact_devices` e `expected`, e a põe numa lista negra
+    /// gravada no banco, para que a confiança que um irmão repassa não a aceite de volta. Só `trust`
+    /// ou `accept` explícitos a tiram dela. **Não** bloqueia mensagens: a conversa existente continua, e
+    /// o que a identidade já sabe de mim (endereços anunciados antes) continua sabido. A minha própria
+    /// identidade é recusada: os meus devices são família, não contatos.
+    pub fn untrust(&mut self, identity: &IdentityId) -> Result<(), Error> {
+        if identity == self.device.identity() {
+            return Err(Error::OwnIdentity);
+        }
+        // Lista negra primeiro: se o passo seguinte falhar, o lado seguro (desconfiar) já está gravado.
+        self.outbox.add_distrusted(identity)?;
+        self.outbox.remove_trusted(identity)?;
+        if !self.distrusted.contains(identity) {
+            self.distrusted.push(identity.clone());
+        }
+        self.trusted.retain(|trusted| trusted != identity);
+        self.contact_devices
+            .retain(|_, invite| invite.identity() != identity);
+        self.expected.retain(|_, owner| owner != identity);
         Ok(())
     }
 
     /// Desconfio de `identity` (`untrust`)?
-    #[allow(dead_code)] // stub
     fn is_distrusted(&self, identity: &IdentityId) -> bool {
         self.distrusted.contains(identity)
     }
@@ -1217,6 +1242,10 @@ impl Chat {
                 }
             } else if from_sibling || device == peer {
                 // Device de contato repassado por um irmão, ou o convite que o contato anuncia de si.
+                // Identidade que desconfio (`untrust`) não volta pela confiança herdada do irmão.
+                if from_sibling && self.is_distrusted(&owner) {
+                    continue;
+                }
                 match insert_bounded(
                     &mut self.contact_devices,
                     &protected,
