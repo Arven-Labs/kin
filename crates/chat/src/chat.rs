@@ -530,7 +530,7 @@ impl Chat {
         self.trusted.retain(|trusted| trusted != identity);
         self.contact_devices
             .retain(|_, invite| invite.identity() != identity);
-        self.expected.retain(|_, owner| owner != identity);
+        self.expected.retain(|_, owner| owner == identity);
         Ok(())
     }
 
