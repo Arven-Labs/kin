@@ -907,3 +907,17 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Não verificado**: a falha real (só `SendFailed` simulado); `Welcome` entregue e descartado pelo outro lado; reinício do
   processo no meio do handshake; o `lab/` de NAT.
 - **Próximo passo**: dica de `/trust`; roteiro de 3 devices; rodar o `lab/` de NAT.
+
+### 2026-11-10 — Sessão 19
+
+#### Dica de `/trust` só para quem não é irmão (P24, PR #60)
+
+- **Decisão do dono** (plan mode): fatia só da dica (sem roteiro de 3 devices, revogação nem device morto).
+- **Feito** (`crates/cli/src/main.rs`): `should_hint_trust(peer, own)` (`peer != own`); `on_event` recebe a minha `IdentityId` e só
+  imprime `(para aceitar este contato: /trust)` quando é outra identidade.
+- **Testes**: 2 em `cli::tests` (primeiros testes do crate). No CI com o stub (`true`) falhou 1 (irmão sem dica) e passou 1
+  (guarda). A primeira rodada falhou no clippy por função sem uso, não no teste, e foi refeita ligando o stub ao `on_event`.
+  Verdes depois. Mutação `!=`→`==` (PR #61, fechado e apagado): os 2 falharam.
+- **Não verificado**: a saída real da CLI (só o predicado é testado, não o `println!` em `on_event`); a dica ainda aparece para
+  contato já confiável.
+- **Próximo passo**: roteiro de 3 devices; device morto nunca discado; rodar o `lab/` de NAT.
