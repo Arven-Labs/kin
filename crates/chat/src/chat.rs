@@ -2969,23 +2969,24 @@ mod tests {
             sibling: (sibling, mut raw),
             ..
         } = household();
-        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES)
-            .map(|_| invite_for(&bia_key))
-            .collect();
-        feed_list(&mut bia, sibling, &mut raw, &invites[..MAX_KNOWN_DEVICES]);
-        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
-        let newcomer = invites[MAX_KNOWN_DEVICES].peer_id();
+        // O novo é o menor Peer ID: cheio, o despejo o ignora (ele seria o primeiro a sair).
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        let newcomer = invites[0].peer_id();
+        let dead = invites[1].peer_id();
+        feed_list(&mut bia, sibling, &mut raw, &invites[1..4]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[4..]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
         assert!(!bia.household.contains_key(&newcomer), "cheio: ignorado");
 
         bia.handle(NodeEvent::DialFailed {
-            peer: Some(invites[0].peer_id()),
+            peer: Some(dead),
             reason: "fora do ar".to_string(),
         });
-        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
 
         assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
         assert!(bia.household.contains_key(&newcomer));
-        assert!(!bia.household.contains_key(&invites[0].peer_id()));
+        assert!(!bia.household.contains_key(&dead));
     }
 
     /// P24: re-anúncio ao irmão tem intervalo mínimo; o que chega dentro dele fica pendente e sai no
