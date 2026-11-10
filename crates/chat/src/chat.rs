@@ -1243,7 +1243,7 @@ impl Chat {
             } else if from_sibling || device == peer {
                 // Device de contato repassado por um irmão, ou o convite que o contato anuncia de si.
                 // Identidade que desconfio (`untrust`) não volta pela confiança herdada do irmão.
-                if from_sibling && self.is_distrusted(&owner) {
+                if from_sibling && !self.is_distrusted(&owner) {
                     continue;
                 }
                 match insert_bounded(
