@@ -306,6 +306,10 @@ pub struct Chat {
     /// Identidades que aceitei (convite aceito ou `trust`), além da minha. Só destas se processa a lista
     /// de devices e a elas se anuncia o meu convite. Só em memória. Pequena: busca linear.
     trusted: Vec<IdentityId>,
+    /// Identidades de que desconfio (`untrust`): a confiança que um irmão repassa não as aceita de volta;
+    /// só `trust`/`accept` explícitos as tiram daqui. Gravadas no banco (`kin_distrusted`).
+    #[allow(dead_code)] // stub
+    distrusted: Vec<IdentityId>,
     /// Convites de devices de contatos aceitos, como eles mesmos anunciaram ou como um irmão repassou.
     /// Só em memória. Vão para os meus irmãos, para que eles também achem o contato.
     contact_devices: HashMap<PeerId, Invite>,
@@ -401,6 +405,7 @@ impl Chat {
             lists_acted: Default::default(),
             household: HashMap::new(),
             trusted: Vec::new(),
+            distrusted: Vec::new(),
             contact_devices: HashMap::new(),
             last_sibling_announce: HashMap::new(),
             sibling_pending: Default::default(),
@@ -496,6 +501,17 @@ impl Chat {
             self.announce_devices(peer);
         }
         Ok(())
+    }
+
+    /// Deixa de confiar em `identity` (stub: ainda não faz nada).
+    pub fn untrust(&mut self, _identity: &IdentityId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Desconfio de `identity` (`untrust`)?
+    #[allow(dead_code)] // stub
+    fn is_distrusted(&self, identity: &IdentityId) -> bool {
+        self.distrusted.contains(identity)
     }
 
     /// `identity` é a minha ou foi aceita?
@@ -3429,6 +3445,174 @@ mod tests {
 
         assert!(bia.is_trusted(&ana));
         assert!(!bia.is_trusted(&cleo));
+    }
+
+    /// P24 (`untrust`): deixar de confiar tira a confiança e grava a lista negra.
+    #[tokio::test]
+    async fn untrust_withdraws_the_trust_and_remembers_the_distrust() {
+        let mut bia = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        let ana = StandaloneIdentity::generate().id();
+        bia.trust(ana.clone()).unwrap();
+
+        bia.untrust(&ana).unwrap();
+
+        assert!(!bia.is_trusted(&ana));
+        assert!(bia.is_distrusted(&ana));
+        assert!(bia.outbox.trusted_identities().unwrap().is_empty());
+        assert_eq!(bia.outbox.distrusted_identities().unwrap(), vec![ana]);
+    }
+
+    /// P24 (`untrust`): a desconfiança sobrevive a reabrir o `Chat`; confiar de propósito depois a
+    /// apaga, e isso também sobrevive.
+    #[tokio::test]
+    async fn distrust_survives_reopening_and_an_explicit_trust_clears_it_for_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bia.db");
+        let (bia_key, bia_device) = (StandaloneIdentity::generate(), DeviceKey::generate());
+        let (ana, cleo) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        let config = || NodeConfig {
+            mdns: false,
+            ..Default::default()
+        };
+        {
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            bia.trust(ana.clone()).unwrap();
+            bia.untrust(&ana).unwrap();
+        }
+        {
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            assert!(!bia.is_trusted(&ana));
+            assert!(bia.is_distrusted(&ana));
+            assert!(!bia.is_distrusted(&cleo));
+            bia.trust(ana.clone()).unwrap();
+        }
+
+        let bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+
+        assert!(bia.is_trusted(&ana));
+        assert!(!bia.is_distrusted(&ana));
+    }
+
+    /// P24 (`untrust`): aceitar o convite da identidade (ato explícito) volta a confiar nela.
+    #[tokio::test]
+    async fn accepting_an_invite_after_untrust_trusts_again() {
+        let mut bia = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        let ana = StandaloneIdentity::generate();
+        bia.trust(ana.id()).unwrap();
+        bia.untrust(&ana.id()).unwrap();
+
+        bia.accept(&invite_for(&ana)).unwrap();
+
+        assert!(bia.is_trusted(&ana.id()));
+        assert!(!bia.is_distrusted(&ana.id()));
+    }
+
+    /// P24 (`untrust`): os meus devices são família, não contatos: recusa e nada muda.
+    #[tokio::test]
+    async fn untrust_refuses_my_own_identity() {
+        let key = StandaloneIdentity::generate();
+        let mut bia = chat(&key, &DeviceKey::generate());
+
+        let result = bia.untrust(&key.id());
+
+        assert!(matches!(result, Err(Error::OwnIdentity)));
+        assert!(bia.is_trusted(&key.id()));
+        assert!(!bia.is_distrusted(&key.id()));
+    }
+
+    /// P24 (`untrust`): um irmão que repassa um device da identidade desconfiada não a faz ser confiada
+    /// de novo, nem guardada, nem discada.
+    #[tokio::test]
+    async fn a_sibling_forwarding_a_distrusted_identity_does_not_bring_the_trust_back() {
+        let Household {
+            mut bia,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let cleo = StandaloneIdentity::generate();
+        bia.trust(cleo.id()).unwrap();
+        bia.untrust(&cleo.id()).unwrap();
+        let forwarded = invite_for(&cleo);
+
+        feed_list(
+            &mut bia,
+            sibling,
+            &mut raw,
+            std::slice::from_ref(&forwarded),
+        );
+
+        assert!(!bia.is_trusted(&cleo.id()));
+        assert!(bia.contact_devices.is_empty(), "não guardou");
+        assert!(
+            !bia.expected.contains_key(&forwarded.peer_id()),
+            "nem discou"
+        );
+    }
+
+    /// P24 (`untrust`): a lista negra é por identidade: outra identidade repassada pelo irmão segue
+    /// sendo confiada, guardada e discada.
+    #[tokio::test]
+    async fn distrusting_one_identity_does_not_affect_another_forwarded_by_a_sibling() {
+        let Household {
+            mut bia,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let (cleo, dora) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        bia.untrust(&cleo.id()).unwrap();
+        let forwarded = invite_for(&dora);
+
+        feed_list(
+            &mut bia,
+            sibling,
+            &mut raw,
+            std::slice::from_ref(&forwarded),
+        );
+
+        assert!(bia.is_trusted(&dora.id()));
+        assert!(bia.contact_devices.contains_key(&forwarded.peer_id()));
+        assert!(bia.expected.contains_key(&forwarded.peer_id()));
+    }
+
+    /// P24 (`untrust`): esquece os devices da identidade em `contact_devices` e `expected`, sem mexer nos
+    /// de outras identidades nem na conversa já existente com ela.
+    #[tokio::test]
+    async fn untrust_forgets_that_identitys_devices_but_keeps_its_conversation() {
+        let Household {
+            mut bia,
+            ana_key,
+            ana_device: (ana_peer, _),
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let dora = StandaloneIdentity::generate();
+        let (ana_other, dora_device) = (invite_for(&ana_key), invite_for(&dora));
+        bia.trust(ana_key.id()).unwrap();
+        feed_list(
+            &mut bia,
+            sibling,
+            &mut raw,
+            &[ana_other.clone(), dora_device.clone()],
+        );
+        assert!(bia.contact_devices.contains_key(&ana_other.peer_id()));
+        assert!(bia.expected.contains_key(&ana_other.peer_id()));
+
+        bia.untrust(&ana_key.id()).unwrap();
+
+        assert!(!bia.contact_devices.contains_key(&ana_other.peer_id()));
+        assert!(!bia.expected.contains_key(&ana_other.peer_id()));
+        assert!(bia.contact_devices.contains_key(&dora_device.peer_id()));
+        assert!(bia.expected.contains_key(&dora_device.peer_id()));
+        assert!(
+            bia.conversations.contains_key(&ana_peer),
+            "a conversa segue"
+        );
     }
 
     /// P24: confiar DEPOIS de a conversa ficar pronta faz o anúncio que antes foi calado (a lista só

@@ -314,6 +314,63 @@ impl Outbox {
         Ok(())
     }
 
+    /// Deixa de confiar em `identity` (apaga de `kin_trusted`); repetir é inofensivo.
+    #[allow(dead_code)] // stub: some quando o Chat passar a usar
+    pub(crate) fn remove_trusted(&self, identity: &IdentityId) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "DELETE FROM kin_trusted WHERE identity = ?1",
+                params![identity.public_key().encode_protobuf()],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// Grava que desconfio de `identity` (lista negra que vence a confiança herdada de um irmão);
+    /// repetir é inofensivo.
+    #[allow(dead_code)] // stub
+    pub(crate) fn add_distrusted(&self, identity: &IdentityId) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO kin_distrusted (identity) VALUES (?1)",
+                params![identity.public_key().encode_protobuf()],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// Tira `identity` da lista negra (o usuário voltou a confiar de propósito); repetir é inofensivo.
+    #[allow(dead_code)] // stub
+    pub(crate) fn remove_distrusted(&self, identity: &IdentityId) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "DELETE FROM kin_distrusted WHERE identity = ?1",
+                params![identity.public_key().encode_protobuf()],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// As identidades desconfiadas. Linha que não decodifica é ignorada (como em `trusted_identities`).
+    #[allow(dead_code)] // stub
+    pub(crate) fn distrusted_identities(&self) -> Result<Vec<IdentityId>, Error> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT identity FROM kin_distrusted")
+            .map_err(Error::storage)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(Error::storage)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let bytes = row.map_err(Error::storage)?;
+            if let Ok(key) = PublicKey::try_decode_protobuf(&bytes) {
+                out.push(IdentityId::new(key));
+            }
+        }
+        Ok(out)
+    }
+
     /// As identidades aceitas. Linha que não decodifica é ignorada: vale menos confiar a menos.
     pub(crate) fn trusted_identities(&self) -> Result<Vec<IdentityId>, Error> {
         let mut statement = self
@@ -977,6 +1034,66 @@ mod tests {
         let mut want = vec![ana, bia];
         want.sort_by_key(IdentityId::to_base58);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn distrusted_identities_survive_reopening_and_are_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (ana, bia) = (identity(), identity());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            assert!(outbox.distrusted_identities().unwrap().is_empty());
+            outbox.add_distrusted(&ana).unwrap();
+            outbox.add_distrusted(&bia).unwrap();
+            outbox.add_distrusted(&ana).unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        let mut got = outbox.distrusted_identities().unwrap();
+        let mut want = vec![ana, bia];
+        got.sort_by_key(IdentityId::to_base58);
+        want.sort_by_key(IdentityId::to_base58);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn removing_a_trust_or_a_distrust_touches_only_that_identity_and_is_idempotent() {
+        let outbox = Outbox::memory().unwrap();
+        let (ana, bia) = (identity(), identity());
+        outbox.add_trusted(&ana).unwrap();
+        outbox.add_trusted(&bia).unwrap();
+        outbox.add_distrusted(&ana).unwrap();
+        outbox.add_distrusted(&bia).unwrap();
+
+        outbox.remove_trusted(&ana).unwrap();
+        outbox.remove_trusted(&ana).unwrap();
+        outbox.remove_distrusted(&bia).unwrap();
+        outbox.remove_distrusted(&bia).unwrap();
+
+        assert_eq!(outbox.trusted_identities().unwrap(), vec![bia]);
+        assert_eq!(outbox.distrusted_identities().unwrap(), vec![ana]);
+    }
+
+    #[test]
+    fn a_version_4_database_opens_gains_the_distrusted_table_and_keeps_the_trusted_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let ana = identity();
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.add_trusted(&ana).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_distrusted; PRAGMA user_version = 4;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert!(outbox.distrusted_identities().unwrap().is_empty());
+        assert_eq!(outbox.trusted_identities().unwrap(), vec![ana]);
     }
 
     // 14
