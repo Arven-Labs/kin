@@ -947,3 +947,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   (`forget_unreachable`): sair do C não gera discagem, então não há `DialFailed` e nada a observar. Relay real e NAT. Contato
   em endereço de LAN/privado visto como contato (aqui o caminho foi de irmão, sem o filtro `dialable`). Só 1 execução.
 - **Próximo passo**: CLI enviar por identidade (`send_to`) para poder medir o espelho; device morto nunca discado; `lab/` de NAT.
+
+#### CLI envia por identidade e o espelho medido (P24, PR #63)
+
+- **Decisões do dono** (plan mode): a linha digitada vai à identidade da conversa atual (`send_to`), descartado um `/to`; depois
+  do PR, roteiro manual para medir o espelho.
+- **Feito** (`crates/cli/src/main.rs`): `identity_of(met, peer)`; o laço troca `chat.send(peer, ..)` por
+  `chat.send_to(&identidade, ..)`; sem identidade conhecida a CLI avisa e não envia; comentário do topo atualizado.
+- **Testes**: 3 em `cli::tests`. No CI com o stub (`None`) falharam 2 (achar a identidade; dois devices da mesma identidade) e
+  passou 1 (peer desconhecido, guarda); verdes depois. Mutação `==`→`!=` no filtro (PR #64, fechado e apagado): 2 falharam; o
+  terceiro passa de propósito (os dois devices têm a mesma identidade).
+- **Roteiro manual** (binário do commit do PR compilado pelo dono; A1 e A2 irmãos, C contato que confia em X; LAN
+  `192.168.1.200`, `--no-nostr --no-mdns`; chaves descartáveis, apagadas ao fim):
+
+| Passo | Resultado |
+|---|---|
+| A2 `--pair` + `--dial` A1; A1 `/accept` C; C `/trust` | topologia fechada: A1, A2 e C com conversa pronta com os outros (A2 achou C sozinho de novo) |
+| A1 digita `ola de A1` | C recebe `peer: ola de A1`; **A2 imprime `eu → <identidade de C>: ola de A1`**; A1 vê `entregue` |
+| A2 digita `ola de A2` | C recebe; **A1 imprime `eu → <identidade de C>: ola de A2`**; A2 vê `entregue` |
+| `MessageId` | o mesmo (`7b858a03`, `085aa254`) no remetente, no espelho e em C |
+| duplicatas em C | 0 (2 mensagens, 2 linhas) |
+
+- **Não verificado**: contato com 2 ou mais devices (fan-out de uma linha a N devices e as várias linhas `entregue`); espelho
+  com a mensagem enviada com o irmão offline (outbox do espelho só em teste de `chat`); relay real e NAT; só 1 execução.
+- **Próximo passo**: device morto nunca discado; revogação de device; `lab/` de NAT.
