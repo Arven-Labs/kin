@@ -259,11 +259,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current: Option<PeerId> = None;
     // Identidades vistas em `ConversationReady` nesta execução: `/trust` só aceita uma destas.
     let mut met: Vec<(PeerId, IdentityId)> = Vec::new();
+    let own = identity.id();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
     loop {
         tokio::select! {
-            event = chat.next_event() => on_event(event, &mut current, &mut seen, &mut met),
+            event = chat.next_event() => on_event(event, &mut current, &mut seen, &mut met, &own),
             line = lines.next_line() => {
                 let Some(line) = line? else { break };
                 let line = line.trim();
@@ -454,11 +455,18 @@ async fn serve_relay(args: &Args, device: &DeviceKey) -> Result<(), Box<dyn std:
     }
 }
 
+/// A dica de `/trust` só vale para outra pessoa: um irmão (mesma identidade que a minha) já é
+/// confiável por construção.
+fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
+    peer_identity != own
+}
+
 fn on_event(
     event: ChatEvent,
     current: &mut Option<PeerId>,
     seen: &mut Vec<MessageId>,
     met: &mut Vec<(PeerId, IdentityId)>,
+    own: &IdentityId,
 ) {
     match event {
         ChatEvent::Listening(addr) => println!("escutando em {addr}"),
@@ -471,7 +479,9 @@ fn on_event(
                 peer,
                 identity.to_base58()
             );
-            println!("(para aceitar este contato: /trust)");
+            if should_hint_trust(&identity, own) {
+                println!("(para aceitar este contato: /trust)");
+            }
             met.retain(|(known, _)| *known != peer);
             met.push((peer, identity));
             *current = Some(peer);
@@ -548,5 +558,23 @@ fn on_event(
             println!("(relays de {peer}: {})", relays.join(", "));
         }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_trust_for_another_person() {
+        let me = StandaloneIdentity::generate().id();
+        let other = StandaloneIdentity::generate().id();
+        assert!(should_hint_trust(&other, &me));
+    }
+
+    #[test]
+    fn no_trust_hint_for_a_sibling() {
+        let me = StandaloneIdentity::generate().id();
+        assert!(!should_hint_trust(&me.clone(), &me));
     }
 }
