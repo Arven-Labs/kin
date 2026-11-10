@@ -454,6 +454,12 @@ async fn serve_relay(args: &Args, device: &DeviceKey) -> Result<(), Box<dyn std:
     }
 }
 
+/// A dica de `/trust` só vale para outra pessoa: um irmão (mesma identidade que a minha) já é
+/// confiável por construção.
+fn should_hint_trust(_peer_identity: &IdentityId, _own: &IdentityId) -> bool {
+    true
+}
+
 fn on_event(
     event: ChatEvent,
     current: &mut Option<PeerId>,
@@ -548,5 +554,23 @@ fn on_event(
             println!("(relays de {peer}: {})", relays.join(", "));
         }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hints_trust_for_another_person() {
+        let me = StandaloneIdentity::generate().id();
+        let other = StandaloneIdentity::generate().id();
+        assert!(should_hint_trust(&other, &me));
+    }
+
+    #[test]
+    fn no_trust_hint_for_a_sibling() {
+        let me = StandaloneIdentity::generate().id();
+        assert!(!should_hint_trust(&me.clone(), &me));
     }
 }
