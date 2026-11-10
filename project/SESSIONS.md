@@ -891,3 +891,19 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Não verificado**: o `lab/` de NAT (não roda no CI); o braço mDNS não tem teste próprio; evidência estatística, sem repro
   determinístico.
 - **Próximo passo**: P25 (d) (`KeyPackage`/`Welcome` perdidos); dica de `/trust`; roteiro de 3 devices; rodar o `lab/` no PR.
+
+#### P25 (d): reenviar `KeyPackage` e `Welcome` (PR #53)
+
+- **Decisão do dono** (plan mode): reenviar os dois, com teto (descartados: só o `KeyPackage`; não fazer agora). Falha **não
+  observada**: é endurecimento da mesma família do `Hello` perdido.
+- **Feito** (`crates/chat/src/chat.rs`): `hellos` virou `handshake: HashMap<SendId, Envelope>`, preenchido em `transmit` para
+  `Hello`, `KeyPackage` e `Welcome`; `resend_hello` virou `resend_handshake` (mesmos bytes, 3 por tipo e por conexão,
+  `handshake_retries` por `(peer, tipo)`). `Hello` e `KeyPackage` só sem conversa; o `Welcome` reenvia mesmo com conversa, porque
+  quem o manda já a tem (`ready`).
+- **Testes**: 8 novos em `chat::tests` (e o que fixava "`KeyPackage` não reenvia" virou o de `Mls`). No CI antes da
+  implementação, 4 falharam (os de reenviar) e os demais passaram como guardas. Verdes depois. 6 mutações em PRs descartáveis
+  (#54 a #59, fechados), todas pegas pelo teste certo: sem checagem de conectado, `KeyPackage` com conversa, teto 103, sem zerar ao
+  desconectar, teto compartilhado entre tipos, `Welcome` exigindo sem conversa.
+- **Não verificado**: a falha real (só `SendFailed` simulado); `Welcome` entregue e descartado pelo outro lado; reinício do
+  processo no meio do handshake; o `lab/` de NAT.
+- **Próximo passo**: dica de `/trust`; roteiro de 3 devices; rodar o `lab/` de NAT.
