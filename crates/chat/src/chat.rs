@@ -518,9 +518,6 @@ impl Chat {
     /// o que a identidade já sabe de mim (endereços anunciados antes) continua sabido. A minha própria
     /// identidade é recusada: os meus devices são família, não contatos.
     pub fn untrust(&mut self, identity: &IdentityId) -> Result<(), Error> {
-        if identity == self.device.identity() {
-            return Err(Error::OwnIdentity);
-        }
         // Lista negra primeiro: se o passo seguinte falhar, o lado seguro (desconfiar) já está gravado.
         self.outbox.add_distrusted(identity)?;
         self.outbox.remove_trusted(identity)?;
