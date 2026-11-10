@@ -20,7 +20,8 @@
 //! Segundo device da mesma identidade: `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
 //! `kin://pair/...`; no device novo, `--pair ARQUIVO` (ou `-` para stdin) a importa na primeira execução
 //! e recusa se já houver identidade. É o segredo inteiro, sem cifra: use só em terminal privado.
-//! Linhas digitadas vão ao peer da conversa;
+//! Linhas digitadas vão à identidade da conversa atual (a todos os devices dela) e são espelhadas
+//! nos meus outros devices (`eu → ...`);
 //! `/r <id> texto` responde à mensagem `<id>` (thread); `/quit` sai.
 
 use std::path::{Path, PathBuf};
@@ -467,8 +468,10 @@ fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
 
 /// A identidade vista em `ConversationReady` para `peer`: a linha digitada vai a ela (a todos os
 /// devices dela, e espelhada nos meus outros devices), não só ao device da conversa atual.
-fn identity_of(_met: &[(PeerId, IdentityId)], _peer: PeerId) -> Option<IdentityId> {
-    None
+fn identity_of(met: &[(PeerId, IdentityId)], peer: PeerId) -> Option<IdentityId> {
+    met.iter()
+        .find(|(known, _)| *known == peer)
+        .map(|(_, identity)| identity.clone())
 }
 
 fn on_event(
