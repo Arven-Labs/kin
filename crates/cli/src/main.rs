@@ -411,6 +411,7 @@ fn accept(chat: &mut Chat, link: &str) {
 
 /// Que identidade um argumento de `/trust` ou `/untrust` designa.
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // stub: o stub só devolve `Unknown`
 enum Resolved {
     One(IdentityId),
     Unknown,
