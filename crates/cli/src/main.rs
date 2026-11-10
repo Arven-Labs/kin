@@ -436,9 +436,7 @@ fn resolve_identity(
     });
     let mut chosen: Vec<&IdentityId> = Vec::new();
     for (_, identity) in matching {
-        if !chosen.contains(&identity) {
-            chosen.push(identity);
-        }
+        chosen.push(identity);
     }
     match chosen.as_slice() {
         [identity] => Resolved::One((*identity).clone()),
