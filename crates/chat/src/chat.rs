@@ -2783,6 +2783,35 @@ mod tests {
         );
     }
 
+    /// P24 (despejo): um novo com conexão entra mesmo sendo o menor Peer ID: sai o menor dos que não
+    /// têm conversa nem conexão.
+    #[tokio::test]
+    async fn a_connected_newcomer_displaces_an_unreachable_entry_even_if_it_is_the_smallest() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        for chunk in invites[1..].chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+        bia.connected.insert(invites[0].peer_id());
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
+
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        assert!(
+            bia.household.contains_key(&invites[0].peer_id()),
+            "o conectado entrou"
+        );
+        assert!(
+            !bia.household.contains_key(&invites[1].peer_id()),
+            "saiu o menor sem conexão"
+        );
+    }
+
     /// P24 (despejo): com todas as entradas protegidas, nada sai e o novo é ignorado.
     #[tokio::test]
     async fn a_household_full_of_connected_devices_ignores_the_newcomer() {
