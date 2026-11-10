@@ -921,3 +921,29 @@ descartáveis no scratchpad (apagadas ao fim), `--no-nostr --no-mdns`.
 - **Não verificado**: a saída real da CLI (só o predicado é testado, não o `println!` em `on_event`); a dica ainda aparece para
   contato já confiável.
 - **Próximo passo**: roteiro de 3 devices; device morto nunca discado; rodar o `lab/` de NAT.
+
+#### Roteiro manual de 3 devices: descoberta (P24)
+
+Binário `target/debug/kin` compilado pelo dono (`!cargo build -p kin-cli`, ADR 0009), commit `e7e4dc0`. Eu rodei 3 processos
+em `192.168.1.200` (TCP, portas 9101 a 9103), `--no-nostr --no-mdns`, `--listen` + `--external-addr` iguais, chaves descartáveis
+no scratchpad (apagadas ao fim). **A1** e **A2** são da identidade X (A2 por `--pair`); **C** é o contato (identidade Y).
+Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send(peer)`, só `send_to` espelha).
+
+| Passo | Resultado |
+|---|---|
+| `/invite` em C, sem `--external-addr` | "sem endereço compartilhável": `--listen` sozinho não basta; precisou de `--external-addr` |
+| A2 `--pair` + `--dial` A1 | conversa pronta nos dois, mesma identidade X; `identity.key` igual (`cmp`); **sem** a dica de `/trust` (PR #60) |
+| A1 `/accept` do convite de C | A1↔C pronta (Y); A2 **não** discou C em 32 s (0 menções a C no log de A2) |
+| C `/trust` em X | em ~15 s A2 conectou a C sozinho (sem `--dial`): conversa pronta com Y |
+| texto A2→C e C→A2 | chegou nos dois lados; `Delivered` no remetente |
+| C sai (`/quit`) | A1 e A2 só mostram "desconectado"; **sem** `DialFailed` |
+
+- **Achado (confirma o ADR 0006 §5, consentimento)**: a descoberta só andou depois que C passou a confiar em X. Antes, C não
+  anunciava o seu convite a A1, então A1 não tinha o que repassar ao irmão. Aceitar o convite de C (`/accept` em A1) não
+  basta para A2 achar C.
+- **Observado vs inferido**: a descoberta não tem `println!` próprio; "A2 achou C" é inferido de `conectado`/`conversa cifrada
+  pronta` em A2 sem `--dial` e sem outro caminho (mDNS desligado, sem relay).
+- **Não medido**: **espelho** (`SentElsewhere`): a CLI não alcança; depende de ela usar `Chat::send_to`. Frescor
+  (`forget_unreachable`): sair do C não gera discagem, então não há `DialFailed` e nada a observar. Relay real e NAT. Contato
+  em endereço de LAN/privado visto como contato (aqui o caminho foi de irmão, sem o filtro `dialable`). Só 1 execução.
+- **Próximo passo**: CLI enviar por identidade (`send_to`) para poder medir o espelho; device morto nunca discado; `lab/` de NAT.
