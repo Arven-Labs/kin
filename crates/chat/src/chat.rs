@@ -488,7 +488,7 @@ impl Chat {
             return Ok(());
         }
         // Confiar de propósito tira a identidade da lista negra do `untrust`.
-        if self.is_distrusted(&identity) {
+        if !self.is_distrusted(&identity) {
             self.outbox.remove_distrusted(&identity)?;
             self.distrusted.retain(|distrusted| *distrusted != identity);
         }
