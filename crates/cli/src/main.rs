@@ -457,8 +457,8 @@ async fn serve_relay(args: &Args, device: &DeviceKey) -> Result<(), Box<dyn std:
 
 /// A dica de `/trust` só vale para outra pessoa: um irmão (mesma identidade que a minha) já é
 /// confiável por construção.
-fn should_hint_trust(_peer_identity: &IdentityId, _own: &IdentityId) -> bool {
-    true
+fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
+    peer_identity != own
 }
 
 fn on_event(
