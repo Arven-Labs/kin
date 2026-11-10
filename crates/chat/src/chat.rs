@@ -370,7 +370,6 @@ impl Chat {
         chat.distrusted = chat.outbox.distrusted_identities()?;
         // A desconfiança vence: se um `untrust` caiu no meio (gravou a lista negra e não apagou a
         // confiança), a identidade não volta a ser confiada ao reabrir.
-        chat.trusted.retain(|t| !chat.distrusted.contains(t));
         for (label, id) in chat.device.remembered()? {
             // Rótulo ou conversa que não carregam mais são ignorados: o handshake refaz.
             let Ok(peer) = label.parse::<PeerId>() else {
