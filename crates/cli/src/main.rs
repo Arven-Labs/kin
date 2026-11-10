@@ -312,7 +312,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     None => (None, line),
                 };
-                match chat.send(peer, text, parent) {
+                let Some(target) = identity_of(&met, peer) else {
+                    println!("(identidade desconhecida: a conversa não completou o handshake)");
+                    continue;
+                };
+                match chat.send_to(&target, text, parent) {
                     Ok(id) => {
                         seen.push(id);
                         println!("[{}] você: {text}", short(&id));
@@ -461,6 +465,12 @@ fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
     peer_identity != own
 }
 
+/// A identidade vista em `ConversationReady` para `peer`: a linha digitada vai a ela (a todos os
+/// devices dela, e espelhada nos meus outros devices), não só ao device da conversa atual.
+fn identity_of(_met: &[(PeerId, IdentityId)], _peer: PeerId) -> Option<IdentityId> {
+    None
+}
+
 fn on_event(
     event: ChatEvent,
     current: &mut Option<PeerId>,
@@ -576,5 +586,33 @@ mod tests {
     fn no_trust_hint_for_a_sibling() {
         let me = StandaloneIdentity::generate().id();
         assert!(!should_hint_trust(&me.clone(), &me));
+    }
+
+    #[test]
+    fn identity_of_finds_the_identity_seen_for_that_peer() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let (x, y) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        let met = vec![(a, x.clone()), (b, y.clone())];
+        assert_eq!(identity_of(&met, a), Some(x));
+        assert_eq!(identity_of(&met, b), Some(y));
+    }
+
+    #[test]
+    fn identity_of_is_none_for_a_peer_never_ready() {
+        let met = vec![(PeerId::random(), StandaloneIdentity::generate().id())];
+        assert_eq!(identity_of(&met, PeerId::random()), None);
+        assert_eq!(identity_of(&[], PeerId::random()), None);
+    }
+
+    #[test]
+    fn two_devices_of_one_identity_resolve_to_the_same_identity() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let x = StandaloneIdentity::generate().id();
+        let met = vec![(a, x.clone()), (b, x.clone())];
+        assert_eq!(identity_of(&met, a), identity_of(&met, b));
+        assert_eq!(identity_of(&met, a), Some(x));
     }
 }
