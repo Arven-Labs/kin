@@ -151,7 +151,8 @@ const CONTACT_DIAL_ADDRS: usize = 4;
 
 /// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
 /// `expected`). É o mesmo teto da lista do codec: a lista que sai já corta nesse número, então guardar
-/// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
+/// mais não serviria a nada. `household` e `contact_devices` despejam ao encher ([`insert_bounded`]);
+/// em `expected`, cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
 const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
 /// Quantas vezes se reenvia cada mensagem de handshake (`Hello`, `KeyPackage`, `Welcome`) a um peer
@@ -178,20 +179,37 @@ enum Inserted {
     Changed,
 }
 
-/// Guarda `invite` em `map` respeitando [`MAX_KNOWN_DEVICES`] (stub: ainda sem despejo).
+/// Guarda `invite` em `map` respeitando [`MAX_KNOWN_DEVICES`]. Quem já está só se atualiza. Cheio, sai
+/// a entrada de **menor Peer ID** entre as não protegidas (`protected`: com conversa ou conexão, ou
+/// seja, alcançáveis), se ela for menor que o Peer ID novo ou se o novo for protegido; senão o novo é
+/// ignorado. Sem relógio não há "o mais velho", e uma ordem total faz todos os devices
+/// convergirem para o mesmo conjunto: irmãos que trocam listas não despejam as entradas uns dos outros
+/// sem parar.
 fn insert_bounded(
     map: &mut HashMap<PeerId, Invite>,
-    _protected: &std::collections::HashSet<PeerId>,
+    protected: &std::collections::HashSet<PeerId>,
     key: PeerId,
     invite: Invite,
 ) -> Inserted {
-    if !has_room(map, &key) {
-        return Inserted::Ignored;
+    if let Some(known) = map.get_mut(&key) {
+        if *known == invite {
+            return Inserted::Unchanged;
+        }
+        *known = invite;
+        return Inserted::Changed;
     }
-    if map.insert(key, invite.clone()).as_ref() == Some(&invite) {
-        Inserted::Unchanged
-    } else {
-        Inserted::Changed
+    if map.len() < MAX_KNOWN_DEVICES {
+        map.insert(key, invite);
+        return Inserted::Changed;
+    }
+    let victim = map.keys().filter(|k| !protected.contains(k)).min().copied();
+    match victim {
+        Some(victim) if protected.contains(&key) || victim < key => {
+            map.remove(&victim);
+            map.insert(key, invite);
+            Inserted::Changed
+        }
+        _ => Inserted::Ignored,
     }
 }
 
