@@ -17,6 +17,8 @@
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
+//! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
+//! deixa de valer (um irmão que o repasse não o faz voltar); a conversa e as mensagens seguem.
 //! Segundo device da mesma identidade: `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
 //! `kin://pair/...`; no device novo, `--pair ARQUIVO` (ou `-` para stdin) a importa na primeira execução
 //! e recusa se já houver identidade. É o segredo inteiro, sem cifra: use só em terminal privado.
@@ -411,7 +413,6 @@ fn accept(chat: &mut Chat, link: &str) {
 
 /// Que identidade um argumento de `/trust` ou `/untrust` designa.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)] // stub: o stub só devolve `Unknown`
 enum Resolved {
     One(IdentityId),
     Unknown,
@@ -422,11 +423,28 @@ enum Resolved {
 /// (vários devices da mesma identidade contam como uma). Só vale para identidades vistas em
 /// `ConversationReady` nesta execução (`met`).
 fn resolve_identity(
-    _prefix: &str,
-    _current: Option<PeerId>,
-    _met: &[(PeerId, IdentityId)],
+    prefix: &str,
+    current: Option<PeerId>,
+    met: &[(PeerId, IdentityId)],
 ) -> Resolved {
-    Resolved::Unknown
+    let matching = met.iter().filter(|(peer, identity)| {
+        if prefix.is_empty() {
+            Some(*peer) == current
+        } else {
+            identity.to_base58().starts_with(prefix)
+        }
+    });
+    let mut chosen: Vec<&IdentityId> = Vec::new();
+    for (_, identity) in matching {
+        if !chosen.contains(&identity) {
+            chosen.push(identity);
+        }
+    }
+    match chosen.as_slice() {
+        [identity] => Resolved::One((*identity).clone()),
+        [] => Resolved::Unknown,
+        _ => Resolved::Ambiguous,
+    }
 }
 
 /// `/trust`: passa a confiar numa identidade que já completou o handshake nesta execução.
