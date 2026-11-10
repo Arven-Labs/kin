@@ -2649,19 +2649,14 @@ mod tests {
             sibling: (sibling, mut raw),
             ..
         } = household();
-        let mut invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
-        invites.reverse();
+        // Do menor para o maior: sem despejo ficariam os 8 primeiros, não os 8 maiores.
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
 
         for chunk in invites.chunks(3) {
             feed_list(&mut bia, sibling, &mut raw, chunk);
         }
 
-        let largest: Vec<PeerId> = invites[..MAX_KNOWN_DEVICES]
-            .iter()
-            .map(Invite::peer_id)
-            .collect::<Vec<_>>();
-        let mut largest = largest;
-        largest.sort();
+        let largest: Vec<PeerId> = invites[1..].iter().map(Invite::peer_id).collect();
         assert_eq!(peer_ids(&bia.household), largest);
     }
 
@@ -2674,18 +2669,13 @@ mod tests {
             ..
         } = household();
         let cleo = StandaloneIdentity::generate();
-        let mut invites = invites_by_peer_id(&cleo, MAX_KNOWN_DEVICES + 1);
-        invites.reverse();
+        let invites = invites_by_peer_id(&cleo, MAX_KNOWN_DEVICES + 1);
 
         for chunk in invites.chunks(3) {
             feed_list(&mut bia, sibling, &mut raw, chunk);
         }
 
-        let mut largest: Vec<PeerId> = invites[..MAX_KNOWN_DEVICES]
-            .iter()
-            .map(Invite::peer_id)
-            .collect();
-        largest.sort();
+        let largest: Vec<PeerId> = invites[1..].iter().map(Invite::peer_id).collect();
         assert_eq!(peer_ids(&bia.contact_devices), largest);
     }
 
