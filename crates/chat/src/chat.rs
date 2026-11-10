@@ -2698,7 +2698,8 @@ mod tests {
     }
 
     /// P24 (despejo): cheio, um Peer ID maior que o menor sem conversa entra e o menor sai (e deixa de
-    /// ser repassado); o novo é discado.
+    /// ser repassado). Se o novo é discado já depende de `expected` ter vaga (outro teto, liberado por
+    /// `DialFailed`), e não é fixado aqui.
     #[tokio::test]
     async fn a_full_household_evicts_the_smallest_peer_id_for_a_larger_newcomer() {
         let Household {
@@ -2722,7 +2723,6 @@ mod tests {
             !bia.household.contains_key(&invites[0].peer_id()),
             "o menor saiu"
         );
-        assert!(bia.expected.contains_key(&newcomer), "e o novo é discado");
         assert!(
             bia.device_list()
                 .iter()
