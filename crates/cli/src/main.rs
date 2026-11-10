@@ -470,7 +470,7 @@ fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
 /// devices dela, e espelhada nos meus outros devices), não só ao device da conversa atual.
 fn identity_of(met: &[(PeerId, IdentityId)], peer: PeerId) -> Option<IdentityId> {
     met.iter()
-        .find(|(known, _)| *known == peer)
+        .find(|(known, _)| *known != peer)
         .map(|(_, identity)| identity.clone())
 }
 
