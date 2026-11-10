@@ -259,11 +259,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current: Option<PeerId> = None;
     // Identidades vistas em `ConversationReady` nesta execução: `/trust` só aceita uma destas.
     let mut met: Vec<(PeerId, IdentityId)> = Vec::new();
+    let own = identity.id();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
     loop {
         tokio::select! {
-            event = chat.next_event() => on_event(event, &mut current, &mut seen, &mut met),
+            event = chat.next_event() => on_event(event, &mut current, &mut seen, &mut met, &own),
             line = lines.next_line() => {
                 let Some(line) = line? else { break };
                 let line = line.trim();
@@ -465,6 +466,7 @@ fn on_event(
     current: &mut Option<PeerId>,
     seen: &mut Vec<MessageId>,
     met: &mut Vec<(PeerId, IdentityId)>,
+    own: &IdentityId,
 ) {
     match event {
         ChatEvent::Listening(addr) => println!("escutando em {addr}"),
@@ -477,7 +479,9 @@ fn on_event(
                 peer,
                 identity.to_base58()
             );
-            println!("(para aceitar este contato: /trust)");
+            if should_hint_trust(&identity, own) {
+                println!("(para aceitar este contato: /trust)");
+            }
             met.retain(|(known, _)| *known != peer);
             met.push((peer, identity));
             *current = Some(peer);
