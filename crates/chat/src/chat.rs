@@ -3525,6 +3525,30 @@ mod tests {
         assert!(!bia.is_distrusted(&ana));
     }
 
+    /// P24 (`untrust`): se um `untrust` caiu no meio (a lista negra gravada, a confiança ainda no banco), a
+    /// desconfiança vence ao reabrir.
+    #[tokio::test]
+    async fn a_half_done_untrust_reopens_as_distrusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bia.db");
+        let (bia_key, bia_device) = (StandaloneIdentity::generate(), DeviceKey::generate());
+        let ana = StandaloneIdentity::generate().id();
+        let config = || NodeConfig {
+            mdns: false,
+            ..Default::default()
+        };
+        {
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            bia.trust(ana.clone()).unwrap();
+            bia.outbox.add_distrusted(&ana).unwrap();
+        }
+
+        let bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+
+        assert!(bia.is_distrusted(&ana));
+        assert!(!bia.is_trusted(&ana));
+    }
+
     /// P24 (`untrust`): aceitar o convite da identidade (ato explícito) volta a confiar nela.
     #[tokio::test]
     async fn accepting_an_invite_after_untrust_trusts_again() {
