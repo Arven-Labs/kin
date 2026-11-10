@@ -1180,12 +1180,7 @@ impl Chat {
         let me = self.peer_id();
         let mut learned = false;
         // Quem tem conversa ou conexão é alcançável e nunca é despejado de `household`/`contact_devices`.
-        let protected: std::collections::HashSet<PeerId> = self
-            .conversations
-            .keys()
-            .chain(self.connected.iter())
-            .copied()
-            .collect();
+        let protected: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
         for invite in invites {
             let device = invite.peer_id();
             if device == me {
