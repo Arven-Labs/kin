@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
-use kin_chat::{Chat, ChatEvent, Invite, Message, MessageId};
+use kin_chat::{Chat, ChatEvent, Error, Invite, Message, MessageId};
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -291,6 +291,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trust(&mut chat, line.strip_prefix("/trust").unwrap_or("").trim(), current, &met);
                     continue;
                 }
+                if line == "/untrust" || line.starts_with("/untrust ") {
+                    untrust(&mut chat, line.strip_prefix("/untrust").unwrap_or("").trim(), current, &met);
+                    continue;
+                }
                 // A chave mestra nunca vai a um contato por engano (ex.: Ctrl+V do link de pareamento).
                 if line.contains("kin://pair/") {
                     println!("(não enviado: isto é um link de pareamento, a sua chave mestra)");
@@ -405,30 +409,54 @@ fn accept(chat: &mut Chat, link: &str) {
     }
 }
 
-/// `/trust`: passa a confiar numa identidade que já completou o handshake nesta execução. Sem
-/// argumento, a da conversa atual; com argumento, a única cujo base58 começa com ele.
+/// Que identidade um argumento de `/trust` ou `/untrust` designa.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolved {
+    One(IdentityId),
+    Unknown,
+    Ambiguous,
+}
+
+/// Sem prefixo, a identidade da conversa atual; com prefixo, a única cujo base58 começa com ele
+/// (vários devices da mesma identidade contam como uma). Só vale para identidades vistas em
+/// `ConversationReady` nesta execução (`met`).
+fn resolve_identity(
+    _prefix: &str,
+    _current: Option<PeerId>,
+    _met: &[(PeerId, IdentityId)],
+) -> Resolved {
+    Resolved::Unknown
+}
+
+/// `/trust`: passa a confiar numa identidade que já completou o handshake nesta execução.
 fn trust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerId, IdentityId)]) {
-    let candidates: Vec<&IdentityId> = if prefix.is_empty() {
-        met.iter()
-            .filter(|(peer, _)| Some(*peer) == current)
-            .map(|(_, identity)| identity)
-            .collect()
-    } else {
-        let mut matches: Vec<&IdentityId> = met
-            .iter()
-            .map(|(_, identity)| identity)
-            .filter(|identity| identity.to_base58().starts_with(prefix))
-            .collect();
-        matches.dedup();
-        matches
-    };
-    match candidates.as_slice() {
-        [identity] => match chat.trust((*identity).clone()) {
+    match resolve_identity(prefix, current, met) {
+        Resolved::One(identity) => match chat.trust(identity.clone()) {
             Ok(()) => println!("(confio em {})", identity.to_base58()),
             Err(e) => println!("(não consegui gravar a confiança: {e})"),
         },
-        [] => println!("(nenhuma identidade conhecida assim; veja `conversa cifrada pronta`)"),
-        _ => println!("(prefixo ambíguo: digite mais caracteres)"),
+        Resolved::Unknown => {
+            println!("(nenhuma identidade conhecida assim; veja `conversa cifrada pronta`)");
+        }
+        Resolved::Ambiguous => println!("(prefixo ambíguo: digite mais caracteres)"),
+    }
+}
+
+/// `/untrust`: deixa de confiar numa identidade (ver `Chat::untrust`). A conversa já aberta continua e
+/// as mensagens dela ainda chegam; só deixam de valer a lista de devices dela e o meu anúncio a ela.
+fn untrust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerId, IdentityId)]) {
+    match resolve_identity(prefix, current, met) {
+        Resolved::One(identity) => match chat.untrust(&identity) {
+            Ok(()) => println!("(desconfio de {})", identity.to_base58()),
+            Err(Error::OwnIdentity) => {
+                println!("(essa é a sua identidade: os seus devices são família, não contatos)");
+            }
+            Err(e) => println!("(não consegui gravar a desconfiança: {e})"),
+        },
+        Resolved::Unknown => {
+            println!("(nenhuma identidade conhecida assim; veja `conversa cifrada pronta`)");
+        }
+        Resolved::Ambiguous => println!("(prefixo ambíguo: digite mais caracteres)"),
     }
 }
 
@@ -601,6 +629,70 @@ mod tests {
         let met = vec![(a, x.clone()), (b, y.clone())];
         assert_eq!(identity_of(&met, a), Some(x));
         assert_eq!(identity_of(&met, b), Some(y));
+    }
+
+    #[test]
+    fn without_a_prefix_the_current_conversations_identity_is_chosen() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let (x, y) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        let met = vec![(a, x.clone()), (b, y.clone())];
+        assert_eq!(resolve_identity("", Some(b), &met), Resolved::One(y));
+        assert_eq!(resolve_identity("", Some(a), &met), Resolved::One(x));
+    }
+
+    #[test]
+    fn without_a_prefix_and_without_a_conversation_nothing_is_chosen() {
+        let met = vec![(PeerId::random(), StandaloneIdentity::generate().id())];
+        assert_eq!(resolve_identity("", None, &met), Resolved::Unknown);
+        assert_eq!(
+            resolve_identity("", Some(PeerId::random()), &met),
+            Resolved::Unknown
+        );
+    }
+
+    #[test]
+    fn a_unique_prefix_chooses_that_identity() {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        let (x, y) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        let met = vec![(a, x.clone()), (b, y)];
+        // O base58 inteiro de `x` é um prefixo que só `x` tem.
+        assert_eq!(
+            resolve_identity(&x.to_base58(), None, &met),
+            Resolved::One(x)
+        );
+    }
+
+    #[test]
+    fn a_prefix_shared_by_two_identities_is_ambiguous_and_one_matching_nothing_is_unknown() {
+        let met = vec![
+            (PeerId::random(), StandaloneIdentity::generate().id()),
+            (PeerId::random(), StandaloneIdentity::generate().id()),
+        ];
+        let shared = &met[0].1.to_base58()[..4];
+        assert!(met[1].1.to_base58().starts_with(shared));
+        assert_eq!(resolve_identity(shared, None, &met), Resolved::Ambiguous);
+        assert_eq!(resolve_identity("zzzzzz", None, &met), Resolved::Unknown);
+    }
+
+    #[test]
+    fn two_devices_of_the_same_identity_are_one_choice() {
+        let (a, b, c) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let (x, y) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        // Não consecutivos: `dedup` sozinho não os juntaria.
+        let met = vec![(a, x.clone()), (b, y), (c, x.clone())];
+        assert_eq!(
+            resolve_identity(&x.to_base58(), None, &met),
+            Resolved::One(x)
+        );
     }
 
     #[test]
