@@ -151,7 +151,8 @@ const CONTACT_DIAL_ADDRS: usize = 4;
 
 /// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
 /// `expected`). É o mesmo teto da lista do codec: a lista que sai já corta nesse número, então guardar
-/// mais não serviria a nada. Cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
+/// mais não serviria a nada. `household` e `contact_devices` despejam ao encher ([`insert_bounded`]);
+/// em `expected`, cheio, o Peer ID novo é ignorado (o já conhecido ainda se atualiza).
 const MAX_KNOWN_DEVICES: usize = crate::payload::MAX_DECODED_DEVICES;
 
 /// Quantas vezes se reenvia cada mensagem de handshake (`Hello`, `KeyPackage`, `Welcome`) a um peer
@@ -165,6 +166,51 @@ const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
     map.contains_key(key) || map.len() < MAX_KNOWN_DEVICES
+}
+
+/// Resultado de [`insert_bounded`].
+#[derive(Debug, PartialEq, Eq)]
+enum Inserted {
+    /// Peer ID novo com o mapa cheio e nada a despejar: nem guardado, nem discado.
+    Ignored,
+    /// Já estava com o mesmo convite.
+    Unchanged,
+    /// Entrou, ou o convite mudou (um despejo também conta).
+    Changed,
+}
+
+/// Guarda `invite` em `map` respeitando [`MAX_KNOWN_DEVICES`]. Quem já está só se atualiza. Cheio, sai
+/// a entrada de **menor Peer ID** entre as não protegidas (`protected`: com conversa ou conexão, ou
+/// seja, alcançáveis), se ela for menor que o Peer ID novo ou se o novo for protegido; senão o novo é
+/// ignorado. Sem relógio não há "o mais velho", e uma ordem total faz todos os devices
+/// convergirem para o mesmo conjunto: irmãos que trocam listas não despejam as entradas uns dos outros
+/// sem parar.
+fn insert_bounded(
+    map: &mut HashMap<PeerId, Invite>,
+    protected: &std::collections::HashSet<PeerId>,
+    key: PeerId,
+    invite: Invite,
+) -> Inserted {
+    if let Some(known) = map.get_mut(&key) {
+        if *known == invite {
+            return Inserted::Unchanged;
+        }
+        *known = invite;
+        return Inserted::Changed;
+    }
+    if map.len() < MAX_KNOWN_DEVICES {
+        map.insert(key, invite);
+        return Inserted::Changed;
+    }
+    let victim = map.keys().filter(|k| !protected.contains(k)).min().copied();
+    match victim {
+        Some(victim) if protected.contains(&key) || victim < key => {
+            map.remove(&victim);
+            map.insert(key, invite);
+            Inserted::Changed
+        }
+        _ => Inserted::Ignored,
+    }
 }
 
 /// Endereços a tentar para um device listado: só os que passam em [`dialable`], todos se o remetente
@@ -1133,6 +1179,13 @@ impl Chat {
         }
         let me = self.peer_id();
         let mut learned = false;
+        // Quem tem conversa ou conexão é alcançável e nunca é despejado de `household`/`contact_devices`.
+        let protected: std::collections::HashSet<PeerId> = self
+            .conversations
+            .keys()
+            .chain(self.connected.iter())
+            .copied()
+            .collect();
         for invite in invites {
             let device = invite.peer_id();
             if device == me {
@@ -1142,20 +1195,24 @@ impl Chat {
             // Teto de cada mapa (P24): Peer ID novo com o mapa cheio é ignorado por inteiro (nem
             // guardado, nem discado); quem já está segue sendo atualizado.
             if from_sibling && owner == *self.device.identity() {
-                if !has_room(&self.household, &device) {
-                    continue;
+                match insert_bounded(&mut self.household, &protected, device, invite.clone()) {
+                    Inserted::Ignored => continue,
+                    outcome => learned |= outcome == Inserted::Changed,
                 }
-                learned |= self.household.insert(device, invite.clone()).as_ref() != Some(&invite);
             } else if from_sibling || device == peer {
                 // Device de contato repassado por um irmão, ou o convite que o contato anuncia de si.
-                if !has_room(&self.contact_devices, &device) {
-                    continue;
+                match insert_bounded(
+                    &mut self.contact_devices,
+                    &protected,
+                    device,
+                    invite.clone(),
+                ) {
+                    Inserted::Ignored => continue,
+                    outcome => learned |= outcome == Inserted::Changed,
                 }
                 if from_sibling {
                     self.trust(owner.clone())?;
                 }
-                learned |=
-                    self.contact_devices.insert(device, invite.clone()).as_ref() != Some(&invite);
             }
             if self.conversations.contains_key(&device) {
                 continue;
@@ -2587,52 +2644,230 @@ mod tests {
         bia.on_mls(peer, &wire).unwrap();
     }
 
-    /// P24: `household` guarda no máximo `MAX_KNOWN_DEVICES`; o Peer ID novo além disso é ignorado por
-    /// inteiro (nem entra em `expected`, nem é discado), e quem já está continua lá.
+    /// `n` convites de devices novos de `identity`, em ordem de Peer ID.
+    fn invites_by_peer_id(identity: &StandaloneIdentity, n: usize) -> Vec<Invite> {
+        let mut invites: Vec<Invite> = (0..n).map(|_| invite_for(identity)).collect();
+        invites.sort_by_key(Invite::peer_id);
+        invites
+    }
+
+    fn peer_ids(map: &HashMap<PeerId, Invite>) -> Vec<PeerId> {
+        let mut ids: Vec<PeerId> = map.keys().copied().collect();
+        ids.sort();
+        ids
+    }
+
+    /// P24: `household` guarda no máximo `MAX_KNOWN_DEVICES`; com o mapa cheio, o que fica são os
+    /// maiores Peer IDs (nenhum tem conversa), seja qual for a ordem em que chegaram.
     #[tokio::test]
-    async fn my_household_stops_growing_at_the_cap_and_ignores_the_extra_device() {
+    async fn my_household_stops_growing_at_the_cap_and_keeps_the_largest_peer_ids() {
         let Household {
             mut bia,
             bia_key,
             sibling: (sibling, mut raw),
             ..
         } = household();
-        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES)
-            .map(|_| invite_for(&bia_key))
-            .collect();
+        // Do menor para o maior: sem despejo ficariam os 8 primeiros, não os 8 maiores.
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
 
         for chunk in invites.chunks(3) {
             feed_list(&mut bia, sibling, &mut raw, chunk);
         }
-        let extra = invites[MAX_KNOWN_DEVICES].peer_id();
-        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
-        assert!(!bia.household.contains_key(&extra), "o 9º foi ignorado");
-        assert!(!bia.expected.contains_key(&extra), "e não é discado");
 
-        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
-        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
-        assert!(bia.household.contains_key(&invites[0].peer_id()));
+        let largest: Vec<PeerId> = invites[1..].iter().map(Invite::peer_id).collect();
+        assert_eq!(peer_ids(&bia.household), largest);
     }
 
-    /// P24: o mesmo teto vale para os devices de contatos repassados por um irmão.
+    /// P24: o mesmo teto e a mesma regra valem para os devices de contatos repassados por um irmão.
     #[tokio::test]
-    async fn contact_devices_stop_growing_at_the_cap() {
+    async fn contact_devices_stop_growing_at_the_cap_and_keep_the_largest_peer_ids() {
         let Household {
             mut bia,
             sibling: (sibling, mut raw),
             ..
         } = household();
         let cleo = StandaloneIdentity::generate();
-        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES).map(|_| invite_for(&cleo)).collect();
+        let invites = invites_by_peer_id(&cleo, MAX_KNOWN_DEVICES + 1);
 
         for chunk in invites.chunks(3) {
             feed_list(&mut bia, sibling, &mut raw, chunk);
         }
 
-        let extra = invites[MAX_KNOWN_DEVICES].peer_id();
-        assert_eq!(bia.contact_devices.len(), MAX_KNOWN_DEVICES);
-        assert!(!bia.contact_devices.contains_key(&extra));
-        assert!(!bia.expected.contains_key(&extra));
+        let largest: Vec<PeerId> = invites[1..].iter().map(Invite::peer_id).collect();
+        assert_eq!(peer_ids(&bia.contact_devices), largest);
+    }
+
+    /// P24 (despejo): cheio, um Peer ID maior que o menor sem conversa entra e o menor sai (e deixa de
+    /// ser repassado). Se o novo é discado já depende de `expected` ter vaga (outro teto, liberado por
+    /// `DialFailed`), e não é fixado aqui.
+    #[tokio::test]
+    async fn a_full_household_evicts_the_smallest_peer_id_for_a_larger_newcomer() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        feed_list(&mut bia, sibling, &mut raw, &invites[..3]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[3..6]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[6..MAX_KNOWN_DEVICES]);
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+
+        let newcomer = invites[MAX_KNOWN_DEVICES].peer_id();
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        assert!(bia.household.contains_key(&newcomer), "o maior entrou");
+        assert!(
+            !bia.household.contains_key(&invites[0].peer_id()),
+            "o menor saiu"
+        );
+        assert!(
+            bia.device_list()
+                .iter()
+                .all(|invite| invite.peer_id() != invites[0].peer_id()),
+            "o despejado não é mais repassado"
+        );
+    }
+
+    /// P24 (despejo): um Peer ID menor que todos os sem conversa é ignorado por inteiro (nem guardado,
+    /// nem discado) e o mapa não muda.
+    #[tokio::test]
+    async fn a_newcomer_smaller_than_every_unprotected_entry_is_ignored() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        for chunk in invites[1..].chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+        let before = peer_ids(&bia.household);
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
+
+        assert_eq!(peer_ids(&bia.household), before);
+        assert!(!bia.expected.contains_key(&invites[0].peer_id()));
+    }
+
+    /// P24 (despejo): quem tem conversa ou conexão nunca é despejado; o despejado sai só entre os demais.
+    #[tokio::test]
+    async fn an_entry_with_a_connection_is_never_evicted() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        for chunk in invites[..MAX_KNOWN_DEVICES].chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+        bia.connected.insert(invites[0].peer_id());
+        bia.connected.insert(invites[1].peer_id());
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+
+        assert!(bia.household.contains_key(&invites[0].peer_id()));
+        assert!(bia.household.contains_key(&invites[1].peer_id()));
+        assert!(
+            !bia.household.contains_key(&invites[2].peer_id()),
+            "o menor sem conexão saiu"
+        );
+        assert!(
+            bia.household
+                .contains_key(&invites[MAX_KNOWN_DEVICES].peer_id())
+        );
+    }
+
+    /// P24 (despejo): um novo com conexão entra mesmo sendo o menor Peer ID: sai o menor dos que não
+    /// têm conversa nem conexão.
+    #[tokio::test]
+    async fn a_connected_newcomer_displaces_an_unreachable_entry_even_if_it_is_the_smallest() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        for chunk in invites[1..].chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+        bia.connected.insert(invites[0].peer_id());
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
+
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        assert!(
+            bia.household.contains_key(&invites[0].peer_id()),
+            "o conectado entrou"
+        );
+        assert!(
+            !bia.household.contains_key(&invites[1].peer_id()),
+            "saiu o menor sem conexão"
+        );
+    }
+
+    /// P24 (despejo): com todas as entradas protegidas, nada sai e o novo é ignorado.
+    #[tokio::test]
+    async fn a_household_full_of_connected_devices_ignores_the_newcomer() {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        for chunk in invites[..MAX_KNOWN_DEVICES].chunks(3) {
+            feed_list(&mut bia, sibling, &mut raw, chunk);
+        }
+        for invite in &invites[..MAX_KNOWN_DEVICES] {
+            bia.connected.insert(invite.peer_id());
+        }
+        let before = peer_ids(&bia.household);
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+
+        assert_eq!(peer_ids(&bia.household), before);
+        assert!(
+            !bia.expected
+                .contains_key(&invites[MAX_KNOWN_DEVICES].peer_id())
+        );
+    }
+
+    /// P24 (despejo): dois devices que recebem as mesmas entradas em ordens diferentes terminam com o
+    /// mesmo conjunto: sem isso, irmãos trocando listas despejariam as entradas uns dos outros sem fim.
+    #[tokio::test]
+    async fn the_kept_set_does_not_depend_on_the_arrival_order() {
+        let cleo = StandaloneIdentity::generate();
+        let invites = invites_by_peer_id(&cleo, 2 * MAX_KNOWN_DEVICES);
+        let mut sets = Vec::new();
+        for ascending in [true, false] {
+            let Household {
+                mut bia,
+                sibling: (sibling, mut raw),
+                ..
+            } = household();
+            let mut order = invites.clone();
+            if !ascending {
+                order.reverse();
+            }
+            for chunk in order.chunks(3) {
+                feed_list(&mut bia, sibling, &mut raw, chunk);
+            }
+            sets.push(peer_ids(&bia.contact_devices));
+        }
+        let mut largest: Vec<PeerId> = invites[MAX_KNOWN_DEVICES..]
+            .iter()
+            .map(Invite::peer_id)
+            .collect();
+        largest.sort();
+        assert_eq!(sets[0], sets[1]);
+        assert_eq!(sets[0], largest);
     }
 
     /// P24: `expected` também tem teto contra listas de contato em conexões sucessivas; mas o `accept`
@@ -2763,23 +2998,24 @@ mod tests {
             sibling: (sibling, mut raw),
             ..
         } = household();
-        let invites: Vec<Invite> = (0..=MAX_KNOWN_DEVICES)
-            .map(|_| invite_for(&bia_key))
-            .collect();
-        feed_list(&mut bia, sibling, &mut raw, &invites[..MAX_KNOWN_DEVICES]);
-        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
-        let newcomer = invites[MAX_KNOWN_DEVICES].peer_id();
+        // O novo é o menor Peer ID: cheio, o despejo o ignora (ele seria o primeiro a sair).
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        let newcomer = invites[0].peer_id();
+        let dead = invites[1].peer_id();
+        feed_list(&mut bia, sibling, &mut raw, &invites[1..4]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[4..]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
         assert!(!bia.household.contains_key(&newcomer), "cheio: ignorado");
 
         bia.handle(NodeEvent::DialFailed {
-            peer: Some(invites[0].peer_id()),
+            peer: Some(dead),
             reason: "fora do ar".to_string(),
         });
-        feed_list(&mut bia, sibling, &mut raw, &invites[MAX_KNOWN_DEVICES..]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
 
         assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
         assert!(bia.household.contains_key(&newcomer));
-        assert!(!bia.household.contains_key(&invites[0].peer_id()));
+        assert!(!bia.household.contains_key(&dead));
     }
 
     /// P24: re-anúncio ao irmão tem intervalo mínimo; o que chega dentro dele fica pendente e sai no

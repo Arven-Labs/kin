@@ -971,3 +971,23 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: contato com 2 ou mais devices (fan-out de uma linha a N devices e as várias linhas `entregue`); espelho
   com a mensagem enviada com o irmão offline (outbox do espelho só em teste de `chat`); relay real e NAT; só 1 execução.
 - **Próximo passo**: device morto nunca discado; revogação de device; `lab/` de NAT.
+
+#### Device morto nunca discado: despejo ao encher (P24, PR #65)
+
+- **Decisão do dono** (plan mode): despejar **ao encher** (descartados: TTL com varredura; só documentar). Sem relógio nem timer.
+- **Feito** (`crates/chat/src/chat.rs`): `insert_bounded` substitui `has_room` + `insert` em `household` e `contact_devices`. Cheio,
+  sai a entrada de **menor Peer ID** entre as sem conversa e sem conexão (`protected`), se for menor que o novo ou se o novo for
+  protegido; senão o novo é ignorado. A ordem total faz irmãos convergirem para o mesmo conjunto (sem despejo mútuo infinito).
+  `expected` e `has_room` ficam como estavam. Efeito colateral: `trust` do irmão passou a rodar **depois** de guardar a entrada.
+- **Testes**: 6 novos e 3 reescritos (2 de teto, cujo contrato "o 9º é ignorado" virou "ficam os 8 maiores", e o do frescor). No CI
+  com o stub (sem despejo, antes do 7º teste) 5 de 7 falharam e 2 passaram como guarda. **Erros meus no caminho**: (1) os dois testes de teto alimentavam do maior para o
+  menor, então o stub passava (provavam nada): refeitos do menor para o maior; (2) o teste de frescor da Sessão 18
+  (`a_failed_dial_frees_a_slot_in_a_full_household`) usava Peer IDs aleatórios e "cheio: ignorado", e ficou **intermitente** com o
+  despejo (passou numa rodada por sorte): o novo agora é o menor Peer ID; (3) uma asserção de que o novo é discado ia além do plano
+  (`expected` também está cheio nos testes) e saiu; (4) faltava cobrir "novo protegido e menor": teste adicionado.
+- **Mutações** (PRs #66 a #68, fechados e apagados), todas pegas: `<`→`>` (7 falham), sem `protected` (3), novo protegido sem
+  prioridade (1).
+- **Não verificado**: processos reais (sem saída na CLI); `learned` (re-anúncio): nenhum teste fixa que o novo ignorado não conta;
+  o novo entra no mapa mas só é discado quando `expected` libera vaga (`DialFailed`); um vivo discável ainda sem conversa pode ser
+  despejado por um morto de Peer ID maior (preço de não ter relógio).
+- **Próximo passo**: revogação de device; teste do `learned`; `lab/` de NAT.
