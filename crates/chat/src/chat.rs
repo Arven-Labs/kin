@@ -1625,7 +1625,7 @@ impl Chat {
             imported,
             done,
         });
-        if done {
+        if !done {
             self.history_sessions.remove(&peer);
         } else {
             self.history_sessions.insert(peer, received + count);
