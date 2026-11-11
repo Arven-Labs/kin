@@ -24,17 +24,14 @@ const TAG_HISTORY_REQUEST: u8 = 5;
 const TAG_HISTORY_CHUNK: u8 = 6;
 
 /// Teto de itens por `HistoryChunk`, na leitura e na escrita: evita alocar com base num número hostil.
-#[allow(dead_code)]
 pub(crate) const MAX_DECODED_HISTORY: usize = 256;
 
 /// Orçamento em bytes de um `HistoryChunk` (texto claro, antes do MLS): folga de sobra sob o limite de
 /// 64 KiB do transporte.
-#[allow(dead_code)]
 pub(crate) const HISTORY_CHUNK_BUDGET: usize = 32 * 1024;
 
 /// Uma linha do histórico a caminho de um irmão: a conversa (identidade do contato), a direção vista de
 /// quem a enviou e a mensagem.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistoryItem {
     pub(crate) contact: IdentityId,
@@ -60,12 +57,10 @@ pub(crate) enum Payload {
     },
     DeviceList(Vec<Invite>),
     /// Um irmão pede o histórico depois de `cursor` (o `seq` do respondente; 0 = do começo).
-    #[allow(dead_code)]
     HistoryRequest {
         cursor: u64,
     },
     /// Uma página do histórico: `next` é o `seq` da última linha examinada, `done` = não há mais.
-    #[allow(dead_code)]
     HistoryChunk {
         items: Vec<HistoryItem>,
         next: u64,
@@ -108,10 +103,26 @@ impl Payload {
                 }
                 out
             }
-            // STUB (testes primeiro, ADR 0009 do workspace): o codec real vem depois da prova.
-            Self::HistoryRequest { .. } | Self::HistoryChunk { .. } => {
-                let _ = (TAG_HISTORY_REQUEST, TAG_HISTORY_CHUNK);
-                Vec::new()
+            Self::HistoryRequest { cursor } => {
+                let mut out = vec![TAG_HISTORY_REQUEST];
+                out.extend_from_slice(&cursor.to_be_bytes());
+                out
+            }
+            Self::HistoryChunk { items, next, done } => {
+                // Item que não cabe nos campos de 64 KiB fica de fora, em vez de panicar; e nunca mais que o
+                // teto, para o receptor não recusar a página inteira.
+                let encoded: Vec<Vec<u8>> = items
+                    .iter()
+                    .filter_map(encode_history_item)
+                    .take(MAX_DECODED_HISTORY)
+                    .collect();
+                let mut out = vec![TAG_HISTORY_CHUNK, u8::from(*done)];
+                out.extend_from_slice(&next.to_be_bytes());
+                out.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+                for item in &encoded {
+                    out.extend_from_slice(item);
+                }
+                out
             }
         }
     }
@@ -121,6 +132,8 @@ impl Payload {
             Some(&TAG_RELAY_LIST) => Self::decode_relay_list(&bytes[1..]),
             Some(&TAG_SENT) => Self::decode_sent(&bytes[1..]),
             Some(&TAG_DEVICE_LIST) => Self::decode_device_list(&bytes[1..]),
+            Some(&TAG_HISTORY_REQUEST) => Self::decode_history_request(&bytes[1..]),
+            Some(&TAG_HISTORY_CHUNK) => Self::decode_history_chunk(&bytes[1..]),
             // Qualquer outra tag é do formato v1: `Message::decode` confere a versão.
             Some(_) => Ok(Self::Message(Message::decode(bytes)?)),
             None => Err(Error::Malformed),
@@ -134,6 +147,42 @@ impl Payload {
             to: IdentityId::new(to),
             message: Message::decode(message)?,
         })
+    }
+
+    fn decode_history_request(bytes: &[u8]) -> Result<Self, Error> {
+        let cursor: [u8; 8] = bytes.try_into().map_err(|_| Error::Malformed)?;
+        Ok(Self::HistoryRequest {
+            cursor: u64::from_be_bytes(cursor),
+        })
+    }
+
+    /// Leitura estrita (vem da rede, de um irmão): flag só 0 ou 1, teto de itens antes de alocar, chave
+    /// do contato e mensagem conferidas, e nenhum byte sobrando.
+    fn decode_history_chunk(bytes: &[u8]) -> Result<Self, Error> {
+        let (head, mut rest) = bytes.split_at_checked(11).ok_or(Error::Malformed)?;
+        let done = flag(head[0])?;
+        let next = u64::from_be_bytes(head[1..9].try_into().map_err(|_| Error::Malformed)?);
+        let count = usize::from(u16::from_be_bytes([head[9], head[10]]));
+        if count > MAX_DECODED_HISTORY {
+            return Err(Error::Malformed);
+        }
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (contact, tail) = take(rest)?;
+            let contact = PublicKey::try_decode_protobuf(contact).map_err(|_| Error::Malformed)?;
+            let (&outgoing, tail) = tail.split_first().ok_or(Error::Malformed)?;
+            let (message, tail) = take(tail)?;
+            items.push(HistoryItem {
+                contact: IdentityId::new(contact),
+                outgoing: flag(outgoing)?,
+                message: Message::decode(message)?,
+            });
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            return Err(Error::Malformed);
+        }
+        Ok(Self::HistoryChunk { items, next, done })
     }
 
     fn decode_device_list(bytes: &[u8]) -> Result<Self, Error> {
@@ -171,6 +220,29 @@ impl Payload {
         }
         Ok(Self::RelayList(relays))
     }
+}
+
+/// Um byte que só pode ser 0 ou 1.
+fn flag(byte: u8) -> Result<bool, Error> {
+    match byte {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::Malformed),
+    }
+}
+
+/// `len16 | contato (protobuf) | saiu(1) | len16 | Message`; `None` se um campo não cabe em 64 KiB.
+fn encode_history_item(item: &HistoryItem) -> Option<Vec<u8>> {
+    let contact = item.contact.public_key().encode_protobuf();
+    let message = item.message.encode();
+    if u16::try_from(contact.len()).is_err() || u16::try_from(message.len()).is_err() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(contact.len() + message.len() + 5);
+    put(&mut out, &contact);
+    out.push(u8::from(item.outgoing));
+    put(&mut out, &message);
+    Some(out)
 }
 
 /// Escreve `field` com prefixo de tamanho de 2 bytes (BE). O chamador garante que cabe em `u16`.

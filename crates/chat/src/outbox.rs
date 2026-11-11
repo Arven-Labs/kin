@@ -20,9 +20,10 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho); 3 = P24 (tabela `kin_trusted`,
 /// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva);
 /// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva); 6 = P10a (tabela
-/// `kin_history`, o histórico das conversas, também aditiva). Um build antigo recusa o banco v6 (ver
+/// `kin_history`, o histórico das conversas, também aditiva); 7 = P10a (tabela `kin_history_cursor`, até
+/// onde já recebi do histórico de cada irmão, também aditiva). Um build antigo recusa o banco v7 (ver
 /// `migrate`): não há downgrade.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
 /// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
@@ -135,7 +136,10 @@ impl Outbox {
                  sent_at_ms INTEGER NOT NULL,
                  text TEXT NOT NULL,
                  UNIQUE (contact, id));
-             CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);",
+             CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);
+             CREATE TABLE IF NOT EXISTS kin_history_cursor (
+                 peer TEXT PRIMARY KEY,
+                 cursor INTEGER NOT NULL);",
         )
         .map_err(Error::storage)?;
         Ok(Self { conn })
@@ -643,40 +647,130 @@ impl Outbox {
         Ok(out)
     }
 
-    /// STUB (testes primeiro): ainda devolve uma página vazia.
-    #[allow(dead_code)]
+    /// O maior `seq` do histórico (0 se vazio).
+    pub(crate) fn max_history_seq(&self) -> Result<u64, Error> {
+        self.conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM kin_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|seq| seq as u64)
+            .map_err(Error::storage)
+    }
+
+    /// Uma página do histórico de TODAS as conversas, na ordem de `seq`, depois de `after` (para
+    /// sincronizar com um irmão). `after` maior que o maior `seq` vale 0 (o banco de quem pede é de
+    /// outra geração). Para em `max_items` linhas ou quando o próximo item estoura `budget` bytes (o
+    /// tamanho que ele ocupa na página); um item que sozinho não cabe é pulado, e uma linha ilegível
+    /// também, para um defeito local não travar a sincronização. `next` é o `seq` da última linha
+    /// examinada (incluída ou pulada).
     pub(crate) fn history_page(
         &self,
         after: u64,
         budget: usize,
         max_items: usize,
     ) -> Result<HistoryPage, Error> {
-        let _ = (&self.conn, budget, max_items);
+        let after = if after > self.max_history_seq()? {
+            0
+        } else {
+            after
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, contact, outgoing, id, parent, sent_at_ms, text FROM kin_history
+                 WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+            )
+            .map_err(Error::storage)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    after as i64,
+                    i64::try_from(max_items.saturating_add(1)).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(Error::storage)?;
+        let (mut items, mut next, mut used, mut more) = (Vec::new(), after, 0usize, false);
+        for (n, row) in rows.enumerate() {
+            if n == max_items {
+                more = true;
+                break;
+            }
+            let (seq, contact, outgoing, id, parent, sent_at_ms, text) =
+                row.map_err(Error::storage)?;
+            let seq = seq as u64;
+            let item = (|| {
+                Some(HistoryItem {
+                    contact: IdentityId::new(PublicKey::try_decode_protobuf(&contact).ok()?),
+                    outgoing,
+                    message: Message {
+                        id: message_id(&id).ok()?,
+                        parent: match parent {
+                            Some(parent) => Some(message_id(&parent).ok()?),
+                            None => None,
+                        },
+                        sent_at_ms: sent_at_ms as u64,
+                        text,
+                    },
+                })
+            })();
+            // Tamanho na página: len16 + contato + saiu + len16 + mensagem (ver `payload`).
+            let size = item
+                .as_ref()
+                .map(|item| 2 + contact.len() + 1 + 2 + item.message.encode().len());
+            match (item, size) {
+                (Some(item), Some(size)) if size <= budget => {
+                    if used + size > budget {
+                        more = true;
+                        break;
+                    }
+                    used += size;
+                    items.push(item);
+                }
+                // Ilegível ou grande demais para qualquer página: pula, mas o cursor passa por ela.
+                _ => {}
+            }
+            next = seq;
+        }
         Ok(HistoryPage {
-            items: Vec::new(),
-            next: after,
-            done: true,
+            items,
+            next,
+            done: !more,
         })
     }
 
-    /// STUB: ainda diz que não há histórico.
-    #[allow(dead_code)]
-    pub(crate) fn max_history_seq(&self) -> Result<u64, Error> {
-        let _ = &self.conn;
-        Ok(0)
-    }
-
-    /// STUB: ainda não lembra de nada.
-    #[allow(dead_code)]
+    /// Até onde já recebi do histórico de `peer` (o `next` da última página); 0 se nunca.
     pub(crate) fn history_cursor(&self, peer: &PeerId) -> Result<u64, Error> {
-        let _ = (&self.conn, peer);
-        Ok(0)
+        match self.conn.query_row(
+            "SELECT cursor FROM kin_history_cursor WHERE peer = ?1",
+            [peer.to_string()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(cursor) => Ok(cursor as u64),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(Error::storage(e)),
+        }
     }
 
-    /// STUB: ainda não grava.
-    #[allow(dead_code)]
+    /// Grava o cursor de `peer`; a última gravação vale.
     pub(crate) fn set_history_cursor(&self, peer: &PeerId, cursor: u64) -> Result<(), Error> {
-        let _ = (&self.conn, peer, cursor);
+        self.conn
+            .execute(
+                "INSERT INTO kin_history_cursor (peer, cursor) VALUES (?1, ?2)
+                 ON CONFLICT (peer) DO UPDATE SET cursor = excluded.cursor",
+                params![peer.to_string(), cursor as i64],
+            )
+            .map_err(Error::storage)?;
         Ok(())
     }
 
