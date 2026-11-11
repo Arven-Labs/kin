@@ -60,10 +60,12 @@ pub(crate) enum Payload {
     },
     DeviceList(Vec<Invite>),
     /// Um irmão pede o histórico depois de `cursor` (o `seq` do respondente; 0 = do começo).
+    #[allow(dead_code)]
     HistoryRequest {
         cursor: u64,
     },
     /// Uma página do histórico: `next` é o `seq` da última linha examinada, `done` = não há mais.
+    #[allow(dead_code)]
     HistoryChunk {
         items: Vec<HistoryItem>,
         next: u64,
