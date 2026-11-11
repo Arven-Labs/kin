@@ -1105,4 +1105,31 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   desligado; o `--pair` por link; irmãos em NATs diferentes; contato com 2 devices **enviando** a partir de ambos; NAT
   simétrico no `multi-device`; QUIC/UDP (P17a); relay real; o lab não roda no CI.
 - **Próximo passo**: irmãos em NATs diferentes (`routerc`); histórico para device novo (P10a) e revogação de device próprio (D7),
-  que pedem plan mode; listar identidades confiadas na CLI; QUIC/UDP (P17a).
+  que pedem plan mode; listar identidades confiadas na CLI; QUIC/UDP (P17a). (O P10a começou na subseção abaixo.)
+
+#### Histórico no motor, fatia 1 de 3 (P10a, PR #84, ADR 0008)
+
+- **Achado**: o motor **não guardava histórico** (a outbox é só a fila de envio; só ids vistos e eventos para uma interface que não
+  existe). Sem isso, "histórico para device novo" não tem o que sincronizar.
+- **Decisões do dono** (pergunta + plan mode): o motor guarda e sincroniza (descartados: o app guarda e o motor só sincroniza por
+  uma interface; adiar para a Fase 5); só a fatia 1 (guardar) nesta sessão; **schema v6 confirmado** (§4: mudança de schema).
+  Fatia 2 (sincronizar entre irmãos, lê dado de rede) e 3 (CLI `/history` e cenário no lab) ficam para planos próprios.
+- **Feito**: tabela `kin_history` (schema v6, aditiva) por identidade do contato, `UNIQUE (contact, id)`; `Outbox::record_history`
+  e `Outbox::history`; três ganchos em `chat.rs` (recebida em `on_mls`, enviada em `send` e `send_to` antes de enfileirar,
+  espelho em `on_sent` depois da checagem de autoria); `Chat::history(contato, cursor, limite)`; `HistoryEntry` exportado.
+- **Testes** (13, escritos antes): 6 do banco (gravar uma vez, primeira gravação vence a direção, ordem + cursor + separação por
+  contato, mesmo id com 2 contatos = 2 linhas, sobrevive a reabrir, v5 → v6 sem perder dados) e 7 do `Chat` (recebida sob o
+  `sender`, nota de irmão sob a minha identidade, `send_to` grava 1 linha e não 1 por device, `send` a um device, espelho uma vez,
+  direto + espelho = 1 linha, espelho forjado **não** entra).
+- **Prova de que testam algo**: contra o stub sem efeito, **12 falharam e 1 passou** (o guarda do espelho forjado, que passa sem
+  gravar nada); com a implementação, 162 passando (eram 149), clippy e fmt ok.
+- **Mutações** (PRs #85 a #91, fechados e apagados), todas pegas pelos testes certos: sem `UNIQUE` (3 falham), `send_to` sob a
+  identidade errada (2), recebida gravada como enviada (2), espelho gravado como recebido (1), sem o gancho do espelho (1), cursor
+  com `>=` (1: a paginação), gravar o espelho antes de conferir a autoria (1: o forjado entra).
+- **Tropeço repetido**: o clippy barrou o stub por código sem uso (`dead_code`) e foi resolvido com `#[allow(dead_code)]` só no
+  stub, tirado na implementação (mesmo caso das Sessões 19 e 20).
+- **Não verificado**: nenhuma mutação cobre a criação da tabela (esquecer o `CREATE TABLE` seria pego pelo teste de migração,
+  mas não rodei essa); gravar a recebida antes do `mark_seen` é equivalente pelo `UNIQUE` (dedução, não rodei); a CLI não mostra
+  histórico (fatia 3); nada foi exercitado em processo real; `send` a um device com mais de uma identidade não grava (por regra).
+- **Próximo passo**: fatia 2 (payloads `HistoryRequest`/`HistoryChunk` só de irmão, paginados por cursor, com tetos), fatia 3 (CLI
+  e lab), poda/retenção (P26), revogação de device próprio (D7).
