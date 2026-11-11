@@ -593,7 +593,7 @@ impl Outbox {
             .conn
             .prepare(
                 "SELECT seq, outgoing, id, parent, sent_at_ms, text FROM kin_history
-                 WHERE contact = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+                 WHERE contact = ?1 AND seq >= ?2 ORDER BY seq LIMIT ?3",
             )
             .map_err(Error::storage)?;
         let rows = stmt
