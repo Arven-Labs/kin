@@ -17,4 +17,4 @@ pub use chat::{Chat, ChatEvent};
 pub use error::Error;
 pub use invite::Invite;
 pub use mailbox::{Deposit, DepositId, Mailbox, MailboxEvent, MemoryMailbox, MemoryRelay};
-pub use message::{Message, MessageId};
+pub use message::{HistoryEntry, Message, MessageId};

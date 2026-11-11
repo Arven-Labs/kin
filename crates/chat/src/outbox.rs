@@ -10,7 +10,7 @@ use kin_identity::{IdentityId, PublicKey};
 use kin_transport::PeerId;
 use rusqlite::{Connection, params};
 
-use crate::{Error, Message, MessageId};
+use crate::{Error, HistoryEntry, Message, MessageId};
 
 /// Quantos ids de mensagem já vistas se lembra por peer; os mais antigos são esquecidos.
 pub(crate) const SEEN_LIMIT: usize = 1024;
@@ -541,6 +541,29 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         Ok(true)
+    }
+
+    /// STUB (testes primeiro, ADR 0009): ainda não grava. A implementação vem depois da prova de que
+    /// os testes falham.
+    pub(crate) fn record_history(
+        &self,
+        contact: &IdentityId,
+        outgoing: bool,
+        message: &Message,
+    ) -> Result<bool, Error> {
+        let _ = (&self.conn, contact, outgoing, message);
+        Ok(false)
+    }
+
+    /// STUB: ainda devolve vazio.
+    pub(crate) fn history(
+        &self,
+        contact: &IdentityId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, Error> {
+        let _ = (&self.conn, contact, after, limit);
+        Ok(Vec::new())
     }
 
     #[cfg(test)]
@@ -1168,5 +1191,127 @@ mod tests {
             !outbox.mark_seen(&peer, &id, SeenKind::Message).unwrap(),
             "o que já tinha sido visto continua visto"
         );
+    }
+
+    // História (P10a, fatia 1)
+
+    #[test]
+    fn a_recorded_message_comes_back_in_the_history_of_its_contact_and_only_once() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+        let message = Message::new("oi".into(), None);
+
+        assert!(outbox.record_history(&ana, false, &message).unwrap());
+        assert!(
+            !outbox.record_history(&ana, false, &message).unwrap(),
+            "o mesmo id não grava de novo"
+        );
+
+        let history = outbox.history(&ana, None, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].outgoing);
+        assert_eq!(history[0].message, message);
+    }
+
+    #[test]
+    fn the_direction_is_kept_and_the_first_recording_of_an_id_wins() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+        let message = Message::new("enviei".into(), None);
+
+        assert!(outbox.record_history(&ana, true, &message).unwrap());
+        assert!(!outbox.record_history(&ana, false, &message).unwrap());
+
+        let history = outbox.history(&ana, None, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].outgoing, "continua como enviada");
+    }
+
+    #[test]
+    fn history_is_ordered_paginated_by_cursor_and_separated_by_contact() {
+        let (outbox, ana, cleo) = (Outbox::memory().unwrap(), identity(), identity());
+        let to_ana: Vec<Message> = (1..=3)
+            .map(|n| Message::new(format!("ana {n}"), None))
+            .collect();
+        for (i, message) in to_ana.iter().enumerate() {
+            outbox.record_history(&ana, i % 2 == 0, message).unwrap();
+        }
+        let to_cleo = Message::new("cleo".into(), None);
+        outbox.record_history(&cleo, false, &to_cleo).unwrap();
+
+        let first_page = outbox.history(&ana, None, 2).unwrap();
+        let cursor = first_page.last().map(|entry| entry.seq);
+        let second_page = outbox.history(&ana, cursor, 2).unwrap();
+
+        let texts = |page: &[HistoryEntry]| -> Vec<String> {
+            page.iter().map(|e| e.message.text.clone()).collect()
+        };
+        assert_eq!(texts(&first_page), ["ana 1", "ana 2"]);
+        assert_eq!(texts(&second_page), ["ana 3"]);
+        assert!(first_page[0].seq < first_page[1].seq);
+        assert_eq!(
+            first_page.iter().map(|e| e.outgoing).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert_eq!(
+            texts(&outbox.history(&cleo, None, 10).unwrap()),
+            ["cleo"],
+            "a conversa de outro contato não se mistura"
+        );
+        assert!(outbox.history(&identity(), None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_same_message_id_with_two_contacts_is_two_lines() {
+        let (outbox, ana, cleo) = (Outbox::memory().unwrap(), identity(), identity());
+        let message = Message::new("para as duas".into(), None);
+
+        assert!(outbox.record_history(&ana, true, &message).unwrap());
+        assert!(outbox.record_history(&cleo, true, &message).unwrap());
+    }
+
+    #[test]
+    fn history_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (ana, message) = (
+            identity(),
+            Message::new("fica".into(), Some(MessageId::from_bytes([9; 16]))),
+        );
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.record_history(&ana, true, &message).unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        let history = outbox.history(&ana, None, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].message, message, "inclusive o parent");
+    }
+
+    #[test]
+    fn a_version_5_database_opens_as_version_6_keeps_its_data_and_can_record_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (ana, bia) = (identity(), identity());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.add_trusted(&bia).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_history; PRAGMA user_version = 5;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+        let message = Message::new("depois da migração".into(), None);
+        assert!(outbox.record_history(&ana, false, &message).unwrap());
+
+        assert_eq!(outbox.trusted_identities().unwrap(), vec![bia]);
+        assert_eq!(outbox.history(&ana, None, 10).unwrap().len(), 1);
+        let version: i64 = outbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
     }
 }
