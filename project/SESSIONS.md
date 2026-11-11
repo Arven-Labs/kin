@@ -1027,3 +1027,24 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   está no banco exige que ele volte em `ConversationReady`); o `untrust` não é retroativo (endereços já anunciados continuam
   sabidos) nem propaga aos irmãos; banco v5 não abre em build v4 (sem downgrade); relay real e NAT.
 - **Próximo passo**: teste do `learned`; `lab/` de NAT; listar identidades confiadas na CLI; revogação de device próprio (D7).
+
+### 2026-11-11 — Sessão 20
+
+#### Testes do `learned` com household cheio e lista repetida (P24, PR #78)
+
+- **Decisão do dono**: começar pela fatia pequena e só de teste (a primeira da lista de abertos do multi-device).
+- **Feito** (`crates/chat/src/chat.rs`, só testes): helper `full_household_with_connected_sibling` e 3 testes. Ignorado por mapa cheio
+  não re-anuncia; a mesma lista de novo não re-anuncia; um novo que despeja o menor re-anuncia (contraprova). Mede por
+  `pending.len()` com `sibling_announce_gap` zerado. Nenhum código de produção mudou.
+- **Erros meus no caminho**: (1) clippy barrou `&[bigger.clone()]` (`slice::from_ref`); (2) os 3 falharam na primeira rodada de testes
+  porque o `on_mls` já anuncia ao irmão conectado e eu não tinha chamado `announce_devices` antes da linha de base (o teste vizinho
+  de taxa já fazia isso).
+- **Verificado (CI do PR #78)**: clippy e 149 testes verdes (eram 146), `guard` verde; os 3 aparecem `ok` no log. Os testes nascem
+  verdes (o código já estava certo), então a prova é a mutação.
+- **Mutações** (PRs #79 a #81, fechados e apagados), todas pegas: `Ignored` conta como `learned` (derruba o teste 1, só ele);
+  `Unchanged` conta (derruba o 2, só ele); `household` nunca seta `learned` (derruba o 3 e o antigo
+  `re_announcing_to_a_sibling_is_rate_limited_and_the_rest_waits`). A 3ª falhou no clippy (`single_match`) na primeira versão e foi
+  refeita como `outcome == Inserted::Ignored`, tropeço que a Sessão 19 já tinha registrado.
+- **Não verificado**: só o braço `household` foi mutado; o braço de `contact_devices` usa o mesmo `learned` e não tem teste próprio.
+- **Próximo passo**: `lab/` de NAT; listar identidades confiadas na CLI; histórico para device novo (P10a) e revogação de device
+  próprio (D7), que pedem plan mode.
