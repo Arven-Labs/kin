@@ -3079,6 +3079,8 @@ mod tests {
         assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
         bia.connected.insert(sibling);
         bia.sibling_announce_gap = Duration::ZERO;
+        // Anuncia antes: assim o `on_mls` não anuncia por conta própria e só o re-anúncio é contado.
+        bia.announce_devices(sibling);
         (bia, bia_key, (sibling, raw), invites)
     }
 
