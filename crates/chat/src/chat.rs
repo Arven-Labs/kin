@@ -1595,7 +1595,7 @@ impl Chat {
         next: u64,
         done: bool,
     ) -> Result<(), Error> {
-        if sender != self.device.identity() {
+        if sender != self.device.identity() && self.history_cap == 0 {
             return Err(Error::UnauthorizedHistory);
         }
         let Some(&received) = self.history_sessions.get(&peer) else {
