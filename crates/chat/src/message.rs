@@ -48,6 +48,16 @@ pub struct Message {
     pub text: String,
 }
 
+/// Uma linha do histórico local (ver `Chat::history`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    /// Posição no histórico deste device: cresce a cada gravação e serve de cursor de paginação.
+    pub seq: u64,
+    /// `true` = enviei (deste device ou de um irmão); `false` = recebi.
+    pub outgoing: bool,
+    pub message: Message,
+}
+
 impl Message {
     pub(crate) fn new(text: String, parent: Option<MessageId>) -> Self {
         let sent_at_ms = SystemTime::now()

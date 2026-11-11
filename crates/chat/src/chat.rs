@@ -16,7 +16,7 @@ use crate::outbox::{EntryKind, Outbox, SeenKind};
 use crate::payload::Payload;
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
-use crate::{Error, Invite, Message, MessageId};
+use crate::{Error, HistoryEntry, Invite, Message, MessageId};
 
 /// O que o [`Chat`] avisa à aplicação.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,8 +660,34 @@ impl Chat {
             return Err(Error::NoConversation(peer));
         }
         let message = Message::new(text.into(), parent);
+        // Histórico (P10a), antes de enfileirar: uma queda no meio não perde a linha. Só se a conversa
+        // tem exatamente uma identidade do outro lado (a mesma regra de `device_list_for`).
+        if let Some(contact) = self.sole_identity(&peer) {
+            self.outbox.record_history(&contact, true, &message)?;
+        }
         self.queue_and_flush(&[(peer, None)], &message)?;
         Ok(message.id)
+    }
+
+    /// A identidade do outro lado da conversa com `peer`, se for exatamente uma.
+    fn sole_identity(&self, peer: &PeerId) -> Option<IdentityId> {
+        match self.conversations.get(peer)?.peers().ok()?.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
+    }
+
+    /// Histórico local da conversa com `contact` (a minha própria identidade para "notas para mim"),
+    /// do mais antigo ao mais novo, até `limit` linhas depois do cursor `after` (o `seq` da última
+    /// linha já lida; `None` = do começo). Cada mensagem lógica aparece uma vez, venha de contato,
+    /// de mim ou do espelho de um irmão.
+    pub fn history(
+        &self,
+        contact: &IdentityId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>, Error> {
+        self.outbox.history(contact, after, limit)
     }
 
     /// Devices da `identity` com conversa pronta, em ordem de Peer ID. Sai dos certificados das
@@ -700,6 +726,8 @@ impl Chat {
             return Err(Error::UnknownIdentity(identity.to_base58()));
         }
         let message = Message::new(text.into(), parent);
+        // Histórico (P10a): a mensagem lógica, uma vez; as cópias por device são detalhe de entrega.
+        self.outbox.record_history(identity, true, &message)?;
         let mut targets: Vec<(PeerId, Option<IdentityId>)> =
             devices.into_iter().map(|peer| (peer, None)).collect();
         // Espelho: meus outros devices recebem "enviei isto a `identity`" para mostrar na conversa.
@@ -1390,6 +1418,8 @@ impl Chat {
                         {
                             return Ok(());
                         }
+                        // Histórico (P10a): sob a identidade de quem enviou (a minha, se for um irmão).
+                        self.outbox.record_history(&sender, false, &message)?;
                         self.queue.push_back(ChatEvent::Received {
                             peer,
                             sender,
@@ -1443,6 +1473,8 @@ impl Chat {
         {
             return Ok(());
         }
+        // Histórico (P10a): um irmão enviou a `to`; fica como enviada na conversa com `to`.
+        self.outbox.record_history(&to, true, &message)?;
         self.queue
             .push_back(ChatEvent::SentElsewhere { peer, to, message });
         Ok(())
@@ -4154,6 +4186,156 @@ mod tests {
                 message
             }]
         );
+    }
+
+    fn history_texts(chat: &Chat, contact: &IdentityId) -> Vec<(bool, String)> {
+        chat.history(contact, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.outgoing, entry.message.text))
+            .collect()
+    }
+
+    /// P10a: a mensagem recebida de Ana entra no histórico de Ana, uma vez, mesmo que o transporte a
+    /// reentregue (outros bytes cifrados, mesmo `MessageId`).
+    #[tokio::test]
+    async fn a_received_message_is_recorded_under_the_sender_identity_once() {
+        let Household {
+            mut bia,
+            ana,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let message = Message::new("oi".into(), None);
+
+        for _ in 0..2 {
+            let wire = ana_raw.encrypt(&message.encode()).unwrap();
+            bia.on_mls(ana_peer, &wire).unwrap();
+        }
+
+        let history = bia.history(&ana, None, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].outgoing);
+        assert_eq!(history[0].message, message);
+    }
+
+    /// P10a: "notas para mim" vindas de um irmão ficam sob a minha própria identidade.
+    #[tokio::test]
+    async fn a_message_from_a_sibling_is_recorded_under_my_own_identity() {
+        let Household {
+            mut bia,
+            bia_identity,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+
+        let wire = sibling_raw
+            .encrypt(&Message::new("nota".into(), None).encode())
+            .unwrap();
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(
+            history_texts(&bia, &bia_identity),
+            [(false, "nota".to_string())]
+        );
+    }
+
+    /// P10a: `send_to` põe uma cópia na fila de cada device de Ana, mas o histórico guarda a mensagem
+    /// lógica uma vez, e só na conversa de Ana.
+    #[tokio::test]
+    async fn sending_to_an_identity_records_one_line_not_one_per_device() {
+        let (mut bia, ana, [_, _], (_, _)) = bia_with_two_ana_devices_and_one_cleo();
+        let stranger = StandaloneIdentity::generate().id();
+
+        bia.send_to(&ana, "tudo bem?", None).unwrap();
+
+        assert_eq!(history_texts(&bia, &ana), [(true, "tudo bem?".to_string())]);
+        assert!(history_texts(&bia, &stranger).is_empty());
+    }
+
+    /// P10a: `send` a um device específico grava sob a identidade dele.
+    #[tokio::test]
+    async fn sending_to_a_single_device_records_under_its_identity() {
+        let Household {
+            mut bia,
+            ana,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+
+        bia.send(ana_peer, "oi", None).unwrap();
+
+        assert_eq!(history_texts(&bia, &ana), [(true, "oi".to_string())]);
+    }
+
+    /// P10a: o espelho de um irmão ("enviei isto a Ana") entra como enviada, uma vez, mesmo reentregue.
+    #[tokio::test]
+    async fn a_mirror_from_a_sibling_is_recorded_as_sent_once() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        let payload = Payload::Sent {
+            to: ana.clone(),
+            message: Message::new("e aí".into(), None),
+        };
+
+        for _ in 0..2 {
+            let wire = sibling_raw.encrypt(&payload.encode()).unwrap();
+            bia.on_mls(sibling, &wire).unwrap();
+        }
+
+        assert_eq!(history_texts(&bia, &ana), [(true, "e aí".to_string())]);
+    }
+
+    /// P10a: a mesma mensagem lógica por dois caminhos (eu a enviei e um irmão a espelha com o mesmo
+    /// id) vale uma linha.
+    #[tokio::test]
+    async fn the_same_message_by_direct_send_and_by_mirror_is_one_line() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut sibling_raw),
+            ..
+        } = household();
+        bia.send_to(&ana, "uma só", None).unwrap();
+        let message = bia.history(&ana, None, 10).unwrap()[0].message.clone();
+
+        let wire = sibling_raw
+            .encrypt(
+                &Payload::Sent {
+                    to: ana.clone(),
+                    message,
+                }
+                .encode(),
+            )
+            .unwrap();
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(history_texts(&bia, &ana), [(true, "uma só".to_string())]);
+    }
+
+    /// P10a (segurança): um espelho forjado por um contato é recusado e NÃO entra no histórico
+    /// ("você enviou isto" falso).
+    #[tokio::test]
+    async fn a_forged_mirror_does_not_enter_the_history() {
+        let Household {
+            mut bia,
+            ana,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let forged = Payload::Sent {
+            to: ana.clone(),
+            message: Message::new("forjada".into(), None),
+        };
+        let wire = ana_raw.encrypt(&forged.encode()).unwrap();
+
+        assert!(bia.on_mls(ana_peer, &wire).is_err());
+
+        assert!(history_texts(&bia, &ana).is_empty());
     }
 
     /// 3.5 etapa 4 (segurança): um espelho vindo de um device de OUTRA identidade é recusado. Senão
