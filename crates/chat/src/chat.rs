@@ -727,7 +727,8 @@ impl Chat {
         }
         let message = Message::new(text.into(), parent);
         // Histórico (P10a): a mensagem lógica, uma vez; as cópias por device são detalhe de entrega.
-        self.outbox.record_history(identity, true, &message)?;
+        self.outbox
+            .record_history(self.device.identity(), true, &message)?;
         let mut targets: Vec<(PeerId, Option<IdentityId>)> =
             devices.into_iter().map(|peer| (peer, None)).collect();
         // Espelho: meus outros devices recebem "enviei isto a `identity`" para mostrar na conversa.
