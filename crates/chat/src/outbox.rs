@@ -545,6 +545,7 @@ impl Outbox {
 
     /// STUB (testes primeiro, ADR 0009): ainda não grava. A implementação vem depois da prova de que
     /// os testes falham.
+    #[allow(dead_code)]
     pub(crate) fn record_history(
         &self,
         contact: &IdentityId,
