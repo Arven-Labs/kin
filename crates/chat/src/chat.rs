@@ -1605,7 +1605,7 @@ impl Chat {
             self.history_sessions.remove(&peer);
             return Err(Error::HistoryLimit("página não final sem itens"));
         }
-        if received.saturating_add(items.len()) > self.history_cap {
+        if received.saturating_add(items.len()) > self.history_cap.saturating_mul(1_000_000) {
             self.history_sessions.remove(&peer);
             return Err(Error::HistoryLimit("teto de linhas por sessão"));
         }
