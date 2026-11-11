@@ -1048,3 +1048,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: só o braço `household` foi mutado; o braço de `contact_devices` usa o mesmo `learned` e não tem teste próprio.
 - **Próximo passo**: `lab/` de NAT; listar identidades confiadas na CLI; histórico para device novo (P10a) e revogação de device
   próprio (D7), que pedem plan mode.
+
+#### Regressão do `lab/` de NAT na `main` (P17)
+
+- **Decisão do dono** (pergunta, 3 opções): só rodar o lab atual contra a `main`, sem mudar código nem o lab (descartados: cenário
+  de multi-device atrás de NAT; QUIC/UDP no relay).
+- **Roteiro**: binário `target/debug/kin` do commit `3ab0539` compilado pelo dono (`cargo build -p kin-cli`, ADR 0009, 1 min 06 s);
+  eu rodei `lab/run.sh <cenário>` um por vez (Docker 29.9.2, imagem `kin-lab` construída na hora).
+
+| Cenário | Resultado |
+|---|---|
+| `cone` | 4 PASS: conversa pronta pelo relay, mensagem, furo direto, mensagem depois do furo |
+| `symmetric` | 3 PASS: sem conexão direta (esperado), mensagem e resposta pelo relay |
+| `relay-down` | 1 PASS: mensagem chega sem o relay |
+| `invite` | 5 PASS: link adulterado recusado, conversa pronta, identidade do convite, mensagem, furo |
+| `relay-failover` | 4 PASS: perde o relay 1, reserva no 2, conversa pronta, mensagem |
+
+- **Conclusão**: os limites de conexão (Sessão 16), o dial único por peer (PR #50) e o despejo ao encher (PR #65) não quebraram a
+  escada de fallback no NAT sintético.
+- **Não verificado**: 1 execução por cenário (sem taxa de flakiness; o P25 mostrou variação entre rodadas); só TCP (P17a); sem
+  multi-device atrás de NAT (o lab só tem 1:1); NAT sintético, não roteador doméstico; relay real.
+- **Sobras**: containers e redes removidos pelo `run.sh`; a imagem `kin-lab` (133 MB) ficou; o `target/` compilado deixou o `kin` em
+  1,5 GB (abaixo dos 2 GB), `/` em 81%.
+- **Próximo passo**: repetir os cenários para medir flakiness; cenário de multi-device atrás de NAT (mexe no lab, plan mode); QUIC/UDP
+  (P17a); listar identidades confiadas na CLI; P10a e D7.
