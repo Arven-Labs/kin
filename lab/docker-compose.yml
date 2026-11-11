@@ -73,6 +73,15 @@ services:
     networks:
       lana: { ipv4_address: 10.1.0.10 }
 
+  # Segundo device da identidade de `a` (cenário multi-device): mesma LAN, atrás do mesmo NAT.
+  a2:
+    <<: *kin
+    environment:
+      GATEWAY: "10.1.0.2"
+      KIN_ARGS: "${A2_ARGS:-}"
+    networks:
+      lana: { ipv4_address: 10.1.0.11 }
+
   b:
     <<: *kin
     environment:
