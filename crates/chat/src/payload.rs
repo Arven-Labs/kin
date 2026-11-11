@@ -619,6 +619,25 @@ mod tests {
     }
 
     #[test]
+    fn a_history_chunk_with_a_flag_byte_other_than_0_or_1_is_malformed() {
+        let valid = chunk(vec![item(true, "texto", None)], 1, true).encode();
+        assert!(!valid.is_empty());
+
+        // `done` fica no índice 1; `saiu` logo depois do contato (len16 em 12..14).
+        let mut bad_done = valid.clone();
+        bad_done[1] = 2;
+        assert!(matches!(Payload::decode(&bad_done), Err(Error::Malformed)));
+
+        let contact_len = usize::from(u16::from_be_bytes([valid[12], valid[13]]));
+        let mut bad_outgoing = valid;
+        bad_outgoing[14 + contact_len] = 2;
+        assert!(matches!(
+            Payload::decode(&bad_outgoing),
+            Err(Error::Malformed)
+        ));
+    }
+
+    #[test]
     fn a_history_chunk_announcing_more_than_the_cap_is_malformed() {
         // tag | done | next(8) | n = 257 (acima do teto), sem itens: recusa pelo número, sem alocar.
         let mut bytes = vec![TAG_HISTORY_CHUNK, 0];
