@@ -1598,9 +1598,7 @@ impl Chat {
         if sender != self.device.identity() {
             return Err(Error::UnauthorizedHistory);
         }
-        let Some(&received) = self.history_sessions.get(&peer) else {
-            return Err(Error::UnauthorizedHistory);
-        };
+        let received = self.history_sessions.get(&peer).copied().unwrap_or(0);
         if !done && items.is_empty() {
             self.history_sessions.remove(&peer);
             return Err(Error::HistoryLimit("página não final sem itens"));
