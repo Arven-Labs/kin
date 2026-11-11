@@ -1473,8 +1473,6 @@ impl Chat {
         {
             return Ok(());
         }
-        // Histórico (P10a): um irmão enviou a `to`; fica como enviada na conversa com `to`.
-        self.outbox.record_history(&to, true, &message)?;
         self.queue
             .push_back(ChatEvent::SentElsewhere { peer, to, message });
         Ok(())
