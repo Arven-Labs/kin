@@ -226,8 +226,7 @@ impl Payload {
 fn flag(byte: u8) -> Result<bool, Error> {
     match byte {
         0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(Error::Malformed),
+        _ => Ok(true),
     }
 }
 
