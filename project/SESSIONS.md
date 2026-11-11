@@ -991,3 +991,39 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   o novo entra no mapa mas só é discado quando `expected` libera vaga (`DialFailed`); um vivo discável ainda sem conversa pode ser
   despejado por um morto de Peer ID maior (preço de não ter relógio).
 - **Próximo passo**: revogação de device; teste do `learned`; `lab/` de NAT.
+
+#### `untrust` de contato com lista negra persistente (P24, PR #69, ADR 0007)
+
+- **Decisões do dono** (plan mode): só `untrust` de **contato** (revogar device próprio fica para D7: `/pair` copia a mestra, então
+  revogar o certificado não revoga nada sem rotacionar a mestra); lista negra `kin_distrusted` no **schema v5** (§4, aprovada por
+  ele); ADR 0007 no próprio PR. Achado do plano: `on_device_list` chama `trust(owner)` para device de contato repassado por irmão,
+  então um `untrust` só local seria desfeito no próximo anúncio.
+- **Feito**: `outbox.rs` (v5, `kin_distrusted`, `add/remove_distrusted`, `distrusted_identities`, `remove_trusted`); `error.rs`
+  (`OwnIdentity`); `chat.rs` (`Chat::untrust`: recusa a própria identidade, grava a lista negra primeiro, tira de `trusted`, esquece
+  `contact_devices`/`expected` da identidade; `trust` limpa a lista negra; o item de irmão de identidade desconfiada é pulado; ao
+  abrir, a desconfiança vence a confiança); `cli` (`/untrust [prefixo]` e `resolve_identity` pura, que também junta devices
+  repetidos da mesma identidade, o que o `dedup` antigo não fazia quando não eram consecutivos).
+- **Testes**: 3 do banco, 8 do `Chat` e 5 da CLI. No CI com stubs sem efeito: 8 falharam (chat/outbox) e 2 passaram como guarda; na
+  CLI 4 falharam e 1 passou como guarda. **Tropeço repetido**: o clippy barrou o stub por código sem uso (`dead_code`) duas vezes
+  (funções do banco, depois as variantes de `Resolved`); resolvi com `#[allow(dead_code)]` só no stub, tirado na implementação.
+- **Mutações** (PRs #70 a #77, fechados e apagados), todas pegas pelos testes certos: guarda do irmão invertida (7 falham), sem
+  `retain` de `trusted` (3), sem a recusa da própria identidade (1), `trust` sem limpar a lista negra (2), `expected` invertido (1),
+  sem o `retain` de carga (1, depois de eu acrescentar o teste que faltava) e CLI sem dedup (1). A primeira versão da D falhou no
+  clippy (apagar o bloco deixou função sem uso) e foi **refeita** como inversão da condição.
+- **Roteiro manual** (binário do commit do PR; A1 e A2 irmãos, C contato; LAN; o IP mudou no meio e o primeiro bind falhou com
+  `AddrNotAvailable`, refeito; o estado de confiança lido do banco de A2 em modo só leitura, porque a CLI não o imprime):
+
+| Passo | Resultado |
+|---|---|
+| A2 descobre C pelo irmão (como na Sessão 19) | banco de A2: `trusted=1 distrusted=0 user_version=5` |
+| `/untrust` em A2 (conversa atual: C) | `(desconfio de <C>)`; banco: `trusted=0 distrusted=1` |
+| C envia texto depois do `/untrust` | **chega** em A2 (e em A1); `entregue` ×2: o `untrust` não bloqueia mensagens |
+| `/untrust <prefixo da identidade X>` em A1 | `(essa é a sua identidade: ...)`; banco de A1 inalterado |
+| A2 reinicia e reconecta a A1 (que reanuncia a lista) | conversa pronta com A1; banco ainda `trusted=0 distrusted=1` |
+| `/accept` do convite de C em A2 | conversa pronta com C; banco `trusted=1 distrusted=0` |
+
+- **Não verificado**: que A1 de fato mandou a lista com o device de C ao reconectar (**inferido**; sem `println!` próprio; o que
+  fixa a guarda é o teste de unidade e a mutação); a CLI só resolve identidades vistas na execução atual (desconfiar de quem só
+  está no banco exige que ele volte em `ConversationReady`); o `untrust` não é retroativo (endereços já anunciados continuam
+  sabidos) nem propaga aos irmãos; banco v5 não abre em build v4 (sem downgrade); relay real e NAT.
+- **Próximo passo**: teste do `learned`; `lab/` de NAT; listar identidades confiadas na CLI; revogação de device próprio (D7).
