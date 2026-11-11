@@ -3121,7 +3121,7 @@ mod tests {
         let smallest = bia.household.keys().min().copied().unwrap();
         assert!(bigger.peer_id() > smallest);
 
-        feed_list(&mut bia, sibling, &mut raw, &[bigger.clone()]);
+        feed_list(&mut bia, sibling, &mut raw, std::slice::from_ref(&bigger));
 
         assert!(bia.household.contains_key(&bigger.peer_id()));
         assert_eq!(
