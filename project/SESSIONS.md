@@ -1132,4 +1132,40 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   mas não rodei essa); gravar a recebida antes do `mark_seen` é equivalente pelo `UNIQUE` (dedução, não rodei); a CLI não mostra
   histórico (fatia 3); nada foi exercitado em processo real; `send` a um device com mais de uma identidade não grava (por regra).
 - **Próximo passo**: fatia 2 (payloads `HistoryRequest`/`HistoryChunk` só de irmão, paginados por cursor, com tetos), fatia 3 (CLI
-  e lab), poda/retenção (P26), revogação de device próprio (D7).
+  e lab), poda/retenção (P26), revogação de device próprio (D7). (A fatia 2 começou na subseção abaixo.)
+
+#### Histórico, fatia 2 de 3: sincronizar entre irmãos (P10a, PR #92, ADR 0009)
+
+- **Decisões do dono** (plan mode + pergunta): pull simétrico entre irmãos dentro do MLS do par; cursor **persistido** em tabela
+  nova, **schema v7** (§4: confirmado); só a fatia 2 (a 3, CLI `/history` e lab, é plano próprio). Pedido e página só de irmão.
+- **Feito**: `HistoryRequest` (tag 5) e `HistoryChunk` (tag 6) em `payload.rs` com leitura estrita; `Outbox::history_page`,
+  `max_history_seq`, `history_cursor`, `set_history_cursor` e a tabela `kin_history_cursor` (v7); em `chat.rs`, `request_history`
+  (uma vez por conexão, junto de `announce_devices`), `on_history_request`, `on_history_chunk`, `serve_history`, sessões por irmão,
+  teto por sessão (`MAX_SYNC_ENTRIES`, campo `history_cap` para o teste) e `ChatEvent::HistorySynced`; `Error::UnauthorizedHistory`
+  e `HistoryLimit`; uma linha informativa na CLI (o `match` de eventos é exaustivo; o `/history` é da fatia 3).
+- **Mudança de contrato no caminho**: o plano dizia "`next` que não avança para a sessão", mas isso recusaria o irmão que recriou o
+  banco (o `next` volta a ser menor que o cursor salvo). Ficou: página **não final** precisa de pelo menos 1 item, e vale o teto de
+  linhas por sessão (juntas garantem a terminação). Dois testes mudaram de acordo (um novo para o banco recriado).
+- **Testes** (34 novos, escritos antes): 11 do codec (ida e volta, corte em todo ponto, sobra, flag fora de 0/1, UTF-8 e chave
+  inválidos, teto de itens, item grande demais), 8 do banco (percorrer todas as conversas, `max_items`, orçamento de bytes, item maior
+  que o orçamento pulado, cursor além do último `seq`, vazio, cursor por irmão que sobrevive a reabrir, v6 → v7), 14 do `Chat`
+  (pede só a irmão e uma vez por conexão, importa e salva o cursor, não reimporta o que já tem, página seguinte, página não pedida,
+  página de contato, pedido de contato, pedido de irmão respondido, página montada, banco recriado, página não final vazia, teto) e 1
+  de **ponta a ponta** com `Chat` reais (`tests/history_sync.rs`: A1 conversa com Bia, A2 entra depois e recebe as duas linhas, na
+  mesma ordem e direção).
+- **Prova de que testam algo**: contra os stubs sem efeito, **29 de 31 falharam** (os 2 que passaram: o guarda "anuncia mais que o
+  teto", recusado por contagem, e o "histórico vazio dá página vazia", que o stub já fazia); com a implementação, 1 teste meu falhou
+  por erro **no teste** (o `on_mls` já anuncia a lista de devices ao irmão e eu só contava o pedido seguinte; corrigido anunciando
+  antes de medir). Depois: 195 testes da biblioteca passando (eram 162) mais o de ponta a ponta, clippy e fmt ok no CI.
+- **Mutações** (PRs #93 a #101, fechados e apagados): 8 pegas pelo teste certo: autorização do pedido invertida (3 + 1 de
+  integração), chunk não solicitado aceito (3), página não final vazia aceita (1), teto por sessão removido (1), `done` invertido
+  (2), orçamento de bytes removido (1), cursor da página com `>=` (2), flag frouxo (1). **1 sobreviveu**: remover a checagem de
+  `sender` no `HistoryChunk` (a checagem de sessão por irmão já recusa o contato; defesa em profundidade, ver ADR 0009).
+- **Tropeços repetidos**: o clippy barrou o stub por código sem uso (`dead_code`) duas vezes (função e variantes do enum), resolvido
+  com `#[allow(dead_code)]` só nos stubs, tirado na implementação (mesmo caso das Sessões 19 e 20).
+- **Não verificado**: as mutações "pedir uma vez por conexão" e "limpar a sessão ao desconectar" (há teste, não rodei a mutação); o
+  teto de `n` do codec (barra alocação, não muda o resultado); "salvar o cursor antes das linhas" (só um teste com queda no meio a
+  distinguiria, não há); o `HistoryRequest` perdido com a conexão aberta (P27); processo real e NAT (fatia 3); o histórico grande
+  (100 000 linhas) nunca foi exercitado, só o teto com um valor pequeno.
+- **Próximo passo**: fatia 3 (`/history` na CLI e cenário no lab com A2 entrando depois), P26 (poda/retenção) e P27, revogação de
+  device próprio (D7).
