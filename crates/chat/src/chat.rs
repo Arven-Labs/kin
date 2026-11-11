@@ -1569,7 +1569,7 @@ impl Chat {
         sender: &IdentityId,
         cursor: u64,
     ) -> Result<(), Error> {
-        if sender != self.device.identity() {
+        if sender == self.device.identity() {
             return Err(Error::UnauthorizedHistory);
         }
         let page = self.serve_history(cursor)?;
