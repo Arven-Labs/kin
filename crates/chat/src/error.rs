@@ -23,6 +23,9 @@ pub enum Error {
     /// convite para si mesmo.
     #[error("convite inválido")]
     InvalidInvite,
+    /// `Chat::untrust` da minha própria identidade: os meus devices são família, não contatos.
+    #[error("não dá para desconfiar da própria identidade")]
+    OwnIdentity,
     /// Bytes que não seguem o formato do Kin.
     #[error("mensagem malformada")]
     Malformed,
