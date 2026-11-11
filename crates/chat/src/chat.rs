@@ -1238,7 +1238,7 @@ impl Chat {
             if from_sibling && owner == *self.device.identity() {
                 match insert_bounded(&mut self.household, &protected, device, invite.clone()) {
                     Inserted::Ignored => continue,
-                    outcome => learned |= outcome == Inserted::Changed,
+                    _ => learned = true,
                 }
             } else if from_sibling || device == peer {
                 // Device de contato repassado por um irmão, ou o convite que o contato anuncia de si.
