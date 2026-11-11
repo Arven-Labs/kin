@@ -1601,7 +1601,7 @@ impl Chat {
         let Some(&received) = self.history_sessions.get(&peer) else {
             return Err(Error::UnauthorizedHistory);
         };
-        if !done && items.is_empty() {
+        if !done && items.len() > MAX_SYNC_ENTRIES {
             self.history_sessions.remove(&peer);
             return Err(Error::HistoryLimit("página não final sem itens"));
         }
