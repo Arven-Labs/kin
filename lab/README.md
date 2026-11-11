@@ -22,6 +22,12 @@ KEEP=1 lab/run.sh cone          # deixa os containers de pé para olhar os logs
 | `relay-down` | depois do furo, o relay cai e a conexão direta segue viva |
 | `invite` | `a` gera o link (`/invite`), `b` o aceita (`--accept`) atrás de NAT: link adulterado é recusado, conversa pronta, hole punching |
 | `relay-failover` | dois relays; o reservado cai, `a` passa para o outro e um convite novo funciona por ele |
+| `multi-device` | `a` e `a2` (mesma identidade, mesma LAN) e `b` como contato atrás de outro NAT: `a2` **não** acha `b` antes do `/trust` (controle negativo) e acha sozinho depois, furo direto `a2` ↔ `b`, espelho nos dois sentidos com o mesmo `MessageId`, e `b` falando com a identidade chega nos dois |
+
+`REPEAT=5 lab/run.sh` roda cada cenário 5 vezes e imprime `x/5` por cenário (o hole punching varia de rodada para rodada).
+
+No `multi-device`, o `a2` recebe o `identity.key` de `a` por `compose cp` (é o que o `--pair` grava): o `/pair` da CLI recusa
+saída que não é terminal, e o log do Docker é um pipe.
 
 Os roteadores descartam em silêncio pacote de fora sem mapeamento (como um roteador doméstico), o que
 deixa o SYN reenviado passar quando o outro lado abre o mapeamento.

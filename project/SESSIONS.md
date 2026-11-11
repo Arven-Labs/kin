@@ -1071,4 +1071,38 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Sobras**: containers e redes removidos pelo `run.sh`; a imagem `kin-lab` (133 MB) ficou; o `target/` compilado deixou o `kin` em
   1,5 GB (abaixo dos 2 GB), `/` em 81%.
 - **Próximo passo**: repetir os cenários para medir flakiness; cenário de multi-device atrás de NAT (mexe no lab, plan mode); QUIC/UDP
-  (P17a); listar identidades confiadas na CLI; P10a e D7.
+  (P17a); listar identidades confiadas na CLI; P10a e D7. (Os dois primeiros foram feitos na subseção abaixo.)
+
+#### Cenário `multi-device` no lab e 5 repetições (P24, P17; branch `lab-multi-device`)
+
+- **Decisões do dono** (plan mode): irmãos na mesma LAN atrás do mesmo NAT; 5 repetições por cenário. Só `lab/` e docs, nenhum
+  código de produção; binário do commit `3ab0539` (os commits seguintes são só docs).
+- **Feito**: serviço `a2` (10.1.0.11) no `docker-compose.yml`; `scenario_multi_device` e `REPEAT=N` no `run.sh`; README.
+  Fluxo: `a` (A1) sobe com `--listen`; `a2` (A2) recebe o `identity.key` de A1 e disca A1 na LAN; `b` (C) gera `/invite`; A1
+  `/accept`; controle negativo (20 s sem A2 mencionar C); C `/trust`; A2 acha C sozinho; furo A2 ↔ C; espelho nos dois sentidos
+  com o `MessageId` conferido; C fala com a identidade e os dois irmãos recebem.
+- **Desvio do plano**: o `/pair confirmo` recusa saída que não é terminal (`print_pair`), e o log do Docker é um pipe; o link de
+  pareamento não sai no lab. O A2 recebe o `identity.key` por `compose cp` (é o que o `--pair` grava); o `--pair` em si **não**
+  foi exercitado aqui (foi na Sessão 16, em LAN).
+- **Erro meu no caminho**: o `compose start` volta antes do `kin` imprimir o `peer id`, então `A2_ID` ficou vazio, o padrão
+  "pronta com $A2_ID" casou com qualquer peer e o check "mesma identidade" falhou. Corrigido esperando o `peer id`.
+- **Resultado** (`REPEAT=5 lab/run.sh`, 135 PASS, 0 FAIL):
+
+| Cenário | Rodadas OK |
+|---|---|
+| `cone` | 5/5 |
+| `symmetric` | 5/5 |
+| `relay-down` | 5/5 |
+| `invite` | 5/5 |
+| `relay-failover` | 5/5 |
+| `multi-device` | 5/5 |
+
+- **Conclusão**: a descoberta por irmão, o consentimento (controle negativo), o furo A2 ↔ C, o espelho e o fan-out para os dois
+  devices funcionam atrás de NAT cone com relay, e nenhum cenário mostrou flakiness em 5 rodadas. Primeira observação em
+  processo real de contato falando com uma identidade de 2 devices.
+- **Não verificado**: 5 rodadas só separam "sempre passa" de "falha de vez em quando" (5/5 não exclui, por exemplo, 10% de
+  falha); a descoberta não tem `println!` próprio, "A2 achou C" é inferido de `conversa cifrada pronta` sem `--dial` e com mDNS
+  desligado; o `--pair` por link; irmãos em NATs diferentes; contato com 2 devices **enviando** a partir de ambos; NAT
+  simétrico no `multi-device`; QUIC/UDP (P17a); relay real; o lab não roda no CI.
+- **Próximo passo**: irmãos em NATs diferentes (`routerc`); histórico para device novo (P10a) e revogação de device próprio (D7),
+  que pedem plan mode; listar identidades confiadas na CLI; QUIC/UDP (P17a).
