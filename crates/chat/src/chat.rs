@@ -660,8 +660,21 @@ impl Chat {
             return Err(Error::NoConversation(peer));
         }
         let message = Message::new(text.into(), parent);
+        // Histórico (P10a), antes de enfileirar: uma queda no meio não perde a linha. Só se a conversa
+        // tem exatamente uma identidade do outro lado (a mesma regra de `device_list_for`).
+        if let Some(contact) = self.sole_identity(&peer) {
+            self.outbox.record_history(&contact, true, &message)?;
+        }
         self.queue_and_flush(&[(peer, None)], &message)?;
         Ok(message.id)
+    }
+
+    /// A identidade do outro lado da conversa com `peer`, se for exatamente uma.
+    fn sole_identity(&self, peer: &PeerId) -> Option<IdentityId> {
+        match self.conversations.get(peer)?.peers().ok()?.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// Histórico local da conversa com `contact` (a minha própria identidade para "notas para mim"),
@@ -713,6 +726,8 @@ impl Chat {
             return Err(Error::UnknownIdentity(identity.to_base58()));
         }
         let message = Message::new(text.into(), parent);
+        // Histórico (P10a): a mensagem lógica, uma vez; as cópias por device são detalhe de entrega.
+        self.outbox.record_history(identity, true, &message)?;
         let mut targets: Vec<(PeerId, Option<IdentityId>)> =
             devices.into_iter().map(|peer| (peer, None)).collect();
         // Espelho: meus outros devices recebem "enviei isto a `identity`" para mostrar na conversa.
@@ -1403,6 +1418,8 @@ impl Chat {
                         {
                             return Ok(());
                         }
+                        // Histórico (P10a): sob a identidade de quem enviou (a minha, se for um irmão).
+                        self.outbox.record_history(&sender, false, &message)?;
                         self.queue.push_back(ChatEvent::Received {
                             peer,
                             sender,
@@ -1456,6 +1473,8 @@ impl Chat {
         {
             return Ok(());
         }
+        // Histórico (P10a): um irmão enviou a `to`; fica como enviada na conversa com `to`.
+        self.outbox.record_history(&to, true, &message)?;
         self.queue
             .push_back(ChatEvent::SentElsewhere { peer, to, message });
         Ok(())

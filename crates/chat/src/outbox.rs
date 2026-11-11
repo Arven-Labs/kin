@@ -18,9 +18,10 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// Versão do esquema (`PRAGMA user_version`). 0 = até a 3.4; 1 = 3.5 etapa 1 (mensagem por
 /// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho); 3 = P24 (tabela `kin_trusted`,
 /// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva);
-/// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva). Um build antigo
-/// recusa o banco v5 (ver `migrate`): não há downgrade.
-const SCHEMA_VERSION: i64 = 5;
+/// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva); 6 = P10a (tabela
+/// `kin_history`, o histórico das conversas, também aditiva). Um build antigo recusa o banco v6 (ver
+/// `migrate`): não há downgrade.
+const SCHEMA_VERSION: i64 = 6;
 
 /// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
 /// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
@@ -113,7 +114,17 @@ impl Outbox {
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  peer TEXT NOT NULL,
                  id BLOB NOT NULL,
-                 UNIQUE (peer, id));",
+                 UNIQUE (peer, id));
+             CREATE TABLE IF NOT EXISTS kin_history (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 contact BLOB NOT NULL,
+                 outgoing INTEGER NOT NULL,
+                 id BLOB NOT NULL,
+                 parent BLOB,
+                 sent_at_ms INTEGER NOT NULL,
+                 text TEXT NOT NULL,
+                 UNIQUE (contact, id));
+             CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);",
         )
         .map_err(Error::storage)?;
         Ok(Self { conn })
@@ -543,28 +554,82 @@ impl Outbox {
         Ok(true)
     }
 
-    /// STUB (testes primeiro, ADR 0009): ainda não grava. A implementação vem depois da prova de que
-    /// os testes falham.
-    #[allow(dead_code)]
+    /// Grava `message` no histórico da conversa com `contact` (P10a); `outgoing` = enviei, em vez de
+    /// recebi. `false` se esse `(contact, id)` já estava: a primeira gravação vence, então o mesmo
+    /// `MessageId` chegando por dois caminhos (direto e espelho) vale uma linha.
     pub(crate) fn record_history(
         &self,
         contact: &IdentityId,
         outgoing: bool,
         message: &Message,
     ) -> Result<bool, Error> {
-        let _ = (&self.conn, contact, outgoing, message);
-        Ok(false)
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO kin_history (contact, outgoing, id, parent, sent_at_ms, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    contact.public_key().encode_protobuf(),
+                    outgoing,
+                    &message.id.as_bytes()[..],
+                    message.parent.as_ref().map(|p| p.as_bytes().to_vec()),
+                    message.sent_at_ms as i64,
+                    message.text,
+                ],
+            )
+            .map_err(Error::storage)?;
+        Ok(inserted > 0)
     }
 
-    /// STUB: ainda devolve vazio.
+    /// Até `limit` linhas do histórico com `contact`, do mais antigo ao mais novo, depois do cursor
+    /// `after` (o `seq` da última linha já lida; `None` = do começo).
     pub(crate) fn history(
         &self,
         contact: &IdentityId,
         after: Option<u64>,
         limit: usize,
     ) -> Result<Vec<HistoryEntry>, Error> {
-        let _ = (&self.conn, contact, after, limit);
-        Ok(Vec::new())
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, outgoing, id, parent, sent_at_ms, text FROM kin_history
+                 WHERE contact = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+            )
+            .map_err(Error::storage)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    contact.public_key().encode_protobuf(),
+                    after.map_or(0, |seq| seq as i64),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(Error::storage)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, outgoing, id, parent, sent_at_ms, text) = row.map_err(Error::storage)?;
+            out.push(HistoryEntry {
+                seq: seq as u64,
+                outgoing,
+                message: Message {
+                    id: message_id(&id)?,
+                    parent: parent.as_deref().map(message_id).transpose()?,
+                    sent_at_ms: sent_at_ms as u64,
+                    text,
+                },
+            });
+        }
+        Ok(out)
     }
 
     #[cfg(test)]
