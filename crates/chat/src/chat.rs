@@ -3063,6 +3063,76 @@ mod tests {
         assert!(!bia.household.contains_key(&dead));
     }
 
+    /// `household` cheio com o irmão conectado e o intervalo de re-anúncio zerado: qualquer
+    /// aprendizado que conte como novo sairia na hora, então `pending` revela se `learned` disparou.
+    fn full_household_with_connected_sibling() -> (Chat, StandaloneIdentity, RawDevice, Vec<Invite>)
+    {
+        let Household {
+            mut bia,
+            bia_key,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let invites = invites_by_peer_id(&bia_key, MAX_KNOWN_DEVICES + 1);
+        feed_list(&mut bia, sibling, &mut raw, &invites[1..4]);
+        feed_list(&mut bia, sibling, &mut raw, &invites[4..]);
+        assert_eq!(bia.household.len(), MAX_KNOWN_DEVICES);
+        bia.connected.insert(sibling);
+        bia.sibling_announce_gap = Duration::ZERO;
+        // Anuncia antes: assim o `on_mls` não anuncia por conta própria e só o re-anúncio é contado.
+        bia.announce_devices(sibling);
+        (bia, bia_key, (sibling, raw), invites)
+    }
+
+    /// P24 (`learned`): um Peer ID novo ignorado por o mapa estar cheio não é aprendizado; não
+    /// dispara re-anúncio aos irmãos.
+    #[tokio::test]
+    async fn an_ignored_newcomer_in_a_full_household_is_not_re_announced() {
+        let (mut bia, _key, (sibling, mut raw), invites) = full_household_with_connected_sibling();
+        let newcomer = invites[0].peer_id();
+        let sent = bia.pending.len();
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[..1]);
+
+        assert!(!bia.household.contains_key(&newcomer), "cheio: ignorado");
+        assert_eq!(bia.pending.len(), sent, "ignorado não é aprendizado");
+        assert!(bia.sibling_pending.is_empty());
+    }
+
+    /// P24 (`learned`): a mesma lista de novo (nada mudou) também não dispara re-anúncio.
+    #[tokio::test]
+    async fn an_unchanged_list_from_a_sibling_is_not_re_announced() {
+        let (mut bia, _key, (sibling, mut raw), invites) = full_household_with_connected_sibling();
+        let sent = bia.pending.len();
+
+        feed_list(&mut bia, sibling, &mut raw, &invites[1..4]);
+
+        assert_eq!(bia.pending.len(), sent, "nada mudou, nada a anunciar");
+        assert!(bia.sibling_pending.is_empty());
+    }
+
+    /// P24 (`learned`), contraprova: um Peer ID novo que cabe (maior que o menor guardado, com o mapa
+    /// cheio) é aprendizado e sai na hora; sem isto os dois testes acima passariam por não anunciar nunca.
+    #[tokio::test]
+    async fn a_newcomer_that_displaces_another_in_a_full_household_is_re_announced() {
+        let (mut bia, bia_key, (sibling, mut raw), _invites) =
+            full_household_with_connected_sibling();
+        let sent = bia.pending.len();
+        // Maior que todos os guardados: entra e despeja o menor.
+        let bigger = invites_by_peer_id(&bia_key, 64).pop().unwrap();
+        let smallest = bia.household.keys().min().copied().unwrap();
+        assert!(bigger.peer_id() > smallest);
+
+        feed_list(&mut bia, sibling, &mut raw, std::slice::from_ref(&bigger));
+
+        assert!(bia.household.contains_key(&bigger.peer_id()));
+        assert_eq!(
+            bia.pending.len(),
+            sent + 1,
+            "o despejo conta como aprendizado"
+        );
+    }
+
     /// P24: re-anúncio ao irmão tem intervalo mínimo; o que chega dentro dele fica pendente e sai no
     /// próximo evento depois do prazo, sem perder a atualização.
     #[tokio::test]
