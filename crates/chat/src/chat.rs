@@ -13,7 +13,7 @@ use futures::pin_mut;
 
 use crate::nostr::validate_peer_relays;
 use crate::outbox::{EntryKind, Outbox, SeenKind};
-use crate::payload::Payload;
+use crate::payload::{HistoryItem, Payload};
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
 use crate::{Error, HistoryEntry, Invite, Message, MessageId};
@@ -51,6 +51,13 @@ pub enum ChatEvent {
     HolePunch {
         peer: PeerId,
         result: Result<(), String>,
+    },
+    /// Chegou uma página do histórico de um irmão (P10a): `imported` linhas novas gravadas (as que já
+    /// existiam não contam); `done` = não há mais nada a pedir a ele. Leia com `Chat::history`.
+    HistorySynced {
+        peer: PeerId,
+        imported: usize,
+        done: bool,
     },
     /// Conversa E2EE pronta: já dá para enviar mensagens a este peer.
     ConversationReady {
@@ -162,6 +169,11 @@ const MAX_HANDSHAKE_RETRIES: u8 = 3;
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
 const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
+
+/// Teto de linhas de histórico importadas de um irmão por sessão de sincronização (P10a). Um irmão
+/// comprometido (chave mestra vazada) não pode encher o disco sem limite.
+#[allow(dead_code)]
+const MAX_SYNC_ENTRIES: usize = 100_000;
 
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
@@ -318,6 +330,10 @@ pub struct Chat {
     sibling_pending: std::collections::HashSet<PeerId>,
     /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
     sibling_announce_gap: Duration,
+    /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
+    /// alimentar 100 000 linhas).
+    #[allow(dead_code)]
+    history_cap: usize,
     /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
     advertised: Vec<Multiaddr>,
     /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
@@ -413,6 +429,7 @@ impl Chat {
             last_sibling_announce: HashMap::new(),
             sibling_pending: Default::default(),
             sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
+            history_cap: MAX_SYNC_ENTRIES,
             advertised: Vec::new(),
             in_flight: HashMap::new(),
             mailbox: None,
@@ -1211,6 +1228,8 @@ impl Chat {
             Ok(wire) => {
                 self.devices_announced.insert(peer);
                 self.transmit(peer, &Envelope::Mls(wire));
+                // O outro lado já tem a conversa (mesmo ponto do anúncio): se for irmão, pede o histórico.
+                self.request_history(peer);
             }
             Err(e) => self.drop_message(peer, e.into()),
         }
@@ -1430,6 +1449,12 @@ impl Chat {
                     Payload::RelayList(relays) => self.on_relay_list(peer, &relays),
                     Payload::Sent { to, message } => self.on_sent(peer, &sender, to, message),
                     Payload::DeviceList(invites) => self.on_device_list(peer, &sender, invites),
+                    Payload::HistoryRequest { cursor } => {
+                        self.on_history_request(peer, &sender, cursor)
+                    }
+                    Payload::HistoryChunk { items, next, done } => {
+                        self.on_history_chunk(peer, &sender, items, next, done)
+                    }
                 }
             }
             Ok(Decrypted::EpochChanged) => {
@@ -1477,6 +1502,45 @@ impl Chat {
         self.outbox.record_history(&to, true, &message)?;
         self.queue
             .push_back(ChatEvent::SentElsewhere { peer, to, message });
+        Ok(())
+    }
+
+    /// STUB (testes primeiro): ainda não pede nada ao irmão.
+    fn request_history(&mut self, peer: PeerId) {
+        let _ = peer;
+    }
+
+    /// STUB: ainda não monta a página.
+    #[allow(dead_code)]
+    fn serve_history(&self, cursor: u64) -> Result<Payload, Error> {
+        Ok(Payload::HistoryChunk {
+            items: Vec::new(),
+            next: cursor,
+            done: true,
+        })
+    }
+
+    /// STUB: ainda não responde ao pedido de um irmão.
+    fn on_history_request(
+        &mut self,
+        peer: PeerId,
+        sender: &IdentityId,
+        cursor: u64,
+    ) -> Result<(), Error> {
+        let _ = (peer, sender, cursor);
+        Ok(())
+    }
+
+    /// STUB: ainda não importa a página de um irmão.
+    fn on_history_chunk(
+        &mut self,
+        peer: PeerId,
+        sender: &IdentityId,
+        items: Vec<HistoryItem>,
+        next: u64,
+        done: bool,
+    ) -> Result<(), Error> {
+        let _ = (peer, sender, items, next, done);
         Ok(())
     }
 
@@ -4336,6 +4400,392 @@ mod tests {
         assert!(bia.on_mls(ana_peer, &wire).is_err());
 
         assert!(history_texts(&bia, &ana).is_empty());
+    }
+
+    // Sincronização do histórico entre irmãos (P10a, fatia 2)
+
+    fn chunk_wire(
+        raw: &mut Conversation,
+        items: Vec<HistoryItem>,
+        next: u64,
+        done: bool,
+    ) -> Vec<u8> {
+        raw.encrypt(&Payload::HistoryChunk { items, next, done }.encode())
+            .unwrap()
+    }
+
+    fn history_item(contact: &IdentityId, outgoing: bool, text: &str) -> HistoryItem {
+        HistoryItem {
+            contact: contact.clone(),
+            outgoing,
+            message: Message::new(text.into(), None),
+        }
+    }
+
+    fn synced(events: &[ChatEvent]) -> Vec<(usize, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::HistorySynced { imported, done, .. } => Some((*imported, *done)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Bia pede o histórico ao irmão (conectado) e fica à espera da página.
+    fn asking(bia: &mut Chat, sibling: PeerId) {
+        bia.connected.insert(sibling);
+        bia.request_history(sibling);
+    }
+
+    /// P10a: `announce_devices` a um irmão também pede o histórico (o mesmo ponto: o outro lado já
+    /// tem a conversa); a um contato, não.
+    #[tokio::test]
+    async fn announcing_devices_to_a_sibling_also_asks_for_its_history() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        bia.connected.insert(sibling);
+        let before = bia.pending.len();
+
+        bia.announce_devices(sibling);
+
+        assert_eq!(bia.pending.len(), before + 2, "lista de devices + pedido");
+    }
+
+    /// P10a: só se pede histórico a irmão, e uma vez por conexão.
+    #[tokio::test]
+    async fn history_is_asked_of_siblings_only_and_once_per_connection() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        bia.connected.insert(ana_peer);
+        let before = bia.pending.len();
+        bia.request_history(ana_peer);
+        assert_eq!(bia.pending.len(), before, "contato: nada");
+
+        asking(&mut bia, sibling);
+        assert_eq!(bia.pending.len(), before + 1);
+        bia.request_history(sibling);
+        assert_eq!(bia.pending.len(), before + 1, "a mesma conexão: uma vez");
+
+        bia.handle(NodeEvent::PeerDisconnected(sibling));
+        bia.connected.insert(sibling);
+        bia.request_history(sibling);
+        assert_eq!(bia.pending.len(), before + 2, "nova conexão: pede de novo");
+    }
+
+    /// P10a: a página de um irmão que eu pedi é importada, cada linha sob o contato e a direção certos,
+    /// o cursor é gravado e o evento chega.
+    #[tokio::test]
+    async fn a_chunk_from_a_sibling_i_asked_is_imported_and_the_cursor_saved() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let cleo = StandaloneIdentity::generate().id();
+        asking(&mut bia, sibling);
+        events(&mut bia);
+
+        let wire = chunk_wire(
+            &mut raw,
+            vec![
+                history_item(&ana, true, "enviei a ana"),
+                history_item(&cleo, false, "recebi de cleo"),
+            ],
+            5,
+            true,
+        );
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(
+            history_texts(&bia, &ana),
+            [(true, "enviei a ana".to_string())]
+        );
+        assert_eq!(
+            history_texts(&bia, &cleo),
+            [(false, "recebi de cleo".to_string())]
+        );
+        assert_eq!(synced(&events(&mut bia)), [(2, true)]);
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 5);
+    }
+
+    /// P10a: o que eu já tinha não é importado de novo nem conta no evento.
+    #[tokio::test]
+    async fn lines_i_already_have_are_not_imported_again() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        let known = history_item(&ana, false, "já tinha");
+        bia.outbox
+            .record_history(&known.contact, known.outgoing, &known.message)
+            .unwrap();
+        asking(&mut bia, sibling);
+        events(&mut bia);
+
+        let wire = chunk_wire(
+            &mut raw,
+            vec![known, history_item(&ana, true, "nova")],
+            2,
+            true,
+        );
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(bia.history(&ana, None, 10).unwrap().len(), 2);
+        assert_eq!(synced(&events(&mut bia)), [(1, true)]);
+    }
+
+    /// P10a: página que não é final faz pedir a seguinte; a final encerra a sessão.
+    #[tokio::test]
+    async fn a_non_final_chunk_asks_for_the_next_page_and_the_final_one_ends_the_session() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        asking(&mut bia, sibling);
+        let after_request = bia.pending.len();
+
+        let first = chunk_wire(&mut raw, vec![history_item(&ana, true, "p1")], 3, false);
+        bia.on_mls(sibling, &first).unwrap();
+        assert_eq!(bia.pending.len(), after_request + 1, "pediu a seguinte");
+
+        let last = chunk_wire(&mut raw, vec![history_item(&ana, true, "p2")], 6, true);
+        bia.on_mls(sibling, &last).unwrap();
+        assert_eq!(
+            bia.pending.len(),
+            after_request + 1,
+            "a final não pede mais"
+        );
+
+        let late = chunk_wire(&mut raw, vec![history_item(&ana, true, "p3")], 9, true);
+        assert!(matches!(
+            bia.on_mls(sibling, &late),
+            Err(Error::UnauthorizedHistory)
+        ));
+        assert_eq!(
+            history_texts(&bia, &ana),
+            [(true, "p1".to_string()), (true, "p2".to_string())]
+        );
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 6);
+    }
+
+    /// P10a (segurança): uma página que eu não pedi é recusada e nada é gravado.
+    #[tokio::test]
+    async fn a_chunk_i_did_not_ask_for_is_refused() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+
+        let wire = chunk_wire(&mut raw, vec![history_item(&ana, true, "intrusa")], 1, true);
+
+        assert!(matches!(
+            bia.on_mls(sibling, &wire),
+            Err(Error::UnauthorizedHistory)
+        ));
+        assert!(history_texts(&bia, &ana).is_empty());
+    }
+
+    /// P10a (segurança): uma página de um CONTATO é recusada mesmo com um pedido em voo para o irmão.
+    #[tokio::test]
+    async fn a_chunk_from_a_contact_is_refused() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        asking(&mut bia, sibling);
+
+        let wire = chunk_wire(
+            &mut ana_raw,
+            vec![history_item(&ana, true, "forjada")],
+            1,
+            true,
+        );
+
+        assert!(matches!(
+            bia.on_mls(ana_peer, &wire),
+            Err(Error::UnauthorizedHistory)
+        ));
+        assert!(history_texts(&bia, &ana).is_empty());
+    }
+
+    /// P10a (segurança): um CONTATO pedindo histórico é recusado e nada é enviado.
+    #[tokio::test]
+    async fn a_history_request_from_a_contact_is_refused_and_nothing_is_sent() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        bia.outbox
+            .record_history(
+                &StandaloneIdentity::generate().id(),
+                true,
+                &Message::new("segredo".into(), None),
+            )
+            .unwrap();
+        let before = bia.pending.len();
+
+        let wire = ana_raw
+            .encrypt(&Payload::HistoryRequest { cursor: 0 }.encode())
+            .unwrap();
+
+        assert!(matches!(
+            bia.on_mls(ana_peer, &wire),
+            Err(Error::UnauthorizedHistory)
+        ));
+        assert_eq!(bia.pending.len(), before, "nada enviado");
+    }
+
+    /// P10a: o pedido de um irmão é respondido (uma página enviada).
+    #[tokio::test]
+    async fn a_history_request_from_a_sibling_is_answered() {
+        let Household {
+            mut bia,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        bia.outbox
+            .record_history(
+                &StandaloneIdentity::generate().id(),
+                true,
+                &Message::new("a enviar".into(), None),
+            )
+            .unwrap();
+        let before = bia.pending.len();
+
+        let wire = raw
+            .encrypt(&Payload::HistoryRequest { cursor: 0 }.encode())
+            .unwrap();
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(bia.pending.len(), before + 1);
+    }
+
+    /// P10a: o que o respondente monta: todas as conversas, na ordem, e o cursor devolvido avança.
+    #[tokio::test]
+    async fn the_page_i_serve_has_every_conversation_in_order_and_resumes_after_next() {
+        let Household { bia, .. } = household();
+        let (ana, cleo) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        for (contact, outgoing, text) in [
+            (&ana, true, "um"),
+            (&cleo, false, "dois"),
+            (&ana, true, "tres"),
+        ] {
+            bia.outbox
+                .record_history(contact, outgoing, &Message::new(text.into(), None))
+                .unwrap();
+        }
+
+        let Payload::HistoryChunk { items, next, done } = bia.serve_history(0).unwrap() else {
+            panic!("esperava uma página");
+        };
+
+        let texts: Vec<&str> = items.iter().map(|i| i.message.text.as_str()).collect();
+        assert_eq!(texts, ["um", "dois", "tres"]);
+        assert!(done);
+        assert_eq!(next, bia.outbox.max_history_seq().unwrap());
+        assert_eq!(items[1].contact, cleo);
+        assert!(!items[1].outgoing);
+    }
+
+    /// P10a (anti-laço): o cursor que o irmão devolve tem de avançar a partir do que pedi (o cursor
+    /// salvo, na reconexão); senão a sincronização para e nada é gravado.
+    #[tokio::test]
+    async fn a_chunk_whose_next_does_not_advance_from_the_saved_cursor_stops_the_session() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        bia.outbox.set_history_cursor(&sibling, 42).unwrap();
+        asking(&mut bia, sibling);
+
+        let stuck = chunk_wire(&mut raw, vec![history_item(&ana, true, "laço")], 40, false);
+
+        assert!(matches!(
+            bia.on_mls(sibling, &stuck),
+            Err(Error::HistoryLimit(_))
+        ));
+        assert!(history_texts(&bia, &ana).is_empty());
+        let later = chunk_wire(&mut raw, vec![history_item(&ana, true, "depois")], 50, true);
+        assert!(
+            matches!(bia.on_mls(sibling, &later), Err(Error::UnauthorizedHistory)),
+            "a sessão acabou"
+        );
+    }
+
+    /// P10a: com o cursor salvo em 42, uma página que avança (43) é aceita.
+    #[tokio::test]
+    async fn a_chunk_that_advances_from_the_saved_cursor_is_accepted() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        bia.outbox.set_history_cursor(&sibling, 42).unwrap();
+        asking(&mut bia, sibling);
+
+        let wire = chunk_wire(&mut raw, vec![history_item(&ana, true, "novo")], 43, true);
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(history_texts(&bia, &ana), [(true, "novo".to_string())]);
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 43);
+    }
+
+    /// P10a (teto): passar do teto de linhas por sessão para a sincronização.
+    #[tokio::test]
+    async fn the_session_stops_when_it_passes_the_per_session_cap() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        bia.history_cap = 3;
+        asking(&mut bia, sibling);
+
+        let two = chunk_wire(
+            &mut raw,
+            vec![history_item(&ana, true, "a"), history_item(&ana, true, "b")],
+            2,
+            false,
+        );
+        bia.on_mls(sibling, &two).unwrap();
+        let over = chunk_wire(
+            &mut raw,
+            vec![history_item(&ana, true, "c"), history_item(&ana, true, "d")],
+            4,
+            false,
+        );
+
+        assert!(matches!(
+            bia.on_mls(sibling, &over),
+            Err(Error::HistoryLimit(_))
+        ));
+        assert_eq!(history_texts(&bia, &ana).len(), 2, "o excedente não entra");
     }
 
     /// 3.5 etapa 4 (segurança): um espelho vindo de um device de OUTRA identidade é recusado. Senão

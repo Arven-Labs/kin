@@ -20,6 +20,27 @@ use crate::{Error, Invite, Message};
 const TAG_RELAY_LIST: u8 = 2;
 const TAG_SENT: u8 = 3;
 const TAG_DEVICE_LIST: u8 = 4;
+const TAG_HISTORY_REQUEST: u8 = 5;
+const TAG_HISTORY_CHUNK: u8 = 6;
+
+/// Teto de itens por `HistoryChunk`, na leitura e na escrita: evita alocar com base num número hostil.
+#[allow(dead_code)]
+pub(crate) const MAX_DECODED_HISTORY: usize = 256;
+
+/// Orçamento em bytes de um `HistoryChunk` (texto claro, antes do MLS): folga de sobra sob o limite de
+/// 64 KiB do transporte.
+#[allow(dead_code)]
+pub(crate) const HISTORY_CHUNK_BUDGET: usize = 32 * 1024;
+
+/// Uma linha do histórico a caminho de um irmão: a conversa (identidade do contato), a direção vista de
+/// quem a enviou e a mensagem.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryItem {
+    pub(crate) contact: IdentityId,
+    pub(crate) outgoing: bool,
+    pub(crate) message: Message,
+}
 
 /// Teto de devices por lista, na leitura e na escrita: evita alocar com base num número hostil.
 pub(crate) const MAX_DECODED_DEVICES: usize = 8;
@@ -38,6 +59,16 @@ pub(crate) enum Payload {
         message: Message,
     },
     DeviceList(Vec<Invite>),
+    /// Um irmão pede o histórico depois de `cursor` (o `seq` do respondente; 0 = do começo).
+    HistoryRequest {
+        cursor: u64,
+    },
+    /// Uma página do histórico: `next` é o `seq` da última linha examinada, `done` = não há mais.
+    HistoryChunk {
+        items: Vec<HistoryItem>,
+        next: u64,
+        done: bool,
+    },
 }
 
 impl Payload {
@@ -74,6 +105,11 @@ impl Payload {
                     put(&mut out, item);
                 }
                 out
+            }
+            // STUB (testes primeiro, ADR 0009 do workspace): o codec real vem depois da prova.
+            Self::HistoryRequest { .. } | Self::HistoryChunk { .. } => {
+                let _ = (TAG_HISTORY_REQUEST, TAG_HISTORY_CHUNK);
+                Vec::new()
             }
         }
     }
@@ -152,7 +188,7 @@ fn take(bytes: &[u8]) -> Result<(&[u8], &[u8]), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Error, Message};
+    use crate::{Error, Message, MessageId};
 
     // 1
     #[test]
@@ -414,5 +450,151 @@ mod tests {
         let payload = Payload::DeviceList(vec![]);
 
         assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
+    }
+
+    // História (P10a, fatia 2)
+
+    fn item(outgoing: bool, text: &str, parent: Option<MessageId>) -> HistoryItem {
+        HistoryItem {
+            contact: StandaloneIdentity::generate().id(),
+            outgoing,
+            message: Message::new(text.into(), parent),
+        }
+    }
+
+    fn chunk(items: Vec<HistoryItem>, next: u64, done: bool) -> Payload {
+        Payload::HistoryChunk { items, next, done }
+    }
+
+    #[test]
+    fn a_history_request_survives_encode_and_decode() {
+        let payload = Payload::HistoryRequest {
+            cursor: 0x0102_0304_0506_0708,
+        };
+
+        let bytes = payload.encode();
+
+        assert_eq!(bytes.len(), 9, "tag + cursor de 8 bytes");
+        assert_eq!(Payload::decode(&bytes).unwrap(), payload);
+    }
+
+    #[test]
+    fn a_history_chunk_survives_encode_and_decode_with_direction_and_parent() {
+        let parent = MessageId::from_bytes([7; 16]);
+        let payload = chunk(
+            vec![
+                item(true, "enviei", None),
+                item(false, "recebi", Some(parent)),
+            ],
+            77,
+            false,
+        );
+
+        assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
+    }
+
+    #[test]
+    fn an_empty_final_history_chunk_is_valid() {
+        let payload = chunk(vec![], 5, true);
+
+        assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
+    }
+
+    #[test]
+    fn a_truncated_history_chunk_is_malformed_at_every_cut() {
+        let full = chunk(
+            vec![item(true, "um", None), item(false, "dois", None)],
+            9,
+            false,
+        )
+        .encode();
+        assert!(!full.is_empty());
+
+        for cut in 1..full.len() {
+            assert!(
+                matches!(Payload::decode(&full[..cut]), Err(Error::Malformed)),
+                "corte em {cut} de {}",
+                full.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_history_request_is_malformed() {
+        let full = Payload::HistoryRequest { cursor: 1 }.encode();
+        assert!(!full.is_empty());
+
+        for cut in 1..full.len() {
+            assert!(matches!(
+                Payload::decode(&full[..cut]),
+                Err(Error::Malformed)
+            ));
+        }
+        let mut longer = full.clone();
+        longer.push(0);
+        assert!(matches!(Payload::decode(&longer), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn a_history_chunk_with_trailing_bytes_is_malformed() {
+        let mut bytes = chunk(vec![item(true, "um", None)], 1, true).encode();
+        assert!(!bytes.is_empty());
+        bytes.push(0);
+
+        assert!(matches!(Payload::decode(&bytes), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn a_history_chunk_announcing_more_than_the_cap_is_malformed() {
+        // tag | done | next(8) | n = 257 (acima do teto), sem itens: recusa pelo número, sem alocar.
+        let mut bytes = vec![TAG_HISTORY_CHUNK, 0];
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&((MAX_DECODED_HISTORY + 1) as u16).to_be_bytes());
+
+        assert!(matches!(Payload::decode(&bytes), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn a_history_chunk_with_invalid_utf8_text_or_a_bad_contact_key_is_malformed() {
+        let valid = chunk(vec![item(true, "texto", None)], 1, true).encode();
+        assert!(!valid.is_empty());
+
+        // Último byte = último byte do texto: UTF-8 inválido.
+        let mut bad_text = valid.clone();
+        *bad_text.last_mut().unwrap() = 0xFF;
+        assert!(matches!(Payload::decode(&bad_text), Err(Error::Malformed)));
+
+        // tag(1) done(1) next(8) n(2) len16(2) → o 1º byte do contato fica na posição 14.
+        let mut bad_contact = valid;
+        bad_contact[14] = 0xFF;
+        assert!(matches!(
+            Payload::decode(&bad_contact),
+            Err(Error::Malformed)
+        ));
+    }
+
+    #[test]
+    fn encoding_a_history_chunk_never_goes_past_the_item_cap() {
+        let many: Vec<HistoryItem> = (0..=MAX_DECODED_HISTORY)
+            .map(|n| item(true, &n.to_string(), None))
+            .collect();
+
+        let decoded = Payload::decode(&chunk(many.clone(), 1, false).encode()).unwrap();
+
+        // O 257º fica de fora na escrita, para o receptor não recusar a página inteira.
+        assert_eq!(
+            decoded,
+            chunk(many[..MAX_DECODED_HISTORY].to_vec(), 1, false)
+        );
+    }
+
+    #[test]
+    fn a_history_item_too_big_for_its_field_is_left_out_of_the_chunk() {
+        let huge = item(true, &"x".repeat(70_000), None);
+        let small = item(false, "pequena", None);
+
+        let decoded = Payload::decode(&chunk(vec![huge, small.clone()], 2, true).encode()).unwrap();
+
+        assert_eq!(decoded, chunk(vec![small], 2, true));
     }
 }

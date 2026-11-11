@@ -19,6 +19,14 @@ pub enum Error {
     /// Um espelho "enviei isto" (`Payload::Sent`) veio de um device que não é da minha identidade.
     #[error("espelho recusado: o remetente não é um device desta identidade")]
     UnauthorizedMirror,
+    /// Um pedido ou uma página de histórico (`HistoryRequest`/`HistoryChunk`) veio de um device que não é
+    /// da minha identidade, ou uma página chegou sem eu ter pedido.
+    #[error("histórico recusado: não é de um device desta identidade, ou não foi pedido")]
+    UnauthorizedHistory,
+    /// A sincronização de histórico com um irmão passou do teto de linhas por sessão ou não avança (o
+    /// irmão devolve o mesmo cursor sem terminar): parada para não encher o disco nem girar sem fim.
+    #[error("sincronização de histórico interrompida: {0}")]
+    HistoryLimit(&'static str),
     /// Link de convite ilegível, adulterado (assinatura inválida) ou de versão desconhecida; ou um
     /// convite para si mesmo.
     #[error("convite inválido")]
