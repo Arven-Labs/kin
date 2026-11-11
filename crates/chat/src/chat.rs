@@ -1419,7 +1419,7 @@ impl Chat {
                             return Ok(());
                         }
                         // Histórico (P10a): sob a identidade de quem enviou (a minha, se for um irmão).
-                        self.outbox.record_history(&sender, false, &message)?;
+                        self.outbox.record_history(&sender, true, &message)?;
                         self.queue.push_back(ChatEvent::Received {
                             peer,
                             sender,
