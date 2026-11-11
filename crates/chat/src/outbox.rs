@@ -10,6 +10,7 @@ use kin_identity::{IdentityId, PublicKey};
 use kin_transport::PeerId;
 use rusqlite::{Connection, params};
 
+use crate::payload::HistoryItem;
 use crate::{Error, HistoryEntry, Message, MessageId};
 
 /// Quantos ids de mensagem já vistas se lembra por peer; os mais antigos são esquecidos.
@@ -19,9 +20,10 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// `(peer, id)`); 2 = 3.5 etapa 4 (coluna `to_identity` do espelho); 3 = P24 (tabela `kin_trusted`,
 /// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva);
 /// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva); 6 = P10a (tabela
-/// `kin_history`, o histórico das conversas, também aditiva). Um build antigo recusa o banco v6 (ver
+/// `kin_history`, o histórico das conversas, também aditiva); 7 = P10a (tabela `kin_history_cursor`, até
+/// onde já recebi do histórico de cada irmão, também aditiva). Um build antigo recusa o banco v7 (ver
 /// `migrate`): não há downgrade.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
 /// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
@@ -53,6 +55,16 @@ pub(crate) enum EntryKind {
     Mirror(IdentityId),
     /// Não há entrada com esse peer e id (já saiu da fila).
     Missing,
+}
+
+/// Uma página do histórico de todas as conversas, na ordem de `seq` (ver [`Outbox::history_page`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HistoryPage {
+    pub(crate) items: Vec<HistoryItem>,
+    /// `seq` da última linha examinada (incluída ou pulada); o cursor de quem pede a seguinte.
+    pub(crate) next: u64,
+    /// Não há mais linhas depois de `next`.
+    pub(crate) done: bool,
 }
 
 pub(crate) struct Outbox {
@@ -124,7 +136,10 @@ impl Outbox {
                  sent_at_ms INTEGER NOT NULL,
                  text TEXT NOT NULL,
                  UNIQUE (contact, id));
-             CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);",
+             CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);
+             CREATE TABLE IF NOT EXISTS kin_history_cursor (
+                 peer TEXT PRIMARY KEY,
+                 cursor INTEGER NOT NULL);",
         )
         .map_err(Error::storage)?;
         Ok(Self { conn })
@@ -630,6 +645,133 @@ impl Outbox {
             });
         }
         Ok(out)
+    }
+
+    /// O maior `seq` do histórico (0 se vazio).
+    pub(crate) fn max_history_seq(&self) -> Result<u64, Error> {
+        self.conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM kin_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|seq| seq as u64)
+            .map_err(Error::storage)
+    }
+
+    /// Uma página do histórico de TODAS as conversas, na ordem de `seq`, depois de `after` (para
+    /// sincronizar com um irmão). `after` maior que o maior `seq` vale 0 (o banco de quem pede é de
+    /// outra geração). Para em `max_items` linhas ou quando o próximo item estoura `budget` bytes (o
+    /// tamanho que ele ocupa na página); um item que sozinho não cabe é pulado, e uma linha ilegível
+    /// também, para um defeito local não travar a sincronização. `next` é o `seq` da última linha
+    /// examinada (incluída ou pulada).
+    pub(crate) fn history_page(
+        &self,
+        after: u64,
+        budget: usize,
+        max_items: usize,
+    ) -> Result<HistoryPage, Error> {
+        let after = if after > self.max_history_seq()? {
+            0
+        } else {
+            after
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, contact, outgoing, id, parent, sent_at_ms, text FROM kin_history
+                 WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+            )
+            .map_err(Error::storage)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    after as i64,
+                    i64::try_from(max_items.saturating_add(1)).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(Error::storage)?;
+        let (mut items, mut next, mut used, mut more) = (Vec::new(), after, 0usize, false);
+        for (n, row) in rows.enumerate() {
+            if n == max_items {
+                more = true;
+                break;
+            }
+            let (seq, contact, outgoing, id, parent, sent_at_ms, text) =
+                row.map_err(Error::storage)?;
+            let seq = seq as u64;
+            let item = (|| {
+                Some(HistoryItem {
+                    contact: IdentityId::new(PublicKey::try_decode_protobuf(&contact).ok()?),
+                    outgoing,
+                    message: Message {
+                        id: message_id(&id).ok()?,
+                        parent: match parent {
+                            Some(parent) => Some(message_id(&parent).ok()?),
+                            None => None,
+                        },
+                        sent_at_ms: sent_at_ms as u64,
+                        text,
+                    },
+                })
+            })();
+            // Tamanho na página: len16 + contato + saiu + len16 + mensagem (ver `payload`).
+            let size = item
+                .as_ref()
+                .map(|item| 2 + contact.len() + 1 + 2 + item.message.encode().len());
+            match (item, size) {
+                (Some(item), Some(size)) if size <= budget => {
+                    if used + size > budget {
+                        more = true;
+                        break;
+                    }
+                    used += size;
+                    items.push(item);
+                }
+                // Ilegível ou grande demais para qualquer página: pula, mas o cursor passa por ela.
+                _ => {}
+            }
+            next = seq;
+        }
+        Ok(HistoryPage {
+            items,
+            next,
+            done: !more,
+        })
+    }
+
+    /// Até onde já recebi do histórico de `peer` (o `next` da última página); 0 se nunca.
+    pub(crate) fn history_cursor(&self, peer: &PeerId) -> Result<u64, Error> {
+        match self.conn.query_row(
+            "SELECT cursor FROM kin_history_cursor WHERE peer = ?1",
+            [peer.to_string()],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(cursor) => Ok(cursor as u64),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(Error::storage(e)),
+        }
+    }
+
+    /// Grava o cursor de `peer`; a última gravação vale.
+    pub(crate) fn set_history_cursor(&self, peer: &PeerId, cursor: u64) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT INTO kin_history_cursor (peer, cursor) VALUES (?1, ?2)
+                 ON CONFLICT (peer) DO UPDATE SET cursor = excluded.cursor",
+                params![peer.to_string(), cursor as i64],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1378,6 +1520,176 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    // Sincronização do histórico (P10a, fatia 2)
+
+    const BIG: usize = 1 << 20;
+
+    fn texts(page: &HistoryPage) -> Vec<String> {
+        page.items.iter().map(|i| i.message.text.clone()).collect()
+    }
+
+    #[test]
+    fn a_history_page_walks_all_conversations_in_seq_order_and_marks_the_end() {
+        let (outbox, ana, cleo) = (Outbox::memory().unwrap(), identity(), identity());
+        for (contact, outgoing, text) in [
+            (&ana, true, "a1"),
+            (&cleo, false, "c1"),
+            (&ana, false, "a2"),
+            (&ana, true, "a3"),
+        ] {
+            let message = Message::new(text.into(), None);
+            outbox.record_history(contact, outgoing, &message).unwrap();
+        }
+
+        let page = outbox.history_page(0, BIG, 256).unwrap();
+
+        assert_eq!(texts(&page), ["a1", "c1", "a2", "a3"]);
+        assert!(page.done);
+        assert_eq!(page.next, outbox.max_history_seq().unwrap());
+        let contacts: Vec<&IdentityId> = page.items.iter().map(|i| &i.contact).collect();
+        assert_eq!(contacts, [&ana, &cleo, &ana, &ana]);
+        let directions: Vec<bool> = page.items.iter().map(|i| i.outgoing).collect();
+        assert_eq!(directions, [true, false, false, true]);
+    }
+
+    #[test]
+    fn a_history_page_stops_at_max_items_and_the_next_one_resumes_after_next() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+        for n in 1..=5 {
+            let message = Message::new(format!("m{n}"), None);
+            outbox.record_history(&ana, true, &message).unwrap();
+        }
+
+        let first = outbox.history_page(0, BIG, 2).unwrap();
+        assert_eq!(texts(&first), ["m1", "m2"]);
+        assert!(!first.done);
+        let second = outbox.history_page(first.next, BIG, 2).unwrap();
+        assert_eq!(texts(&second), ["m3", "m4"]);
+        assert!(!second.done);
+        let third = outbox.history_page(second.next, BIG, 2).unwrap();
+        assert_eq!(texts(&third), ["m5"]);
+        assert!(third.done);
+    }
+
+    #[test]
+    fn a_history_page_stops_at_the_byte_budget_and_the_walk_still_reaches_every_line() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+        let big = "x".repeat(20_000);
+        for n in 1..=3 {
+            let message = Message::new(format!("{n}{big}"), None);
+            outbox.record_history(&ana, true, &message).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut after = 0;
+        let mut pages = 0;
+        loop {
+            let page = outbox.history_page(after, 32 * 1024, 256).unwrap();
+            assert!(page.items.len() <= 1, "duas de 20 KB não cabem em 32 KiB");
+            seen.extend(texts(&page).into_iter().map(|t| t[..1].to_string()));
+            pages += 1;
+            if page.done {
+                break;
+            }
+            assert!(page.next > after, "o cursor tem de avançar");
+            after = page.next;
+        }
+
+        assert_eq!(seen, ["1", "2", "3"]);
+        assert_eq!(pages, 3);
+    }
+
+    #[test]
+    fn a_message_bigger_than_the_whole_budget_is_skipped_and_the_walk_continues() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+        for text in [
+            "antes".to_string(),
+            "h".repeat(40_000),
+            "depois".to_string(),
+        ] {
+            outbox
+                .record_history(&ana, true, &Message::new(text, None))
+                .unwrap();
+        }
+
+        let page = outbox.history_page(0, 32 * 1024, 256).unwrap();
+
+        assert_eq!(texts(&page), ["antes", "depois"]);
+        assert!(page.done);
+        assert_eq!(page.next, outbox.max_history_seq().unwrap());
+    }
+
+    #[test]
+    fn a_cursor_beyond_the_last_seq_serves_from_the_start() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+        for n in 1..=2 {
+            let message = Message::new(format!("m{n}"), None);
+            outbox.record_history(&ana, true, &message).unwrap();
+        }
+
+        let page = outbox.history_page(9_999, BIG, 256).unwrap();
+
+        assert_eq!(texts(&page), ["m1", "m2"]);
+    }
+
+    #[test]
+    fn an_empty_history_gives_an_empty_final_page_and_seq_zero() {
+        let outbox = Outbox::memory().unwrap();
+
+        let page = outbox.history_page(0, BIG, 256).unwrap();
+
+        assert!(page.items.is_empty() && page.done);
+        assert_eq!(page.next, 0);
+        assert_eq!(outbox.max_history_seq().unwrap(), 0);
+    }
+
+    #[test]
+    fn the_history_cursor_is_remembered_per_peer_and_survives_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (one, two, unknown) = (peer(), peer(), peer());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            assert_eq!(outbox.history_cursor(&one).unwrap(), 0, "padrão");
+            outbox.set_history_cursor(&one, 5).unwrap();
+            outbox.set_history_cursor(&two, 9).unwrap();
+            outbox.set_history_cursor(&one, 7).unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+
+        assert_eq!(outbox.history_cursor(&one).unwrap(), 7, "a última grava");
+        assert_eq!(outbox.history_cursor(&two).unwrap(), 9);
+        assert_eq!(outbox.history_cursor(&unknown).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_version_6_database_opens_as_version_7_keeps_its_history_and_gains_the_cursor_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (ana, peer) = (identity(), peer());
+        let message = Message::new("antes".into(), None);
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.record_history(&ana, true, &message).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_history_cursor; PRAGMA user_version = 6;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+        outbox.set_history_cursor(&peer, 3).unwrap();
+
+        assert_eq!(outbox.history(&ana, None, 10).unwrap()[0].message, message);
+        assert_eq!(outbox.history_cursor(&peer).unwrap(), 3);
+        let version: i64 = outbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
     }
 }

@@ -618,6 +618,14 @@ fn on_event(
             println!("(relays de {peer}: {})", relays.join(", "));
         }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
+        ChatEvent::HistorySynced {
+            peer,
+            imported,
+            done,
+        } => {
+            let end = if done { ", completo" } else { "" };
+            println!("(histórico de {peer}: {imported} novas{end})");
+        }
     }
 }
 
