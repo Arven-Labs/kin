@@ -4645,6 +4645,8 @@ mod tests {
             ..
         } = household();
         asking(&mut bia, sibling);
+        // Anuncia antes: assim o `on_mls` não anuncia por conta própria e só o pedido seguinte é contado.
+        bia.announce_devices(sibling);
         let after_request = bia.pending.len();
 
         let first = chunk_wire(&mut raw, vec![history_item(&ana, true, "p1")], 3, false);
