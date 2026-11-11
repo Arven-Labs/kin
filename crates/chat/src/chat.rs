@@ -1237,7 +1237,10 @@ impl Chat {
             // guardado, nem discado); quem já está segue sendo atualizado.
             if from_sibling && owner == *self.device.identity() {
                 match insert_bounded(&mut self.household, &protected, device, invite.clone()) {
-                    Inserted::Ignored => continue,
+                    Inserted::Ignored => {
+                        learned = true;
+                        continue;
+                    }
                     outcome => learned |= outcome == Inserted::Changed,
                 }
             } else if from_sibling || device == peer {
