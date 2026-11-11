@@ -730,7 +730,7 @@ impl Outbox {
                 .map(|item| 2 + contact.len() + 1 + 2 + item.message.encode().len());
             match (item, size) {
                 (Some(item), Some(size)) if size <= budget => {
-                    if used + size > budget {
+                    if used + size > budget * 1_000 {
                         more = true;
                         break;
                     }
