@@ -4,7 +4,7 @@
 > Toda pendência encontrada em qualquer arquivo do projeto deve ser registrada aqui com um ID único.
 > Ao resolver uma, marcar como `✅ Resolvida` com a sessão em que foi corrigida.
 >
-> Última atualização: 2026-11-11 (Sessão 20, testes do `learned`)
+> Última atualização: 2026-11-11 (Sessão 20, testes do `learned`; `lab/` de NAT na `main`: 5 cenários PASS)
 
 ---
 

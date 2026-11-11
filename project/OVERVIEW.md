@@ -37,7 +37,7 @@ Fase 7 — (opcional) Roteamento multi-hop / privado            [ ] Pendente
 Fase 8 — (opcional) Blockchain: registro, proof-of-relay      [ ] Pendente
 ```
 
-Próximo passo: roteiro com 3 devices (espelho e descoberta) e relay real; depois o resto do P24. Antes de
+Próximo passo: roteiro de multi-device com relay real e atrás de NAT; depois o resto do P24 (o `lab/` 1:1 passou na Sessão 20). Antes de
 distribuir: teste manual em redes reais, QUIC no laboratório (P17), P13/P16/P18. Detalhes em `PHASE.md`,
 `PENDING.md` e `SESSIONS.md`.
 
