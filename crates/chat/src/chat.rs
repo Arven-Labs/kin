@@ -1459,6 +1459,7 @@ impl Chat {
         to: IdentityId,
         message: Message,
     ) -> Result<(), Error> {
+        self.outbox.record_history(&to, true, &message)?;
         if sender != self.device.identity() {
             return Err(Error::UnauthorizedMirror);
         }
