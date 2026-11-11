@@ -122,8 +122,7 @@ impl Outbox {
                  id BLOB NOT NULL,
                  parent BLOB,
                  sent_at_ms INTEGER NOT NULL,
-                 text TEXT NOT NULL,
-                 UNIQUE (contact, id));
+                 text TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);",
         )
         .map_err(Error::storage)?;
