@@ -514,7 +514,9 @@ fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
 }
 
 /// Quantas linhas o `/history` mostra sem `N`, e o teto de `N`.
+#[allow(dead_code)] // stub (testes primeiro)
 const DEFAULT_HISTORY: usize = 20;
+#[allow(dead_code)] // stub (testes primeiro)
 const MAX_HISTORY: usize = 200;
 
 /// Argumentos do `/history`: `[prefixo] [N]`. Um único argumento só de dígitos é `N`; para usar um
