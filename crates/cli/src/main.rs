@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
-use kin_chat::{Chat, ChatEvent, Error, Invite, Message, MessageId};
+use kin_chat::{Chat, ChatEvent, Error, HistoryEntry, Invite, Message, MessageId};
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -513,6 +513,31 @@ fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
     peer_identity != own
 }
 
+/// Quantas linhas o `/history` mostra sem `N`, e o teto de `N`.
+const DEFAULT_HISTORY: usize = 20;
+const MAX_HISTORY: usize = 200;
+
+/// Argumentos do `/history`: `[prefixo] [N]`. Um único argumento só de dígitos é `N`; para usar um
+/// prefixo que seja só dígitos, passe também o `N`. `N` acima de `MAX_HISTORY` vira o teto; `N = 0`
+/// ou lixo é erro.
+#[allow(dead_code)] // stub (testes primeiro)
+fn parse_history_args(_rest: &str) -> Result<(String, usize), String> {
+    Ok((String::new(), 0))
+}
+
+/// Linha do `/history`: `[id8] você: texto` / `[id8] peer: texto`, com `↳ pai8` entre o autor e o
+/// texto quando a mensagem responde a outra.
+#[allow(dead_code)] // stub (testes primeiro)
+fn format_entry(_entry: &HistoryEntry) -> String {
+    String::new()
+}
+
+/// As últimas `n` linhas, na ordem original.
+#[allow(dead_code)] // stub (testes primeiro)
+fn tail(_entries: Vec<HistoryEntry>, _n: usize) -> Vec<HistoryEntry> {
+    Vec::new()
+}
+
 /// A identidade vista em `ConversationReady` para `peer`: a linha digitada vai a ela (a todos os
 /// devices dela, e espelhada nos meus outros devices), não só ao device da conversa atual.
 fn identity_of(met: &[(PeerId, IdentityId)], peer: PeerId) -> Option<IdentityId> {
@@ -632,6 +657,102 @@ fn on_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(seq: u64, outgoing: bool, id: u8, parent: Option<u8>, text: &str) -> HistoryEntry {
+        HistoryEntry {
+            seq,
+            outgoing,
+            message: Message {
+                id: MessageId::from_bytes([id; 16]),
+                parent: parent.map(|p| MessageId::from_bytes([p; 16])),
+                sent_at_ms: 0,
+                text: text.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn history_without_arguments_uses_the_current_conversation_and_the_default_count() {
+        assert_eq!(parse_history_args(""), Ok((String::new(), DEFAULT_HISTORY)));
+    }
+
+    #[test]
+    fn history_with_only_digits_is_a_count() {
+        assert_eq!(parse_history_args("5"), Ok((String::new(), 5)));
+    }
+
+    #[test]
+    fn history_with_a_prefix_and_a_count() {
+        assert_eq!(parse_history_args("3xK 7"), Ok(("3xK".to_string(), 7)));
+    }
+
+    #[test]
+    fn history_with_only_a_prefix_uses_the_default_count() {
+        assert_eq!(
+            parse_history_args("3xK"),
+            Ok(("3xK".to_string(), DEFAULT_HISTORY))
+        );
+    }
+
+    #[test]
+    fn history_with_a_numeric_prefix_needs_the_count_too() {
+        assert_eq!(parse_history_args("12 4"), Ok(("12".to_string(), 4)));
+    }
+
+    #[test]
+    fn history_count_above_the_cap_becomes_the_cap() {
+        assert_eq!(parse_history_args("999"), Ok((String::new(), MAX_HISTORY)));
+    }
+
+    #[test]
+    fn history_rejects_a_zero_or_non_numeric_count_and_extra_arguments() {
+        assert!(parse_history_args("0").is_err());
+        assert!(parse_history_args("3xK 0").is_err());
+        assert!(parse_history_args("3xK abc").is_err());
+        assert!(parse_history_args("3xK 5 9").is_err());
+    }
+
+    #[test]
+    fn a_sent_entry_reads_voce_and_a_received_one_reads_peer() {
+        assert_eq!(
+            format_entry(&entry(1, true, 0xab, None, "oi")),
+            "[abababab] você: oi"
+        );
+        assert_eq!(
+            format_entry(&entry(2, false, 0xcd, None, "olá")),
+            "[cdcdcdcd] peer: olá"
+        );
+    }
+
+    #[test]
+    fn a_reply_shows_the_short_id_of_its_parent() {
+        assert_eq!(
+            format_entry(&entry(3, false, 0xcd, Some(0xab), "sim")),
+            "[cdcdcdcd] peer ↳ abababab: sim"
+        );
+        assert_eq!(
+            format_entry(&entry(4, true, 0xef, Some(0xcd), "ok")),
+            "[efefefef] você ↳ cdcdcdcd: ok"
+        );
+    }
+
+    #[test]
+    fn tail_keeps_the_last_n_in_the_original_order() {
+        let all: Vec<_> = (1..=5)
+            .map(|i| entry(i, true, i as u8, None, "x"))
+            .collect();
+        let last: Vec<u64> = tail(all, 2).iter().map(|e| e.seq).collect();
+        assert_eq!(last, vec![4, 5]);
+    }
+
+    #[test]
+    fn tail_of_a_short_or_empty_history_returns_all_of_it() {
+        let all: Vec<_> = (1..=3)
+            .map(|i| entry(i, true, i as u8, None, "x"))
+            .collect();
+        assert_eq!(tail(all, 10).len(), 3);
+        assert!(tail(Vec::new(), 10).is_empty());
+    }
 
     #[test]
     fn hints_trust_for_another_person() {
