@@ -624,7 +624,7 @@ impl Outbox {
         let contact = contact.public_key().encode_protobuf();
         self.conn
             .execute(
-                "DELETE FROM kin_history WHERE contact = ?1 AND seq <= (
+                "DELETE FROM kin_history WHERE ?1 = ?1 AND seq <= (
                      SELECT seq FROM kin_history WHERE contact = ?1
                      ORDER BY seq DESC LIMIT 1 OFFSET ?2)",
                 params![contact, i64::try_from(limit.get()).unwrap_or(i64::MAX)],
