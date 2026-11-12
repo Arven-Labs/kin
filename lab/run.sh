@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|history-sync]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -262,6 +262,76 @@ scenario_multi_device() {
   check "c -> X: a2 recebe" wait_log a2 "peer: oi de C" 20
 }
 
+# A1 (`a`) e C (`b`) conversam; SÓ DEPOIS entra A2 (`a2`), irmão de A1 com banco vazio, e deve receber o
+# histórico pelo pull da sincronização (ADR 0009). Confere por MessageId e direção, não só por texto.
+# Como em `multi-device`, A2 recebe o `identity.key` de A1 por `compose cp`. Para o `/history` de A2
+# achar a identidade de C, C precisa confiar em X (senão A2 nunca vê C e `/history` não a resolve).
+# Não cobre: reconexão sem reimportar (reiniciar o A2 esbarraria no P16, re-handshake após perda de estado).
+scenario_history_sync() {
+  echo "== Histórico para um device novo (A1 e C conversam; A2 entra depois)"
+  infra cone || { fail "montar o laboratório"; return; }
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --listen /ip4/0.0.0.0/tcp/4002"
+  compose up -d a >/dev/null
+  wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; return; }
+  A1_ID=$(peer_id a)
+  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
+  compose up -d b >/dev/null
+  wait_log b "reserva aceita no relay" 30 || { fail "c sem reserva no relay"; logs b; return; }
+  C_ID=$(peer_id b)
+  say b "/invite"
+  wait_log b "convite: kin://invite/" 15 || { fail "c não gerou o convite"; logs b; return; }
+  LINK=$(logs b | grep -oE 'kin://invite/[A-Za-z0-9_-]+' | tail -1)
+  say a "/accept $LINK"
+  if wait_log a "conversa cifrada pronta com $C_ID" 45 && wait_log b "conversa cifrada pronta com $A1_ID" 45; then
+    pass "a1 aceita o convite de c (conversa pronta)"
+  else
+    fail "a1 e c não ficaram com conversa pronta"; logs a | tail -15; logs b | tail -15; return
+  fi
+  Y=$(first a "conversa cifrada pronta com $C_ID \(identidade [A-Za-z0-9]+" | awk '{print $NF}')
+
+  # Três mensagens: a1 -> c, c -> a1, e a resposta de a1 à de c (`/r`).
+  msg_id() { logs "$1" | grep -oE "\[[0-9a-f]{8}\] $2" | head -1 | grep -oE '[0-9a-f]{8}' | head -1; }
+  say a "h1"; wait_log b "peer: h1" 20 || { fail "h1 não chegou a c"; return; }
+  say b "h2"; wait_log a "peer: h2" 20 || { fail "h2 não chegou a a1"; return; }
+  ID1=$(msg_id a "você: h1"); ID2=$(msg_id a "peer: h2")
+  say a "/r $ID2 h3"; wait_log a "você: h3" 20 && wait_log b "↳ $ID2" 20 || { fail "h3 (resposta) não chegou a c"; return; }
+  ID3=$(msg_id a "você: h3")
+  [ -n "$ID1" ] && [ -n "$ID2" ] && [ -n "$ID3" ] && pass "a1 e c trocaram 3 mensagens (uma resposta)" \
+    || { fail "não achei os MessageIds no log de a1"; return; }
+
+  # Só agora entra o a2, com banco vazio.
+  local keydir; keydir=$(mktemp -d)
+  compose cp a:/data/identity.key "$keydir/identity.key" >/dev/null 2>&1 \
+    || { fail "copiar o identity.key de a"; rm -rf "$keydir"; return; }
+  export A2_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
+  compose create a2 >/dev/null 2>&1
+  compose cp "$keydir/identity.key" a2:/tmp/identity.key >/dev/null 2>&1 \
+    || { fail "copiar o identity.key para a2"; rm -rf "$keydir"; return; }
+  rm -rf "$keydir"
+  compose start a2 >/dev/null
+  wait_log a2 "peer id: [A-Za-z0-9]+" 15 || { fail "a2 não subiu"; logs a2; return; }
+  check "a2 recebe as 3 mensagens do irmão (histórico completo)" \
+    wait_log a2 "histórico de $A1_ID: 3 novas, completo" 40 || { logs a2 | tail -20; logs a | tail -20; }
+
+  # A2 só resolve a identidade de C depois de vê-la (`ConversationReady`), então C confia em X.
+  say b "/trust"
+  wait_log a2 "conversa cifrada pronta com $C_ID" 60 || { fail "a2 não achou c em 60s"; logs a2 | tail -20; return; }
+  say a2 "/history $Y 10"
+  wait_log a2 "histórico com $Y: 3 linhas" 15 || { fail "a2 não imprimiu o histórico"; logs a2 | tail -20; return; }
+  check "a2 /history: h1 enviada, mesmo MessageId" wait_log a2 "\[$ID1\] você: h1" 5
+  check "a2 /history: h2 recebida, mesmo MessageId" wait_log a2 "\[$ID2\] peer: h2" 5
+  check "a2 /history: h3 é resposta a h2, mesmo MessageId" wait_log a2 "\[$ID3\] você ↳ $ID2: h3" 5
+
+  # Mensagem nova depois da sincronização: chega 1 vez em cada irmão e entra no histórico sem duplicar.
+  say b "h4"
+  wait_log a "peer: h4" 20 && wait_log a2 "peer: h4" 20 || { fail "h4 não chegou aos dois irmãos"; return; }
+  ID4=$(msg_id a2 "peer: h4")
+  say a2 "/history $Y 2"
+  wait_log a2 "histórico com $Y: 2 linhas" 15 || { fail "a2 não imprimiu o segundo histórico"; return; }
+  check "h4 chegou 1 vez a cada irmão e aparece 1 vez no /history do a2" \
+    test "$(logs a2 | grep -cE "\[$ID4\] peer: h4")" -eq 2 -a "$(logs a | grep -cE "\[$ID4\] peer: h4")" -eq 1
+}
+
 # run_scenario NOME: roda um cenário (FAILED fica 1 se algo falhou).
 run_scenario() {
   case "$1" in
@@ -271,12 +341,13 @@ run_scenario() {
     invite) scenario_invite ;;
     relay-failover) scenario_relay_failover ;;
     multi-device) scenario_multi_device ;;
+    history-sync) scenario_history_sync ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device history-sync)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}

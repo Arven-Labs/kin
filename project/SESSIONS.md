@@ -1169,3 +1169,40 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   (100 000 linhas) nunca foi exercitado, só o teto com um valor pequeno.
 - **Próximo passo**: fatia 3 (`/history` na CLI e cenário no lab com A2 entrando depois), P26 (poda/retenção) e P27, revogação de
   device próprio (D7).
+
+### 2026-11-12 — Sessão 21
+
+#### CI quebrado pelo toolchain (P28, PR #103)
+
+- **Sintoma**: o PR #102 (rascunho) reprovou no clippy antes dos testes: `unreachable call` em `#[derive(NetworkBehaviour)]`
+  (`crates/transport/src/node.rs:30`), código que eu não toquei. A `main` estava verde na véspera.
+- **Causa** (confirmada pelos logs): o `stable` subiu de rustc 1.99.1 (run verde 43122425915) para 1.100.0 (run vermelho
+  43311744271). `libp2p-swarm-derive` 0.36.0 é a última publicada, sem correção a montante.
+- **Decisão do dono** (pergunta, 3 opções): fixar o toolchain em 1.99.1 em `ci.yml` (descartados: `#![allow(unreachable_code)]` no
+  crate `transport`, que desliga o lint no crate inteiro e não dá para testar local; os dois). PR #103, verde, mesclado. Pendência P28.
+
+#### `/history` na CLI e cenário `history-sync` no lab (P10a, fatia 3, PR #102)
+
+- **Decisões do dono** (plan mode): `/history [prefixo] [N]` da conversa atual, últimas N (descartados: todas as conversas
+  paginado; só no lab sem comando); cenário `history-sync` novo (descartado: estender o `multi-device`, em que A2 entra antes das
+  mensagens). Aprovou a tabela de testes e o argumento só de dígitos ser `N`. Nenhum código de produção em `crates/chat`.
+- **Feito**: `crates/cli/src/main.rs` (`parse_history_args`, `format_entry`, `tail`, `history`, o comando e o cabeçalho de uso);
+  `lab/run.sh` (`scenario_history_sync`) e `lab/README.md`. Cenário: A1 e C trocam 3 mensagens (uma resposta com `/r`), só então
+  entra A2 com banco vazio; confere `3 novas, completo`, depois do `/trust` de C o `/history` do A2 com os mesmos `MessageId` e
+  direções, e uma mensagem nova de C chegando 1 vez em cada irmão sem duplicar.
+- **Desvio do plano**: o plano previa também "reconectar o A2 não reimporta" no lab. Descartei: reiniciar o A2 esbarra no P16
+  (re-handshake após perda de estado) e daria falha que não é da fatia. A não-reimportação já tem teste na fatia 2.
+- **Descoberta no desenho**: o `/history` só resolve identidades vistas em `ConversationReady` nesta execução (como `/trust`), então
+  o A2 só vê o histórico de C depois de achá-lo (por isso o `/trust` de C no cenário). Virou o P29(a).
+- **Prova de que testam algo**: 11 testes novos escritos antes; contra os stubs, **11 de 11 falharam** (CI do #102, run
+  43315976151); com a implementação, passam (run 43316808060, clippy e todos os testes verdes).
+- **Mutação** (PR #104, fechado e apagado): `tail` pegando as primeiras N em vez das últimas derruba exatamente
+  `tail_keeps_the_last_n_in_the_original_order`.
+- **Tropeço repetido**: o clippy barrou o stub por código sem uso (`dead_code`), desta vez nas constantes; mesmo caso das Sessões
+  19 a 21. Também rodei por engano um `cat >>` vazio no Bash contra `SESSIONS.md` (sem efeito no arquivo; a regra é só `Edit`).
+- **Lab** (rodado pelo dono, `REPEAT=5 lab/run.sh history-sync`, binário do commit de código do PR #102): **5/5**, 35 PASS e 0 FAIL
+  (7 checks por rodada). NAT sintético, só TCP, A1 e A2 na mesma LAN, 1 execução de 5 rodadas.
+- **Não verificado**: a função
+  `history` (leitura por cursor) não tem teste unitário (depende de `Chat`); só 1 mutação (o resto de `parse_history_args` e
+  `format_entry` não foi mutado); histórico grande (mais de uma página de 256) nunca exercitado na CLI.
+- **Próximo passo**: P26 (poda/retenção), P27, D7 (revogação de device próprio), irmãos em NATs diferentes e relay real.
