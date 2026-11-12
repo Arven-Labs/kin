@@ -32,8 +32,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Fixado em 1.99.1: o 1.100.0 (2026-11-09) faz o clippy reprovar o `#[derive(NetworkBehaviour)]`
+      # de `crates/transport/src/node.rs` com `unreachable call`, e a libp2p-swarm-derive 0.36.0
+      # (a última) não tem correção. Subir de propósito, num PR próprio, quando houver.
       - name: Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
 
