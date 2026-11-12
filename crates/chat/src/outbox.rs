@@ -4,6 +4,7 @@
 //! A fila guarda o texto em claro até a mensagem ser confirmada (só é cifrada na hora de enviar, para
 //! o ciphertext não envelhecer; ver ADR 0002). Por isso o arquivo é 0600, como o do `crypto` (P13).
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use kin_identity::{IdentityId, PublicKey};
@@ -67,8 +68,13 @@ pub(crate) struct HistoryPage {
     pub(crate) done: bool,
 }
 
+/// Teto padrão de linhas do histórico por contato (P26a).
+pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 10_000;
+
 pub(crate) struct Outbox {
     conn: Connection,
+    /// Teto de linhas do histórico por contato (`None` = sem teto); ver [`Outbox::set_history_limit`].
+    history_limit: Option<NonZeroUsize>,
 }
 
 impl Outbox {
@@ -142,7 +148,10 @@ impl Outbox {
                  cursor INTEGER NOT NULL);",
         )
         .map_err(Error::storage)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            history_limit: NonZeroUsize::new(DEFAULT_HISTORY_LIMIT),
+        })
     }
 
     /// Leva um banco da 3.4 (versão 0) ao esquema da 3.5: a mesma mensagem lógica pode esperar por
@@ -569,6 +578,12 @@ impl Outbox {
         Ok(true)
     }
 
+    /// Teto de linhas do histórico por contato (P26a); `None` = sem teto. O excesso (as linhas mais
+    /// antigas, por `seq`) sai na próxima gravação daquela conversa; baixar o teto não apaga na hora.
+    pub(crate) fn set_history_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.history_limit = limit;
+    }
+
     /// Grava `message` no histórico da conversa com `contact` (P10a); `outgoing` = enviei, em vez de
     /// recebi. `false` se esse `(contact, id)` já estava: a primeira gravação vence, então o mesmo
     /// `MessageId` chegando por dois caminhos (direto e espelho) vale uma linha.
@@ -593,7 +608,29 @@ impl Outbox {
                 ],
             )
             .map_err(Error::storage)?;
+        if inserted > 0 {
+            self.prune_history(contact)?;
+        }
         Ok(inserted > 0)
+    }
+
+    /// Apaga o que passa do teto na conversa com `contact`: as linhas mais antigas por `seq`. Com
+    /// menos de `limite + 1` linhas a subconsulta dá `NULL` e nada sai. O `seq` é `AUTOINCREMENT`, então
+    /// não é reaproveitado e os cursores dos irmãos continuam valendo.
+    fn prune_history(&self, contact: &IdentityId) -> Result<(), Error> {
+        let Some(limit) = self.history_limit else {
+            return Ok(());
+        };
+        let contact = contact.public_key().encode_protobuf();
+        self.conn
+            .execute(
+                "DELETE FROM kin_history WHERE contact = ?1 AND seq <= (
+                     SELECT seq FROM kin_history WHERE contact = ?1
+                     ORDER BY seq DESC LIMIT 1 OFFSET ?2)",
+                params![contact, i64::try_from(limit.get()).unwrap_or(i64::MAX)],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
     }
 
     /// Até `limit` linhas do histórico com `contact`, do mais antigo ao mais novo, depois do cursor
@@ -1431,6 +1468,120 @@ mod tests {
         let history = outbox.history(&ana, None, 10).unwrap();
         assert_eq!(history.len(), 1);
         assert!(history[0].outgoing, "continua como enviada");
+    }
+
+    fn history_texts(outbox: &Outbox, contact: &IdentityId) -> Vec<String> {
+        outbox
+            .history(contact, None, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.message.text)
+            .collect()
+    }
+
+    fn record(outbox: &Outbox, contact: &IdentityId, text: &str) -> Message {
+        let message = Message::new(text.into(), None);
+        outbox.record_history(contact, true, &message).unwrap();
+        message
+    }
+
+    /// P26a: passando do teto, ficam as linhas mais novas, na ordem.
+    #[test]
+    fn the_history_keeps_only_the_newest_lines_up_to_the_limit() {
+        let (mut outbox, ana) = (Outbox::memory().unwrap(), identity());
+        outbox.set_history_limit(NonZeroUsize::new(3));
+
+        for n in 1..=5 {
+            record(&outbox, &ana, &format!("ana {n}"));
+        }
+
+        assert_eq!(history_texts(&outbox, &ana), ["ana 3", "ana 4", "ana 5"]);
+    }
+
+    /// P26a: o teto é por contato; uma conversa cheia não apaga a de outro.
+    #[test]
+    fn the_limit_is_per_contact() {
+        let (mut outbox, ana, cleo) = (Outbox::memory().unwrap(), identity(), identity());
+        outbox.set_history_limit(NonZeroUsize::new(3));
+        record(&outbox, &cleo, "cleo 1");
+        record(&outbox, &cleo, "cleo 2");
+
+        for n in 1..=5 {
+            record(&outbox, &ana, &format!("ana {n}"));
+        }
+
+        assert_eq!(history_texts(&outbox, &ana), ["ana 3", "ana 4", "ana 5"]);
+        assert_eq!(history_texts(&outbox, &cleo), ["cleo 1", "cleo 2"]);
+    }
+
+    /// P26a: baixar o teto não apaga na hora; regravar uma linha que já existe (ignorada) também não;
+    /// só uma linha nova daquela conversa faz o excesso sair.
+    #[test]
+    fn lowering_the_limit_prunes_only_on_the_next_new_line() {
+        let (mut outbox, ana) = (Outbox::memory().unwrap(), identity());
+        outbox.set_history_limit(NonZeroUsize::new(5));
+        let first = record(&outbox, &ana, "ana 1");
+        for n in 2..=5 {
+            record(&outbox, &ana, &format!("ana {n}"));
+        }
+
+        outbox.set_history_limit(NonZeroUsize::new(2));
+        assert_eq!(history_texts(&outbox, &ana).len(), 5, "baixar não apaga");
+        assert!(!outbox.record_history(&ana, true, &first).unwrap());
+        assert_eq!(
+            history_texts(&outbox, &ana).len(),
+            5,
+            "linha repetida não poda"
+        );
+
+        record(&outbox, &ana, "ana 6");
+        assert_eq!(history_texts(&outbox, &ana), ["ana 5", "ana 6"]);
+    }
+
+    /// P26a: sem teto (`None`) nada é apagado, mesmo depois de ter havido um.
+    #[test]
+    fn without_a_limit_nothing_is_pruned() {
+        let (mut outbox, ana) = (Outbox::memory().unwrap(), identity());
+        outbox.set_history_limit(NonZeroUsize::new(2));
+        outbox.set_history_limit(None);
+
+        for n in 1..=5 {
+            record(&outbox, &ana, &format!("ana {n}"));
+        }
+
+        assert_eq!(history_texts(&outbox, &ana).len(), 5);
+    }
+
+    /// P26a: o `seq` não volta atrás com a poda, então o cursor de um irmão continua valendo.
+    #[test]
+    fn the_sequence_keeps_growing_after_pruning() {
+        let (mut outbox, ana) = (Outbox::memory().unwrap(), identity());
+        outbox.set_history_limit(NonZeroUsize::new(2));
+        for n in 1..=3 {
+            record(&outbox, &ana, &format!("ana {n}"));
+        }
+        let cursor = outbox.max_history_seq().unwrap();
+
+        record(&outbox, &ana, "ana 4");
+
+        let after = outbox.history(&ana, Some(cursor), 10).unwrap();
+        assert_eq!(after.len(), 1);
+        assert!(after[0].seq > cursor);
+        assert_eq!(after[0].message.text, "ana 4");
+    }
+
+    /// P26a: sem configurar, o teto é o padrão (`DEFAULT_HISTORY_LIMIT`).
+    #[test]
+    fn the_default_limit_applies_without_configuration() {
+        let (outbox, ana) = (Outbox::memory().unwrap(), identity());
+
+        for n in 1..=DEFAULT_HISTORY_LIMIT + 1 {
+            record(&outbox, &ana, &format!("ana {n}"));
+        }
+
+        let texts = history_texts(&outbox, &ana);
+        assert_eq!(texts.len(), DEFAULT_HISTORY_LIMIT);
+        assert_eq!(texts[0], "ana 2");
     }
 
     #[test]

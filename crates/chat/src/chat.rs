@@ -711,6 +711,13 @@ impl Chat {
         self.outbox.history(contact, after, limit)
     }
 
+    /// Teto de linhas do histórico **por contato** (padrão 10 000; `None` = sem teto). Passando do
+    /// teto, as linhas mais antigas daquela conversa são apagadas, sem volta, na próxima gravação;
+    /// baixar o teto não apaga na hora.
+    pub fn set_history_limit(&mut self, limit: Option<std::num::NonZeroUsize>) {
+        self.outbox.set_history_limit(limit);
+    }
+
     /// Devices da `identity` com conversa pronta, em ordem de Peer ID. Sai dos certificados das
     /// conversas (a identidade do outro membro), então não há lista separada para ficar velha.
     pub fn devices_of(&self, identity: &IdentityId) -> Vec<PeerId> {
@@ -4405,6 +4412,56 @@ mod tests {
 
         assert_eq!(history_texts(&bia, &ana), [(true, "tudo bem?".to_string())]);
         assert!(history_texts(&bia, &stranger).is_empty());
+    }
+
+    /// P26a: o teto vale pela API do `Chat`: depois de 5 envios com teto 3, o histórico tem os 3 últimos.
+    #[tokio::test]
+    async fn chat_history_respects_the_configured_limit() {
+        let Household { mut bia, ana, .. } = household();
+        bia.set_history_limit(std::num::NonZeroUsize::new(3));
+
+        for n in 1..=5 {
+            bia.send_to(&ana, format!("msg {n}"), None).unwrap();
+        }
+
+        assert_eq!(
+            history_texts(&bia, &ana),
+            [
+                (true, "msg 3".to_string()),
+                (true, "msg 4".to_string()),
+                (true, "msg 5".to_string())
+            ]
+        );
+    }
+
+    /// P26a: um irmão que importa mais linhas que o teto fica com as últimas, e o cursor salvo é o
+    /// `next` da página (podar não faz puxar de novo).
+    #[tokio::test]
+    async fn importing_from_a_sibling_keeps_the_newest_within_the_limit_and_the_cursor() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        bia.set_history_limit(std::num::NonZeroUsize::new(3));
+        asking(&mut bia, sibling);
+        let items = (1..=5)
+            .map(|n| history_item(&ana, true, &format!("h{n}")))
+            .collect();
+
+        let wire = chunk_wire(&mut raw, items, 5, true);
+        bia.on_mls(sibling, &wire).unwrap();
+
+        assert_eq!(
+            history_texts(&bia, &ana),
+            [
+                (true, "h3".to_string()),
+                (true, "h4".to_string()),
+                (true, "h5".to_string())
+            ]
+        );
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 5);
     }
 
     /// P10a: `send` a um device específico grava sob a identidade dele.

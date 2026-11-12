@@ -1205,4 +1205,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: a função
   `history` (leitura por cursor) não tem teste unitário (depende de `Chat`); só 1 mutação (o resto de `parse_history_args` e
   `format_entry` não foi mutado); histórico grande (mais de uma página de 256) nunca exercitado na CLI.
-- **Próximo passo**: P26 (poda/retenção), P27, D7 (revogação de device próprio), irmãos em NATs diferentes e relay real.
+- **Próximo passo**: P26 (poda/retenção), P27, D7 (revogação de device próprio), irmãos em NATs diferentes e relay real. (O P26a foi
+  feito na subseção abaixo.)
+
+#### Teto de linhas do histórico por contato (P26a, PR #105, ADR 0010)
+
+- **Decisões do dono** (plan mode + 2 perguntas): teto de **linhas por contato** (descartados: idade, por usar `sent_at_ms` do
+  remetente ou exigir schema v8; só manual); **padrão ligado, poda ao gravar** (descartado: opt-in). Sem schema novo.
+- **Feito**: `Outbox` ganha `history_limit` (padrão `DEFAULT_HISTORY_LIMIT` = 10 000), `set_history_limit` e `prune_history`, chamado
+  por `record_history` só quando a linha entrou (o único funil: 4 ganchos + importação do irmão); `Chat::set_history_limit(Option<NonZeroUsize>)`.
+  Baixar o teto não apaga na hora.
+- **Testes** (8 novos, escritos antes): 6 no `Outbox` (últimas N, por contato, baixar o teto + linha repetida não poda, sem teto, `seq`
+  segue crescendo, padrão de 10 000) e 2 no `Chat` (`send_to` 5 vezes com teto 3; importação de 5 linhas de irmão com teto 3, cursor
+  `next` preservado).
+- **Prova de que testam algo**: contra os stubs, **6 de 8 falharam** (CI do #105, run 43322024788); os 2 que passaram são guardas que o
+  stub já satisfaz (sem teto não apaga; o `seq` só cresce). Com a implementação: clippy e todos os testes verdes (run 43322663371).
+- **Mutações** (PRs #106 a #109, fechados e apagados), todas pegas: guardar N+1 (derruba 6), `DELETE` sem filtro de contato (derruba
+  `the_limit_is_per_contact`, só ele), `ASC` no lugar de `DESC` (derruba 6), podar mesmo com a gravação ignorada (derruba só
+  `lowering_the_limit_prunes_only_on_the_next_new_line`).
+- **Erro meu no caminho**: `&format!(...)` em `send_to` (o clippy barrou `needless_borrows_for_generic_args`); corrigido.
+- **Risco aceito**: apaga dado do usuário, sem volta e sem aviso, ligado por padrão (AGENTS.md §4); registrado no ADR 0010.
+- **Não verificado**: volume real (10 000 linhas só no teste do padrão, em memória; o custo do `DELETE` por gravação não foi medido num
+  arquivo em disco); a mutação "baixar o teto apaga na hora" não foi rodada; `set_history_limit` não está ligado à CLI; o padrão
+  não foi exercitado no lab.
+- **Próximo passo**: P27, D7, flag/comando da CLI para o teto (se virar necessidade), irmãos em NATs diferentes.
