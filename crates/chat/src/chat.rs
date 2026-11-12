@@ -1067,7 +1067,6 @@ impl Chat {
             },
             NodeEvent::MessageDelivered { peer, id } => {
                 self.handshake.remove(&id);
-                self.history_requests.remove(&id);
                 if let Some(Some(message)) = self.pending.remove(&id) {
                     // O ack fecha o ciclo: sai da fila e libera uma vaga na janela. Só o ack de um
                     // device do destinatário é "entregue": o de um irmão (espelho) só libera a fila.
