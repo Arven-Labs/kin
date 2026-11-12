@@ -337,7 +337,6 @@ pub struct Chat {
     /// Sessões de sincronização em curso (um pedido em voo por irmão): quantas linhas já recebi nela.
     history_sessions: HashMap<PeerId, usize>,
     /// Envios de `HistoryRequest` em voo (id → peer); falhar um deles libera o pedido (P27a).
-    #[allow(dead_code)] // stub (testes primeiro)
     history_requests: HashMap<SendId, PeerId>,
     /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
     advertised: Vec<Multiaddr>,
@@ -1056,6 +1055,8 @@ impl Chat {
                 self.sibling_pending.remove(&peer);
                 self.history_requested.remove(&peer);
                 self.history_sessions.remove(&peer);
+                self.history_requests
+                    .retain(|_, requested| *requested != peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -1066,6 +1067,7 @@ impl Chat {
             },
             NodeEvent::MessageDelivered { peer, id } => {
                 self.handshake.remove(&id);
+                self.history_requests.remove(&id);
                 if let Some(Some(message)) = self.pending.remove(&id) {
                     // O ack fecha o ciclo: sai da fila e libera uma vaga na janela. Só o ack de um
                     // device do destinatário é "entregue": o de um irmão (espelho) só libera a fila.
@@ -1086,6 +1088,13 @@ impl Chat {
             }
             NodeEvent::SendFailed { peer, id, reason } => {
                 let handshake = self.handshake.remove(&id);
+                // O pedido de histórico se perdeu com a conexão de pé: libera o estado dele, e o próximo
+                // `announce_devices` (já liberado abaixo, e com o seu limite de taxa) pede de novo do
+                // cursor salvo. Sem reenvio aqui, para não virar laço (P27a).
+                if let Some(requested) = self.history_requests.remove(&id) {
+                    self.history_requested.remove(&requested);
+                    self.history_sessions.remove(&requested);
+                }
                 match self.pending.remove(&id).flatten() {
                     // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
                     Some(message) => {
@@ -1552,7 +1561,10 @@ impl Chat {
             return;
         };
         match conversation.encrypt(&Payload::HistoryRequest { cursor }.encode()) {
-            Ok(wire) => self.transmit(peer, &Envelope::Mls(wire)),
+            Ok(wire) => {
+                let id = self.transmit(peer, &Envelope::Mls(wire));
+                self.history_requests.insert(id, peer);
+            }
             Err(e) => {
                 self.history_sessions.remove(&peer);
                 self.drop_message(peer, e.into());
@@ -1716,7 +1728,7 @@ impl Chat {
         self.transmit(peer, &envelope);
     }
 
-    fn transmit(&mut self, peer: PeerId, envelope: &Envelope) {
+    fn transmit(&mut self, peer: PeerId, envelope: &Envelope) -> SendId {
         let id = self.node.send(peer, envelope.encode());
         self.pending.insert(id, None);
         if matches!(
@@ -1725,6 +1737,7 @@ impl Chat {
         ) {
             self.handshake.insert(id, envelope.clone());
         }
+        id
     }
 
     fn drop_message(&mut self, peer: PeerId, error: Error) {
