@@ -4421,7 +4421,7 @@ mod tests {
         bia.set_history_limit(std::num::NonZeroUsize::new(3));
 
         for n in 1..=5 {
-            bia.send_to(&ana, &format!("msg {n}"), None).unwrap();
+            bia.send_to(&ana, format!("msg {n}"), None).unwrap();
         }
 
         assert_eq!(
