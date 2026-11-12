@@ -57,7 +57,7 @@ precisa que uma mensagem a uma identidade chegue em todos os devices dela e apar
   recorte.
 - **Um `MessageId` por device.** Quebra `parent` (threads) e dedupe entre devices.
 - **Autoria do espelho por `peers().first()`** (a primeira versão). Forjável: ver "O que a auditoria mostrou".
-- **Certificado delegado pelo device antigo** (a mestra num device só). Muda o formato do certificado (v4) e cria ponto
+- **Certificado delegado pelo device antigo** (a mestra num device só; retomado como direção proposta no ADR 0011). Muda o formato do certificado (v4) e cria ponto
   único; fica para o provedor TruthID (D7).
 - **Anunciar também endereços de LAN/loopback** para o teste de integração. Vaza IPs privados a contatos; escolheu-se
   `set_advertised_addrs`.
