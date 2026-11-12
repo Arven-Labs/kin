@@ -1,7 +1,7 @@
 # ADR 0009 — Sincronização do histórico entre irmãos (P10a, fatia 2)
 
-- **Status**: aceito (Sessão 20, 2026-11-11). Implementado no PR #92 (fatia 2 de 3; a 3, CLI `/history` e cenário no
-  laboratório, vem depois).
+- **Status**: aceito (Sessão 20, 2026-11-11). Implementado no PR #92 (fatia 2 de 3). A fatia 3 (CLI `/history` e cenário
+  `history-sync` no laboratório) está no PR #102 (Sessão 21); o ADR não muda, só passa a ter consumidor na CLI.
 - **Relacionados**: ADR 0008 (o motor guarda o histórico, fatia 1); ADR 0006 (multi-device: pares device↔device, espelho `Sent`,
   autoria pelo `sender` do MLS); P10(a), P26 e P27 em `PENDING.md`.
 
