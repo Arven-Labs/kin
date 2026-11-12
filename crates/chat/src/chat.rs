@@ -1091,10 +1091,9 @@ impl Chat {
                 // O pedido de histórico se perdeu com a conexão de pé: libera o estado dele, e o próximo
                 // `announce_devices` (já liberado abaixo, e com o seu limite de taxa) pede de novo do
                 // cursor salvo. Sem reenvio aqui, para não virar laço (P27a).
-                if let Some(requested) = self.history_requests.remove(&id) {
-                    self.history_requested.remove(&requested);
-                    self.history_sessions.remove(&requested);
-                }
+                self.history_requests.remove(&id);
+                self.history_requested.remove(&peer);
+                self.history_sessions.remove(&peer);
                 match self.pending.remove(&id).flatten() {
                     // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
                     Some(message) => {
