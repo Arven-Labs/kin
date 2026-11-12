@@ -23,6 +23,7 @@ KEEP=1 lab/run.sh cone          # deixa os containers de pé para olhar os logs
 | `invite` | `a` gera o link (`/invite`), `b` o aceita (`--accept`) atrás de NAT: link adulterado é recusado, conversa pronta, hole punching |
 | `relay-failover` | dois relays; o reservado cai, `a` passa para o outro e um convite novo funciona por ele |
 | `multi-device` | `a` e `a2` (mesma identidade, mesma LAN) e `b` como contato atrás de outro NAT: `a2` **não** acha `b` antes do `/trust` (controle negativo) e acha sozinho depois, furo direto `a2` ↔ `b`, espelho nos dois sentidos com o mesmo `MessageId`, e `b` falando com a identidade chega nos dois |
+| `history-sync` | `a` e `b` trocam 3 mensagens (uma resposta com `/r`) e **só depois** entra o `a2` (irmão, banco vazio): recebe `3 novas, completo`; depois do `/trust` de `b`, o `/history` do `a2` mostra as 3 linhas com os mesmos `MessageId` e direções, e uma mensagem nova de `b` chega 1 vez em cada irmão sem duplicar no histórico. **Não cobre** reconectar o `a2` sem reimportar (reiniciar esbarra no P16) |
 
 `REPEAT=5 lab/run.sh` roda cada cenário 5 vezes e imprime `x/5` por cenário (o hole punching varia de rodada para rodada).
 
