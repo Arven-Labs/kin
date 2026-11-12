@@ -561,8 +561,7 @@ fn format_entry(entry: &HistoryEntry) -> String {
 
 /// As últimas `n` linhas, na ordem original.
 fn tail(mut entries: Vec<HistoryEntry>, n: usize) -> Vec<HistoryEntry> {
-    let skip = entries.len().saturating_sub(n);
-    entries.drain(..skip);
+    entries.truncate(n);
     entries
 }
 
