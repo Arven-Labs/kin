@@ -48,7 +48,7 @@ pedir o histórico ao irmão pela conversa que os dois já têm, sem depender do
 - **Texto em claro em repouso** no mesmo arquivo 0600 que já guarda a outbox (e, ao lado, as chaves MLS): o histórico inteiro
   das conversas fica legível por quem ler o arquivo. Segue o P13 (sem cifra em repouso); não é pior que o estado de hoje, mas
   cresce com o uso.
-- **A tabela cresce sem teto.** Não há poda nem retenção (P26).
+- **A tabela cresce sem teto.** Não há poda nem retenção (P26). *(Resolvido na Sessão 21: teto de linhas por contato, ADR 0010.)*
 - **Sem downgrade**: um build v5 recusa o banco v6 (`migrate`), como nas v3 a v5.
 - **"Notas para mim" são relativas ao device**: quem envia grava como enviada e o irmão que recebe grava como recebida (é a mesma
   linha lógica vista dos dois lados). A fatia 2 precisa tratar isso ao juntar históricos (a primeira gravação vence).
