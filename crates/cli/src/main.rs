@@ -24,6 +24,8 @@
 //! e recusa se já houver identidade. É o segredo inteiro, sem cifra: use só em terminal privado.
 //! Linhas digitadas vão à identidade da conversa atual (a todos os devices dela) e são espelhadas
 //! nos meus outros devices (`eu → ...`);
+//! `/history [prefixo] [N]` mostra as últimas N linhas (padrão 20, teto 200) do histórico local com a
+//! conversa atual (ou a identidade que começa com o prefixo), inclusive o que um irmão sincronizou;
 //! `/r <id> texto` responde à mensagem `<id>` (thread); `/quit` sai.
 
 use std::path::{Path, PathBuf};
@@ -293,6 +295,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     trust(&mut chat, line.strip_prefix("/trust").unwrap_or("").trim(), current, &met);
                     continue;
                 }
+                if line == "/history" || line.starts_with("/history ") {
+                    history(&chat, line.strip_prefix("/history").unwrap_or("").trim(), current, &met);
+                    continue;
+                }
                 if line == "/untrust" || line.starts_with("/untrust ") {
                     untrust(&mut chat, line.strip_prefix("/untrust").unwrap_or("").trim(), current, &met);
                     continue;
@@ -514,30 +520,98 @@ fn should_hint_trust(peer_identity: &IdentityId, own: &IdentityId) -> bool {
 }
 
 /// Quantas linhas o `/history` mostra sem `N`, e o teto de `N`.
-#[allow(dead_code)] // stub (testes primeiro)
 const DEFAULT_HISTORY: usize = 20;
-#[allow(dead_code)] // stub (testes primeiro)
 const MAX_HISTORY: usize = 200;
+/// Linhas lidas por vez de `Chat::history` (a API pagina do mais antigo ao mais novo).
+const HISTORY_PAGE: usize = 256;
 
 /// Argumentos do `/history`: `[prefixo] [N]`. Um único argumento só de dígitos é `N`; para usar um
 /// prefixo que seja só dígitos, passe também o `N`. `N` acima de `MAX_HISTORY` vira o teto; `N = 0`
 /// ou lixo é erro.
-#[allow(dead_code)] // stub (testes primeiro)
-fn parse_history_args(_rest: &str) -> Result<(String, usize), String> {
-    Ok((String::new(), 0))
+fn parse_history_args(rest: &str) -> Result<(String, usize), String> {
+    let count = |text: &str| match text.parse::<usize>() {
+        Ok(0) | Err(_) => Err(format!("N inválido: {text}")),
+        Ok(n) => Ok(n.min(MAX_HISTORY)),
+    };
+    let all_digits = |text: &str| text.chars().all(|c| c.is_ascii_digit());
+    match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => Ok((String::new(), DEFAULT_HISTORY)),
+        [one] if all_digits(one) => Ok((String::new(), count(one)?)),
+        [prefix] => Ok(((*prefix).to_string(), DEFAULT_HISTORY)),
+        [prefix, n] => Ok(((*prefix).to_string(), count(n)?)),
+        _ => Err("uso: /history [prefixo] [N]".to_string()),
+    }
 }
 
 /// Linha do `/history`: `[id8] você: texto` / `[id8] peer: texto`, com `↳ pai8` entre o autor e o
 /// texto quando a mensagem responde a outra.
-#[allow(dead_code)] // stub (testes primeiro)
-fn format_entry(_entry: &HistoryEntry) -> String {
-    String::new()
+fn format_entry(entry: &HistoryEntry) -> String {
+    let author = if entry.outgoing { "você" } else { "peer" };
+    let message = &entry.message;
+    match &message.parent {
+        Some(parent) => format!(
+            "[{}] {author} ↳ {}: {}",
+            short(&message.id),
+            short(parent),
+            message.text
+        ),
+        None => format!("[{}] {author}: {}", short(&message.id), message.text),
+    }
 }
 
 /// As últimas `n` linhas, na ordem original.
-#[allow(dead_code)] // stub (testes primeiro)
-fn tail(_entries: Vec<HistoryEntry>, _n: usize) -> Vec<HistoryEntry> {
-    Vec::new()
+fn tail(mut entries: Vec<HistoryEntry>, n: usize) -> Vec<HistoryEntry> {
+    let skip = entries.len().saturating_sub(n);
+    entries.drain(..skip);
+    entries
+}
+
+/// `/history`: as últimas linhas da conversa com a identidade escolhida (como em `/trust`). Lê o
+/// histórico inteiro por cursor, mantendo só a cauda, porque a API pagina do começo.
+fn history(chat: &Chat, rest: &str, current: Option<PeerId>, met: &[(PeerId, IdentityId)]) {
+    let (prefix, n) = match parse_history_args(rest) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            println!("({e})");
+            return;
+        }
+    };
+    let identity = match resolve_identity(&prefix, current, met) {
+        Resolved::One(identity) => identity,
+        Resolved::Unknown => {
+            println!("(nenhuma identidade conhecida assim; veja `conversa cifrada pronta`)");
+            return;
+        }
+        Resolved::Ambiguous => {
+            println!("(prefixo ambíguo: digite mais caracteres)");
+            return;
+        }
+    };
+    let mut last = Vec::new();
+    let mut after = None;
+    loop {
+        let page = match chat.history(&identity, after, HISTORY_PAGE) {
+            Ok(page) => page,
+            Err(e) => {
+                println!("(não consegui ler o histórico: {e})");
+                return;
+            }
+        };
+        let Some(newest) = page.last().map(|entry| entry.seq) else {
+            break;
+        };
+        after = Some(newest);
+        last.extend(page);
+        last = tail(last, n);
+    }
+    println!(
+        "(histórico com {}: {} linhas)",
+        identity.to_base58(),
+        last.len()
+    );
+    for entry in &last {
+        println!("{}", format_entry(entry));
+    }
 }
 
 /// A identidade vista em `ConversationReady` para `peer`: a linha digitada vai a ela (a todos os
