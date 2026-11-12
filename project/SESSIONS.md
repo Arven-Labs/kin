@@ -1258,4 +1258,28 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: nenhum teste em processo real nem no lab (um `SendFailed` real do libp2p com a conexão aberta não foi
   provocado); o retry depende de um gatilho (a próxima mensagem do irmão que dispare `announce_devices`), então sem tráfego a
   sessão só reabre ao reconectar; a resposta (`HistoryChunk`) perdida de quem serve continua sem tratamento.
-- **Próximo passo**: D7 (revogação de device próprio), P28, P29, irmãos em NATs diferentes e relay real.
+- **Próximo passo**: D7 (revogação de device próprio), P28, P29, irmãos em NATs diferentes e relay real. (O D7 começou na subseção
+  abaixo, só como desenho.)
+
+#### Revogação de device próprio: só desenho (D7, P30, ADR 0011, PR de docs)
+
+- **Decisão do dono** (plan mode + pergunta): esta sessão só **desenha** e audita (ADR 0011), sem código (descartados: implementar
+  certificados delegados já; implementar a rotação da mestra).
+- **Achado de leitura**: a identidade é a chave pública mestra e o `/pair` copia a mestra secreta para cada device, então revogar
+  um certificado não revoga nada (quem tem o device tem a mestra e assina outro). Revogar de verdade exige mudar o modelo de
+  chaves (§4).
+- **Feito**: ADR 0011 (**proposto**) com modelo de ameaça (T1 a T7), opções A (rotação), B (certificados delegados), C (devices
+  pares, descartada), D (mestra fria + autoridade) e E (chave de recuperação pré-comprometida), requisitos transversais, 7 fatias e 6
+  decisões para o dono; P30 no `PENDING.md`; ponteiros nos ADRs 0006 e 0007 e no `ARCHITECTURE.md`.
+- **Auditoria** (`security-auditor`, somente leitura): confirmou os fatos 1 a 3, **refutou parcialmente o 4** (o contato não recebe a
+  lista de devices: só o convite do remetente), e achou 4 críticos (a `DeviceList` não serve de canal; sem validade "não recebi" =
+  "não revogado"; "maior sequência vale" permite des-revogar por replay; primário sem recuperação), 6 importantes e 4 sugestões,
+  todos incorporados (tabela no fim do ADR). **Corrigiu uma referência minha**: os dispositivos vinculados do Signal **não** são
+  precedente de B (o primário entrega a chave de identidade ao secundário).
+- **Erros meus no caminho**: o rascunho tinha o Fato 4 errado (li o `device_list_for` só depois), citava o Signal como precedente,
+  propunha lista de revogação com "maior sequência vale" e dispensava `not_after`; o parecer pegou os quatro.
+- **Não verificado**: nenhuma das referências externas foi conferida contra a especificação (Matrix, Signal, Keybase, RFC 5280, RFC
+  9420/9750, KERI); a viabilidade de D e E com o formato de certificado atual; o comportamento do MLS ao apagar um par ativo. O
+  auditor também não analisou D e E.
+- **Próximo passo**: o dono decide as 6 perguntas do ADR (direção B; D ou E; identidade queimada; primário obrigatório;
+  validade; limite do contato offline); depois, a fatia 1 (custódia e cifra da mestra, P13) com plan mode.

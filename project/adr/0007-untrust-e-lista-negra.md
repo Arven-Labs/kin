@@ -31,7 +31,7 @@ device meu não revoga nada de verdade sem rotacionar a mestra.
    ignora. Não há payload novo entre irmãos.
 5. **CLI**: `/untrust [prefixo]`, com a mesma resolução do `/trust` (função pura `resolve_identity`, só sobre identidades
    vistas em `ConversationReady` nesta execução).
-6. **Revogação de device próprio: fora**, vai para D7. Exige rotação da mestra ou certificados delegados (o provedor TruthID),
+6. **Revogação de device próprio: fora**, vai para D7 (desenho proposto no ADR 0011, Sessão 21). Exige rotação da mestra ou certificados delegados (o provedor TruthID),
    o que muda o formato do certificado e o pareamento: área de cripto (§4), ADR e auditoria próprios.
 
 ## Alternativas descartadas
