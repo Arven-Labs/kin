@@ -336,6 +336,8 @@ pub struct Chat {
     history_requested: std::collections::HashSet<PeerId>,
     /// Sessões de sincronização em curso (um pedido em voo por irmão): quantas linhas já recebi nela.
     history_sessions: HashMap<PeerId, usize>,
+    /// Envios de `HistoryRequest` em voo (id → peer); falhar um deles libera o pedido (P27a).
+    history_requests: HashMap<SendId, PeerId>,
     /// Endereços que este device anuncia; vazio = os do nó (`Node::shareable_addresses`).
     advertised: Vec<Multiaddr>,
     /// Mensagens da outbox enviadas e ainda sem ack, por peer (limitadas por [`SEND_WINDOW`]).
@@ -433,6 +435,7 @@ impl Chat {
             sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
             history_cap: MAX_SYNC_ENTRIES,
             history_requested: Default::default(),
+            history_requests: HashMap::new(),
             history_sessions: HashMap::new(),
             advertised: Vec::new(),
             in_flight: HashMap::new(),
@@ -1052,6 +1055,8 @@ impl Chat {
                 self.sibling_pending.remove(&peer);
                 self.history_requested.remove(&peer);
                 self.history_sessions.remove(&peer);
+                self.history_requests
+                    .retain(|_, requested| *requested != peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -1062,6 +1067,7 @@ impl Chat {
             },
             NodeEvent::MessageDelivered { peer, id } => {
                 self.handshake.remove(&id);
+                self.history_requests.remove(&id);
                 if let Some(Some(message)) = self.pending.remove(&id) {
                     // O ack fecha o ciclo: sai da fila e libera uma vaga na janela. Só o ack de um
                     // device do destinatário é "entregue": o de um irmão (espelho) só libera a fila.
@@ -1082,6 +1088,13 @@ impl Chat {
             }
             NodeEvent::SendFailed { peer, id, reason } => {
                 let handshake = self.handshake.remove(&id);
+                // O pedido de histórico se perdeu com a conexão de pé: libera o estado dele, e o próximo
+                // `announce_devices` (já liberado abaixo, e com o seu limite de taxa) pede de novo do
+                // cursor salvo. Sem reenvio aqui, para não virar laço (P27a).
+                if let Some(requested) = self.history_requests.remove(&id) {
+                    self.history_requested.remove(&requested);
+                    self.history_sessions.remove(&requested);
+                }
                 match self.pending.remove(&id).flatten() {
                     // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
                     Some(message) => {
@@ -1548,7 +1561,10 @@ impl Chat {
             return;
         };
         match conversation.encrypt(&Payload::HistoryRequest { cursor }.encode()) {
-            Ok(wire) => self.transmit(peer, &Envelope::Mls(wire)),
+            Ok(wire) => {
+                let id = self.transmit(peer, &Envelope::Mls(wire));
+                self.history_requests.insert(id, peer);
+            }
             Err(e) => {
                 self.history_sessions.remove(&peer);
                 self.drop_message(peer, e.into());
@@ -1712,7 +1728,7 @@ impl Chat {
         self.transmit(peer, &envelope);
     }
 
-    fn transmit(&mut self, peer: PeerId, envelope: &Envelope) {
+    fn transmit(&mut self, peer: PeerId, envelope: &Envelope) -> SendId {
         let id = self.node.send(peer, envelope.encode());
         self.pending.insert(id, None);
         if matches!(
@@ -1721,6 +1737,7 @@ impl Chat {
         ) {
             self.handshake.insert(id, envelope.clone());
         }
+        id
     }
 
     fn drop_message(&mut self, peer: PeerId, error: Error) {
@@ -4728,6 +4745,154 @@ mod tests {
             [(true, "p1".to_string()), (true, "p2".to_string())]
         );
         assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 6);
+    }
+
+    fn all_sends(bia: &Chat) -> std::collections::HashSet<SendId> {
+        bia.pending.keys().copied().collect()
+    }
+
+    /// Os envios que saíram depois de `before`.
+    fn sent_since(bia: &Chat, before: &std::collections::HashSet<SendId>) -> Vec<SendId> {
+        bia.pending
+            .keys()
+            .copied()
+            .filter(|id| !before.contains(id))
+            .collect()
+    }
+
+    /// P27a: o envio do `HistoryRequest` falha com o irmão conectado: a sessão fecha e o estado do
+    /// pedido é liberado; o próximo `announce_devices` pede de novo.
+    #[tokio::test]
+    async fn a_failed_history_request_is_asked_again_on_the_next_announce() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        let before = all_sends(&bia);
+        asking(&mut bia, sibling);
+        let request = sent_since(&bia, &before);
+        assert_eq!(request.len(), 1, "só o pedido saiu");
+
+        fail_send(&mut bia, sibling, request[0]);
+
+        assert!(!bia.history_requested.contains(&sibling));
+        assert!(!bia.history_sessions.contains_key(&sibling));
+        bia.announce_devices(sibling);
+        assert!(bia.history_requested.contains(&sibling), "pediu de novo");
+        assert!(bia.history_sessions.contains_key(&sibling));
+    }
+
+    /// P27a: a falha de outro envio de controle (o anúncio de devices) não fecha a sessão de histórico.
+    #[tokio::test]
+    async fn a_failed_device_list_does_not_close_the_history_session() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        asking(&mut bia, sibling);
+        let before = all_sends(&bia);
+        bia.announce_devices(sibling);
+        let list = sent_since(&bia, &before);
+        assert_eq!(list.len(), 1, "só o anúncio saiu (o pedido já existe)");
+
+        fail_send(&mut bia, sibling, list[0]);
+
+        assert!(bia.history_sessions.contains_key(&sibling));
+        assert!(bia.history_requested.contains(&sibling));
+    }
+
+    /// P27a: o pedido da PRÓXIMA página também pode se perder; a sessão fecha, o cursor salvo fica e o
+    /// próximo gatilho pede de novo a partir dele.
+    #[tokio::test]
+    async fn a_failed_next_page_request_closes_the_session_and_resumes_from_the_saved_cursor() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, mut raw),
+            ..
+        } = household();
+        asking(&mut bia, sibling);
+        // Anuncia antes: assim o `on_mls` não anuncia por conta própria e só o pedido seguinte sai.
+        bia.announce_devices(sibling);
+        let before = all_sends(&bia);
+        let first = chunk_wire(&mut raw, vec![history_item(&ana, true, "p1")], 3, false);
+        bia.on_mls(sibling, &first).unwrap();
+        let next_request = sent_since(&bia, &before);
+        assert_eq!(next_request.len(), 1, "pediu a seguinte");
+
+        fail_send(&mut bia, sibling, next_request[0]);
+
+        assert!(!bia.history_sessions.contains_key(&sibling));
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 3);
+        bia.announce_devices(sibling);
+        assert!(bia.history_sessions.contains_key(&sibling), "retomou");
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 3);
+    }
+
+    /// P27a: o id do pedido sai da lista quando ele é entregue (não vaza).
+    #[tokio::test]
+    async fn a_delivered_history_request_leaves_the_in_flight_list() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        let before = all_sends(&bia);
+        asking(&mut bia, sibling);
+        let request = sent_since(&bia, &before)[0];
+        assert!(bia.history_requests.contains_key(&request));
+
+        bia.handle(NodeEvent::MessageDelivered {
+            peer: sibling,
+            id: request,
+        });
+
+        assert!(bia.history_requests.is_empty());
+    }
+
+    /// P27a: ao desconectar, os ids de pedido em voo daquele peer saem da lista.
+    #[tokio::test]
+    async fn disconnecting_forgets_the_in_flight_history_requests() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        asking(&mut bia, sibling);
+        assert!(!bia.history_requests.is_empty());
+
+        bia.handle(NodeEvent::PeerDisconnected(sibling));
+
+        assert!(bia.history_requests.is_empty());
+    }
+
+    /// P27d: a checagem de `sender` do `HistoryChunk` vale por si, não só pela de sessão: com a sessão
+    /// aberta, uma página assinada por OUTRA identidade é recusada e nada é gravado.
+    #[tokio::test]
+    async fn a_chunk_from_another_identity_is_refused_even_with_the_session_open() {
+        let Household {
+            mut bia,
+            ana,
+            sibling: (sibling, _),
+            ..
+        } = household();
+        asking(&mut bia, sibling);
+        let stranger = StandaloneIdentity::generate().id();
+
+        let result = bia.on_history_chunk(
+            sibling,
+            &stranger,
+            vec![history_item(&ana, true, "intrusa")],
+            5,
+            true,
+        );
+
+        assert!(matches!(result, Err(Error::UnauthorizedHistory)));
+        assert!(history_texts(&bia, &ana).is_empty());
+        assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 0);
+        assert!(bia.history_sessions.contains_key(&sibling));
     }
 
     /// P10a (segurança): uma página que eu não pedi é recusada e nada é gravado.
