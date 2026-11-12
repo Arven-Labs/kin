@@ -608,9 +608,7 @@ impl Outbox {
                 ],
             )
             .map_err(Error::storage)?;
-        if inserted > 0 {
-            self.prune_history(contact)?;
-        }
+        self.prune_history(contact)?;
         Ok(inserted > 0)
     }
 
