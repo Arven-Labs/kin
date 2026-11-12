@@ -627,7 +627,7 @@ impl Outbox {
                 "DELETE FROM kin_history WHERE contact = ?1 AND seq <= (
                      SELECT seq FROM kin_history WHERE contact = ?1
                      ORDER BY seq DESC LIMIT 1 OFFSET ?2)",
-                params![contact, i64::try_from(limit.get()).unwrap_or(i64::MAX)],
+                params![contact, i64::try_from(limit.get() + 1).unwrap_or(i64::MAX)],
             )
             .map_err(Error::storage)?;
         Ok(())
