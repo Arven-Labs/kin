@@ -48,9 +48,12 @@ então formato estrito, tetos e autorização são parte da decisão.
 - **Banda e leitura**: cada reconexão de irmão custa uma leitura de página por pedido (um irmão não é limitado por taxa) e, na
   primeira vez, o histórico inteiro em páginas de ~32 KiB.
 - **Sem downgrade** (schema v7), como nas v3 a v6.
-- **Pedido perdido**: se o envio do `HistoryRequest` falhar com a conexão aberta, a sessão fica sem resposta até reconectar
-  (o pedido é de controle e não vai à outbox). Ver P27.
+- **Pedido perdido** (corrigido na Sessão 21, PR #110): o `HistoryRequest` é de controle e não vai à outbox, e antes uma falha de
+  envio com a conexão aberta deixava a sessão sem resposta até reconectar. Agora o id do envio fica em `history_requests`; o
+  `SendFailed` dele libera `history_requested` e a sessão, e o próximo `announce_devices` (com o limite de taxa existente) pede de
+  novo do cursor salvo. Sem reenvio imediato. Continua valendo para a **resposta** (`HistoryChunk`) perdida de quem serve: o
+  pedinte espera até reconectar. Ver P27.
 - **A checagem de `sender` na página é defesa em profundidade**: para um contato a checagem de sessão já recusa (só há sessão
-  para irmãos). A mutação que a remove **sobrevive** aos testes; só um grupo MLS com membro extra a distinguiria, e esse caso é
-  barrado antes no `crypto` (limite de 2 membros, ADR 0006).
+  para irmãos). Um teste chama `on_history_chunk` direto com `sender` de outra identidade e a mutação que remove a checagem agora
+  é pega (Sessão 21).
 - "Notas para mim" continuam relativas ao device (primeira gravação vence), como no ADR 0008.

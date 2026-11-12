@@ -1228,4 +1228,34 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: volume real (10 000 linhas só no teste do padrão, em memória; o custo do `DELETE` por gravação não foi medido num
   arquivo em disco); a mutação "baixar o teto apaga na hora" não foi rodada; `set_history_limit` não está ligado à CLI; o padrão
   não foi exercitado no lab.
-- **Próximo passo**: P27, D7, flag/comando da CLI para o teto (se virar necessidade), irmãos em NATs diferentes.
+- **Próximo passo**: P27, D7, flag/comando da CLI para o teto (se virar necessidade), irmãos em NATs diferentes. (O P27 a e d foram
+  feitos na subseção abaixo.)
+
+#### Pedido de histórico perdido e `sender` do chunk (P27 a e d, PR #110)
+
+- **Decisão do dono** (plan mode + pergunta): tratar só **(a)** e **(d)** (descartados: somar um limite de taxa (b); só (a)). Os
+  outros viraram risco aceito, com o motivo, no `PENDING.md`.
+- **Causa de (a)** (lida no código): o `HistoryRequest` é de controle (`pending = None`); o `SendFailed` liberava `announced` e
+  `devices_announced` mas não `history_requested` nem a sessão, então `request_history` ficava no-op naquela conexão.
+- **Feito** (`crates/chat/src/chat.rs`): `transmit` devolve o `SendId`; campo `history_requests: HashMap<SendId, PeerId>` registrado em
+  `send_history_request`; `MessageDelivered` o retira, `PeerDisconnected` limpa os do peer e o `SendFailed` de um id registrado
+  libera `history_requested` e a sessão. Sem reenvio imediato: o retry é o `announce_devices` já liberado pelo `SendFailed`, com o
+  limite de taxa existente, a partir do cursor salvo. Falha do pedido da próxima página vale igual.
+- **Desvio do plano**: o teste "entregue e depois falha outro envio" era inalcançável (os ids não se repetem) e a mutação
+  correspondente seria equivalente; troquei por 2 testes da limpeza da lista (ao entregar e ao desconectar), o que exigiu o campo
+  `history_requests` já nos testes (stub só do campo, com `allow(dead_code)`).
+- **Testes** (6 novos, escritos antes): falha do pedido pede de novo no próximo anúncio; falha do `DeviceList` não fecha a sessão;
+  falha do pedido da próxima página fecha e retoma do cursor salvo; entregar tira o id; desconectar tira os ids; `on_history_chunk`
+  com `sender` de outra identidade e sessão aberta é recusado (nada gravado, cursor 0).
+- **Prova de que testam algo**: contra o código sem a correção, **4 de 6 falharam** (CI do #110, run 43327340040); os 2 que passaram
+  são guardas (falha do `DeviceList`; `sender` do chunk, que já tinha a checagem). Com a implementação: tudo verde (run 43327961330).
+- **Mutações** (PRs #111 a #115, fechados e apagados), todas pegas pelo teste certo: não liberar `history_requested` (derruba 2),
+  qualquer `SendFailed` fecha a sessão (derruba `a_failed_device_list_does_not_close_the_history_session`), não retirar o id ao
+  entregar (1), não limpar ao desconectar (1) e **remover a checagem de `sender` do chunk** (1: a que sobrevivia desde a Sessão 20).
+- **Tropeços meus**: (1) o helper de teste `in_flight` colidia com um já existente (erro de compilação no CI; renomeado
+  `all_sends`); (2) o `HashSet` planejado virou `HashMap<SendId, PeerId>` para limpar por peer; os testes tiveram de usar
+  `contains_key`.
+- **Não verificado**: nenhum teste em processo real nem no lab (um `SendFailed` real do libp2p com a conexão aberta não foi
+  provocado); o retry depende de um gatilho (a próxima mensagem do irmão que dispare `announce_devices`), então sem tráfego a
+  sessão só reabre ao reconectar; a resposta (`HistoryChunk`) perdida de quem serve continua sem tratamento.
+- **Próximo passo**: D7 (revogação de device próprio), P28, P29, irmãos em NATs diferentes e relay real.
