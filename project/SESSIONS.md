@@ -1200,8 +1200,9 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `tail_keeps_the_last_n_in_the_original_order`.
 - **Tropeço repetido**: o clippy barrou o stub por código sem uso (`dead_code`), desta vez nas constantes; mesmo caso das Sessões
   19 a 21. Também rodei por engano um `cat >>` vazio no Bash contra `SESSIONS.md` (sem efeito no arquivo; a regra é só `Edit`).
-- **Não verificado**: **o cenário `history-sync` não foi rodado** (precisa do binário e do Docker, dono; `bash -n` passou); a função
+- **Lab** (rodado pelo dono, `REPEAT=5 lab/run.sh history-sync`, binário do commit de código do PR #102): **5/5**, 35 PASS e 0 FAIL
+  (7 checks por rodada). NAT sintético, só TCP, A1 e A2 na mesma LAN, 1 execução de 5 rodadas.
+- **Não verificado**: a função
   `history` (leitura por cursor) não tem teste unitário (depende de `Chat`); só 1 mutação (o resto de `parse_history_args` e
   `format_entry` não foi mutado); histórico grande (mais de uma página de 256) nunca exercitado na CLI.
-- **Próximo passo**: o dono roda `cargo build -p kin-cli` e `REPEAT=5 lab/run.sh history-sync`; P26 (poda/retenção), P27, D7
-  (revogação de device próprio).
+- **Próximo passo**: P26 (poda/retenção), P27, D7 (revogação de device próprio), irmãos em NATs diferentes e relay real.

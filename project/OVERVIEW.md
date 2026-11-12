@@ -37,7 +37,7 @@ Fase 7 — (opcional) Roteamento multi-hop / privado            [ ] Pendente
 Fase 8 — (opcional) Blockchain: registro, proof-of-relay      [ ] Pendente
 ```
 
-Próximo passo: rodar `REPEAT=5 lab/run.sh history-sync` (P10a, fatia 3: `/history` e o cenário estão no PR #102; as fatias 1 e 2, guardar e sincronizar entre irmãos, nos PRs #84 e #92); irmãos em NATs diferentes e relay real; depois o resto do P24 (o `lab/`, 1:1 e multi-device na mesma LAN, passou 5/5 por cenário na Sessão 20). Antes de
+Próximo passo: (P10a, fatia 3 feita no PR #102: `/history` e o cenário `history-sync`, 5/5 no lab; as fatias 1 e 2 nos PRs #84 e #92); irmãos em NATs diferentes e relay real; depois o resto do P24 (o `lab/`, 1:1 e multi-device na mesma LAN, passou 5/5 por cenário na Sessão 20). Antes de
 distribuir: teste manual em redes reais, QUIC no laboratório (P17), P13/P16/P18. Detalhes em `PHASE.md`,
 `PENDING.md` e `SESSIONS.md`.
 
