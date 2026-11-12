@@ -4734,7 +4734,7 @@ mod tests {
         assert_eq!(bia.outbox.history_cursor(&sibling).unwrap(), 6);
     }
 
-    fn in_flight(bia: &Chat) -> std::collections::HashSet<SendId> {
+    fn all_sends(bia: &Chat) -> std::collections::HashSet<SendId> {
         bia.pending.keys().copied().collect()
     }
 
@@ -4756,7 +4756,7 @@ mod tests {
             sibling: (sibling, _),
             ..
         } = household();
-        let before = in_flight(&bia);
+        let before = all_sends(&bia);
         asking(&mut bia, sibling);
         let request = sent_since(&bia, &before);
         assert_eq!(request.len(), 1, "só o pedido saiu");
@@ -4779,7 +4779,7 @@ mod tests {
             ..
         } = household();
         asking(&mut bia, sibling);
-        let before = in_flight(&bia);
+        let before = all_sends(&bia);
         bia.announce_devices(sibling);
         let list = sent_since(&bia, &before);
         assert_eq!(list.len(), 1, "só o anúncio saiu (o pedido já existe)");
@@ -4803,7 +4803,7 @@ mod tests {
         asking(&mut bia, sibling);
         // Anuncia antes: assim o `on_mls` não anuncia por conta própria e só o pedido seguinte sai.
         bia.announce_devices(sibling);
-        let before = in_flight(&bia);
+        let before = all_sends(&bia);
         let first = chunk_wire(&mut raw, vec![history_item(&ana, true, "p1")], 3, false);
         bia.on_mls(sibling, &first).unwrap();
         let next_request = sent_since(&bia, &before);
@@ -4826,7 +4826,7 @@ mod tests {
             sibling: (sibling, _),
             ..
         } = household();
-        let before = in_flight(&bia);
+        let before = all_sends(&bia);
         asking(&mut bia, sibling);
         let request = sent_since(&bia, &before)[0];
         assert!(bia.history_requests.contains_key(&request));
