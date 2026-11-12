@@ -69,11 +69,12 @@ pub(crate) struct HistoryPage {
 }
 
 /// Teto padrão de linhas do histórico por contato (P26a).
-#[allow(dead_code)] // stub (testes primeiro)
 pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 10_000;
 
 pub(crate) struct Outbox {
     conn: Connection,
+    /// Teto de linhas do histórico por contato (`None` = sem teto); ver [`Outbox::set_history_limit`].
+    history_limit: Option<NonZeroUsize>,
 }
 
 impl Outbox {
@@ -147,7 +148,10 @@ impl Outbox {
                  cursor INTEGER NOT NULL);",
         )
         .map_err(Error::storage)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            history_limit: NonZeroUsize::new(DEFAULT_HISTORY_LIMIT),
+        })
     }
 
     /// Leva um banco da 3.4 (versão 0) ao esquema da 3.5: a mesma mensagem lógica pode esperar por
@@ -576,7 +580,9 @@ impl Outbox {
 
     /// Teto de linhas do histórico por contato (P26a); `None` = sem teto. O excesso (as linhas mais
     /// antigas, por `seq`) sai na próxima gravação daquela conversa; baixar o teto não apaga na hora.
-    pub(crate) fn set_history_limit(&mut self, _limit: Option<NonZeroUsize>) {}
+    pub(crate) fn set_history_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.history_limit = limit;
+    }
 
     /// Grava `message` no histórico da conversa com `contact` (P10a); `outgoing` = enviei, em vez de
     /// recebi. `false` se esse `(contact, id)` já estava: a primeira gravação vence, então o mesmo
@@ -602,7 +608,29 @@ impl Outbox {
                 ],
             )
             .map_err(Error::storage)?;
+        if inserted > 0 {
+            self.prune_history(contact)?;
+        }
         Ok(inserted > 0)
+    }
+
+    /// Apaga o que passa do teto na conversa com `contact`: as linhas mais antigas por `seq`. Com
+    /// menos de `limite + 1` linhas a subconsulta dá `NULL` e nada sai. O `seq` é `AUTOINCREMENT`, então
+    /// não é reaproveitado e os cursores dos irmãos continuam valendo.
+    fn prune_history(&self, contact: &IdentityId) -> Result<(), Error> {
+        let Some(limit) = self.history_limit else {
+            return Ok(());
+        };
+        let contact = contact.public_key().encode_protobuf();
+        self.conn
+            .execute(
+                "DELETE FROM kin_history WHERE contact = ?1 AND seq <= (
+                     SELECT seq FROM kin_history WHERE contact = ?1
+                     ORDER BY seq DESC LIMIT 1 OFFSET ?2)",
+                params![contact, i64::try_from(limit.get()).unwrap_or(i64::MAX)],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
     }
 
     /// Até `limit` linhas do histórico com `contact`, do mais antigo ao mais novo, depois do cursor
