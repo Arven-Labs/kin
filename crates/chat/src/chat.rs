@@ -1055,8 +1055,6 @@ impl Chat {
                 self.sibling_pending.remove(&peer);
                 self.history_requested.remove(&peer);
                 self.history_sessions.remove(&peer);
-                self.history_requests
-                    .retain(|_, requested| *requested != peer);
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
