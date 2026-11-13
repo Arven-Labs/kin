@@ -170,9 +170,7 @@ fn resolve(path: &Path) -> Result<PathBuf, String> {
     };
     for component in &components[keep..] {
         match component {
-            Component::ParentDir => {
-                resolved.pop();
-            }
+            Component::ParentDir => {}
             Component::CurDir => {}
             other => resolved.push(other.as_os_str()),
         }
