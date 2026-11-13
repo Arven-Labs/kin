@@ -50,21 +50,118 @@ pub enum Access {
 
 /// Decisão pura: dado o pedido, o estado dos arquivos e se há terminal, o que fazer (ou por que recusar).
 pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access, String> {
-    let _ = (opts, state, tty);
-    unimplemented!("stub: decide")
+    if opts.no_passphrase {
+        if opts.passphrase_file.is_some() {
+            return Err("--no-passphrase e --passphrase-file são excludentes".into());
+        }
+        if opts.protect {
+            return Err("--protect exige senha: não combina com --no-passphrase".into());
+        }
+        return match state {
+            FilesState::Sealed | FilesState::Mixed => {
+                Err("as chaves estão cifradas: informe a senha (sem --no-passphrase)".into())
+            }
+            FilesState::New | FilesState::Plain => Ok(Access::Plain(PlainReason::Explicit)),
+        };
+    }
+    match (state, opts.protect) {
+        (FilesState::New | FilesState::Sealed, true) => {
+            return Err("--protect: não há chave em claro para cifrar neste --data-dir".into());
+        }
+        (FilesState::Plain, false) if opts.passphrase_file.is_none() => {
+            return Ok(Access::Plain(PlainReason::Legacy));
+        }
+        (FilesState::Plain | FilesState::Mixed, false) => {
+            return Err(
+                "há chave em claro neste --data-dir: rode uma vez com --protect para cifrá-la"
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    let source = match (&opts.passphrase_file, tty) {
+        (Some(path), _) => Source::File(path.clone()),
+        (None, true) => Source::Prompt {
+            confirm: state == FilesState::New || opts.protect,
+        },
+        (None, false) => {
+            return Err(
+                "sem terminal e sem senha: use --passphrase-file ARQUIVO (ou KIN_PASSPHRASE_FILE), ou --no-passphrase para chaves em claro"
+                    .into(),
+            );
+        }
+    };
+    Ok(Access::Sealed {
+        source,
+        protect: opts.protect,
+    })
 }
 
 /// Estado dos arquivos de chave em `dir` (só os que existem).
 pub fn files_state(dir: &Path) -> Result<FilesState, Box<dyn std::error::Error>> {
-    let _ = dir;
-    unimplemented!("stub: files_state")
+    let mut sealed = Vec::new();
+    for name in ["identity.key", "device.key"] {
+        let path = dir.join(name);
+        if path.exists() {
+            sealed.push(kin_identity::key_file_is_sealed(&path)?);
+        }
+    }
+    if sealed.is_empty() {
+        return Ok(FilesState::New);
+    }
+    Ok(if sealed.iter().all(|s| *s) {
+        FilesState::Sealed
+    } else if sealed.iter().any(|s| *s) {
+        FilesState::Mixed
+    } else {
+        FilesState::Plain
+    })
 }
 
 /// Lê a senha de um arquivo: uma linha, até 4 KiB, UTF-8, sem a quebra de linha final, normalizada em
-/// NFKC. No Unix recusa arquivo legível por grupo ou outros.
+/// NFKC. No Unix recusa arquivo legível por grupo ou outros. Os erros nunca citam o conteúdo.
 pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
-    let _ = path;
-    unimplemented!("stub: read_passphrase_file")
+    use std::io::Read as _;
+    const LIMIT: u64 = 4096;
+    let shown = path.display();
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("arquivo de senha {shown}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = file
+            .metadata()
+            .map_err(|e| format!("arquivo de senha {shown}: {e}"))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "arquivo de senha {shown} legível por outros usuários (modo {:o}): use chmod 600",
+                mode & 0o777
+            ));
+        }
+    }
+    let mut raw = Zeroizing::new(Vec::new());
+    (&mut file)
+        .take(LIMIT + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("arquivo de senha {shown}: {e}"))?;
+    if raw.len() as u64 > LIMIT {
+        return Err(format!("arquivo de senha {shown} maior que {LIMIT} bytes"));
+    }
+    let body: &[u8] = if let Some(rest) = raw.strip_suffix(b"\r\n") {
+        rest
+    } else if let Some(rest) = raw.strip_suffix(b"\n") {
+        rest
+    } else {
+        &raw
+    };
+    let text =
+        std::str::from_utf8(body).map_err(|_| format!("arquivo de senha {shown} não é UTF-8"))?;
+    if text.is_empty() {
+        return Err(format!("arquivo de senha {shown} está vazio"));
+    }
+    Ok(kin_identity::normalize_passphrase(text))
 }
 
 /// Carrega (ou cria) `identity.key` e `device.key` em `dir`.
@@ -80,8 +177,60 @@ pub fn load(
     protect: bool,
     params: KdfParams,
 ) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
-    let _ = (dir, pair_text, passphrase, protect, params);
-    unimplemented!("stub: load")
+    std::fs::create_dir_all(dir)?;
+    let identity_path = dir.join("identity.key");
+    let device_path = dir.join("device.key");
+    if let Some(text) = pair_text {
+        if identity_path.exists() {
+            return Err(
+                "já existe identity.key neste --data-dir: --pair não sobrescreve uma identidade"
+                    .into(),
+            );
+        }
+        // Estado MLS e outbox pertencem à identidade que os criou; com outra identidade, o `Chat`
+        // abriria conversas que não são dela.
+        if dir.join("mls.sqlite").exists() {
+            return Err(
+                "este --data-dir já tem estado (mls.sqlite) de outra identidade: use um diretório novo"
+                    .into(),
+            );
+        }
+        let imported = StandaloneIdentity::from_pair_link(text)?;
+        match passphrase {
+            Some(pass) => imported.save_sealed(&identity_path, pass, params)?,
+            None => imported.save(&identity_path)?,
+        }
+    }
+    if protect {
+        let pass = passphrase.ok_or("--protect exige uma senha")?;
+        if identity_path.exists() && !kin_identity::key_file_is_sealed(&identity_path)? {
+            StandaloneIdentity::protect(&identity_path, pass, params)?;
+        }
+        if device_path.exists() && !kin_identity::key_file_is_sealed(&device_path)? {
+            DeviceKey::protect(&device_path, pass, params)?;
+        }
+    }
+    let identity = if identity_path.exists() {
+        StandaloneIdentity::load_with(&identity_path, passphrase)?
+    } else {
+        let identity = StandaloneIdentity::generate();
+        match passphrase {
+            Some(pass) => identity.save_sealed(&identity_path, pass, params)?,
+            None => identity.save(&identity_path)?,
+        }
+        identity
+    };
+    let device = if device_path.exists() {
+        DeviceKey::load_with(&device_path, passphrase)?
+    } else {
+        let device = DeviceKey::generate();
+        match passphrase {
+            Some(pass) => device.save_sealed(&device_path, pass, params)?,
+            None => crate::write_private(&device_path, &device.to_bytes()?)?,
+        }
+        device
+    };
+    Ok((identity, device))
 }
 
 #[cfg(test)]

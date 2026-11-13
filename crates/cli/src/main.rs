@@ -30,7 +30,6 @@
 
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)] // stub: sai quando a implementação entrar
 mod keys;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
@@ -40,7 +39,6 @@ use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits}
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct Args {
-    #[allow(dead_code)] // stub: sai quando a implementação entrar
     keys: keys::KeyOptions,
     data_dir: PathBuf,
     listen: Option<Multiaddr>,
@@ -70,7 +68,6 @@ fn parse_from(
     argv: impl IntoIterator<Item = String>,
     env_passphrase_file: Option<String>,
 ) -> Result<Args, String> {
-    let _ = &env_passphrase_file;
     let mut args = Args {
         keys: keys::KeyOptions::default(),
         data_dir: PathBuf::from(".kin"),
@@ -96,6 +93,9 @@ fn parse_from(
             "--dial" => args.dial = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--accept" => args.accept = Some(value()?),
             "--pair" => args.pair = Some(value()?),
+            "--passphrase-file" => args.keys.passphrase_file = Some(value()?.into()),
+            "--protect" => args.keys.protect = true,
+            "--no-passphrase" => args.keys.no_passphrase = true,
             "--relay-count" => {
                 args.relay_count = Some(value()?.parse().map_err(|e| format!("{e}"))?);
             }
@@ -119,61 +119,85 @@ fn parse_from(
             other => return Err(format!("argumento desconhecido: {other}")),
         }
     }
+    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
+        args.keys.passphrase_file = env_passphrase_file
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+    }
     Ok(args)
 }
 
-/// Carrega a identidade e a chave de device do diretório, criando-as na primeira execução.
-/// Sem cifra em repouso (P13): só para desenvolvimento.
+/// Carrega a identidade e a chave de device do diretório, criando-as na primeira execução (P13,
+/// ADR 0012). Por padrão ficam **cifradas** com uma senha (prompt, `--passphrase-file` ou
+/// `KIN_PASSPHRASE_FILE`); `--no-passphrase` grava em claro; `--protect` cifra no lugar um diretório
+/// antigo em claro.
 ///
-/// `pair` (de `--pair`, ADR 0006): o link `kin://pair/...` de outro device desta identidade, lido de
-/// um arquivo (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com
-/// `identity.key` já existente falha, em vez de sobrescrever uma identidade. O device continua com
-/// `device.key` próprio, gerado aqui.
-fn load_keys(
-    dir: &Path,
-    pair: Option<&str>,
-) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+/// `--pair` (ADR 0006): o link `kin://pair/...` de outro device desta identidade, lido de um arquivo
+/// (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com `identity.key`
+/// já existente falha, em vez de sobrescrever uma identidade. O device continua com `device.key`
+/// próprio, gerado aqui.
+fn open_keys(args: &Args) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+    let dir = &args.data_dir;
     std::fs::create_dir_all(dir)?;
-    let identity_path = dir.join("identity.key");
-    let device_path = dir.join("device.key");
-    if let Some(source) = pair {
-        if identity_path.exists() {
-            return Err(
-                "já existe identity.key neste --data-dir: --pair não sobrescreve uma identidade"
-                    .into(),
-            );
+    let state = keys::files_state(dir)?;
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let access = keys::decide(&args.keys, state, tty)?;
+    let (passphrase, protect) = match &access {
+        keys::Access::Plain(keys::PlainReason::Explicit) => {
+            eprintln!("aviso: --no-passphrase: as chaves ficam em claro no disco (só 0600)");
+            (None, false)
         }
-        // Estado MLS e outbox pertencem à identidade que os criou; com outra identidade, o `Chat`
-        // abriria conversas que não são dela.
-        if dir.join("mls.sqlite").exists() {
-            return Err(
-                "este --data-dir já tem estado (mls.sqlite) de outra identidade: use um diretório novo"
-                    .into(),
+        keys::Access::Plain(keys::PlainReason::Legacy) => {
+            eprintln!(
+                "aviso: as chaves deste --data-dir estão em claro; rode uma vez com --protect para cifrá-las"
             );
+            (None, false)
         }
-        let text = read_pair_link(source)?;
-        let imported = StandaloneIdentity::from_pair_link(&text)?;
-        write_private(&identity_path, &imported.to_bytes()?)?;
-        println!("identidade importada: {}", imported.id().to_base58());
+        keys::Access::Sealed { source, protect } => {
+            let pass = match source {
+                keys::Source::File(path) => keys::read_passphrase_file(path)?,
+                keys::Source::Prompt { confirm } => prompt_passphrase(*confirm)?,
+            };
+            (Some(pass), *protect)
+        }
+    };
+    let pair_text = args.pair.as_deref().map(read_pair_link).transpose()?;
+    if protect {
+        eprintln!(
+            "aviso: o arquivo em claro antigo pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate a chave como exposta"
+        );
+    }
+    let loaded = keys::load(
+        dir,
+        pair_text.as_deref(),
+        passphrase.as_ref().map(|p| p.as_slice()),
+        protect,
+        kin_identity::KdfParams::DEFAULT,
+    )?;
+    if let Some(source) = &args.pair {
+        println!("identidade importada: {}", loaded.0.id().to_base58());
         if source != "-" {
             println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
         }
     }
-    let identity = if identity_path.exists() {
-        StandaloneIdentity::load(&identity_path)?
-    } else {
-        let identity = StandaloneIdentity::generate();
-        identity.save(&identity_path)?;
-        identity
-    };
-    let device = if device_path.exists() {
-        DeviceKey::from_bytes(&std::fs::read(&device_path)?)?
-    } else {
-        let device = DeviceKey::generate();
-        write_private(&device_path, &device.to_bytes()?)?;
-        device
-    };
-    Ok((identity, device))
+    Ok(loaded)
+}
+
+/// Pede a senha no terminal, sem eco; `confirm` pede de novo e exige que conferam. Normalizada em NFKC.
+fn prompt_passphrase(
+    confirm: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let first = zeroize::Zeroizing::new(rpassword::prompt_password("senha: ")?);
+    if first.is_empty() {
+        return Err("a senha não pode ser vazia".into());
+    }
+    if confirm {
+        let second = zeroize::Zeroizing::new(rpassword::prompt_password("repita a senha: ")?);
+        if *first != *second {
+            return Err("as senhas não conferem".into());
+        }
+    }
+    Ok(kin_identity::normalize_passphrase(&first))
 }
 
 /// Lê o link de pareamento de um arquivo ou do stdin (`-`, até o EOF: o chat do mesmo processo não
@@ -225,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         e
     })?;
-    let (identity, device) = load_keys(&args.data_dir, args.pair.as_deref())?;
+    let (identity, device) = open_keys(&args)?;
     if args.serve_relay {
         return serve_relay(&args, &device).await;
     }
