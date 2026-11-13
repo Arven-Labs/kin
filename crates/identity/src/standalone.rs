@@ -4,7 +4,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use libp2p_identity::{Keypair, PublicKey};
 
-use crate::{DeviceCertificate, Error, IdentityId, IdentityProvider, NostrPublicKey, store};
+use crate::{
+    DeviceCertificate, Error, IdentityId, IdentityProvider, KdfParams, NostrPublicKey, store,
+};
 
 const PAIR_PREFIX: &str = "kin://pair/";
 
@@ -64,6 +66,24 @@ impl StandaloneIdentity {
     pub fn load(path: &Path) -> Result<Self, Error> {
         Self::from_bytes(&store::read_secret(path)?)
     }
+
+    /// Grava a chave mestra **cifrada** com a senha (P13, ADR 0012), de forma atômica e com modo 0600.
+    pub fn save_sealed(
+        &self,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
+    ) -> Result<(), Error> {
+        let _ = (path, passphrase, params);
+        unimplemented!("stub: StandaloneIdentity::save_sealed")
+    }
+
+    /// Lê a chave mestra de um arquivo cifrado ou em claro (formato antigo). Cifrado sem senha:
+    /// [`Error::PassphraseRequired`].
+    pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
+        let _ = (path, passphrase);
+        unimplemented!("stub: StandaloneIdentity::load_with")
+    }
 }
 
 impl IdentityProvider for StandaloneIdentity {
@@ -92,5 +112,102 @@ impl IdentityProvider for StandaloneIdentity {
             created_at,
             signature: self.master.sign(&payload)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PASS: &[u8] = b"senha de teste";
+
+    #[test]
+    fn sealed_identity_loads_back_as_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let identity = StandaloneIdentity::generate();
+        identity.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
+        let loaded = StandaloneIdentity::load_with(&path, Some(PASS)).unwrap();
+        assert_eq!(loaded.id(), identity.id());
+        // Mesma chave: a assinatura de um verifica na pública do outro.
+        let sig = loaded.sign(b"msg").unwrap();
+        assert!(identity.id().public_key().verify(b"msg", &sig));
+    }
+
+    #[test]
+    fn sealed_file_is_not_the_protobuf_of_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let identity = StandaloneIdentity::generate();
+        identity.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        let plain = identity.to_bytes().unwrap();
+        assert!(crate::is_sealed(&on_disk));
+        assert!(!on_disk.windows(plain.len()).any(|w| w == plain.as_slice()));
+    }
+
+    #[test]
+    fn sealed_identity_without_or_with_wrong_passphrase_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        StandaloneIdentity::generate()
+            .save_sealed(&path, PASS, KdfParams::MIN)
+            .unwrap();
+        assert!(matches!(
+            StandaloneIdentity::load_with(&path, None).err().unwrap(),
+            Error::PassphraseRequired
+        ));
+        assert!(matches!(
+            StandaloneIdentity::load_with(&path, Some(b"errada"))
+                .err()
+                .unwrap(),
+            Error::WrongPassphraseOrCorrupt
+        ));
+    }
+
+    #[test]
+    fn legacy_plain_file_still_loads_with_or_without_a_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let identity = StandaloneIdentity::generate();
+        identity.save(&path).unwrap();
+        assert_eq!(
+            StandaloneIdentity::load_with(&path, None).unwrap().id(),
+            identity.id()
+        );
+        assert_eq!(
+            StandaloneIdentity::load_with(&path, Some(PASS))
+                .unwrap()
+                .id(),
+            identity.id()
+        );
+    }
+
+    #[test]
+    fn protecting_a_legacy_file_keeps_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let identity = StandaloneIdentity::generate();
+        identity.save(&path).unwrap();
+        crate::protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        assert_eq!(
+            StandaloneIdentity::load_with(&path, Some(PASS))
+                .unwrap()
+                .id(),
+            identity.id()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sealed_file_has_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        StandaloneIdentity::generate()
+            .save_sealed(&path, PASS, KdfParams::MIN)
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

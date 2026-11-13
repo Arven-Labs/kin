@@ -16,6 +16,18 @@ pub enum Error {
     InvalidPairLink,
     #[error("certificado de device inválido")]
     InvalidCertificate,
+    /// Senha errada e arquivo adulterado são **o mesmo erro** de propósito: distinguir os dois seria um oráculo.
+    #[error("senha errada ou arquivo de chave corrompido")]
+    WrongPassphraseOrCorrupt,
+    /// Cabeçalho ilegível: magic, versão, parâmetros do KDF ou tamanho. Sem detalhe do conteúdo.
+    #[error("arquivo de chave cifrado inválido")]
+    InvalidSealedFile,
+    #[error("o arquivo de chave está cifrado: informe a senha")]
+    PassphraseRequired,
+    #[error("a senha não pode ser vazia")]
+    EmptyPassphrase,
+    #[error("o arquivo de chave já está cifrado")]
+    AlreadySealed,
     #[error("erro de E/S: {0}")]
     Io(#[from] std::io::Error),
 }
