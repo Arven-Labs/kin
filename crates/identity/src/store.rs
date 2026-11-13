@@ -32,7 +32,7 @@ pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error
 /// aparecer durante a gravação: publica com `hard_link` (que não substitui) em vez de `rename`.
 /// Exige sistema de arquivos com hard link.
 pub(crate) fn write_secret_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    write_atomic(path, bytes, false)
+    write_atomic(path, bytes, true)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(), Error> {
