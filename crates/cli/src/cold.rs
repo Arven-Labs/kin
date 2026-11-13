@@ -3,12 +3,13 @@
 //! A mestra fria só assina; quem trabalha no dia a dia é a chave de autoridade (ADR 0013). Nada aqui
 //! abre rede nem `Chat`: só gera chaves e grava arquivos cifrados (ADR 0012).
 
-// STUB (etapa 3 do plano): só as assinaturas, para os testes compilarem e falharem.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
-use kin_identity::{IdentityId, KdfParams};
+use kin_identity::{AuthorityKey, IdentityId, IdentityProvider, KdfParams, StandaloneIdentity};
+use zeroize::Zeroizing;
+
+const AUTHORITY_KEY_FILE: &str = "authority.key";
+const AUTHORITY_CERT_FILE: &str = "authority.cert";
 
 /// Subcomando pedido, já com os caminhos.
 #[derive(Debug, PartialEq, Eq)]
@@ -30,8 +31,52 @@ pub enum ColdCommand {
 }
 
 /// Lê os argumentos **depois** da palavra `cold`.
-pub fn parse(_argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, String> {
-    todo!()
+pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, String> {
+    let mut it = argv.into_iter();
+    let sub = it.next().ok_or("uso: kin cold init|rotate-authority ...")?;
+    let (master_flag, other_master_flag) = match sub.as_str() {
+        "init" => ("--master-out", "--master"),
+        "rotate-authority" => ("--master", "--master-out"),
+        other => return Err(format!("subcomando desconhecido: cold {other}")),
+    };
+    let mut master = None;
+    let mut authority_dir = None;
+    let mut master_passphrase_file = None;
+    let mut passphrase_file = None;
+    while let Some(flag) = it.next() {
+        let mut value = || {
+            it.next()
+                .map(PathBuf::from)
+                .ok_or(format!("{flag} precisa de um valor"))
+        };
+        match flag.as_str() {
+            f if f == master_flag => master = Some(value()?),
+            "--authority-dir" => authority_dir = Some(value()?),
+            "--master-passphrase-file" => master_passphrase_file = Some(value()?),
+            "--passphrase-file" => passphrase_file = Some(value()?),
+            f if f == other_master_flag => {
+                return Err(format!("{f} não existe em cold {sub}: use {master_flag}"));
+            }
+            other => return Err(format!("argumento desconhecido: {other}")),
+        }
+    }
+    let master = master.ok_or(format!("cold {sub} exige {master_flag}"))?;
+    let authority_dir = authority_dir.ok_or(format!("cold {sub} exige --authority-dir"))?;
+    Ok(if sub == "init" {
+        ColdCommand::Init {
+            master_out: master,
+            authority_dir,
+            master_passphrase_file,
+            passphrase_file,
+        }
+    } else {
+        ColdCommand::Rotate {
+            master,
+            authority_dir,
+            master_passphrase_file,
+            passphrase_file,
+        }
+    })
 }
 
 /// O que o usuário precisa ver depois de rodar um comando.
@@ -43,26 +88,194 @@ pub struct Outcome {
 /// Gera a mestra e uma autoridade nova; grava `master_out` (mestra, cifrada com `master_pass`) e,
 /// em `authority_dir`, `authority.key` (cifrada com `authority_pass`) e `authority.cert`.
 pub fn init(
-    _master_out: &Path,
-    _authority_dir: &Path,
-    _master_pass: &[u8],
-    _authority_pass: &[u8],
-    _params: KdfParams,
-    _now: u64,
+    master_out: &Path,
+    authority_dir: &Path,
+    master_pass: &[u8],
+    authority_pass: &[u8],
+    params: KdfParams,
+    now: u64,
 ) -> Result<Outcome, String> {
-    todo!()
+    // Tudo é conferido antes de criar qualquer arquivo ou diretório.
+    check_targets(master_out, authority_dir, master_pass, authority_pass)?;
+    if master_out.exists() {
+        return Err(format!(
+            "{} já existe: não sobrescrevo uma mestra",
+            master_out.display()
+        ));
+    }
+    let master = StandaloneIdentity::generate();
+    if let Some(parent) = master_out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    master
+        .save_sealed(master_out, master_pass, params)
+        .map_err(|e| format!("gravar a mestra: {e}"))?;
+    write_authority(&master, authority_dir, authority_pass, params, now)
 }
 
 /// A mestra fria existente certifica uma autoridade **nova** (mesmo `IdentityId`) em `authority_dir`.
 pub fn rotate(
-    _master_file: &Path,
-    _authority_dir: &Path,
-    _master_pass: &[u8],
-    _authority_pass: &[u8],
-    _params: KdfParams,
-    _now: u64,
+    master_file: &Path,
+    authority_dir: &Path,
+    master_pass: &[u8],
+    authority_pass: &[u8],
+    params: KdfParams,
+    now: u64,
 ) -> Result<Outcome, String> {
-    todo!()
+    check_targets(master_file, authority_dir, master_pass, authority_pass)?;
+    // Senha errada falha aqui, antes de criar qualquer coisa.
+    let master = StandaloneIdentity::load_with(master_file, Some(master_pass))
+        .map_err(|e| format!("abrir a mestra {}: {e}", master_file.display()))?;
+    write_authority(&master, authority_dir, authority_pass, params, now)
+}
+
+/// Recusas que não dependem de abrir nada: senhas iguais, mestra dentro do diretório do primário e
+/// autoridade já existente. A conferência do "dentro de" é lexical (não resolve `..` nem links).
+fn check_targets(
+    master_file: &Path,
+    authority_dir: &Path,
+    master_pass: &[u8],
+    authority_pass: &[u8],
+) -> Result<(), String> {
+    if master_pass == authority_pass {
+        return Err(
+            "a senha da autoridade deve ser diferente da senha da mestra fria: a do primário não pode abrir a mestra"
+                .into(),
+        );
+    }
+    if master_file.starts_with(authority_dir) {
+        return Err(format!(
+            "a mestra fria ({}) não pode ficar dentro do diretório do primário ({}): leve-a para fora dele",
+            master_file.display(),
+            authority_dir.display()
+        ));
+    }
+    for name in [AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+        let path = authority_dir.join(name);
+        if path.exists() {
+            return Err(format!("{} já existe: não sobrescrevo", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// Gera uma autoridade nova, grava `authority.key` (cifrada) e `authority.cert` (assinado pela mestra).
+fn write_authority(
+    master: &StandaloneIdentity,
+    authority_dir: &Path,
+    authority_pass: &[u8],
+    params: KdfParams,
+    now: u64,
+) -> Result<Outcome, String> {
+    let authority = AuthorityKey::generate();
+    let cert = master
+        .certify_authority(&authority.public_key(), now)
+        .map_err(|e| format!("certificar a autoridade: {e}"))?;
+    std::fs::create_dir_all(authority_dir)
+        .map_err(|e| format!("{}: {e}", authority_dir.display()))?;
+    authority
+        .save_sealed(
+            &authority_dir.join(AUTHORITY_KEY_FILE),
+            authority_pass,
+            params,
+        )
+        .map_err(|e| format!("gravar a autoridade: {e}"))?;
+    crate::write_private(&authority_dir.join(AUTHORITY_CERT_FILE), &cert.to_bytes())
+        .map_err(|e| format!("gravar o certificado: {e}"))?;
+    Ok(Outcome {
+        identity: master.id(),
+    })
+}
+
+/// Executa um subcomando: lê as senhas (arquivo ou prompt), roda e imprime o resultado.
+pub fn run(command: ColdCommand) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let (outcome, master_path, authority_dir) = match command {
+        ColdCommand::Init {
+            master_out,
+            authority_dir,
+            master_passphrase_file,
+            passphrase_file,
+        } => {
+            eprintln!(
+                "aviso: rode isto numa máquina sem rede; a mestra existe em claro na memória durante o comando"
+            );
+            let master_pass = passphrase(master_passphrase_file, "senha da mestra fria", true)?;
+            let authority_pass = passphrase(passphrase_file, "senha da autoridade", true)?;
+            let outcome = init(
+                &master_out,
+                &authority_dir,
+                &master_pass,
+                &authority_pass,
+                KdfParams::DEFAULT,
+                now,
+            )?;
+            (outcome, master_out, authority_dir)
+        }
+        ColdCommand::Rotate {
+            master,
+            authority_dir,
+            master_passphrase_file,
+            passphrase_file,
+        } => {
+            let master_pass = passphrase(master_passphrase_file, "senha da mestra fria", false)?;
+            let authority_pass = passphrase(passphrase_file, "senha da autoridade nova", true)?;
+            let outcome = rotate(
+                &master,
+                &authority_dir,
+                &master_pass,
+                &authority_pass,
+                KdfParams::DEFAULT,
+                now,
+            )?;
+            (outcome, master, authority_dir)
+        }
+    };
+    println!("identidade: {}", outcome.identity.to_base58());
+    println!("mestra fria: {}", master_path.display());
+    println!(
+        "autoridade: {} e {}",
+        authority_dir.join(AUTHORITY_KEY_FILE).display(),
+        authority_dir.join(AUTHORITY_CERT_FILE).display()
+    );
+    println!(
+        "guarde a mestra fria FORA do disco do primário (mídia offline). Senha da mestra perdida = identidade perdida: não há recuperação."
+    );
+    println!(
+        "a CLI normal ainda não usa esses arquivos (o pareamento autenticado vem na fatia 2 do P30)."
+    );
+    Ok(())
+}
+
+fn passphrase(
+    file: Option<PathBuf>,
+    label: &str,
+    confirm: bool,
+) -> Result<Zeroizing<Vec<u8>>, String> {
+    if let Some(path) = file {
+        return crate::keys::read_passphrase_file(&path);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(format!("sem terminal: informe a {label} por arquivo"));
+    }
+    let first = Zeroizing::new(
+        rpassword::prompt_password(format!("{label}: ")).map_err(|e| e.to_string())?,
+    );
+    if first.is_empty() {
+        return Err("a senha não pode ser vazia".into());
+    }
+    if confirm {
+        let second = Zeroizing::new(
+            rpassword::prompt_password(format!("repita a {label}: ")).map_err(|e| e.to_string())?,
+        );
+        if *first != *second {
+            return Err("as senhas não conferem".into());
+        }
+    }
+    Ok(kin_identity::normalize_passphrase(&first))
 }
 
 #[cfg(test)]
