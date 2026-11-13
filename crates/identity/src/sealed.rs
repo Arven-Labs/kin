@@ -36,8 +36,11 @@ impl KdfParams {
         t_cost: 1,
         lanes: 1,
     };
+    #[allow(dead_code)] // stub: sai quando a implementação entrar
     pub(crate) const MAX_M_COST_KIB: u32 = 1024 * 1024;
+    #[allow(dead_code)] // stub: sai quando a implementação entrar
     pub(crate) const MAX_T_COST: u32 = 10;
+    #[allow(dead_code)] // stub: sai quando a implementação entrar
     pub(crate) const MAX_LANES: u8 = 4;
 
     /// Valida contra o piso e o teto.
