@@ -21,3 +21,7 @@ kin-crypto.workspace = true
 kin-chat.workspace = true
 tokio.workspace = true
 qrcode.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

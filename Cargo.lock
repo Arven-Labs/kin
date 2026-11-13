@@ -2089,7 +2089,9 @@ dependencies = [
  "kin-overlay",
  "kin-transport",
  "qrcode",
+ "tempfile",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

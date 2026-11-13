@@ -30,6 +30,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)] // stub: sai quando a implementação entrar
+mod keys;
+
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Error, HistoryEntry, Invite, Message, MessageId};
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
@@ -37,6 +40,7 @@ use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits}
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct Args {
+    keys: keys::KeyOptions,
     data_dir: PathBuf,
     listen: Option<Multiaddr>,
     dial: Option<Multiaddr>,
@@ -53,7 +57,21 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_from(
+        std::env::args().skip(1),
+        std::env::var("KIN_PASSPHRASE_FILE").ok(),
+    )
+}
+
+/// `env_passphrase_file`: valor de `KIN_PASSPHRASE_FILE` (vazio conta como ausente). A flag
+/// `--passphrase-file` vence a variável, e `--no-passphrase` a ignora.
+fn parse_from(
+    argv: impl IntoIterator<Item = String>,
+    env_passphrase_file: Option<String>,
+) -> Result<Args, String> {
+    let _ = &env_passphrase_file;
     let mut args = Args {
+        keys: keys::KeyOptions::default(),
         data_dir: PathBuf::from(".kin"),
         listen: None,
         dial: None,
@@ -68,7 +86,7 @@ fn parse_args() -> Result<Args, String> {
         relay_limits: RelayLimits::default(),
         mdns: true,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} precisa de um valor"));
         match flag.as_str() {
@@ -733,6 +751,62 @@ fn on_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(argv: &[&str], env: Option<&str>) -> Result<Args, String> {
+        parse_from(argv.iter().map(|s| s.to_string()), env.map(str::to_string))
+    }
+
+    #[test]
+    fn key_flags_are_parsed() {
+        let args = parse(&["--passphrase-file", "/s/p", "--protect"], None).unwrap();
+        assert_eq!(args.keys.passphrase_file, Some(PathBuf::from("/s/p")));
+        assert!(args.keys.protect);
+        assert!(!args.keys.no_passphrase);
+        let args = parse(&["--no-passphrase"], None).unwrap();
+        assert!(args.keys.no_passphrase);
+        assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    #[test]
+    fn key_options_default_to_nothing_requested() {
+        let args = parse(&[], None).unwrap();
+        assert_eq!(args.keys, keys::KeyOptions::default());
+    }
+
+    #[test]
+    fn the_environment_variable_supplies_the_passphrase_file() {
+        let args = parse(&[], Some("/env/p")).unwrap();
+        assert_eq!(args.keys.passphrase_file, Some(PathBuf::from("/env/p")));
+    }
+
+    #[test]
+    fn the_flag_beats_the_environment_variable() {
+        let args = parse(&["--passphrase-file", "/flag/p"], Some("/env/p")).unwrap();
+        assert_eq!(args.keys.passphrase_file, Some(PathBuf::from("/flag/p")));
+    }
+
+    #[test]
+    fn an_empty_environment_variable_counts_as_unset() {
+        let args = parse(&[], Some("")).unwrap();
+        assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    #[test]
+    fn no_passphrase_ignores_the_environment_variable() {
+        let args = parse(&["--no-passphrase"], Some("/env/p")).unwrap();
+        assert!(args.keys.no_passphrase);
+        assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    #[test]
+    fn passphrase_file_without_a_value_is_an_error() {
+        assert!(parse(&["--passphrase-file"], None).is_err());
+    }
+
+    #[test]
+    fn unknown_flags_are_still_refused() {
+        assert!(parse(&["--nao-existe"], None).is_err());
+    }
 
     fn entry(seq: u64, outgoing: bool, id: u8, parent: Option<u8>, text: &str) -> HistoryEntry {
         HistoryEntry {
