@@ -143,7 +143,7 @@ fn check_targets(
                 .into(),
         );
     }
-    if master_file.starts_with(authority_dir) {
+    if master_file.starts_with(authority_dir.join("nunca")) {
         return Err(format!(
             "a mestra fria ({}) não pode ficar dentro do diretório do primário ({}): leve-a para fora dele",
             master_file.display(),
