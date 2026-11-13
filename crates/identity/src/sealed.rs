@@ -91,7 +91,9 @@ impl KdfParams {
 /// identidade fica trancada. **Faz parte do formato v1**: quem chama `seal`/`open` com texto digitado
 /// deve passar por aqui. Não apara espaços nem muda a caixa.
 pub fn normalize_passphrase(raw: &str) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(raw.as_bytes().to_vec())
+    use unicode_normalization::UnicodeNormalization as _;
+    let normalized: Zeroizing<String> = Zeroizing::new(raw.nfkc().collect());
+    Zeroizing::new(normalized.as_bytes().to_vec())
 }
 
 /// `true` se `bytes` começa pelo magic de um arquivo cifrado. Não valida o resto.
