@@ -13,6 +13,7 @@ x-kin: &kin
   volumes:
     - ../target/debug/kin:/usr/local/bin/kin:ro
     - ./node.sh:/lab/node.sh:ro
+    - ./passphrase:/lab/passphrase:ro
   entrypoint: ["/lab/node.sh"]
   cap_add: [NET_ADMIN]
   stop_grace_period: 1s
