@@ -40,6 +40,7 @@ use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits}
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct Args {
+    #[allow(dead_code)] // stub: sai quando a implementação entrar
     keys: keys::KeyOptions,
     data_dir: PathBuf,
     listen: Option<Multiaddr>,
