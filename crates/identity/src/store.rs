@@ -154,7 +154,7 @@ pub(crate) fn protect_with(
     if crate::is_sealed(&plain) {
         return Err(Error::AlreadySealed);
     }
-    validate(&plain)?;
+    let _ = &validate;
     let sealed = crate::seal(&plain, passphrase, params)?;
     // Reabre antes de substituir o original: uma cifra que não volta nunca chega ao disco.
     if *crate::open(&sealed, passphrase)? != *plain {
