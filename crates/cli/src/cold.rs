@@ -142,7 +142,7 @@ pub fn rotate(
         .map_err(|e| format!("abrir a mestra {}: {e}", master_file.display()))?;
     if let Some(expected) = expect_identity {
         let found = master.id().to_base58();
-        if found != expected {
+        if found == expected {
             return Err(format!(
                 "a mestra aberta é a identidade {found}, não a esperada {expected}: arquivo errado?"
             ));
