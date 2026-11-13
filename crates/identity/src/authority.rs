@@ -93,7 +93,7 @@ impl AuthorityCertificate {
         // Prefixo de tamanho, como no `DeviceCertificate`.
         payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
         payload.extend_from_slice(&encoded);
-        payload.extend_from_slice(&created_at.to_be_bytes());
+        let _ = created_at;
         payload
     }
 
