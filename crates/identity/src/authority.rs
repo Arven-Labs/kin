@@ -143,7 +143,7 @@ impl AuthorityCertificate {
         }
         let mut cur = bytes
             .strip_prefix(FILE_MAGIC.as_slice())
-            .and_then(|rest| rest.strip_prefix(&[FILE_VERSION]))
+            .and_then(|rest| rest.get(1..))
             .ok_or(Error::InvalidAuthorityCertificate)?;
         let identity = PublicKey::try_decode_protobuf(take(&mut cur).map_err(bad)?).map_err(bad)?;
         let authority_key =
