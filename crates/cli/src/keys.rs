@@ -134,7 +134,7 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
             .map_err(|e| format!("arquivo de senha {shown}: {e}"))?
             .permissions()
             .mode();
-        if mode & 0o077 != 0 {
+        if mode & 0o007 != 0 {
             return Err(format!(
                 "arquivo de senha {shown} legível por outros usuários (modo {:o}): use chmod 600",
                 mode & 0o777
