@@ -4,63 +4,74 @@
 //! primário. Esta fatia é só custódia: nenhum byte de fio muda e a autoridade ainda não assina
 //! devices nem revogações (fatias 2 e 3).
 
-// STUB (etapa 1 do plano): só as assinaturas, para os testes compilarem e falharem.
-
 use std::path::Path;
 
-use libp2p_identity::PublicKey;
+use libp2p_identity::{Keypair, PublicKey};
+use zeroize::Zeroizing;
 
-use crate::{Error, IdentityId, KdfParams};
+use crate::device::{put, take};
+use crate::{Error, IdentityId, KdfParams, store};
 
 /// Domínio de assinatura do certificado de autoridade. Diferente do de `DeviceCertificate`, para uma
 /// assinatura de um nunca valer como a do outro.
-#[allow(dead_code)] // só no stub; a implementação usa
 pub(crate) const AUTHORITY_DOMAIN: &[u8] = b"kin/authority-cert/v1";
 
 /// Chave de autoridade (Ed25519): faz o trabalho diário no primário enquanto a mestra fica fria.
 pub struct AuthorityKey {
-    _private: (),
+    keypair: Keypair,
 }
 
 impl AuthorityKey {
     pub fn generate() -> Self {
-        todo!()
+        Self {
+            keypair: Keypair::generate_ed25519(),
+        }
     }
 
     pub fn public_key(&self) -> PublicKey {
-        todo!()
+        self.keypair.public()
     }
 
-    pub fn sign(&self, _message: &[u8]) -> Result<Vec<u8>, Error> {
-        todo!()
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(self.keypair.sign(message)?)
     }
 
+    /// Protobuf do keypair Ed25519 (o mesmo formato da mestra). É segredo: quem chama não registra nem copia.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        todo!()
+        Ok(self.keypair.to_protobuf_encoding()?)
     }
 
-    pub fn from_bytes(_bytes: &[u8]) -> Result<Self, Error> {
-        todo!()
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let keypair =
+            Keypair::from_protobuf_encoding(bytes).map_err(|_| Error::InvalidAuthorityKey)?;
+        keypair
+            .clone()
+            .try_into_ed25519()
+            .map_err(|_| Error::NotEd25519)?;
+        Ok(Self { keypair })
     }
 
-    /// Grava a chave de autoridade **cifrada** com a senha (ADR 0012).
+    /// Grava a chave de autoridade **cifrada** com a senha (ADR 0012), de forma atômica e com modo 0600.
     pub fn save_sealed(
         &self,
-        _path: &Path,
-        _passphrase: &[u8],
-        _params: KdfParams,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
     ) -> Result<(), Error> {
-        todo!()
+        store::write_key_sealed(path, &Zeroizing::new(self.to_bytes()?), passphrase, params)
     }
 
-    /// Cifra no lugar um `authority.key` em claro (migração).
-    pub fn protect(_path: &Path, _passphrase: &[u8], _params: KdfParams) -> Result<(), Error> {
-        todo!()
+    /// Cifra no lugar um `authority.key` em claro (migração), com as garantias de `store::protect_with`.
+    pub fn protect(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
+        store::protect_with(path, passphrase, params, |bytes| {
+            Self::from_bytes(bytes).map(|_| ())
+        })
     }
 
-    /// Lê a chave de autoridade de um arquivo cifrado ou em claro (mesma política do ADR 0012).
-    pub fn load_with(_path: &Path, _passphrase: Option<&[u8]>) -> Result<Self, Error> {
-        todo!()
+    /// Lê a chave de autoridade de um arquivo cifrado ou em claro. Cifrado sem senha:
+    /// [`Error::PassphraseRequired`]; em claro **com** senha: [`Error::PlainFileWhereSealedExpected`].
+    pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
+        Self::from_bytes(&store::read_key(path, passphrase)?)
     }
 }
 
@@ -76,23 +87,63 @@ pub struct AuthorityCertificate {
 
 impl AuthorityCertificate {
     /// Bytes que a mestra assina (domínio + chave de autoridade + `created_at`).
-    #[allow(dead_code)] // só no stub; a implementação usa
-    pub(crate) fn signing_payload(_authority_key: &PublicKey, _created_at: u64) -> Vec<u8> {
-        todo!()
+    pub(crate) fn signing_payload(authority_key: &PublicKey, created_at: u64) -> Vec<u8> {
+        let mut payload = AUTHORITY_DOMAIN.to_vec();
+        let encoded = authority_key.encode_protobuf();
+        // Prefixo de tamanho, como no `DeviceCertificate`.
+        payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&encoded);
+        payload.extend_from_slice(&created_at.to_be_bytes());
+        payload
     }
 
-    /// Confere a assinatura da mestra (`identity`) sobre a chave de autoridade.
+    /// Confere a assinatura da mestra (`identity`) sobre a chave de autoridade. Não diz se essa
+    /// identidade é a que o chamador espera: isso é com quem chama.
     pub fn verify(&self) -> Result<(), Error> {
-        todo!()
+        let payload = Self::signing_payload(&self.authority_key, self.created_at);
+        if self.identity.public_key().verify(&payload, &self.signature) {
+            Ok(())
+        } else {
+            Err(Error::InvalidAuthorityCertificate)
+        }
     }
 
+    /// `len16|identidade | len16|chave de autoridade | created_at u64 BE | len16|assinatura`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        todo!()
+        let mut out = Vec::new();
+        put(&mut out, &self.identity.public_key().encode_protobuf());
+        put(&mut out, &self.authority_key.encode_protobuf());
+        out.extend_from_slice(&self.created_at.to_be_bytes());
+        put(&mut out, &self.signature);
+        out
     }
 
     /// Lê um certificado serializado por [`Self::to_bytes`]. Não confere a assinatura: use `verify`.
-    pub fn from_bytes(_bytes: &[u8]) -> Result<Self, Error> {
-        todo!()
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        fn bad<E>(_: E) -> Error {
+            Error::InvalidAuthorityCertificate
+        }
+        let mut cur = bytes;
+        let identity = PublicKey::try_decode_protobuf(take(&mut cur).map_err(bad)?).map_err(bad)?;
+        let authority_key =
+            PublicKey::try_decode_protobuf(take(&mut cur).map_err(bad)?).map_err(bad)?;
+        let created_at = u64::from_be_bytes(
+            cur.get(..8)
+                .ok_or(Error::InvalidAuthorityCertificate)?
+                .try_into()
+                .map_err(|_| Error::InvalidAuthorityCertificate)?,
+        );
+        cur = &cur[8..];
+        let signature = take(&mut cur).map_err(bad)?.to_vec();
+        if !cur.is_empty() {
+            return Err(Error::InvalidAuthorityCertificate);
+        }
+        Ok(Self {
+            identity: IdentityId::new(identity),
+            authority_key,
+            created_at,
+            signature,
+        })
     }
 }
 

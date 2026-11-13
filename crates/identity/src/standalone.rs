@@ -95,10 +95,16 @@ impl StandaloneIdentity {
     /// com a mestra **fria** (offline). `created_at` em segundos Unix, passado de fora.
     pub fn certify_authority(
         &self,
-        _authority_key: &PublicKey,
-        _created_at: u64,
+        authority_key: &PublicKey,
+        created_at: u64,
     ) -> Result<crate::AuthorityCertificate, Error> {
-        todo!()
+        let payload = crate::AuthorityCertificate::signing_payload(authority_key, created_at);
+        Ok(crate::AuthorityCertificate {
+            identity: self.id(),
+            authority_key: authority_key.clone(),
+            created_at,
+            signature: self.master.sign(&payload)?,
+        })
     }
 
     /// Lê a chave mestra de um arquivo cifrado ou em claro (formato antigo). Cifrado sem senha:
