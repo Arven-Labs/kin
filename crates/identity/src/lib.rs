@@ -6,6 +6,7 @@
 mod device;
 mod error;
 mod provider;
+mod sealed;
 mod standalone;
 mod store;
 
@@ -15,4 +16,6 @@ pub use device::{
 pub use error::Error;
 pub use libp2p_identity::{PeerId, PublicKey};
 pub use provider::{IdentityId, IdentityProvider};
+pub use sealed::{KdfParams, is_sealed, normalize_passphrase, open, seal};
 pub use standalone::StandaloneIdentity;
+pub use store::key_file_is_sealed;

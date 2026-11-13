@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|history-sync]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -182,15 +182,22 @@ scenario_relay_failover() {
 scenario_multi_device() {
   echo "== Multi-device atrás de NAT: descoberta, espelho e fan-out (A1 e A2 irmãos, C contato)"
   infra cone || { fail "montar o laboratório"; return; }
-  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --listen /ip4/0.0.0.0/tcp/4002"
+  # KEY_ARGS (vazio por padrão = chaves cifradas com a senha do lab; `--no-passphrase` = em claro).
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --listen /ip4/0.0.0.0/tcp/4002 ${KEY_ARGS:-}"
   compose up -d a >/dev/null
   wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; return; }
   A1_ID=$(peer_id a)
+  local magic; magic=$(compose exec -T a head -c4 /data/identity.key 2>/dev/null)
+  if [ -n "${KEY_ARGS:-}" ]; then
+    check "identity.key de a está em claro (--no-passphrase)" [ "$magic" != KINK ]
+  else
+    check "identity.key de a está cifrado (começa por KINK)" [ "$magic" = KINK ]
+  fi
 
   local keydir; keydir=$(mktemp -d)
   compose cp a:/data/identity.key "$keydir/identity.key" >/dev/null 2>&1 \
     || { fail "copiar o identity.key de a"; rm -rf "$keydir"; return; }
-  export A2_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
+  export A2_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID ${KEY_ARGS:-}"
   compose create a2 >/dev/null 2>&1
   compose cp "$keydir/identity.key" a2:/tmp/identity.key >/dev/null 2>&1 \
     || { fail "copiar o identity.key para a2"; rm -rf "$keydir"; return; }
@@ -208,7 +215,7 @@ scenario_multi_device() {
   X=$(first a "conversa cifrada pronta com $A2_ID \(identidade [A-Za-z0-9]+" | awk '{print $NF}')
   check "a2 tem a mesma identidade de a1" wait_log a2 "conversa cifrada pronta com $A1_ID \(identidade ${X}\)" 5
 
-  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
+  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR ${KEY_ARGS:-}"
   compose up -d b >/dev/null
   wait_log b "reserva aceita no relay" 30 || { fail "c sem reserva no relay"; logs b; return; }
   C_ID=$(peer_id b)
@@ -260,6 +267,11 @@ scenario_multi_device() {
   say b "oi de C"
   check "c -> X: a1 recebe" wait_log a "peer: oi de C" 20
   check "c -> X: a2 recebe" wait_log a2 "peer: oi de C" 20
+}
+
+# O mesmo cenário com as chaves em claro (`--no-passphrase`): cobre o caminho sem senha.
+scenario_multi_device_plain() {
+  KEY_ARGS="--no-passphrase" scenario_multi_device
 }
 
 # A1 (`a`) e C (`b`) conversam; SÓ DEPOIS entra A2 (`a2`), irmão de A1 com banco vazio, e deve receber o
@@ -341,13 +353,14 @@ run_scenario() {
     invite) scenario_invite ;;
     relay-failover) scenario_relay_failover ;;
     multi-device) scenario_multi_device ;;
+    multi-device-plain) scenario_multi_device_plain ;;
     history-sync) scenario_history_sync ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device history-sync)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}

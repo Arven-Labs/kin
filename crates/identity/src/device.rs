@@ -1,7 +1,9 @@
+use std::path::Path;
+
 use libp2p_identity::{Keypair, PeerId, PublicKey};
 use secp256k1::{Keypair as SchnorrKeypair, Secp256k1, XOnlyPublicKey};
 
-use crate::{Error, IdentityId};
+use crate::{Error, IdentityId, KdfParams, store};
 
 const CERT_DOMAIN: &[u8] = b"kin/device-cert/v3";
 
@@ -71,8 +73,11 @@ impl DeviceKey {
     /// `versão u8 | len16 | keypair de rede (protobuf) | chave secreta Nostr (32 bytes)`.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut out = vec![DEVICE_KEY_FORMAT];
-        put(&mut out, &self.network.to_protobuf_encoding()?);
-        out.extend_from_slice(&self.nostr.secret_bytes());
+        put(
+            &mut out,
+            &zeroize::Zeroizing::new(self.network.to_protobuf_encoding()?),
+        );
+        out.extend_from_slice(&zeroize::Zeroizing::new(self.nostr.secret_bytes())[..]);
         Ok(out)
     }
 
@@ -87,10 +92,41 @@ impl DeviceKey {
             .clone()
             .try_into_ed25519()
             .map_err(|_| Error::NotEd25519)?;
-        let secret: [u8; 32] = cur.try_into().map_err(|_| Error::InvalidDeviceKey)?;
-        let nostr = SchnorrKeypair::from_seckey_slice(&Secp256k1::signing_only(), &secret)
+        let secret = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(cur).map_err(|_| Error::InvalidDeviceKey)?,
+        );
+        let nostr = SchnorrKeypair::from_seckey_slice(&Secp256k1::signing_only(), &secret[..])
             .map_err(|_| Error::InvalidDeviceKey)?;
         Ok(Self { network, nostr })
+    }
+
+    /// Grava a chave do device **cifrada** com a senha (P13, ADR 0012), de forma atômica e com modo 0600.
+    pub fn save_sealed(
+        &self,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
+    ) -> Result<(), Error> {
+        store::write_key_sealed(
+            path,
+            &zeroize::Zeroizing::new(self.to_bytes()?),
+            passphrase,
+            params,
+        )
+    }
+
+    /// Cifra no lugar um `device.key` **em claro** (migração), com as mesmas garantias de
+    /// `StandaloneIdentity::protect`.
+    pub fn protect(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
+        store::protect_with(path, passphrase, params, |bytes| {
+            Self::from_bytes(bytes).map(|_| ())
+        })
+    }
+
+    /// Lê a chave do device de um arquivo cifrado ou em claro. Cifrado sem senha:
+    /// [`Error::PassphraseRequired`]; em claro **com** senha: [`Error::PlainFileWhereSealedExpected`].
+    pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
+        Self::from_bytes(&store::read_key(path, passphrase)?)
     }
 }
 
@@ -225,4 +261,94 @@ pub fn ed25519_bytes(key: &PublicKey) -> Result<[u8; 32], Error> {
         .try_into_ed25519()
         .map_err(|_| Error::NotEd25519)?
         .to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PASS: &[u8] = b"senha de teste";
+
+    #[test]
+    fn sealed_device_key_loads_back_with_the_same_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        let device = DeviceKey::generate();
+        device.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
+        let loaded = DeviceKey::load_with(&path, Some(PASS)).unwrap();
+        assert_eq!(loaded.peer_id(), device.peer_id());
+        assert_eq!(loaded.nostr_public_key(), device.nostr_public_key());
+        assert_eq!(loaded.nostr_secret_bytes(), device.nostr_secret_bytes());
+    }
+
+    #[test]
+    fn sealed_device_key_does_not_leak_the_nostr_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        let device = DeviceKey::generate();
+        device.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+        let secret = device.nostr_secret_bytes();
+        assert!(!on_disk.windows(32).any(|w| w == secret));
+    }
+
+    #[test]
+    fn sealed_device_key_needs_the_right_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        DeviceKey::generate()
+            .save_sealed(&path, PASS, KdfParams::MIN)
+            .unwrap();
+        assert!(matches!(
+            DeviceKey::load_with(&path, None).err().unwrap(),
+            Error::PassphraseRequired
+        ));
+        assert!(matches!(
+            DeviceKey::load_with(&path, Some(b"errada")).err().unwrap(),
+            Error::WrongPassphraseOrCorrupt
+        ));
+    }
+
+    #[test]
+    fn legacy_plain_device_key_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        let device = DeviceKey::generate();
+        std::fs::write(&path, device.to_bytes().unwrap()).unwrap();
+        let loaded = DeviceKey::load_with(&path, None).unwrap();
+        assert_eq!(loaded.peer_id(), device.peer_id());
+    }
+
+    #[test]
+    fn protecting_a_legacy_device_key_keeps_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        let device = DeviceKey::generate();
+        std::fs::write(&path, device.to_bytes().unwrap()).unwrap();
+        DeviceKey::protect(&path, PASS, KdfParams::MIN).unwrap();
+        let loaded = DeviceKey::load_with(&path, Some(PASS)).unwrap();
+        assert_eq!(loaded.nostr_secret_bytes(), device.nostr_secret_bytes());
+    }
+
+    #[test]
+    fn legacy_plain_device_key_is_refused_when_a_passphrase_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        std::fs::write(&path, DeviceKey::generate().to_bytes().unwrap()).unwrap();
+        assert!(matches!(
+            DeviceKey::load_with(&path, Some(PASS)).err().unwrap(),
+            Error::PlainFileWhereSealedExpected
+        ));
+    }
+
+    #[test]
+    fn protecting_a_device_key_refuses_garbage_and_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        for content in [&b""[..], &b"lixo qualquer"[..]] {
+            std::fs::write(&path, content).unwrap();
+            assert!(DeviceKey::protect(&path, PASS, KdfParams::MIN).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), content, "original alterado");
+        }
+    }
 }

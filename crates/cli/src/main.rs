@@ -30,6 +30,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod keys;
+
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Error, HistoryEntry, Invite, Message, MessageId};
 use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
@@ -37,6 +39,7 @@ use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits}
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 struct Args {
+    keys: keys::KeyOptions,
     data_dir: PathBuf,
     listen: Option<Multiaddr>,
     dial: Option<Multiaddr>,
@@ -53,7 +56,20 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_from(
+        std::env::args().skip(1),
+        std::env::var("KIN_PASSPHRASE_FILE").ok(),
+    )
+}
+
+/// `env_passphrase_file`: valor de `KIN_PASSPHRASE_FILE` (vazio conta como ausente). A flag
+/// `--passphrase-file` vence a variável, e `--no-passphrase` a ignora.
+fn parse_from(
+    argv: impl IntoIterator<Item = String>,
+    env_passphrase_file: Option<String>,
+) -> Result<Args, String> {
     let mut args = Args {
+        keys: keys::KeyOptions::default(),
         data_dir: PathBuf::from(".kin"),
         listen: None,
         dial: None,
@@ -68,7 +84,7 @@ fn parse_args() -> Result<Args, String> {
         relay_limits: RelayLimits::default(),
         mdns: true,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} precisa de um valor"));
         match flag.as_str() {
@@ -77,6 +93,9 @@ fn parse_args() -> Result<Args, String> {
             "--dial" => args.dial = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--accept" => args.accept = Some(value()?),
             "--pair" => args.pair = Some(value()?),
+            "--passphrase-file" => args.keys.passphrase_file = Some(value()?.into()),
+            "--protect" => args.keys.protect = true,
+            "--no-passphrase" => args.keys.no_passphrase = true,
             "--relay-count" => {
                 args.relay_count = Some(value()?.parse().map_err(|e| format!("{e}"))?);
             }
@@ -100,61 +119,85 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("argumento desconhecido: {other}")),
         }
     }
+    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
+        args.keys.passphrase_file = env_passphrase_file
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
+    }
     Ok(args)
 }
 
-/// Carrega a identidade e a chave de device do diretório, criando-as na primeira execução.
-/// Sem cifra em repouso (P13): só para desenvolvimento.
+/// Carrega a identidade e a chave de device do diretório, criando-as na primeira execução (P13,
+/// ADR 0012). Por padrão ficam **cifradas** com uma senha (prompt, `--passphrase-file` ou
+/// `KIN_PASSPHRASE_FILE`); `--no-passphrase` grava em claro; `--protect` cifra no lugar um diretório
+/// antigo em claro.
 ///
-/// `pair` (de `--pair`, ADR 0006): o link `kin://pair/...` de outro device desta identidade, lido de
-/// um arquivo (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com
-/// `identity.key` já existente falha, em vez de sobrescrever uma identidade. O device continua com
-/// `device.key` próprio, gerado aqui.
-fn load_keys(
-    dir: &Path,
-    pair: Option<&str>,
-) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+/// `--pair` (ADR 0006): o link `kin://pair/...` de outro device desta identidade, lido de um arquivo
+/// (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com `identity.key`
+/// já existente falha, em vez de sobrescrever uma identidade. O device continua com `device.key`
+/// próprio, gerado aqui.
+fn open_keys(args: &Args) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+    let dir = &args.data_dir;
     std::fs::create_dir_all(dir)?;
-    let identity_path = dir.join("identity.key");
-    let device_path = dir.join("device.key");
-    if let Some(source) = pair {
-        if identity_path.exists() {
-            return Err(
-                "já existe identity.key neste --data-dir: --pair não sobrescreve uma identidade"
-                    .into(),
-            );
+    let state = keys::files_state(dir)?;
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let access = keys::decide(&args.keys, state, tty)?;
+    let (passphrase, protect) = match &access {
+        keys::Access::Plain(keys::PlainReason::Explicit) => {
+            eprintln!("aviso: --no-passphrase: as chaves ficam em claro no disco (só 0600)");
+            (None, false)
         }
-        // Estado MLS e outbox pertencem à identidade que os criou; com outra identidade, o `Chat`
-        // abriria conversas que não são dela.
-        if dir.join("mls.sqlite").exists() {
-            return Err(
-                "este --data-dir já tem estado (mls.sqlite) de outra identidade: use um diretório novo"
-                    .into(),
+        keys::Access::Plain(keys::PlainReason::Legacy) => {
+            eprintln!(
+                "aviso: as chaves deste --data-dir estão em claro; rode uma vez com --protect para cifrá-las"
             );
+            (None, false)
         }
-        let text = read_pair_link(source)?;
-        let imported = StandaloneIdentity::from_pair_link(&text)?;
-        write_private(&identity_path, &imported.to_bytes()?)?;
-        println!("identidade importada: {}", imported.id().to_base58());
+        keys::Access::Sealed { source, protect } => {
+            let pass = match source {
+                keys::Source::File(path) => keys::read_passphrase_file(path)?,
+                keys::Source::Prompt { confirm } => prompt_passphrase(*confirm)?,
+            };
+            (Some(pass), *protect)
+        }
+    };
+    let pair_text = args.pair.as_deref().map(read_pair_link).transpose()?;
+    if protect {
+        eprintln!(
+            "aviso: o arquivo em claro antigo pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate a chave como exposta"
+        );
+    }
+    let loaded = keys::load(
+        dir,
+        pair_text.as_deref(),
+        passphrase.as_ref().map(|p| p.as_slice()),
+        protect,
+        kin_identity::KdfParams::DEFAULT,
+    )?;
+    if let Some(source) = &args.pair {
+        println!("identidade importada: {}", loaded.0.id().to_base58());
         if source != "-" {
             println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
         }
     }
-    let identity = if identity_path.exists() {
-        StandaloneIdentity::load(&identity_path)?
-    } else {
-        let identity = StandaloneIdentity::generate();
-        identity.save(&identity_path)?;
-        identity
-    };
-    let device = if device_path.exists() {
-        DeviceKey::from_bytes(&std::fs::read(&device_path)?)?
-    } else {
-        let device = DeviceKey::generate();
-        write_private(&device_path, &device.to_bytes()?)?;
-        device
-    };
-    Ok((identity, device))
+    Ok(loaded)
+}
+
+/// Pede a senha no terminal, sem eco; `confirm` pede de novo e exige que conferam. Normalizada em NFKC.
+fn prompt_passphrase(
+    confirm: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, Box<dyn std::error::Error>> {
+    let first = zeroize::Zeroizing::new(rpassword::prompt_password("senha: ")?);
+    if first.is_empty() {
+        return Err("a senha não pode ser vazia".into());
+    }
+    if confirm {
+        let second = zeroize::Zeroizing::new(rpassword::prompt_password("repita a senha: ")?);
+        if *first != *second {
+            return Err("as senhas não conferem".into());
+        }
+    }
+    Ok(kin_identity::normalize_passphrase(&first))
 }
 
 /// Lê o link de pareamento de um arquivo ou do stdin (`-`, até o EOF: o chat do mesmo processo não
@@ -206,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         e
     })?;
-    let (identity, device) = load_keys(&args.data_dir, args.pair.as_deref())?;
+    let (identity, device) = open_keys(&args)?;
     if args.serve_relay {
         return serve_relay(&args, &device).await;
     }
@@ -733,6 +776,62 @@ fn on_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(argv: &[&str], env: Option<&str>) -> Result<Args, String> {
+        parse_from(argv.iter().map(|s| s.to_string()), env.map(str::to_string))
+    }
+
+    #[test]
+    fn key_flags_are_parsed() {
+        let args = parse(&["--passphrase-file", "/s/p", "--protect"], None).unwrap();
+        assert_eq!(args.keys.passphrase_file, Some(PathBuf::from("/s/p")));
+        assert!(args.keys.protect);
+        assert!(!args.keys.no_passphrase);
+        let args = parse(&["--no-passphrase"], None).unwrap();
+        assert!(args.keys.no_passphrase);
+        assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    #[test]
+    fn key_options_default_to_nothing_requested() {
+        let args = parse(&[], None).unwrap();
+        assert_eq!(args.keys, keys::KeyOptions::default());
+    }
+
+    #[test]
+    fn the_environment_variable_supplies_the_passphrase_file() {
+        let args = parse(&[], Some("/env/p")).unwrap();
+        assert_eq!(args.keys.passphrase_file, Some(PathBuf::from("/env/p")));
+    }
+
+    #[test]
+    fn the_flag_beats_the_environment_variable() {
+        let args = parse(&["--passphrase-file", "/flag/p"], Some("/env/p")).unwrap();
+        assert_eq!(args.keys.passphrase_file, Some(PathBuf::from("/flag/p")));
+    }
+
+    #[test]
+    fn an_empty_environment_variable_counts_as_unset() {
+        let args = parse(&[], Some("")).unwrap();
+        assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    #[test]
+    fn no_passphrase_ignores_the_environment_variable() {
+        let args = parse(&["--no-passphrase"], Some("/env/p")).unwrap();
+        assert!(args.keys.no_passphrase);
+        assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    #[test]
+    fn passphrase_file_without_a_value_is_an_error() {
+        assert!(parse(&["--passphrase-file"], None).is_err());
+    }
+
+    #[test]
+    fn unknown_flags_are_still_refused() {
+        assert!(parse(&["--nao-existe"], None).is_err());
+    }
 
     fn entry(seq: u64, outgoing: bool, id: u8, parent: Option<u8>, text: &str) -> HistoryEntry {
         HistoryEntry {

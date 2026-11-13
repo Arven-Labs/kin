@@ -1285,4 +1285,39 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   por **D** (mestra fria + autoridade); **identidade nova** na migração; primário **obrigatório**; frescor = **convite com
   expiração primeiro**; limite do contato offline **aceito**. O ADR 0011 passou a **aceito** (PR de docs desta subseção).
 - **Próximo passo**: fatia 1 do P30 (custódia e cifra da mestra do primário, P13, mais a mestra fria e a chave de autoridade da
-  opção D) com plan mode, testes primeiro e auditoria.
+  opção D) com plan mode, testes primeiro e auditoria. (A 1a começou na subseção abaixo.)
+
+#### Cifra em repouso das chaves (P13, P30 fatia 1a, ADR 0012, PR #118)
+
+- **Decisões do dono** (plan mode + perguntas): cortar a fatia 1 em **1a só cifra em repouso** (mestra fria e autoridade viram 1b;
+  descartados: 1a+1b juntas, só 1b); **senha com Argon2id + XChaCha20-Poly1305** (descartados: keyring do SO, os dois em fatias);
+  depois do parecer: recusar arquivo em claro quando há senha, `protect_identity`/`protect_device` com validação, teto do KDF em
+  256 MiB e t ≤ 6 com `MIN` só para testes, **senha normalizada em NFKC**, diretório legado em claro **abre com aviso**, lab com
+  senha de laboratório montada em todos os nós. Aprovou três tabelas de testes (camada `identity`, correções do parecer, CLI).
+- **Feito**: `crates/identity` (`sealed.rs`: `seal`, `open`, `normalize_passphrase`, `KdfParams`; `store.rs`: escrita atômica,
+  `read_key`, `protect_with`, `key_file_is_sealed`; `save_sealed`/`load_with`/`protect` em `StandaloneIdentity` e `DeviceKey`);
+  `crates/cli` (`keys.rs`: `decide`, `files_state`, `read_passphrase_file`, `load`; flags `--passphrase-file`, `--protect`,
+  `--no-passphrase`, `KIN_PASSPHRASE_FILE`, prompt com `rpassword`); lab (`lab/passphrase`, `node.sh`, cenário
+  `multi-device-plain`, checagem de `KINK` no `multi-device`); ADR 0012. Dependências novas: `argon2 =0.5.3`,
+  `chacha20poly1305 =0.10.1`, `zeroize =1.9.1`, `unicode-normalization =0.1.26`, `rpassword =7.5.4`.
+- **Prova de que testam algo** (CI do #118): camada `identity`, **32 de 32 falharam** contra os stubs, depois passaram; correções do
+  parecer, **9 falharam** e passaram; NFKC, **3 falharam** e passaram; CLI, **33 falharam** (25 já passavam: os antigos e 4 de
+  parsing) e passaram. Último run verde: 43346128811 (clippy e todos os testes).
+- **Mutações** (PRs #119 a #123 e #124 a #128, fechados e apagados, 10 de 10 pegas): teto de `m_cost` exclusivo, gravar no lugar
+  em vez de temp+rename, modo 0644, salt zero, `protect` sem recusar arquivo já cifrado, claro aceito com senha, `protect` sem
+  validar, teto de leitura 1000 vezes maior, guarda do legado invertida, checagem de modo do arquivo de senha só para "outros".
+  **Correção ao plano**: a mutação "remover o AAD" **não** derruba teste algum (salt e parâmetros já entram na derivação da
+  chave); o AAD é defesa em profundidade, e o plano exagerou ao vendê-lo como proteção principal.
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; 4 importantes (downgrade, temp de nome fixo, rastro do arquivo
+  em claro, `protect` sem validar) e 5 sugestões, todos tratados ou documentados (tabela no ADR 0012). A mutação da guarda do
+  legado compilou só na segunda tentativa (a primeira deixava um padrão inalcançável e falhava no clippy, não nos testes).
+- **Tropeços**: o clippy barrou o stub por `dead_code` (de novo, 5ª vez; agora também nas constantes e num campo); um `cat >>` no
+  Bash foi barrado pelo classificador (a regra é só `Edit`/`Write`; refiz com `Edit`); a mutação do salt falhou primeiro por
+  compilação (`mut` sem uso).
+- **Lab** (rodado pelo dono, uma rodada de cada, sem `REPEAT`): `multi-device`, `multi-device-plain` e `history-sync`, **29 PASS e 0
+  FAIL, `TUDO OK`**. O `multi-device` confirmou `KINK` no `identity.key` de `a` e o `a2` abriu a cópia com a mesma senha; o
+  `multi-device-plain` confirmou o arquivo em claro.
+- **Não verificado**: o prompt sem eco (o lab não tem terminal); Windows, Android e iOS; o código do `argon2` por dentro (aborto por
+  falta de memória, feature `zeroize`); revisão externa do formato; a recuperabilidade dos blocos do arquivo antigo (só documentada);
+  os demais cenários do lab (`cone`, `symmetric`, `relay-down`, `invite`, `relay-failover`) com chaves cifradas, não rodados.
+- **Próximo passo**: mesclar; depois fatia 1b (mestra fria e chave de autoridade, opção D), em plan mode.

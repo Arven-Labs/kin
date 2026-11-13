@@ -23,12 +23,19 @@ KEEP=1 lab/run.sh cone          # deixa os containers de pé para olhar os logs
 | `invite` | `a` gera o link (`/invite`), `b` o aceita (`--accept`) atrás de NAT: link adulterado é recusado, conversa pronta, hole punching |
 | `relay-failover` | dois relays; o reservado cai, `a` passa para o outro e um convite novo funciona por ele |
 | `multi-device` | `a` e `a2` (mesma identidade, mesma LAN) e `b` como contato atrás de outro NAT: `a2` **não** acha `b` antes do `/trust` (controle negativo) e acha sozinho depois, furo direto `a2` ↔ `b`, espelho nos dois sentidos com o mesmo `MessageId`, e `b` falando com a identidade chega nos dois |
+| `multi-device-plain` | o mesmo cenário com `--no-passphrase` (chaves em claro), para cobrir o caminho sem senha |
 | `history-sync` | `a` e `b` trocam 3 mensagens (uma resposta com `/r`) e **só depois** entra o `a2` (irmão, banco vazio): recebe `3 novas, completo`; depois do `/trust` de `b`, o `/history` do `a2` mostra as 3 linhas com os mesmos `MessageId` e direções, e uma mensagem nova de `b` chega 1 vez em cada irmão sem duplicar no histórico. **Não cobre** reconectar o `a2` sem reimportar (reiniciar esbarra no P16) |
 
 `REPEAT=5 lab/run.sh` roda cada cenário 5 vezes e imprime `x/5` por cenário (o hole punching varia de rodada para rodada).
 
 No `multi-device`, o `a2` recebe o `identity.key` de `a` por `compose cp` (é o que o `--pair` grava): o `/pair` da CLI recusa
 saída que não é terminal, e o log do Docker é um pipe.
+
+**Chaves cifradas (ADR 0012):** por padrão os nós do lab guardam `identity.key` e `device.key` cifrados. O stdin é uma fifo
+(sem terminal), então a senha vem de `lab/passphrase` (senha só do laboratório, montada em `/lab/passphrase`); o `node.sh` a
+copia para um arquivo 0600 e exporta `KIN_PASSPHRASE_FILE`, porque a CLI recusa arquivo de senha legível por outros e o git não
+guarda o modo. Como os dois devices da mesma identidade usam a mesma senha, o `identity.key` copiado por `compose cp` abre no `a2`.
+O `multi-device` confere que o arquivo de `a` começa por `KINK`; o `multi-device-plain` confere que não.
 
 Os roteadores descartam em silêncio pacote de fora sem mapeamento (como um roteador doméstico), o que
 deixa o SYN reenviado passar quando o outro lado abre o mapeamento.
