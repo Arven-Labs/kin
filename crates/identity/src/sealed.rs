@@ -94,7 +94,7 @@ pub fn seal(plaintext: &[u8], passphrase: &[u8], params: KdfParams) -> Result<Ve
     }
     // Revalida: `params` pode ter vindo de uma constante ou de `new`, mas o formato só aceita o que `open` aceita.
     let params = KdfParams::new(params.m_cost_kib, params.t_cost, params.lanes)?;
-    let mut salt = [0u8; SALT_LEN];
+    let salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     let mut rng = secp256k1::rand::thread_rng();
     let _ = &mut rng;
