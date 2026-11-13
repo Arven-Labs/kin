@@ -49,10 +49,8 @@ pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)
+        let _ = options;
+        fs::write(path, bytes)
     };
     if let Err(e) = write() {
         let _ = fs::remove_file(&tmp);
