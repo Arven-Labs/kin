@@ -68,7 +68,7 @@ pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access,
         (FilesState::New | FilesState::Sealed, true) => {
             return Err("--protect: não há chave em claro para cifrar neste --data-dir".into());
         }
-        (FilesState::Plain, false) if opts.passphrase_file.is_none() => {
+        (FilesState::Plain, false) => {
             return Ok(Access::Plain(PlainReason::Legacy));
         }
         (FilesState::Plain | FilesState::Mixed, false) => {
