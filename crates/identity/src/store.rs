@@ -96,9 +96,20 @@ pub fn key_file_is_sealed(path: &Path) -> Result<bool, Error> {
 }
 
 /// Migra um arquivo de chave **em claro** para o formato cifrado, no lugar e de forma atômica.
-/// Recusa um arquivo já cifrado ([`Error::AlreadySealed`]) e senha vazia; em qualquer falha o original
-/// fica intacto.
-pub fn protect_key_file(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
+/// `validate` confere o conteúdo antes de cifrar (um arquivo vazio, truncado ou de outro tipo não é
+/// selado). Recusa um arquivo já cifrado ([`Error::AlreadySealed`]) e senha vazia; em qualquer falha o
+/// original fica intacto.
+///
+/// **Limite**: o `rename` troca o inode; os blocos do arquivo em claro antigo seguem no disco (SSD,
+/// journal, snapshot, backup) até serem reutilizados. Uma chave que já esteve em claro deve ser
+/// considerada exposta se o disco ou o backup não for confiável.
+pub(crate) fn protect_with(
+    path: &Path,
+    passphrase: &[u8],
+    params: KdfParams,
+    validate: impl Fn(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let _ = &validate;
     let plain = Zeroizing::new(fs::read(path)?);
     if crate::is_sealed(&plain) {
         return Err(Error::AlreadySealed);
@@ -113,6 +124,14 @@ mod tests {
 
     const PASS: &[u8] = b"senha de teste";
     const SECRET: &[u8] = b"conteudo-da-chave";
+
+    fn ok(_: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn reject(_: &[u8]) -> Result<(), Error> {
+        Err(Error::InvalidDeviceKey)
+    }
 
     fn plain_file(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("identity.key");
@@ -131,7 +150,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = plain_file(dir.path());
         assert!(!key_file_is_sealed(&path).unwrap());
-        protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        protect_with(&path, PASS, KdfParams::MIN, ok).unwrap();
         assert!(key_file_is_sealed(&path).unwrap());
         assert_eq!(&*open(&fs::read(&path).unwrap(), PASS).unwrap(), SECRET);
         #[cfg(unix)]
@@ -142,7 +161,7 @@ mod tests {
     fn protect_leaves_no_temporary_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         let path = plain_file(dir.path());
-        protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        protect_with(&path, PASS, KdfParams::MIN, ok).unwrap();
         let names: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -154,9 +173,9 @@ mod tests {
     fn protect_refuses_an_already_sealed_file_and_keeps_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = plain_file(dir.path());
-        protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        protect_with(&path, PASS, KdfParams::MIN, ok).unwrap();
         let before = fs::read(&path).unwrap();
-        let err = protect_key_file(&path, b"outra", KdfParams::MIN).unwrap_err();
+        let err = protect_with(&path, b"outra", KdfParams::MIN, ok).unwrap_err();
         assert!(matches!(err, Error::AlreadySealed));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -165,7 +184,7 @@ mod tests {
     fn protect_with_empty_passphrase_keeps_the_original() {
         let dir = tempfile::tempdir().unwrap();
         let path = plain_file(dir.path());
-        let err = protect_key_file(&path, b"", KdfParams::MIN).unwrap_err();
+        let err = protect_with(&path, b"", KdfParams::MIN, ok).unwrap_err();
         assert!(matches!(err, Error::EmptyPassphrase));
         assert_eq!(fs::read(&path).unwrap(), SECRET);
     }
@@ -174,7 +193,7 @@ mod tests {
     fn protect_of_a_missing_file_is_an_io_error() {
         let dir = tempfile::tempdir().unwrap();
         let err =
-            protect_key_file(&dir.path().join("nao-existe"), PASS, KdfParams::MIN).unwrap_err();
+            protect_with(&dir.path().join("nao-existe"), PASS, KdfParams::MIN, ok).unwrap_err();
         assert!(matches!(err, Error::Io(_)));
     }
 
@@ -187,7 +206,7 @@ mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
         // Como root o diretório continua gravável e o cenário não existe: não há o que provar.
         let writable = fs::File::create(dir.path().join("probe")).is_ok();
-        let result = protect_key_file(&path, PASS, KdfParams::MIN);
+        let result = protect_with(&path, PASS, KdfParams::MIN, ok);
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         if !writable {
             assert!(result.is_err());
@@ -200,8 +219,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = plain_file(dir.path());
         assert_eq!(&*read_key(&path, None).unwrap(), SECRET);
-        assert_eq!(&*read_key(&path, Some(PASS)).unwrap(), SECRET);
-        protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        // Com senha informada, um arquivo em claro é anômalo (troca de arquivo): não abre.
+        assert!(matches!(
+            read_key(&path, Some(PASS)).unwrap_err(),
+            Error::PlainFileWhereSealedExpected
+        ));
+        protect_with(&path, PASS, KdfParams::MIN, ok).unwrap();
         assert!(matches!(
             read_key(&path, None).unwrap_err(),
             Error::PassphraseRequired
@@ -210,6 +233,41 @@ mod tests {
         assert!(matches!(
             read_key(&path, Some(b"errada")).unwrap_err(),
             Error::WrongPassphraseOrCorrupt
+        ));
+    }
+
+    #[test]
+    fn protect_does_not_seal_content_the_validator_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = plain_file(dir.path());
+        let err = protect_with(&path, PASS, KdfParams::MIN, reject).unwrap_err();
+        assert!(matches!(err, Error::InvalidDeviceKey));
+        assert_eq!(fs::read(&path).unwrap(), SECRET);
+    }
+
+    #[test]
+    fn a_file_at_the_old_fixed_temp_name_is_left_alone() {
+        // O temp tem nome único: gravar não apaga nem reaproveita o arquivo de outro processo.
+        let dir = tempfile::tempdir().unwrap();
+        let path = plain_file(dir.path());
+        let other = dir.path().join(".identity.key.tmp");
+        fs::write(&other, b"de outro processo").unwrap();
+        write_key_sealed(&path, b"novo", PASS, KdfParams::MIN).unwrap();
+        assert_eq!(fs::read(&other).unwrap(), b"de outro processo");
+    }
+
+    #[test]
+    fn oversized_key_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        fs::write(&path, vec![0u8; 70 * 1024]).unwrap();
+        assert!(matches!(
+            read_key(&path, None).unwrap_err(),
+            Error::KeyFileTooLarge
+        ));
+        assert!(matches!(
+            protect_with(&path, PASS, KdfParams::MIN, ok).unwrap_err(),
+            Error::KeyFileTooLarge
         ));
     }
 

@@ -110,8 +110,16 @@ impl DeviceKey {
         )
     }
 
+    /// Cifra no lugar um `device.key` **em claro** (migração), com as mesmas garantias de
+    /// `StandaloneIdentity::protect`.
+    pub fn protect(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
+        store::protect_with(path, passphrase, params, |bytes| {
+            Self::from_bytes(bytes).map(|_| ())
+        })
+    }
+
     /// Lê a chave do device de um arquivo cifrado ou em claro. Cifrado sem senha:
-    /// [`Error::PassphraseRequired`].
+    /// [`Error::PassphraseRequired`]; em claro **com** senha: [`Error::PlainFileWhereSealedExpected`].
     pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
         Self::from_bytes(&store::read_key(path, passphrase)?)
     }
@@ -312,8 +320,30 @@ mod tests {
         let path = dir.path().join("device.key");
         let device = DeviceKey::generate();
         std::fs::write(&path, device.to_bytes().unwrap()).unwrap();
-        crate::protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        DeviceKey::protect(&path, PASS, KdfParams::MIN).unwrap();
         let loaded = DeviceKey::load_with(&path, Some(PASS)).unwrap();
         assert_eq!(loaded.nostr_secret_bytes(), device.nostr_secret_bytes());
+    }
+
+    #[test]
+    fn legacy_plain_device_key_is_refused_when_a_passphrase_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        std::fs::write(&path, DeviceKey::generate().to_bytes().unwrap()).unwrap();
+        assert!(matches!(
+            DeviceKey::load_with(&path, Some(PASS)).err().unwrap(),
+            Error::PlainFileWhereSealedExpected
+        ));
+    }
+
+    #[test]
+    fn protecting_a_device_key_refuses_garbage_and_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device.key");
+        for content in [&b""[..], &b"lixo qualquer"[..]] {
+            std::fs::write(&path, content).unwrap();
+            assert!(DeviceKey::protect(&path, PASS, KdfParams::MIN).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), content, "original alterado");
+        }
     }
 }

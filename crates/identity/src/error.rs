@@ -28,6 +28,12 @@ pub enum Error {
     EmptyPassphrase,
     #[error("o arquivo de chave já está cifrado")]
     AlreadySealed,
+    /// Com senha informada, um arquivo em claro é anômalo (troca de arquivo por quem tem escrita no
+    /// diretório): recusa em vez de abrir a identidade de outro.
+    #[error("o arquivo de chave está em claro, mas uma senha foi informada: arquivo trocado?")]
+    PlainFileWhereSealedExpected,
+    #[error("arquivo de chave grande demais")]
+    KeyFileTooLarge,
     #[error("erro de E/S: {0}")]
     Io(#[from] std::io::Error),
 }

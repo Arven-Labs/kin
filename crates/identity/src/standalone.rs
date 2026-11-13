@@ -82,8 +82,17 @@ impl StandaloneIdentity {
         )
     }
 
+    /// Cifra no lugar um `identity.key` **em claro** (migração). Confere que o conteúdo é uma mestra
+    /// válida antes de cifrar e que a cifra reabre depois de gravada; recusa arquivo já cifrado.
+    /// O arquivo em claro antigo pode continuar recuperável no disco (ver `store::protect_with`).
+    pub fn protect(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
+        store::protect_with(path, passphrase, params, |bytes| {
+            Self::from_bytes(bytes).map(|_| ())
+        })
+    }
+
     /// Lê a chave mestra de um arquivo cifrado ou em claro (formato antigo). Cifrado sem senha:
-    /// [`Error::PassphraseRequired`].
+    /// [`Error::PassphraseRequired`]; em claro **com** senha: [`Error::PlainFileWhereSealedExpected`].
     pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
         Self::from_bytes(&store::read_key(path, passphrase)?)
     }
@@ -169,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plain_file_still_loads_with_or_without_a_passphrase() {
+    fn legacy_plain_file_loads_only_without_a_passphrase() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("identity.key");
         let identity = StandaloneIdentity::generate();
@@ -178,12 +187,31 @@ mod tests {
             StandaloneIdentity::load_with(&path, None).unwrap().id(),
             identity.id()
         );
-        assert_eq!(
+        // Com senha, um arquivo em claro é uma troca suspeita: não abre.
+        assert!(matches!(
             StandaloneIdentity::load_with(&path, Some(PASS))
-                .unwrap()
-                .id(),
-            identity.id()
-        );
+                .err()
+                .unwrap(),
+            Error::PlainFileWhereSealedExpected
+        ));
+    }
+
+    #[test]
+    fn protect_refuses_garbage_empty_and_already_sealed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        for content in [&b""[..], &b"lixo qualquer"[..]] {
+            std::fs::write(&path, content).unwrap();
+            assert!(StandaloneIdentity::protect(&path, PASS, KdfParams::MIN).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), content, "original alterado");
+        }
+        StandaloneIdentity::generate()
+            .save_sealed(&path, PASS, KdfParams::MIN)
+            .unwrap();
+        assert!(matches!(
+            StandaloneIdentity::protect(&path, PASS, KdfParams::MIN).unwrap_err(),
+            Error::AlreadySealed
+        ));
     }
 
     #[test]
@@ -192,7 +220,7 @@ mod tests {
         let path = dir.path().join("identity.key");
         let identity = StandaloneIdentity::generate();
         identity.save(&path).unwrap();
-        crate::protect_key_file(&path, PASS, KdfParams::MIN).unwrap();
+        StandaloneIdentity::protect(&path, PASS, KdfParams::MIN).unwrap();
         assert_eq!(
             StandaloneIdentity::load_with(&path, Some(PASS))
                 .unwrap()

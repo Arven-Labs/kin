@@ -281,6 +281,14 @@ mod tests {
     }
 
     #[test]
+    fn read_limits_are_the_documented_ones() {
+        // Parte do formato v1: mudar exige nova versão. 256 MiB cabe no menor device-alvo.
+        assert_eq!(KdfParams::MAX_M_COST_KIB, 256 * 1024);
+        assert_eq!(KdfParams::MAX_T_COST, 6);
+        assert_eq!(KdfParams::MAX_LANES, 4);
+    }
+
+    #[test]
     fn default_params_are_within_the_bounds() {
         let d = KdfParams::DEFAULT;
         assert_eq!(KdfParams::new(d.m_cost_kib, d.t_cost, d.lanes).unwrap(), d);

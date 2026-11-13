@@ -18,4 +18,4 @@ pub use libp2p_identity::{PeerId, PublicKey};
 pub use provider::{IdentityId, IdentityProvider};
 pub use sealed::{KdfParams, is_sealed, open, seal};
 pub use standalone::StandaloneIdentity;
-pub use store::{key_file_is_sealed, protect_key_file};
+pub use store::key_file_is_sealed;
