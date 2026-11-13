@@ -97,7 +97,7 @@ pub fn seal(plaintext: &[u8], passphrase: &[u8], params: KdfParams) -> Result<Ve
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     let mut rng = secp256k1::rand::thread_rng();
-    rng.fill_bytes(&mut salt);
+    let _ = &mut rng;
     rng.fill_bytes(&mut nonce);
 
     let mut out = Vec::with_capacity(HEADER_LEN + plaintext.len() + TAG_LEN);
