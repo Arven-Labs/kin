@@ -86,6 +86,14 @@ impl KdfParams {
     }
 }
 
+/// Senha digitada → bytes que entram no KDF: normalização Unicode NFKC. Sem isso, o mesmo texto
+/// ("é" composto ou decomposto, largura total) vira bytes diferentes conforme o teclado ou o SO, e a
+/// identidade fica trancada. **Faz parte do formato v1**: quem chama `seal`/`open` com texto digitado
+/// deve passar por aqui. Não apara espaços nem muda a caixa.
+pub fn normalize_passphrase(raw: &str) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(raw.as_bytes().to_vec())
+}
+
 /// `true` se `bytes` começa pelo magic de um arquivo cifrado. Não valida o resto.
 pub fn is_sealed(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
@@ -323,6 +331,31 @@ mod tests {
             open(&sealed(), b"").unwrap_err(),
             Error::EmptyPassphrase
         ));
+    }
+
+    #[test]
+    fn composed_and_decomposed_accents_give_the_same_passphrase() {
+        assert_eq!(
+            *normalize_passphrase("caf\u{e9}"),
+            *normalize_passphrase("cafe\u{301}")
+        );
+    }
+
+    #[test]
+    fn full_width_characters_are_folded_to_ascii() {
+        assert_eq!(*normalize_passphrase("ＡＢＣ１２３"), b"ABC123");
+    }
+
+    #[test]
+    fn ascii_whitespace_and_case_are_preserved() {
+        assert_eq!(*normalize_passphrase(" Ab c "), b" Ab c ");
+    }
+
+    #[test]
+    fn a_file_sealed_with_one_spelling_opens_with_the_other() {
+        let sealed = seal(SECRET, &normalize_passphrase("caf\u{e9}"), KdfParams::MIN).unwrap();
+        let opened = open(&sealed, &normalize_passphrase("cafe\u{301}")).unwrap();
+        assert_eq!(&*opened, SECRET);
     }
 
     #[test]

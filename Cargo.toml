@@ -46,6 +46,8 @@ base64 = "0.22"
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 zeroize = "=1.9.1"
+# Normalização NFKC da senha antes do KDF: o mesmo texto digitado em teclados/sistemas diferentes dá os mesmos bytes.
+unicode-normalization = "=0.1.26"
 # Prompt de senha sem eco no terminal (CLI).
 rpassword = "=7.5.4"
 qrcode = { version = "0.14", default-features = false }
