@@ -260,7 +260,6 @@ fn write_authority(
     {
         // Uma chave sem certificado só atrapalha (o `rotate` recusaria o diretório): remove a que
         // esta execução acabou de criar.
-        let _ = std::fs::remove_file(&key_path);
         return Err(format!("gravar o certificado: {e}"));
     }
     Ok(Outcome {
