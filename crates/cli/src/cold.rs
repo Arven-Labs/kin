@@ -45,6 +45,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, Stri
     let mut authority_dir = None;
     let mut master_passphrase_file = None;
     let mut passphrase_file = None;
+    let mut expect_identity = None;
     while let Some(flag) = it.next() {
         let mut value = || {
             it.next()
@@ -56,10 +57,17 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, Stri
             "--authority-dir" => authority_dir = Some(value()?),
             "--master-passphrase-file" => master_passphrase_file = Some(value()?),
             "--passphrase-file" => passphrase_file = Some(value()?),
+            "--expect-identity" if sub == "rotate-authority" => {
+                expect_identity = Some(value()?.to_string_lossy().into_owned());
+            }
             f if f == other_master_flag => {
                 return Err(format!("{f} não existe em cold {sub}: use {master_flag}"));
             }
-            other => return Err(format!("argumento desconhecido: {other}")),
+            other => {
+                // Só o nome: `--passphrase=segredo` não pode ser ecoado no terminal.
+                let name = other.split('=').next().unwrap_or(other);
+                return Err(format!("argumento desconhecido: {name}"));
+            }
         }
     }
     let master = master.ok_or(format!("cold {sub} exige {master_flag}"))?;
@@ -77,7 +85,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, Stri
             authority_dir,
             master_passphrase_file,
             passphrase_file,
-            expect_identity: None,
+            expect_identity,
         }
     })
 }
@@ -100,20 +108,22 @@ pub fn init(
 ) -> Result<Outcome, String> {
     // Tudo é conferido antes de criar qualquer arquivo ou diretório.
     check_targets(master_out, authority_dir, master_pass, authority_pass)?;
-    if master_out.exists() {
-        return Err(format!(
-            "{} já existe: não sobrescrevo uma mestra",
-            master_out.display()
-        ));
-    }
+    check_master_absent(master_out)?;
     let master = StandaloneIdentity::generate();
     if let Some(parent) = master_out.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        create_private_dir(parent)?;
     }
+    // `save_sealed_new` falha se o arquivo aparecer no meio (nunca substitui uma mestra).
     master
-        .save_sealed(master_out, master_pass, params)
+        .save_sealed_new(master_out, master_pass, params)
         .map_err(|e| format!("gravar a mestra: {e}"))?;
-    write_authority(&master, authority_dir, authority_pass, params, now)
+    // Daqui em diante a mestra existe: uma falha tem de dizer onde ela está.
+    write_authority(&master, authority_dir, authority_pass, params, now).map_err(|e| {
+        format!(
+            "{e}\na mestra JÁ foi gravada em {}: guarde-a e rode `kin cold rotate-authority` para criar a autoridade",
+            master_out.display()
+        )
+    })
 }
 
 /// A mestra fria existente certifica uma autoridade **nova** (mesmo `IdentityId`) em `authority_dir`.
@@ -124,37 +134,56 @@ pub fn rotate(
     authority_pass: &[u8],
     params: KdfParams,
     now: u64,
-    _expect_identity: Option<&str>,
+    expect_identity: Option<&str>,
 ) -> Result<Outcome, String> {
     check_targets(master_file, authority_dir, master_pass, authority_pass)?;
     // Senha errada falha aqui, antes de criar qualquer coisa.
     let master = StandaloneIdentity::load_with(master_file, Some(master_pass))
         .map_err(|e| format!("abrir a mestra {}: {e}", master_file.display()))?;
+    if let Some(expected) = expect_identity {
+        let found = master.id().to_base58();
+        if found != expected {
+            return Err(format!(
+                "a mestra aberta é a identidade {found}, não a esperada {expected}: arquivo errado?"
+            ));
+        }
+    }
     write_authority(&master, authority_dir, authority_pass, params, now)
+}
+
+/// Resolve um caminho que pode ainda não existir: o ancestral existente mais fundo é canonicalizado
+/// (o SO resolve `..` e links nele) e o resto, que não existe e portanto não tem links, é normalizado
+/// por componentes.
+fn resolve(path: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let absolute = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let components: Vec<Component> = absolute.components().collect();
+    let mut keep = components.len();
+    while keep > 0 && !components[..keep].iter().collect::<PathBuf>().exists() {
+        keep -= 1;
+    }
+    let mut resolved = if keep == 0 {
+        PathBuf::new()
+    } else {
+        std::fs::canonicalize(components[..keep].iter().collect::<PathBuf>())
+            .map_err(|e| format!("{}: {e}", path.display()))?
+    };
+    for component in &components[keep..] {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    Ok(resolved)
 }
 
 /// Conferência só de **caminhos** (mestra dentro do diretório do primário, autoridade já existente),
 /// para o `run` recusar antes de pedir as senhas. Resolve `.`, `..` e links (auditoria 1b, I1).
-#[allow(dead_code)] // só no stub; a implementação usa
-fn check_paths(_master_file: &Path, _authority_dir: &Path) -> Result<(), String> {
-    todo!()
-}
-
-/// Recusas que não dependem de abrir nada: senhas iguais, mestra dentro do diretório do primário e
-/// autoridade já existente. A conferência do "dentro de" é lexical (não resolve `..` nem links).
-fn check_targets(
-    master_file: &Path,
-    authority_dir: &Path,
-    master_pass: &[u8],
-    authority_pass: &[u8],
-) -> Result<(), String> {
-    if master_pass == authority_pass {
-        return Err(
-            "a senha da autoridade deve ser diferente da senha da mestra fria: a do primário não pode abrir a mestra"
-                .into(),
-        );
-    }
-    if master_file.starts_with(authority_dir) {
+fn check_paths(master_file: &Path, authority_dir: &Path) -> Result<(), String> {
+    if resolve(master_file)?.starts_with(resolve(authority_dir)?) {
         return Err(format!(
             "a mestra fria ({}) não pode ficar dentro do diretório do primário ({}): leve-a para fora dele",
             master_file.display(),
@@ -170,6 +199,46 @@ fn check_targets(
     Ok(())
 }
 
+fn check_master_absent(master_out: &Path) -> Result<(), String> {
+    if master_out.exists() {
+        return Err(format!(
+            "{} já existe: não sobrescrevo uma mestra",
+            master_out.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Recusas que não dependem de abrir nada: senha vazia, senhas iguais e os caminhos de
+/// [`check_paths`].
+fn check_targets(
+    master_file: &Path,
+    authority_dir: &Path,
+    master_pass: &[u8],
+    authority_pass: &[u8],
+) -> Result<(), String> {
+    if master_pass.is_empty() || authority_pass.is_empty() {
+        return Err("a senha não pode ser vazia".into());
+    }
+    if master_pass == authority_pass {
+        return Err(
+            "a senha da autoridade deve ser diferente da senha da mestra fria: a do primário não pode abrir a mestra"
+                .into(),
+        );
+    }
+    check_paths(master_file, authority_dir)
+}
+
+/// Cria o diretório (e os pais que faltarem) com modo 0700: ele guarda chaves.
+fn create_private_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Gera uma autoridade nova, grava `authority.key` (cifrada) e `authority.cert` (assinado pela mestra).
 fn write_authority(
     master: &StandaloneIdentity,
@@ -182,17 +251,18 @@ fn write_authority(
     let cert = master
         .certify_authority(&authority.public_key(), now)
         .map_err(|e| format!("certificar a autoridade: {e}"))?;
-    std::fs::create_dir_all(authority_dir)
-        .map_err(|e| format!("{}: {e}", authority_dir.display()))?;
+    create_private_dir(authority_dir)?;
+    let key_path = authority_dir.join(AUTHORITY_KEY_FILE);
     authority
-        .save_sealed(
-            &authority_dir.join(AUTHORITY_KEY_FILE),
-            authority_pass,
-            params,
-        )
+        .save_sealed_new(&key_path, authority_pass, params)
         .map_err(|e| format!("gravar a autoridade: {e}"))?;
-    crate::write_private(&authority_dir.join(AUTHORITY_CERT_FILE), &cert.to_bytes())
-        .map_err(|e| format!("gravar o certificado: {e}"))?;
+    if let Err(e) = crate::write_private(&authority_dir.join(AUTHORITY_CERT_FILE), &cert.to_bytes())
+    {
+        // Uma chave sem certificado só atrapalha (o `rotate` recusaria o diretório): remove a que
+        // esta execução acabou de criar.
+        let _ = std::fs::remove_file(&key_path);
+        return Err(format!("gravar o certificado: {e}"));
+    }
     Ok(Outcome {
         identity: master.id(),
     })
@@ -211,6 +281,9 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
             master_passphrase_file,
             passphrase_file,
         } => {
+            // Recusa por caminho antes de pedir qualquer senha.
+            check_paths(&master_out, &authority_dir)?;
+            check_master_absent(&master_out)?;
             eprintln!(
                 "aviso: rode isto numa máquina sem rede; a mestra existe em claro na memória durante o comando"
             );
@@ -231,8 +304,9 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
             authority_dir,
             master_passphrase_file,
             passphrase_file,
-            expect_identity: _,
+            expect_identity,
         } => {
+            check_paths(&master, &authority_dir)?;
             let master_pass = passphrase(master_passphrase_file, "senha da mestra fria", false)?;
             let authority_pass = passphrase(passphrase_file, "senha da autoridade nova", true)?;
             let outcome = rotate(
@@ -242,8 +316,11 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
                 &authority_pass,
                 KdfParams::DEFAULT,
                 now,
-                None,
+                expect_identity.as_deref(),
             )?;
+            eprintln!(
+                "aviso: a autoridade ANTIGA não foi revogada e continua válida (a revogação vem na fatia 3 do P30); se o primário foi roubado, trate a identidade como exposta"
+            );
             (outcome, master, authority_dir)
         }
     };

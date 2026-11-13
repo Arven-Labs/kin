@@ -25,6 +25,17 @@ pub(crate) fn read_secret(path: &Path) -> Result<Vec<u8>, Error> {
 /// Grava `bytes` em `path` por arquivo temporário no mesmo diretório + `fsync` + `rename`, com modo 0600:
 /// uma queda no meio deixa o arquivo antigo intacto (o `write_secret` trunca no lugar).
 pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    write_atomic(path, bytes, true)
+}
+
+/// Como [`write_secret_atomic`], mas **falha com `AlreadyExists` se `path` existe**, inclusive se
+/// aparecer durante a gravação: publica com `hard_link` (que não substitui) em vez de `rename`.
+/// Exige sistema de arquivos com hard link.
+pub(crate) fn write_secret_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    write_atomic(path, bytes, false)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(), Error> {
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -65,7 +76,12 @@ pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error
     let mut write = || -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        if replace {
+            fs::rename(&tmp, path)
+        } else {
+            fs::hard_link(&tmp, path)?;
+            fs::remove_file(&tmp)
+        }
     };
     if let Err(e) = write() {
         let _ = fs::remove_file(&tmp);
@@ -125,6 +141,16 @@ pub(crate) fn write_key_sealed(
     params: KdfParams,
 ) -> Result<(), Error> {
     write_secret_atomic(path, &crate::seal(bytes, passphrase, params)?)
+}
+
+/// Como [`write_key_sealed`], mas falha se `path` já existe (ver [`write_secret_new`]).
+pub(crate) fn write_key_sealed_new(
+    path: &Path,
+    bytes: &[u8],
+    passphrase: &[u8],
+    params: KdfParams,
+) -> Result<(), Error> {
+    write_secret_new(path, &crate::seal(bytes, passphrase, params)?)
 }
 
 /// `true` se o arquivo de chave em `path` está cifrado.

@@ -16,6 +16,10 @@ use crate::{Error, IdentityId, KdfParams, store};
 /// assinatura de um nunca valer como a do outro.
 pub(crate) const AUTHORITY_DOMAIN: &[u8] = b"kin/authority-cert/v1";
 
+/// Magic e versão do arquivo `authority.cert` (não entram na assinatura, que tem o seu domínio).
+const FILE_MAGIC: &[u8; 4] = b"KAUT";
+const FILE_VERSION: u8 = 1;
+
 /// Chave de autoridade (Ed25519): faz o trabalho diário no primário enquanto a mestra fica fria.
 pub struct AuthorityKey {
     keypair: Keypair,
@@ -65,11 +69,11 @@ impl AuthorityKey {
     /// nunca substitui uma chave existente, nem numa corrida.
     pub fn save_sealed_new(
         &self,
-        _path: &Path,
-        _passphrase: &[u8],
-        _params: KdfParams,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
     ) -> Result<(), Error> {
-        todo!()
+        store::write_key_sealed_new(path, &Zeroizing::new(self.to_bytes()?), passphrase, params)
     }
 
     /// Cifra no lugar um `authority.key` em claro (migração), com as garantias de `store::protect_with`.
@@ -119,9 +123,12 @@ impl AuthorityCertificate {
         }
     }
 
-    /// `len16|identidade | len16|chave de autoridade | created_at u64 BE | len16|assinatura`.
+    /// `"KAUT" | versão u8 (=1) | len16|identidade | len16|chave de autoridade | created_at u64 BE |
+    /// len16|assinatura`. O prefixo separa este arquivo do certificado de device por construção e
+    /// deixa a fatia 4 acrescentar campos numa versão nova (auditoria da fatia 1b, S2).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = FILE_MAGIC.to_vec();
+        out.push(FILE_VERSION);
         put(&mut out, &self.identity.public_key().encode_protobuf());
         put(&mut out, &self.authority_key.encode_protobuf());
         out.extend_from_slice(&self.created_at.to_be_bytes());
@@ -134,7 +141,10 @@ impl AuthorityCertificate {
         fn bad<E>(_: E) -> Error {
             Error::InvalidAuthorityCertificate
         }
-        let mut cur = bytes;
+        let mut cur = bytes
+            .strip_prefix(FILE_MAGIC.as_slice())
+            .and_then(|rest| rest.strip_prefix(&[FILE_VERSION]))
+            .ok_or(Error::InvalidAuthorityCertificate)?;
         let identity = PublicKey::try_decode_protobuf(take(&mut cur).map_err(bad)?).map_err(bad)?;
         let authority_key =
             PublicKey::try_decode_protobuf(take(&mut cur).map_err(bad)?).map_err(bad)?;

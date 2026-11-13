@@ -86,11 +86,16 @@ impl StandaloneIdentity {
     /// nunca substitui uma mestra existente, nem numa corrida.
     pub fn save_sealed_new(
         &self,
-        _path: &Path,
-        _passphrase: &[u8],
-        _params: KdfParams,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
     ) -> Result<(), Error> {
-        todo!()
+        store::write_key_sealed_new(
+            path,
+            &zeroize::Zeroizing::new(self.to_bytes()?),
+            passphrase,
+            params,
+        )
     }
 
     /// Cifra no lugar um `identity.key` **em claro** (migração). Confere que o conteúdo é uma mestra
