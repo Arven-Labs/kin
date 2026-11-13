@@ -48,7 +48,7 @@ impl KdfParams {
 
     /// Valida contra o piso e o teto.
     pub fn new(m_cost_kib: u32, t_cost: u32, lanes: u8) -> Result<Self, Error> {
-        let in_bounds = (Self::MIN.m_cost_kib..=Self::MAX_M_COST_KIB).contains(&m_cost_kib)
+        let in_bounds = (Self::MIN.m_cost_kib..Self::MAX_M_COST_KIB).contains(&m_cost_kib)
             && (Self::MIN.t_cost..=Self::MAX_T_COST).contains(&t_cost)
             && (Self::MIN.lanes..=Self::MAX_LANES).contains(&lanes);
         if in_bounds {
