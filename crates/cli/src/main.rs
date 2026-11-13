@@ -30,6 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod cold;
 mod keys;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
@@ -243,6 +244,16 @@ fn short(id: &MessageId) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `kin cold ...` (P30 fatia 1b): custódia offline da mestra, sem rede nem chat.
+    if std::env::args().nth(1).as_deref() == Some("cold") {
+        let command = cold::parse(std::env::args().skip(2)).map_err(|e| {
+            eprintln!(
+                "{e}\nuso: kin cold init --master-out ARQUIVO --authority-dir DIR [--master-passphrase-file ARQ] [--passphrase-file ARQ]\n     kin cold rotate-authority --master ARQUIVO --authority-dir DIR [--master-passphrase-file ARQ] [--passphrase-file ARQ]"
+            );
+            e
+        })?;
+        return cold::run(command).map_err(Into::into);
+    }
     let args = parse_args().map_err(|e| {
         eprintln!(
             "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"

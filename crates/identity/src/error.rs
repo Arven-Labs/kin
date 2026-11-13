@@ -16,6 +16,10 @@ pub enum Error {
     InvalidPairLink,
     #[error("certificado de device inválido")]
     InvalidCertificate,
+    #[error("certificado de autoridade inválido")]
+    InvalidAuthorityCertificate,
+    #[error("arquivo de chave de autoridade inválido")]
+    InvalidAuthorityKey,
     /// Senha errada e arquivo adulterado são **o mesmo erro** de propósito: distinguir os dois seria um oráculo.
     #[error("senha errada ou arquivo de chave corrompido")]
     WrongPassphraseOrCorrupt,

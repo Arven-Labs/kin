@@ -229,13 +229,13 @@ impl DeviceCertificate {
     }
 }
 
-fn put(out: &mut Vec<u8>, field: &[u8]) {
+pub(crate) fn put(out: &mut Vec<u8>, field: &[u8]) {
     let len = u16::try_from(field.len()).expect("campo do certificado maior que 64 KiB");
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(field);
 }
 
-fn take<'a>(cur: &mut &'a [u8]) -> Result<&'a [u8], Error> {
+pub(crate) fn take<'a>(cur: &mut &'a [u8]) -> Result<&'a [u8], Error> {
     let len = u16::from_be_bytes(
         cur.get(..2)
             .ok_or(Error::InvalidCertificate)?

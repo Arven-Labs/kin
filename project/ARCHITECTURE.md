@@ -282,7 +282,7 @@ a prova. Contatos e conversas sobrevivem.
 - **Revogação de device próprio** (Sessão 21): com o `/pair` copiando a mestra, revogar um certificado não revoga nada.
   O ADR 0011 (aceito) adota certificados delegados, com a mestra só num device primário e a opção D para o primário perdido; ver P30.
   A fatia 1a (ADR 0012) já cifra `identity.key` e `device.key` por senha (Argon2id + XChaCha20-Poly1305); `mls.sqlite` e o histórico
-  seguem em claro.
+  seguem em claro. A fatia 1b (ADR 0013) acrescenta a mestra fria e a chave de autoridade (`kin cold`), só custódia, sem mudar o fio.
 
 **Reabrir se**: o TruthID ganhar um modo local/SDK Rust reutilizável (aí o provedor standalone pode
 passar a ser esse modo).

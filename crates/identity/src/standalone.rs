@@ -82,12 +82,44 @@ impl StandaloneIdentity {
         )
     }
 
+    /// Como [`Self::save_sealed`], mas **falha se o arquivo já existe** (auditoria da fatia 1b, I2):
+    /// nunca substitui uma mestra existente, nem numa corrida.
+    pub fn save_sealed_new(
+        &self,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
+    ) -> Result<(), Error> {
+        store::write_key_sealed_new(
+            path,
+            &zeroize::Zeroizing::new(self.to_bytes()?),
+            passphrase,
+            params,
+        )
+    }
+
     /// Cifra no lugar um `identity.key` **em claro** (migração). Confere que o conteúdo é uma mestra
     /// válida antes de cifrar e que a cifra reabre depois de gravada; recusa arquivo já cifrado.
     /// O arquivo em claro antigo pode continuar recuperável no disco (ver `store::protect_with`).
     pub fn protect(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
         store::protect_with(path, passphrase, params, |bytes| {
             Self::from_bytes(bytes).map(|_| ())
+        })
+    }
+
+    /// Certifica uma chave de autoridade (P30 fatia 1b): "esta chave é a minha autoridade". Deve rodar
+    /// com a mestra **fria** (offline). `created_at` em segundos Unix, passado de fora.
+    pub fn certify_authority(
+        &self,
+        authority_key: &PublicKey,
+        created_at: u64,
+    ) -> Result<crate::AuthorityCertificate, Error> {
+        let payload = crate::AuthorityCertificate::signing_payload(authority_key, created_at);
+        Ok(crate::AuthorityCertificate {
+            identity: self.id(),
+            authority_key: authority_key.clone(),
+            created_at,
+            signature: self.master.sign(&payload)?,
         })
     }
 
@@ -194,6 +226,28 @@ mod tests {
                 .unwrap(),
             Error::PlainFileWhereSealedExpected
         ));
+    }
+
+    #[test]
+    fn save_sealed_new_refuses_an_existing_file_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+        let first = StandaloneIdentity::generate();
+        first.save_sealed_new(&path, PASS, KdfParams::MIN).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            StandaloneIdentity::generate()
+                .save_sealed_new(&path, PASS, KdfParams::MIN)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            StandaloneIdentity::load_with(&path, Some(PASS))
+                .unwrap()
+                .id(),
+            first.id()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

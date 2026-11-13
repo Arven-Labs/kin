@@ -2,7 +2,7 @@
 
 > **Nota**: Este log foi criado junto com o projeto. As sessões serão registradas aqui conforme o trabalho avança.
 >
-> Última atualização: 2026-11-08 (Sessão 15)
+> Última atualização: 2026-11-13 (Sessão 22)
 
 ---
 
@@ -1321,3 +1321,31 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   falta de memória, feature `zeroize`); revisão externa do formato; a recuperabilidade dos blocos do arquivo antigo (só documentada);
   os demais cenários do lab (`cone`, `symmetric`, `relay-down`, `invite`, `relay-failover`) com chaves cifradas, não rodados.
 - **Próximo passo**: mesclar; depois fatia 1b (mestra fria e chave de autoridade, opção D), em plan mode.
+
+### 2026-11-13 — Sessão 22
+
+#### Mestra fria e chave de autoridade (P30, fatia 1b, PR #129, ADR 0013)
+
+- **Decisões do dono** (plan mode + 2 perguntas + 1 da auditoria): corte **só no crate `identity`, sem formato de fio** (descartados:
+  cadeia v4 no certificado de device; só o comando da mestra fria); **comando offline dedicado** (descartado: mestra só em memória);
+  **magic `KAUT` e versão 1** no `authority.cert` (descartado: deixar sem versão). Aprovou as tabelas de testes (`identity`, CLI).
+- **Feito**: `crates/identity/src/authority.rs` (`AuthorityKey`, `AuthorityCertificate`, domínio `kin/authority-cert/v1`),
+  `StandaloneIdentity::certify_authority` e `save_sealed_new`, `store::write_secret_new` (`hard_link`), `put`/`take` `pub(crate)`;
+  `crates/cli/src/cold.rs` (`kin cold init`, `kin cold rotate-authority [--expect-identity]`, `resolve`, `check_paths`); ADR 0013.
+- **Prova de que testam algo** (CI do #129): `identity`, **16 de 16 falharam** contra os stubs, depois passaram; CLI, **11 de 11**;
+  correções da auditoria, **11 falharam** (1 já passava, `wrong_magic_...`, que só vale na mutação) e passaram. Último run de código
+  verde: 43448357213 (clippy e todos os testes).
+- **Mutações** (PRs #130 a #135, #136, #138 a #143, fechados e apagados, 13 de 13 pegas): domínio igual ao de device, payload sem
+  `created_at`, `from_bytes` com bytes sobrando, sem recusa de senhas iguais, mestra dentro do primário aceita, `init` sobrescreve,
+  versão do cert não conferida, `resolve` ignora `..`, sem limpeza da `authority.key`, `--expect-identity` invertido, diretório 0755,
+  erro de argumento ecoa o valor, `write_secret_new` substitui. A mutação "`rename` no lugar do `hard_link`" (#137) falhou no clippy
+  (`if_same_then_else`), não nos testes: refeita como #143. No #138 também falhou, sem relação, `chats_find_each_other_via_mdns_and_talk`
+  (teste de rede por mDNS; parece instável no CI, não investigado).
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; 3 importantes (caminho "dentro do primário" contornável, corrida
+  no "não sobrescrevo", falha parcial no `init`) corrigidos; sugestões tratadas ou registradas (tabela no ADR 0013). A S3 (exigir
+  Ed25519) não tem efeito nesta build e não é testável.
+- **Tropeços**: o clippy barrou o stub por `dead_code` (6ª vez); mutação de senhas iguais teria falhado no clippy por parâmetro sem
+  uso (corrigi antes de subir); ajustei formatação à mão (regra de só `Edit`).
+- **Não verificado**: `init` ponta a ponta num terminal real com `KdfParams::DEFAULT` e o prompt sem eco; `hard_link` em sistemas de
+  arquivos que não o suportam; corrida real do `save_sealed_new`; revisão externa do formato; lab (sem rede nesta fatia, não rodado).
+- **Próximo passo**: fatia 2 (pareamento autenticado, convivendo com o `kin://pair/`), em plan mode; antes, restringir `sign` (S1).
