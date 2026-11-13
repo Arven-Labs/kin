@@ -79,8 +79,7 @@ fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(), Error> {
         if replace {
             fs::rename(&tmp, path)
         } else {
-            fs::hard_link(&tmp, path)?;
-            fs::remove_file(&tmp)
+            fs::rename(&tmp, path)
         }
     };
     if let Err(e) = write() {
