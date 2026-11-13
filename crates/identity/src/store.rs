@@ -31,17 +31,15 @@ pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error
             "caminho sem nome de arquivo",
         )
     })?;
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    // Sobra de uma queda anterior: `create_new` recusaria.
-    match fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    let write = || -> std::io::Result<()> {
+    // Nome único por tentativa: dois processos gravando juntos não pisam no temp um do outro. Uma
+    // sobra de queda é só texto cifrado e não é apagada às cegas.
+    let mut file = None;
+    let mut tmp = path.to_path_buf();
+    for _ in 0..8 {
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".{:016x}.tmp", secp256k1::rand::random::<u64>()));
+        tmp = path.with_file_name(tmp_name);
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -49,7 +47,22 @@ pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&tmp)?;
+        match options.open(&tmp) {
+            Ok(opened) => {
+                file = Some(opened);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut file = file.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "sem nome de arquivo temporário livre",
+        )
+    })?;
+    let mut write = || -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, path)
@@ -60,24 +73,48 @@ pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error
     }
     // Persiste a entrada do diretório (o rename); falhar aqui não desfaz o que já foi gravado.
     #[cfg(unix)]
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
-        && let Ok(dir) = fs::File::open(dir)
     {
-        let _ = dir.sync_all();
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if let Ok(dir) = fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }
 
-/// Lê um arquivo de chave. Cifrado exige `passphrase`; em claro (formato antigo) ignora-a.
+/// Teto de leitura de um arquivo de chave (o maior, o `device.key`, tem ~150 bytes): um arquivo
+/// gigante ou `/dev/zero` no caminho da chave não estoura a memória.
+const KEY_FILE_LIMIT: u64 = 64 * 1024;
+
+fn read_limited(path: &Path) -> Result<Zeroizing<Vec<u8>>, Error> {
+    use std::io::Read as _;
+    let mut bytes = Zeroizing::new(Vec::new());
+    fs::File::open(path)?
+        .take(KEY_FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > KEY_FILE_LIMIT {
+        return Err(Error::KeyFileTooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Lê um arquivo de chave. Cifrado exige `passphrase`. Em claro (formato antigo) só abre **sem** senha:
+/// com senha informada é anômalo (troca de arquivo por quem tem escrita no diretório) e é recusado.
 pub(crate) fn read_key(
     path: &Path,
     passphrase: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let bytes = Zeroizing::new(fs::read(path)?);
-    if !crate::is_sealed(&bytes) {
-        return Ok(bytes);
+    let bytes = read_limited(path)?;
+    if crate::is_sealed(&bytes) {
+        return crate::open(&bytes, passphrase.ok_or(Error::PassphraseRequired)?);
     }
-    crate::open(&bytes, passphrase.ok_or(Error::PassphraseRequired)?)
+    match passphrase {
+        None => Ok(bytes),
+        Some(_) => Err(Error::PlainFileWhereSealedExpected),
+    }
 }
 
 /// Grava `bytes` cifrados com a senha, de forma atômica.
@@ -92,7 +129,11 @@ pub(crate) fn write_key_sealed(
 
 /// `true` se o arquivo de chave em `path` está cifrado.
 pub fn key_file_is_sealed(path: &Path) -> Result<bool, Error> {
-    Ok(crate::is_sealed(&fs::read(path)?))
+    use std::io::Read as _;
+    // Só o magic: o arquivo em claro é um segredo e não precisa ser carregado para isto.
+    let mut head = Vec::with_capacity(4);
+    fs::File::open(path)?.take(4).read_to_end(&mut head)?;
+    Ok(crate::is_sealed(&head))
 }
 
 /// Migra um arquivo de chave **em claro** para o formato cifrado, no lugar e de forma atômica.
@@ -109,12 +150,17 @@ pub(crate) fn protect_with(
     params: KdfParams,
     validate: impl Fn(&[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let _ = &validate;
-    let plain = Zeroizing::new(fs::read(path)?);
+    let plain = read_limited(path)?;
     if crate::is_sealed(&plain) {
         return Err(Error::AlreadySealed);
     }
-    write_key_sealed(path, &plain, passphrase, params)
+    validate(&plain)?;
+    let sealed = crate::seal(&plain, passphrase, params)?;
+    // Reabre antes de substituir o original: uma cifra que não volta nunca chega ao disco.
+    if *crate::open(&sealed, passphrase)? != *plain {
+        return Err(Error::WrongPassphraseOrCorrupt);
+    }
+    write_secret_atomic(path, &sealed)
 }
 
 #[cfg(test)]

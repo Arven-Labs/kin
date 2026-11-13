@@ -73,8 +73,11 @@ impl DeviceKey {
     /// `versão u8 | len16 | keypair de rede (protobuf) | chave secreta Nostr (32 bytes)`.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut out = vec![DEVICE_KEY_FORMAT];
-        put(&mut out, &self.network.to_protobuf_encoding()?);
-        out.extend_from_slice(&self.nostr.secret_bytes());
+        put(
+            &mut out,
+            &zeroize::Zeroizing::new(self.network.to_protobuf_encoding()?),
+        );
+        out.extend_from_slice(&zeroize::Zeroizing::new(self.nostr.secret_bytes())[..]);
         Ok(out)
     }
 
@@ -89,8 +92,10 @@ impl DeviceKey {
             .clone()
             .try_into_ed25519()
             .map_err(|_| Error::NotEd25519)?;
-        let secret: [u8; 32] = cur.try_into().map_err(|_| Error::InvalidDeviceKey)?;
-        let nostr = SchnorrKeypair::from_seckey_slice(&Secp256k1::signing_only(), &secret)
+        let secret = zeroize::Zeroizing::new(
+            <[u8; 32]>::try_from(cur).map_err(|_| Error::InvalidDeviceKey)?,
+        );
+        let nostr = SchnorrKeypair::from_seckey_slice(&Secp256k1::signing_only(), &secret[..])
             .map_err(|_| Error::InvalidDeviceKey)?;
         Ok(Self { network, nostr })
     }

@@ -36,14 +36,18 @@ impl KdfParams {
         t_cost: 3,
         lanes: 1,
     };
-    /// O mínimo aceito (8 MiB, 1 passada): serve aos testes e é o piso na leitura.
+    /// O mínimo aceito (8 MiB, 1 passada): é o piso na leitura e serve aos testes. **Fraco para uso real**
+    /// (abaixo do mínimo da OWASP); a CLI usa [`Self::DEFAULT`].
+    #[doc(hidden)]
     pub const MIN: Self = Self {
         m_cost_kib: 8 * 1024,
         t_cost: 1,
         lanes: 1,
     };
-    pub(crate) const MAX_M_COST_KIB: u32 = 1024 * 1024;
-    pub(crate) const MAX_T_COST: u32 = 10;
+    /// Teto na leitura: o Argon2 **aborta** (não devolve `Err`) se faltar memória, e 256 MiB cabe nos
+    /// devices móveis. Faz parte do formato v1.
+    pub(crate) const MAX_M_COST_KIB: u32 = 256 * 1024;
+    pub(crate) const MAX_T_COST: u32 = 6;
     pub(crate) const MAX_LANES: u8 = 4;
 
     /// Valida contra o piso e o teto.
