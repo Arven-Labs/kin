@@ -30,6 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
+mod cold;
 mod keys;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
