@@ -14,6 +14,7 @@ use crate::{Error, IdentityId, KdfParams};
 
 /// Domínio de assinatura do certificado de autoridade. Diferente do de `DeviceCertificate`, para uma
 /// assinatura de um nunca valer como a do outro.
+#[allow(dead_code)] // só no stub; a implementação usa
 pub(crate) const AUTHORITY_DOMAIN: &[u8] = b"kin/authority-cert/v1";
 
 /// Chave de autoridade (Ed25519): faz o trabalho diário no primário enquanto a mestra fica fria.
@@ -75,6 +76,7 @@ pub struct AuthorityCertificate {
 
 impl AuthorityCertificate {
     /// Bytes que a mestra assina (domínio + chave de autoridade + `created_at`).
+    #[allow(dead_code)] // só no stub; a implementação usa
     pub(crate) fn signing_payload(_authority_key: &PublicKey, _created_at: u64) -> Vec<u8> {
         todo!()
     }
