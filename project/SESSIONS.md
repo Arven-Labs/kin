@@ -1314,8 +1314,10 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Tropeços**: o clippy barrou o stub por `dead_code` (de novo, 5ª vez; agora também nas constantes e num campo); um `cat >>` no
   Bash foi barrado pelo classificador (a regra é só `Edit`/`Write`; refiz com `Edit`); a mutação do salt falhou primeiro por
   compilação (`mut` sem uso).
-- **Não verificado**: o **lab não foi rodado** (precisa do `cargo build -p kin-cli` e do Docker locais; só `bash -n` e `sh -n`); o
-  prompt sem eco; Windows, Android e iOS; o código do `argon2` por dentro (aborto por falta de memória, feature `zeroize`);
-  revisão externa do formato; a recuperabilidade dos blocos do arquivo antigo (só documentada).
-- **Próximo passo**: rodar `lab/run.sh multi-device multi-device-plain history-sync` e mesclar; depois fatia 1b (mestra fria e chave
-  de autoridade, opção D), em plan mode.
+- **Lab** (rodado pelo dono, uma rodada de cada, sem `REPEAT`): `multi-device`, `multi-device-plain` e `history-sync`, **29 PASS e 0
+  FAIL, `TUDO OK`**. O `multi-device` confirmou `KINK` no `identity.key` de `a` e o `a2` abriu a cópia com a mesma senha; o
+  `multi-device-plain` confirmou o arquivo em claro.
+- **Não verificado**: o prompt sem eco (o lab não tem terminal); Windows, Android e iOS; o código do `argon2` por dentro (aborto por
+  falta de memória, feature `zeroize`); revisão externa do formato; a recuperabilidade dos blocos do arquivo antigo (só documentada);
+  os demais cenários do lab (`cone`, `symmetric`, `relay-down`, `invite`, `relay-failover`) com chaves cifradas, não rodados.
+- **Próximo passo**: mesclar; depois fatia 1b (mestra fria e chave de autoridade, opção D), em plan mode.

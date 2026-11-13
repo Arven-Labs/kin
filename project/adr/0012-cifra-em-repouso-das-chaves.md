@@ -60,7 +60,8 @@ viram 1b) e proteger por **senha, Argon2id + XChaCha20-Poly1305**.
 - Revisão externa do formato (uso das crates conferido pelo auditor por leitura; build e testes só no CI).
 - O código do `argon2 0.5.3` não estava no cache local: o aborto por falta de memória e o efeito da feature `zeroize` nos blocos
   vêm do conhecimento do crate. Conferir no docs.rs.
-- O prompt sem eco (`rpassword`) não tem teste automatizado: depende de terminal real. O lab não o cobre (stdin é fifo).
+- O prompt sem eco (`rpassword`) não tem teste automatizado: depende de terminal real. O lab não o cobre (stdin é fifo). O lab
+  rodou (Sessão 21) só `multi-device`, `multi-device-plain` e `history-sync`; os outros cenários não foram repetidos com chaves cifradas.
 - Se `ed25519_dalek` está com a feature `zeroize` neste build do `libp2p-identity`.
 - `cargo audit` (base local) apontou avisos que já existiam (`crypto-bigint`, `libcrux-kem`, `paste`, `proc-macro-error2`); nenhum é
   das crates novas.
