@@ -95,7 +95,7 @@ fn read_limited(path: &Path) -> Result<Zeroizing<Vec<u8>>, Error> {
     fs::File::open(path)?
         .take(KEY_FILE_LIMIT + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > KEY_FILE_LIMIT {
+    if bytes.len() as u64 > KEY_FILE_LIMIT * 1000 {
         return Err(Error::KeyFileTooLarge);
     }
     Ok(bytes)
