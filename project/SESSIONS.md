@@ -1281,5 +1281,8 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: nenhuma das referências externas foi conferida contra a especificação (Matrix, Signal, Keybase, RFC 5280, RFC
   9420/9750, KERI); a viabilidade de D e E com o formato de certificado atual; o comportamento do MLS ao apagar um par ativo. O
   auditor também não analisou D e E.
-- **Próximo passo**: o dono decide as 6 perguntas do ADR (direção B; D ou E; identidade queimada; primário obrigatório;
-  validade; limite do contato offline); depois, a fatia 1 (custódia e cifra da mestra, P13) com plan mode.
+- **Decisões do dono** (depois do merge do PR #116, pergunta a pergunta, todas pela recomendação): direção **B**; primário perdido
+  por **D** (mestra fria + autoridade); **identidade nova** na migração; primário **obrigatório**; frescor = **convite com
+  expiração primeiro**; limite do contato offline **aceito**. O ADR 0011 passou a **aceito** (PR de docs desta subseção).
+- **Próximo passo**: fatia 1 do P30 (custódia e cifra da mestra do primário, P13, mais a mestra fria e a chave de autoridade da
+  opção D) com plan mode, testes primeiro e auditoria.

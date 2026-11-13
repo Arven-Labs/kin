@@ -280,7 +280,7 @@ a prova. Contatos e conversas sobrevivem.
   wallet, o Kin recebe uma delegação (P12).
 - O vínculo é só uma alegação até ser verificado (consulta à chain/RPC da Base ou prova off-chain) — P12.
 - **Revogação de device próprio** (Sessão 21): com o `/pair` copiando a mestra, revogar um certificado não revoga nada.
-  O ADR 0011 (proposto) recomenda certificados delegados, com a mestra só num device primário; ver P30.
+  O ADR 0011 (aceito) adota certificados delegados, com a mestra só num device primário e a opção D para o primário perdido; ver P30.
 
 **Reabrir se**: o TruthID ganhar um modo local/SDK Rust reutilizável (aí o provedor standalone pode
 passar a ser esse modo).

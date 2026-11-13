@@ -1,8 +1,10 @@
 # ADR 0011 — Revogação de device próprio (D7, P30)
 
-- **Status**: **proposto** (Sessão 21, 2026-11-12), revisado após o parecer do `security-auditor` (seção final). Só desenho: nenhum
-  código muda. A decisão final é do dono; área de criptografia e de identidade (AGENTS.md §4), então cada fatia de implementação
-  terá plan mode, testes primeiro e auditoria própria.
+- **Status**: **aceito** (Sessão 21, 2026-11-12): o dono respondeu as 6 decisões (seção "Decisões do dono"), todas pela
+  recomendação. Revisado antes pelo parecer do `security-auditor` (seção final). Continua sendo só desenho: nenhum código mudou.
+  Área de criptografia e de identidade (AGENTS.md §4), então cada fatia de implementação terá plan mode, testes primeiro e
+  auditoria própria, e as fatias que definem formato de fio (declaração de revogação, pedido de pareamento, certificado v4)
+  exigem revisão externa antes de virar protocolo.
 - **Relacionados**: ADR 0006 (multi-device: pares device↔device, `/pair`); ADR 0007 (`untrust` de contato; deixou a revogação de
   device próprio para o D7); ADR 0009 (histórico entre irmãos); D7 em `ARCHITECTURE.md`; P12 (TruthID), P13 (mestra sem cifra em
   repouso), P18 (convite sem expiração), P21 (re-depósito), P24 e P30 em `PENDING.md`.
@@ -95,7 +97,22 @@ usuário guardar.
 Qualquer device revoga qualquer outro; a identidade passa a ser uma cadeia assinada.
 - **Descartada por ora**: muda o que é o `IdentityId` (tudo depende dele) e o TruthID (D7) pressupõe raiz única.
 
-## Decisão proposta (aguarda o dono)
+## Decisões do dono (2026-11-12)
+
+| # | Decisão | Resposta |
+|---|---|---|
+| 1 | Direção | **B** (certificados delegados); C fica como alternativa futura |
+| 2 | Resposta ao primário perdido (T4) | **D** (mestra fria offline certifica a chave de autoridade do primário) |
+| 3 | Migração | **Identidade nova**: a atual é descartada; cada contato reconfirma por verificação fora de banda |
+| 4 | Primário | **Obrigatório** para adicionar e revogar devices |
+| 5 | Frescor | **Convite com expiração primeiro** (resolve o P18); a prova de frescor periódica do primário fica para depois, se precisar |
+| 6 | Contato que só alcança o device roubado | **Risco aceito e documentado** |
+
+Consequências dessas respostas sobre as fatias abaixo: a fatia 1 passa a incluir a **mestra fria e a chave de autoridade** (D),
+não só a cifra em repouso; a fatia 4 é, por ora, só **expiração do convite** (P18). O resto da lista de requisitos e de fatias
+vale como está.
+
+## Decisão proposta (texto original, já aceito pelas respostas acima)
 
 1. **Direção: B**, com **D ou E** como resposta ao T4 (decisão do dono entre as duas; sem uma delas o primário é ponto único sem
    saída). A é só migração. Confiança média: conheço o desenho geral, **não conferi as especificações** (ver referências).
@@ -176,7 +193,7 @@ Qualquer device revoga qualquer outro; a identidade passa a ser uma cadeia assin
 - Comportamento real do MLS ao apagar um par ativo e ao recusar o re-handshake (a medir na fatia 3).
 - Todas as referências externas.
 
-## Decisões que cabem ao dono (para aceitar este ADR)
+## Decisões que cabiam ao dono (respondidas, ver "Decisões do dono")
 
 1. Aceitar **B** como direção (e a opção C como alternativa futura)?
 2. Para o **T4** (primário perdido), qual: **D** (mestra fria + autoridade no primário) ou **E** (chave de recuperação
