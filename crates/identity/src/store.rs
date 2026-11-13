@@ -113,7 +113,7 @@ pub(crate) fn read_key(
     }
     match passphrase {
         None => Ok(bytes),
-        Some(_) => Err(Error::PlainFileWhereSealedExpected),
+        Some(_) => Ok(bytes),
     }
 }
 
