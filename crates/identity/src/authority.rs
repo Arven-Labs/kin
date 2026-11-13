@@ -61,6 +61,17 @@ impl AuthorityKey {
         store::write_key_sealed(path, &Zeroizing::new(self.to_bytes()?), passphrase, params)
     }
 
+    /// Como [`Self::save_sealed`], mas **falha se o arquivo já existe** (auditoria da fatia 1b, I2):
+    /// nunca substitui uma chave existente, nem numa corrida.
+    pub fn save_sealed_new(
+        &self,
+        _path: &Path,
+        _passphrase: &[u8],
+        _params: KdfParams,
+    ) -> Result<(), Error> {
+        todo!()
+    }
+
     /// Cifra no lugar um `authority.key` em claro (migração), com as garantias de `store::protect_with`.
     pub fn protect(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
         store::protect_with(path, passphrase, params, |bytes| {
@@ -289,6 +300,60 @@ mod tests {
         assert!(AuthorityCertificate::from_bytes(&device_cert.to_bytes()).is_err());
         let authority_cert = issue(&master, &AuthorityKey::generate());
         assert!(DeviceCertificate::from_bytes(&authority_cert.to_bytes()).is_err());
+    }
+
+    // ---- magic e versão do arquivo ----
+
+    #[test]
+    fn serialized_certificate_starts_with_magic_and_version() {
+        let master = StandaloneIdentity::generate();
+        let bytes = issue(&master, &AuthorityKey::generate()).to_bytes();
+        assert_eq!(&bytes[..4], b"KAUT");
+        assert_eq!(bytes[4], 1);
+    }
+
+    #[test]
+    fn wrong_magic_wrong_version_or_no_prefix_are_refused() {
+        let master = StandaloneIdentity::generate();
+        let good = issue(&master, &AuthorityKey::generate()).to_bytes();
+        let mut bad_magic = good.clone();
+        bad_magic[0] ^= 1;
+        let mut bad_version = good.clone();
+        bad_version[4] = 2;
+        let no_prefix = good[5..].to_vec();
+        for (name, bytes) in [
+            ("magic", bad_magic),
+            ("versão", bad_version),
+            ("sem prefixo", no_prefix),
+        ] {
+            assert!(
+                AuthorityCertificate::from_bytes(&bytes).is_err(),
+                "{name} aceito"
+            );
+        }
+        AuthorityCertificate::from_bytes(&good).unwrap();
+    }
+
+    // ---- gravação que nunca substitui ----
+
+    #[test]
+    fn save_sealed_new_refuses_an_existing_file_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authority.key");
+        let first = AuthorityKey::generate();
+        first.save_sealed_new(&path, PASS, KdfParams::MIN).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let second = AuthorityKey::generate();
+        assert!(second.save_sealed_new(&path, PASS, KdfParams::MIN).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            AuthorityKey::load_with(&path, Some(PASS))
+                .unwrap()
+                .public_key(),
+            first.public_key()
+        );
+        // Sem sobra de temporário no diretório.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     // ---- rotação ----

@@ -27,6 +27,8 @@ pub enum ColdCommand {
         authority_dir: PathBuf,
         master_passphrase_file: Option<PathBuf>,
         passphrase_file: Option<PathBuf>,
+        /// `--expect-identity BASE58`: recusa se a mestra aberta for de outra identidade.
+        expect_identity: Option<String>,
     },
 }
 
@@ -75,6 +77,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, Stri
             authority_dir,
             master_passphrase_file,
             passphrase_file,
+            expect_identity: None,
         }
     })
 }
@@ -121,12 +124,20 @@ pub fn rotate(
     authority_pass: &[u8],
     params: KdfParams,
     now: u64,
+    _expect_identity: Option<&str>,
 ) -> Result<Outcome, String> {
     check_targets(master_file, authority_dir, master_pass, authority_pass)?;
     // Senha errada falha aqui, antes de criar qualquer coisa.
     let master = StandaloneIdentity::load_with(master_file, Some(master_pass))
         .map_err(|e| format!("abrir a mestra {}: {e}", master_file.display()))?;
     write_authority(&master, authority_dir, authority_pass, params, now)
+}
+
+/// Conferência só de **caminhos** (mestra dentro do diretório do primário, autoridade já existente),
+/// para o `run` recusar antes de pedir as senhas. Resolve `.`, `..` e links (auditoria 1b, I1).
+#[allow(dead_code)] // só no stub; a implementação usa
+fn check_paths(_master_file: &Path, _authority_dir: &Path) -> Result<(), String> {
+    todo!()
 }
 
 /// Recusas que não dependem de abrir nada: senhas iguais, mestra dentro do diretório do primário e
@@ -220,6 +231,7 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
             authority_dir,
             master_passphrase_file,
             passphrase_file,
+            expect_identity: _,
         } => {
             let master_pass = passphrase(master_passphrase_file, "senha da mestra fria", false)?;
             let authority_pass = passphrase(passphrase_file, "senha da autoridade nova", true)?;
@@ -230,6 +242,7 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
                 &authority_pass,
                 KdfParams::DEFAULT,
                 now,
+                None,
             )?;
             (outcome, master, authority_dir)
         }
@@ -348,8 +361,54 @@ mod tests {
                 authority_dir: "d".into(),
                 master_passphrase_file: Some("mp".into()),
                 passphrase_file: Some("ap".into()),
+                expect_identity: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_expect_identity_only_for_rotate() {
+        let rotate_args = [
+            "rotate-authority",
+            "--master",
+            "m.key",
+            "--authority-dir",
+            "d",
+            "--expect-identity",
+            "12D3KooWabc",
+        ];
+        match parse(args(&rotate_args)).unwrap() {
+            ColdCommand::Rotate {
+                expect_identity, ..
+            } => assert_eq!(expect_identity.as_deref(), Some("12D3KooWabc")),
+            other => panic!("esperava Rotate, veio {other:?}"),
+        }
+        assert!(
+            parse(args(&[
+                "init",
+                "--master-out",
+                "m.key",
+                "--authority-dir",
+                "d",
+                "--expect-identity",
+                "x"
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_argument_error_never_echoes_the_value_after_an_equals_sign() {
+        let err = parse(args(&[
+            "init",
+            "--master-out",
+            "m",
+            "--authority-dir",
+            "d",
+            "--passphrase=segredo123",
+        ]))
+        .unwrap_err();
+        assert!(!err.contains("segredo123"), "ecoou o segredo: {err}");
     }
 
     #[test]
@@ -507,6 +566,7 @@ mod tests {
             b"outra senha da autoridade",
             KdfParams::MIN,
             NOW + 1,
+            None,
         )
         .unwrap();
         assert_eq!(outcome.identity, first.identity);
@@ -536,6 +596,7 @@ mod tests {
             AUTH_PASS,
             KdfParams::MIN,
             NOW,
+            None,
         );
         assert!(result.is_err());
         assert!(!dir.path().join("primary2").exists());
@@ -553,6 +614,7 @@ mod tests {
             b"outra senha da autoridade",
             KdfParams::MIN,
             NOW,
+            None,
         );
         assert!(result.is_err());
         assert_eq!(
@@ -572,8 +634,151 @@ mod tests {
             MASTER_PASS,
             KdfParams::MIN,
             NOW,
+            None,
         );
         assert!(result.is_err());
         assert!(!dir.path().join("primary2").exists());
+    }
+
+    // ---- correções da auditoria ----
+
+    #[test]
+    fn check_paths_resolves_dot_dot_and_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::create_dir(p.join("primary")).unwrap();
+        // Direto.
+        assert!(check_paths(&p.join("primary/m.key"), &p.join("primary")).is_err());
+        // Com `..` no meio (o `starts_with` por componentes não via isto).
+        assert!(check_paths(&p.join("x/../primary/m.key"), &p.join("primary")).is_err());
+        assert!(check_paths(&p.join("primary/sub/../m.key"), &p.join("primary")).is_err());
+        // Via symlink para o diretório do primário.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(p.join("primary"), p.join("link")).unwrap();
+            assert!(check_paths(&p.join("link/m.key"), &p.join("primary")).is_err());
+            assert!(check_paths(&p.join("primary/m.key"), &p.join("link")).is_err());
+        }
+        // Fora do diretório, mesmo com nome parecido: aceita.
+        assert!(check_paths(&p.join("primary2/m.key"), &p.join("primary")).is_ok());
+        assert!(check_paths(&p.join("offline/m.key"), &p.join("primary")).is_ok());
+    }
+
+    #[test]
+    fn check_paths_refuses_an_existing_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            check_paths(
+                &dir.path().join("offline/m.key"),
+                &dir.path().join("primary")
+            )
+            .is_ok()
+        );
+        do_init(dir.path());
+        assert!(
+            check_paths(
+                &dir.path().join("offline/m2.key"),
+                &dir.path().join("primary")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn init_refuses_empty_passphrases_before_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        for (master_pass, authority_pass) in [(MASTER_PASS, &b""[..]), (&b""[..], AUTH_PASS)] {
+            let result = init(
+                &dir.path().join("offline/m.key"),
+                &dir.path().join("primary"),
+                master_pass,
+                authority_pass,
+                KdfParams::MIN,
+                NOW,
+            );
+            assert!(result.is_err());
+            assert!(!dir.path().join("offline").exists());
+            assert!(!dir.path().join("primary").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_after_the_master_is_written_cleans_up_and_names_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        // Um symlink pendente no lugar do certificado: `exists()` diz que não existe, a gravação falha.
+        std::os::unix::fs::symlink("/nonexistent-kin-dir/x", primary.join("authority.cert"))
+            .unwrap();
+        let master_file = dir.path().join("offline/m.key");
+        let err = init(
+            &master_file,
+            &primary,
+            MASTER_PASS,
+            AUTH_PASS,
+            KdfParams::MIN,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(&master_file.display().to_string()),
+            "o erro não diz onde a mestra foi gravada: {err}"
+        );
+        assert!(master_file.exists(), "a mestra não deve ser apagada");
+        assert!(
+            !primary.join("authority.key").exists(),
+            "sobrou authority.key sem certificado"
+        );
+    }
+
+    #[test]
+    fn rotate_refuses_a_master_of_another_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = do_init(dir.path());
+        let master_file = dir.path().join("offline/cold-master.key");
+        let other = StandaloneIdentity::generate();
+        let wrong = {
+            use kin_identity::IdentityProvider;
+            other.id().to_base58()
+        };
+        let result = rotate(
+            &master_file,
+            &dir.path().join("primary2"),
+            MASTER_PASS,
+            b"outra senha da autoridade",
+            KdfParams::MIN,
+            NOW,
+            Some(wrong.as_str()),
+        );
+        assert!(result.is_err());
+        assert!(!dir.path().join("primary2").exists());
+        let right = first.identity.to_base58();
+        rotate(
+            &master_file,
+            &dir.path().join("primary2"),
+            MASTER_PASS,
+            b"outra senha da autoridade",
+            KdfParams::MIN,
+            NOW,
+            Some(right.as_str()),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        do_init(dir.path());
+        for sub in ["offline", "primary"] {
+            let mode = std::fs::metadata(dir.path().join(sub))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{sub}");
+        }
     }
 }
