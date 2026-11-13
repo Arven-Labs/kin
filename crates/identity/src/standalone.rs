@@ -91,6 +91,16 @@ impl StandaloneIdentity {
         })
     }
 
+    /// Certifica uma chave de autoridade (P30 fatia 1b): "esta chave é a minha autoridade". Deve rodar
+    /// com a mestra **fria** (offline). `created_at` em segundos Unix, passado de fora.
+    pub fn certify_authority(
+        &self,
+        _authority_key: &PublicKey,
+        _created_at: u64,
+    ) -> Result<crate::AuthorityCertificate, Error> {
+        todo!()
+    }
+
     /// Lê a chave mestra de um arquivo cifrado ou em claro (formato antigo). Cifrado sem senha:
     /// [`Error::PassphraseRequired`]; em claro **com** senha: [`Error::PlainFileWhereSealedExpected`].
     pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
