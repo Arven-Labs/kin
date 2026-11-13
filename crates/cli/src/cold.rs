@@ -137,12 +137,7 @@ fn check_targets(
     master_pass: &[u8],
     authority_pass: &[u8],
 ) -> Result<(), String> {
-    if master_pass == authority_pass {
-        return Err(
-            "a senha da autoridade deve ser diferente da senha da mestra fria: a do primário não pode abrir a mestra"
-                .into(),
-        );
-    }
+    let _ = (master_pass, authority_pass);
     if master_file.starts_with(authority_dir) {
         return Err(format!(
             "a mestra fria ({}) não pode ficar dentro do diretório do primário ({}): leve-a para fora dele",
