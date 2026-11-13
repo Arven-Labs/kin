@@ -74,15 +74,18 @@ impl StandaloneIdentity {
         passphrase: &[u8],
         params: KdfParams,
     ) -> Result<(), Error> {
-        let _ = (path, passphrase, params);
-        unimplemented!("stub: StandaloneIdentity::save_sealed")
+        store::write_key_sealed(
+            path,
+            &zeroize::Zeroizing::new(self.to_bytes()?),
+            passphrase,
+            params,
+        )
     }
 
     /// Lê a chave mestra de um arquivo cifrado ou em claro (formato antigo). Cifrado sem senha:
     /// [`Error::PassphraseRequired`].
     pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
-        let _ = (path, passphrase);
-        unimplemented!("stub: StandaloneIdentity::load_with")
+        Self::from_bytes(&store::read_key(path, passphrase)?)
     }
 }
 

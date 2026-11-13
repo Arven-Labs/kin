@@ -3,7 +3,7 @@ use std::path::Path;
 use libp2p_identity::{Keypair, PeerId, PublicKey};
 use secp256k1::{Keypair as SchnorrKeypair, Secp256k1, XOnlyPublicKey};
 
-use crate::{Error, IdentityId, KdfParams};
+use crate::{Error, IdentityId, KdfParams, store};
 
 const CERT_DOMAIN: &[u8] = b"kin/device-cert/v3";
 
@@ -102,15 +102,18 @@ impl DeviceKey {
         passphrase: &[u8],
         params: KdfParams,
     ) -> Result<(), Error> {
-        let _ = (path, passphrase, params);
-        unimplemented!("stub: DeviceKey::save_sealed")
+        store::write_key_sealed(
+            path,
+            &zeroize::Zeroizing::new(self.to_bytes()?),
+            passphrase,
+            params,
+        )
     }
 
     /// Lê a chave do device de um arquivo cifrado ou em claro. Cifrado sem senha:
     /// [`Error::PassphraseRequired`].
     pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
-        let _ = (path, passphrase);
-        unimplemented!("stub: DeviceKey::load_with")
+        Self::from_bytes(&store::read_key(path, passphrase)?)
     }
 }
 

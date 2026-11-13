@@ -5,13 +5,19 @@
 //!
 //! O cabeçalho inteiro entra como dado associado (AAD) do AEAD.
 
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+use secp256k1::rand::RngCore;
 use zeroize::Zeroizing;
 
 use crate::Error;
 
 const MAGIC: &[u8; 4] = b"KINK";
 const VERSION: u8 = 1;
-const HEADER_LEN: usize = 4 + 1 + 4 + 4 + 1 + 16 + 24;
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 24;
+const HEADER_LEN: usize = 4 + 1 + 4 + 4 + 1 + SALT_LEN + NONCE_LEN;
 const TAG_LEN: usize = 16;
 
 /// Custo do Argon2id gravado no cabeçalho. Na leitura os valores têm piso e teto: o arquivo é entrada
@@ -36,38 +42,117 @@ impl KdfParams {
         t_cost: 1,
         lanes: 1,
     };
-    #[allow(dead_code)] // stub: sai quando a implementação entrar
     pub(crate) const MAX_M_COST_KIB: u32 = 1024 * 1024;
-    #[allow(dead_code)] // stub: sai quando a implementação entrar
     pub(crate) const MAX_T_COST: u32 = 10;
-    #[allow(dead_code)] // stub: sai quando a implementação entrar
     pub(crate) const MAX_LANES: u8 = 4;
 
     /// Valida contra o piso e o teto.
     pub fn new(m_cost_kib: u32, t_cost: u32, lanes: u8) -> Result<Self, Error> {
-        let _ = (m_cost_kib, t_cost, lanes);
-        unimplemented!("stub: KdfParams::new")
+        let in_bounds = (Self::MIN.m_cost_kib..=Self::MAX_M_COST_KIB).contains(&m_cost_kib)
+            && (Self::MIN.t_cost..=Self::MAX_T_COST).contains(&t_cost)
+            && (Self::MIN.lanes..=Self::MAX_LANES).contains(&lanes);
+        if in_bounds {
+            Ok(Self {
+                m_cost_kib,
+                t_cost,
+                lanes,
+            })
+        } else {
+            Err(Error::InvalidSealedFile)
+        }
+    }
+
+    fn derive_key(
+        self,
+        passphrase: &[u8],
+        salt: &[u8; SALT_LEN],
+    ) -> Result<Zeroizing<[u8; 32]>, Error> {
+        let params = Params::new(
+            self.m_cost_kib,
+            self.t_cost,
+            u32::from(self.lanes),
+            Some(32),
+        )
+        .map_err(|_| Error::InvalidSealedFile)?;
+        let mut key = Zeroizing::new([0u8; 32]);
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(passphrase, salt, key.as_mut())
+            .map_err(|_| Error::InvalidSealedFile)?;
+        Ok(key)
     }
 }
 
 /// `true` se `bytes` começa pelo magic de um arquivo cifrado. Não valida o resto.
 pub fn is_sealed(bytes: &[u8]) -> bool {
-    let _ = bytes;
-    unimplemented!("stub: is_sealed")
+    bytes.starts_with(MAGIC)
 }
 
 /// Cifra `plaintext` com a senha. Salt e nonce novos a cada chamada. Senha vazia é recusada.
 pub fn seal(plaintext: &[u8], passphrase: &[u8], params: KdfParams) -> Result<Vec<u8>, Error> {
-    let _ = (
-        plaintext, passphrase, params, MAGIC, VERSION, HEADER_LEN, TAG_LEN,
-    );
-    unimplemented!("stub: seal")
+    if passphrase.is_empty() {
+        return Err(Error::EmptyPassphrase);
+    }
+    // Revalida: `params` pode ter vindo de uma constante ou de `new`, mas o formato só aceita o que `open` aceita.
+    let params = KdfParams::new(params.m_cost_kib, params.t_cost, params.lanes)?;
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    let mut rng = secp256k1::rand::thread_rng();
+    rng.fill_bytes(&mut salt);
+    rng.fill_bytes(&mut nonce);
+
+    let mut out = Vec::with_capacity(HEADER_LEN + plaintext.len() + TAG_LEN);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.extend_from_slice(&params.m_cost_kib.to_be_bytes());
+    out.extend_from_slice(&params.t_cost.to_be_bytes());
+    out.push(params.lanes);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+
+    let key = params.derive_key(passphrase, &salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &out,
+            },
+        )
+        .map_err(|_| Error::WrongPassphraseOrCorrupt)?;
+    out.extend_from_slice(&encrypted);
+    Ok(out)
 }
 
 /// Abre um arquivo cifrado. Os parâmetros do cabeçalho são conferidos **antes** de rodar o KDF.
 pub fn open(bytes: &[u8], passphrase: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let _ = (bytes, passphrase);
-    unimplemented!("stub: open")
+    if passphrase.is_empty() {
+        return Err(Error::EmptyPassphrase);
+    }
+    if bytes.len() < HEADER_LEN + TAG_LEN || !is_sealed(bytes) || bytes[4] != VERSION {
+        return Err(Error::InvalidSealedFile);
+    }
+    let (header, body) = bytes.split_at(HEADER_LEN);
+    let m = u32::from_be_bytes(header[5..9].try_into().expect("4 bytes"));
+    let t = u32::from_be_bytes(header[9..13].try_into().expect("4 bytes"));
+    let params = KdfParams::new(m, t, header[13])?;
+    let salt: [u8; SALT_LEN] = header[14..14 + SALT_LEN].try_into().expect("16 bytes");
+    let nonce: [u8; NONCE_LEN] = header[14 + SALT_LEN..HEADER_LEN]
+        .try_into()
+        .expect("24 bytes");
+
+    let key = params.derive_key(passphrase, &salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_ref()));
+    cipher
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: body,
+                aad: header,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| Error::WrongPassphraseOrCorrupt)
 }
 
 #[cfg(test)]

@@ -24,46 +24,86 @@ pub(crate) fn read_secret(path: &Path) -> Result<Vec<u8>, Error> {
 
 /// Grava `bytes` em `path` por arquivo temporário no mesmo diretório + `fsync` + `rename`, com modo 0600:
 /// uma queda no meio deixa o arquivo antigo intacto (o `write_secret` trunca no lugar).
-#[allow(dead_code)] // stub: sai quando a implementação entrar
 pub(crate) fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let _ = (path, bytes);
-    unimplemented!("stub: write_secret_atomic")
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "caminho sem nome de arquivo",
+        )
+    })?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // Sobra de uma queda anterior: `create_new` recusaria.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let write = || -> std::io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    // Persiste a entrada do diretório (o rename); falhar aqui não desfaz o que já foi gravado.
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(dir) = fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Lê um arquivo de chave. Cifrado exige `passphrase`; em claro (formato antigo) ignora-a.
-#[allow(dead_code)] // stub: sai quando a implementação entrar
 pub(crate) fn read_key(
     path: &Path,
     passphrase: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let _ = (path, passphrase);
-    unimplemented!("stub: read_key")
+    let bytes = Zeroizing::new(fs::read(path)?);
+    if !crate::is_sealed(&bytes) {
+        return Ok(bytes);
+    }
+    crate::open(&bytes, passphrase.ok_or(Error::PassphraseRequired)?)
 }
 
 /// Grava `bytes` cifrados com a senha, de forma atômica.
-#[allow(dead_code)] // stub: sai quando a implementação entrar
 pub(crate) fn write_key_sealed(
     path: &Path,
     bytes: &[u8],
     passphrase: &[u8],
     params: KdfParams,
 ) -> Result<(), Error> {
-    let _ = (path, bytes, passphrase, params);
-    unimplemented!("stub: write_key_sealed")
+    write_secret_atomic(path, &crate::seal(bytes, passphrase, params)?)
 }
 
 /// `true` se o arquivo de chave em `path` está cifrado.
 pub fn key_file_is_sealed(path: &Path) -> Result<bool, Error> {
-    let _ = path;
-    unimplemented!("stub: key_file_is_sealed")
+    Ok(crate::is_sealed(&fs::read(path)?))
 }
 
 /// Migra um arquivo de chave **em claro** para o formato cifrado, no lugar e de forma atômica.
 /// Recusa um arquivo já cifrado ([`Error::AlreadySealed`]) e senha vazia; em qualquer falha o original
 /// fica intacto.
 pub fn protect_key_file(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
-    let _ = (path, passphrase, params);
-    unimplemented!("stub: protect_key_file")
+    let plain = Zeroizing::new(fs::read(path)?);
+    if crate::is_sealed(&plain) {
+        return Err(Error::AlreadySealed);
+    }
+    write_key_sealed(path, &plain, passphrase, params)
 }
 
 #[cfg(test)]
