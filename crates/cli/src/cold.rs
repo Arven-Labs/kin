@@ -65,7 +65,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<ColdCommand, Stri
             }
             other => {
                 // Só o nome: `--passphrase=segredo` não pode ser ecoado no terminal.
-                let name = other.split('=').next().unwrap_or(other);
+                let name = other;
                 return Err(format!("argumento desconhecido: {name}"));
             }
         }
