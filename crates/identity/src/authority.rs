@@ -14,7 +14,7 @@ use crate::{Error, IdentityId, KdfParams, store};
 
 /// Domínio de assinatura do certificado de autoridade. Diferente do de `DeviceCertificate`, para uma
 /// assinatura de um nunca valer como a do outro.
-pub(crate) const AUTHORITY_DOMAIN: &[u8] = b"kin/authority-cert/v1";
+pub(crate) const AUTHORITY_DOMAIN: &[u8] = b"kin/device-cert/v3";
 
 /// Chave de autoridade (Ed25519): faz o trabalho diário no primário enquanto a mestra fica fria.
 pub struct AuthorityKey {
