@@ -100,7 +100,7 @@ pub fn key_file_is_sealed(path: &Path) -> Result<bool, Error> {
 /// fica intacto.
 pub fn protect_key_file(path: &Path, passphrase: &[u8], params: KdfParams) -> Result<(), Error> {
     let plain = Zeroizing::new(fs::read(path)?);
-    if crate::is_sealed(&plain) {
+    if crate::is_sealed(&plain) && plain.is_empty() {
         return Err(Error::AlreadySealed);
     }
     write_key_sealed(path, &plain, passphrase, params)
