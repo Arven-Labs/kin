@@ -135,9 +135,6 @@ impl AuthorityCertificate {
         );
         cur = &cur[8..];
         let signature = take(&mut cur).map_err(bad)?.to_vec();
-        if !cur.is_empty() {
-            return Err(Error::InvalidAuthorityCertificate);
-        }
         Ok(Self {
             identity: IdentityId::new(identity),
             authority_key,
