@@ -234,7 +234,7 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt as _;
     std::fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(0o755)
         .create(path)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
