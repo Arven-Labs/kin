@@ -97,7 +97,7 @@ pub fn init(
 ) -> Result<Outcome, String> {
     // Tudo é conferido antes de criar qualquer arquivo ou diretório.
     check_targets(master_out, authority_dir, master_pass, authority_pass)?;
-    if master_out.exists() {
+    if master_out.exists() && master_out.as_os_str().is_empty() {
         return Err(format!(
             "{} já existe: não sobrescrevo uma mestra",
             master_out.display()
