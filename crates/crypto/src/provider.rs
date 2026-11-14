@@ -84,6 +84,42 @@ impl Provider {
         Ok(())
     }
 
+    pub(crate) fn delete_meta(&self, key: &str) -> Result<(), Error> {
+        self.conn
+            .execute("DELETE FROM kin_meta WHERE key = ?1", [key])
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// Conclui um pareamento: grava o certificado e apaga o pedido pendente **na mesma transação**, para
+    /// um corte no meio não deixar o banco com os dois. É um compare-and-swap: o certificado entra com
+    /// `INSERT` simples (falha se já existe um) e o pedido só é apagado se ainda for **exatamente** o
+    /// `request` lido; senão a transação é desfeita ([`Error::NotPending`]).
+    pub(crate) fn finish_pairing(
+        &self,
+        certificate: &[u8],
+        cert_key: &str,
+        request: &[u8],
+        request_key: &str,
+    ) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction().map_err(Error::storage)?;
+        tx.execute(
+            "INSERT INTO kin_meta (key, value) VALUES (?1, ?2)",
+            params![cert_key, certificate],
+        )
+        .map_err(Error::storage)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM kin_meta WHERE key = ?1 AND value = ?2",
+                params![request_key, request],
+            )
+            .map_err(Error::storage)?;
+        if removed != 1 {
+            return Err(Error::NotPending);
+        }
+        tx.commit().map_err(Error::storage)
+    }
+
     pub(crate) fn remember(&self, label: &str, group_id: &[u8]) -> Result<(), Error> {
         self.conn
             .execute(

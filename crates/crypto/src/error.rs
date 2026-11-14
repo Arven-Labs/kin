@@ -45,6 +45,19 @@ pub enum Error {
     /// O banco foi criado com outra chave de rede; as conversas antigas não valem mais (P15).
     #[error("o estado salvo pertence a outra chave de rede do device")]
     DeviceMismatch,
+    /// O banco já tem certificado (de um pareamento ou de uma mestra): não é um device pendente (P30 2c-ii).
+    #[error("este banco já tem certificado: não está pendente de pareamento")]
+    AlreadyPaired,
+    /// Não há pedido de pareamento guardado neste banco para instalar um certificado.
+    #[error("não há pedido de pareamento pendente neste banco")]
+    NotPending,
+    /// O banco não tem um device pareado (certificado instalado) para reabrir.
+    #[error("este banco não tem um device pareado")]
+    NotPaired,
+    /// O banco tem um pedido de pareamento pendente: abri-lo como mestra ou primário criaria outra chave
+    /// MLS por cima da que o pedido já declarou.
+    #[error("este banco está à espera de um certificado de pareamento")]
+    PairingInProgress,
     #[error("armazenamento: {0}")]
     Storage(String),
     #[error("falha no MLS: {0}")]
