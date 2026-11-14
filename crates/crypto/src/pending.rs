@@ -63,6 +63,24 @@ impl PendingDevice {
         Ok(request)
     }
 
+    /// Como [`Self::request`], com o instante `now` (segundos Unix) passado de fora, para testar o prazo.
+    pub fn request_at(&self, device_key: &DeviceKey, now: u64) -> Result<PairRequest, Error> {
+        let _ = (device_key, now);
+        todo!("P30 2d-ii-a1")
+    }
+
+    /// Como [`Self::install_certificate`], com o instante `now` (segundos Unix) passado de fora.
+    pub fn install_certificate_at(
+        self,
+        device_key: &DeviceKey,
+        certificate: &DeviceCertificate,
+        expected: &IdentityId,
+        now: u64,
+    ) -> Result<CryptoDevice, Error> {
+        let _ = (device_key, certificate, expected, now);
+        todo!("P30 2d-ii-a1")
+    }
+
     /// Descarta o pedido guardado (a pessoa viu um código diferente, ou desistiu). A chave MLS fica; o
     /// próximo [`Self::request`] gera um pedido novo, com outro nonce e outro código. O certificado cobre
     /// as chaves (não o nonce): um emitido para as chaves deste device continua válido; um para as chaves
