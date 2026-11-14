@@ -274,9 +274,9 @@ impl DeviceCertificate {
         let mut cur = bytes;
         let (identity, issuer) = match bytes.strip_prefix(V4_MAGIC.as_slice()) {
             Some(rest) => {
-                cur = rest
-                    .strip_prefix(&[V4_VERSION])
-                    .ok_or(Error::InvalidCertificate)?;
+                // MUTAÇÃO M7: pula o byte de versão sem conferir.
+                let _ = V4_VERSION;
+                cur = rest.get(1..).ok_or(Error::InvalidCertificate)?;
                 let authority = AuthorityCertificate::from_bytes(take(&mut cur)?)
                     .map_err(|_| Error::InvalidCertificate)?;
                 (
