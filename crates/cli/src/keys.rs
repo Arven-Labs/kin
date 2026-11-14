@@ -137,7 +137,8 @@ pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access,
 pub fn files_state(dir: &Path) -> Result<FilesState, Box<dyn std::error::Error>> {
     let mut sealed = Vec::new();
     // O `authority.key` do primário (P30 2b) conta como os outros: cifrado = pedir a senha uma vez.
-    for name in ["identity.key", AUTHORITY_KEY_FILE, "device.key"] {
+    // MUTAÇÃO N3: sem o authority.key.
+    for name in ["identity.key", "device.key"] {
         let path = dir.join(name);
         if path.exists() {
             sealed.push(kin_identity::key_file_is_sealed(&path)?);
