@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 mod cold;
 mod keys;
+#[allow(dead_code)] // TEMPORÁRIO (fase de stubs, remover ao implementar)
 mod pair;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};

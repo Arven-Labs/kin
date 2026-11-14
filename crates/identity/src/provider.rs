@@ -33,7 +33,6 @@ impl IdentityId {
     }
 }
 
-
 /// O que o Kin exige de uma identidade, seja qual for a origem (D7).
 pub trait IdentityProvider {
     /// ID estável da identidade.
