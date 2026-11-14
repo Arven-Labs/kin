@@ -64,8 +64,9 @@ impl PendingDevice {
     }
 
     /// Descarta o pedido guardado (a pessoa viu um código diferente, ou desistiu). A chave MLS fica; o
-    /// próximo [`Self::request`] gera um pedido novo, com outro nonce e outro código, e um certificado do
-    /// pedido antigo deixa de valer.
+    /// próximo [`Self::request`] gera um pedido novo, com outro nonce e outro código. O certificado cobre
+    /// as chaves (não o nonce): um emitido para as chaves deste device continua válido; um para as chaves
+    /// de um intruso nunca casa.
     pub fn discard_request(&self) -> Result<(), Error> {
         self.provider.delete_meta(META_REQUEST)
     }

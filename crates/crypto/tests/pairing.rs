@@ -232,17 +232,18 @@ fn installing_with_another_device_key_is_refused_and_the_database_stays_pending(
 
 // ---- descartar o pedido (auditoria 2c-ii, S4) ----
 
-/// A pessoa viu um código diferente no primário e desistiu: o pedido some, o próximo é outro, e o
-/// certificado do pedido antigo não serve mais.
+/// A pessoa viu um código diferente no primário e desistiu: o pedido some e o próximo é outro (outro
+/// nonce, outro código). O certificado cobre as **chaves**, não o nonce: um certificado do pedido
+/// antigo, emitido pelo primário de verdade para as chaves deste device, continua sendo válido; o de um
+/// pedido com as chaves de um intruso nunca casa (testado em `wrong_certificates`).
 #[test]
-fn a_discarded_request_is_replaced_and_its_certificate_stops_working() {
+fn a_discarded_request_is_replaced_by_a_new_one_with_another_code() {
     let primary = primary_of(&StandaloneIdentity::generate());
     let dir = tempfile::tempdir().unwrap();
     let db = db_in(&dir, "new.db");
     let key = DeviceKey::generate();
     let pending = PendingDevice::open(&db).unwrap();
     let old = pending.request(&key).unwrap();
-    let old_cert = answer(&primary, &old);
 
     pending.discard_request().unwrap();
     let new = pending.request(&key).unwrap();
@@ -251,10 +252,10 @@ fn a_discarded_request_is_replaced_and_its_certificate_stops_working() {
     assert_ne!(new.nonce, old.nonce);
     assert_ne!(new.sas_code(&primary.id()), old.sas_code(&primary.id()));
     assert_eq!(new.signing_key, old.signing_key, "a chave MLS é a mesma");
-    assert!(
-        pending
-            .install_certificate(&key, &old_cert, &primary.id())
-            .is_err()
+    // e o banco guarda o novo, não o antigo
+    assert_eq!(
+        PendingDevice::open(&db).unwrap().request(&key).unwrap(),
+        new
     );
 }
 
