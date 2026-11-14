@@ -1405,4 +1405,15 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `--serve-relay` decifrando a chave e a corrida do primeiro uso viraram P31 (e) a (h).
 - **Tropeço**: o mesmo `large_enum_variant` da 2a, que eu devia ter previsto; e errei a leitura do lint no primeiro `Box`.
 - **Não verificado**: abrir o primário num terminal real (prompt, `KdfParams::DEFAULT`); FIFO no `authority.cert`; lab.
-- **Próximo passo**: P31(a) (PR próprio) e depois a 2c (pedido e resposta de pareamento), em plan mode.
+
+#### A identidade do certificado de device vem do emissor (P31(a), PR #160)
+
+- **Decisão do dono** (plan mode + 1 pergunta): tirar o campo `identity` e derivá-la do emissor (descartada a struct toda
+  privada, que obrigaria os testes de adulteração a mexer em bytes).
+- **Feito**: `Issuer::Master(IdentityId)`, `DeviceCertificate::identity()`; o `verify` do v4 perde a conferência
+  `authority.identity == self.identity` (o tipo garante); chamadores em `crypto`, `chat` e `cli`; testes que trocavam o campo
+  passam a trocar o emissor (v3) ou a afirmar a identidade da cadeia (v4). Bytes no fio inalterados.
+- **Prova**: refatoração sem comportamento novo; a suíte atual ficou verde (run 43545801686). Mutação (PR #161, fechado):
+  `identity()` do v4 devolvendo a chave de autoridade foi pega por 8 testes em 5 crates (run 43546101795).
+- **Tropeço**: o primeiro push não compilou: `parse(credential)?.identity` (acesso depois de `?`) escapou do meu grep.
+- **Próximo passo**: 2c (pedido e resposta de pareamento), em plan mode.

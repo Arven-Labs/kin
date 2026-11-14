@@ -34,7 +34,7 @@ impl Invite {
 
     /// Identidade de quem convidou.
     pub fn identity(&self) -> &IdentityId {
-        &self.certificate.identity
+        self.certificate.identity()
     }
 
     /// Peer ID do device que atende pelo convite.

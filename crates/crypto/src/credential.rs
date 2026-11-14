@@ -33,7 +33,7 @@ pub(crate) fn verify(
     }
     let who = Verified {
         peer: cert.network_peer_id(),
-        identity: cert.identity,
+        identity: cert.identity().clone(),
     };
     if expected.identity.is_some_and(|id| id != &who.identity) {
         return Err(Error::UnexpectedIdentity);
@@ -46,7 +46,7 @@ pub(crate) fn verify(
 
 /// Lê a identidade de uma credencial já validada pelo MLS (sem rechecar a chave do membro).
 pub(crate) fn identity_of(credential: &Credential) -> Result<IdentityId, Error> {
-    Ok(parse(credential)?.identity)
+    Ok(parse(credential)?.identity().clone())
 }
 
 /// Lê o Peer ID de rede certificado numa credencial já validada pelo MLS.
@@ -147,7 +147,7 @@ mod tests {
         let key = DeviceKey::generate().public_key();
         let mut cert = issue(&id, &key, &DeviceKey::generate().public_key());
         // Alguém troca a identidade por outra, mantendo a assinatura original.
-        cert.identity = StandaloneIdentity::generate().id();
+        cert.issuer = kin_identity::Issuer::Master(StandaloneIdentity::generate().id());
         let raw = ed25519_bytes(&key).unwrap();
 
         assert!(matches!(

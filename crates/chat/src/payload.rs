@@ -494,7 +494,7 @@ mod tests {
     fn a_device_list_with_a_tampered_certificate_is_malformed() {
         // Certificado de uma identidade que diz pertencer a outra: a assinatura não bate.
         let mut forged = certificate(&StandaloneIdentity::generate());
-        forged.identity = StandaloneIdentity::generate().id();
+        forged.issuer = kin_identity::Issuer::Master(StandaloneIdentity::generate().id());
 
         let bytes = Payload::DeviceList(vec![Invite::new(forged, vec![])]).encode();
 

@@ -45,7 +45,7 @@ fn certify(issuer: &dyn IdentityProvider, d: &Device) -> DeviceCertificate {
 fn authority_cert_of(cert: &DeviceCertificate) -> &AuthorityCertificate {
     match &cert.issuer {
         Issuer::Authority(a) => a,
-        Issuer::Master => panic!("esperava um certificado v4"),
+        Issuer::Master(_) => panic!("esperava um certificado v4"),
     }
 }
 
@@ -61,7 +61,7 @@ fn a_device_certified_by_the_authority_belongs_to_the_master_identity() {
 
     cert.verify().unwrap();
     assert_eq!(primary.id(), master.id());
-    assert_eq!(cert.identity, master.id());
+    assert_eq!(cert.identity(), &master.id());
     assert_eq!(authority_cert_of(&cert), primary.certificate());
     assert_eq!(cert.signing_key, d.mls.public_key());
     assert_eq!(cert.network_peer_id(), d.net.peer_id());
@@ -87,7 +87,7 @@ fn a_v3_certificate_still_reads_and_verifies_next_to_v4() {
     let master = StandaloneIdentity::generate();
     let v3 = certify(&master, &device());
 
-    assert_eq!(v3.issuer, Issuer::Master);
+    assert_eq!(v3.issuer, Issuer::Master(master.id()));
     // O v3 começa pelo tamanho da identidade (parte alta zero).
     assert_eq!(v3.to_bytes()[0], 0);
     let restored = DeviceCertificate::from_bytes(&v3.to_bytes()).unwrap();
@@ -97,15 +97,18 @@ fn a_v3_certificate_still_reads_and_verifies_next_to_v4() {
 
 // ---- a cadeia precisa fechar ----
 
+/// P31(a): a identidade vem da cadeia, então um device certificado pela autoridade de um intruso só
+/// pode ser do intruso; não há campo para "dizer" que é da mestra.
 #[test]
-fn an_authority_certified_by_another_master_does_not_vouch_for_this_identity() {
+fn an_authority_certified_by_another_master_vouches_only_for_that_master() {
     let master = StandaloneIdentity::generate();
     let intruder = StandaloneIdentity::generate();
-    // A autoridade do intruso certifica o device, e ele diz que o device é da mestra.
-    let mut cert = certify(&primary_of(&intruder), &device());
-    cert.identity = master.id();
 
-    assert!(cert.verify().is_err());
+    let cert = certify(&primary_of(&intruder), &device());
+
+    cert.verify().unwrap();
+    assert_eq!(cert.identity(), &intruder.id());
+    assert_ne!(cert.identity(), &master.id());
 }
 
 #[test]
@@ -153,8 +156,7 @@ fn a_v4_signature_does_not_verify_as_a_v3_certificate_of_the_authority_key() {
     // Quem tem a autoridade tenta fazer a assinatura v4 valer como v3 de uma "identidade" que é a
     // própria chave de autoridade: os domínios precisam ser diferentes.
     let mut cert = certify(&primary, &device());
-    cert.issuer = Issuer::Master;
-    cert.identity = authority_id;
+    cert.issuer = Issuer::Master(authority_id);
 
     assert!(cert.verify().is_err());
 }
@@ -174,8 +176,8 @@ fn an_authority_shared_by_two_masters_does_not_move_a_device_between_them() {
     // Device certificado para m1; trocar a cadeia por a de m2 não pode fazê-lo valer para m2.
     let mut cert = certify(&primary, &device());
     cert.issuer = Issuer::Authority(Box::new(by_m2));
-    cert.identity = m2.id();
 
+    assert_eq!(cert.identity(), &m2.id());
     assert!(cert.verify().is_err());
 }
 
@@ -212,8 +214,7 @@ fn tampering_with_any_device_field_breaks_a_v4_certificate() {
     signature.signature[0] ^= 1;
     let mut empty = good.clone();
     empty.signature.clear();
-    let mut identity = good.clone();
-    identity.identity = StandaloneIdentity::generate().id();
+    // A identidade não é um campo (P31(a)): trocá-la é trocar a cadeia, coberto acima.
 
     for (name, bad) in [
         ("signing_key", signing),
@@ -222,7 +223,6 @@ fn tampering_with_any_device_field_breaks_a_v4_certificate() {
         ("created_at", time),
         ("signature", signature),
         ("empty signature", empty),
-        ("identity", identity),
     ] {
         assert!(bad.verify().is_err(), "{name} adulterado foi aceito");
     }

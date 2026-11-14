@@ -63,7 +63,7 @@ consistentes; sem pânico com bytes hostis; um build antigo não lê v4 como v3 
 | Achado | Gravidade | Tratamento |
 |---|---|---|
 | A1: o payload amarrava só a chave de autoridade, não a emissão do `KAUT` | baixa | **feito**: `created_at` do `KAUT` no payload; teste que falhou antes (run 43539973828) |
-| A2: campos `pub` permitem v4 incoerente em memória, e `to_bytes` grava a identidade da cadeia | baixa | **pendência** (P31): fechar a struct; sem caminho vindo da rede |
+| A2: campos `pub` permitem v4 incoerente em memória, e `to_bytes` grava a identidade da cadeia | baixa | **feito no P31(a)** (Sessão 23, PR #160): sai o campo `identity`; `Issuer::Master(IdentityId)` e `identity()` derivam a identidade do emissor, e o `verify` do v4 perde a conferência que só pegava esse estado |
 | A3: a recarga do SQLite (`CryptoDevice::build`) não chama `verify` nem confere a chave MLS (já existia) | baixa | **pendência** (P31) |
 | A4: codificação protobuf não canônica aceita (S4 do ADR 0013) | sugestão | segue na S4; nenhum consumidor usa os bytes como id |
 | A5: chave Ed25519 de ordem pequena passa no `verify` não estrito do libp2p (já existia) | baixa | **pendência** (P31) |
