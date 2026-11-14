@@ -86,7 +86,7 @@ impl DeviceKey {
     pub(crate) fn sign_nostr(&self, message: &[u8]) -> Vec<u8> {
         Secp256k1::signing_only()
             .sign_schnorr_no_aux_rand(message, &self.nostr)
-            .serialize()
+            .to_byte_array()
             .to_vec()
     }
 

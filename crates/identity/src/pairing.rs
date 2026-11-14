@@ -131,7 +131,10 @@ impl PairRequest {
 
     /// Lê um pedido serializado. Não confere as provas: use [`Self::verify`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let invalid = |_| Error::InvalidPairRequest;
+        // Genérica: serve ao erro do `take` e ao do decodificador de chave, sem expor o detalhe.
+        fn invalid<E>(_: E) -> Error {
+            Error::InvalidPairRequest
+        }
         if bytes.len() > MAX_REQUEST_LEN {
             return Err(Error::InvalidPairRequest);
         }
