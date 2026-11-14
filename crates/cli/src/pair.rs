@@ -188,7 +188,7 @@ fn write_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Lê uma linha de `reader` com teto de `limit` bytes (sem a quebra de linha). Mais que isso é erro:
 /// o código de comparação tem 27 caracteres. Auditoria da 2d-ii-a2, S2.
 fn read_bounded_line(reader: impl std::io::BufRead, limit: usize) -> Result<String, String> {
-    use std::io::{BufRead as _, Read as _};
+    use std::io::BufRead as _;
     let mut raw = Vec::new();
     // Lê no máximo `limit + 1` bytes (a quebra de linha não conta): mais que isso não é um código.
     reader
