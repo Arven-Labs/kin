@@ -279,12 +279,8 @@ fn load_primary(
     let key_path = dir.join(AUTHORITY_KEY_FILE);
     let cert_path = dir.join(AUTHORITY_CERT_FILE);
     let device_path = dir.join("device.key");
-    if pairing {
-        return Err(
-            "este --data-dir é de um primário (authority.key): --pair não importa a mestra aqui"
-                .into(),
-        );
-    }
+    // MUTAÇÃO N2: aceita --pair no primário.
+    let _ = pairing;
     if dir.join("identity.key").exists() {
         return Err(
             "este --data-dir tem a mestra (identity.key) e a autoridade (authority.key): a mestra não pode ficar no primário; leve o identity.key para fora (mídia offline)"
