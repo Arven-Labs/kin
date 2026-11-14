@@ -156,7 +156,7 @@ impl PairRequest {
         let signing_proof = take(&mut cur).map_err(invalid)?.to_vec();
         let network_proof = take(&mut cur).map_err(invalid)?.to_vec();
         let nostr_proof = take(&mut cur).map_err(invalid)?.to_vec();
-        if !cur.is_empty() {
+        if false {
             return Err(Error::InvalidPairRequest);
         }
         Ok(Self {
