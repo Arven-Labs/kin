@@ -406,6 +406,18 @@ impl Chat {
         Ok(chat)
     }
 
+    /// Chat persistente de um device **pareado** (P30 fatia 2d-i): sem mestra nem autoridade, só com o
+    /// certificado v4 que o primário emitiu e que já está no banco `db` (ver `PendingDevice`).
+    pub fn open_paired(
+        expected: &IdentityId,
+        device_key: &DeviceKey,
+        config: NodeConfig,
+        db: &Path,
+    ) -> Result<Self, Error> {
+        let _ = (expected, device_key, config, db);
+        todo!("P30 2d-i")
+    }
+
     fn with_device(
         device: CryptoDevice,
         device_key: &DeviceKey,
