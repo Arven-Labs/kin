@@ -173,9 +173,18 @@ mod tests {
         identity.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
         let loaded = StandaloneIdentity::load_with(&path, Some(PASS)).unwrap();
         assert_eq!(loaded.id(), identity.id());
-        // Mesma chave: a assinatura de um verifica na pública do outro.
-        let sig = loaded.sign(b"msg").unwrap();
-        assert!(identity.id().public_key().verify(b"msg", &sig));
+        // Mesma privada: o certificado que a carregada assina verifica sob a pública da original.
+        let device = crate::DeviceKey::generate();
+        let mut cert = loaded
+            .authorize_device(
+                &device.public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1_000,
+            )
+            .unwrap();
+        cert.identity = identity.id();
+        cert.verify().unwrap();
     }
 
     #[test]

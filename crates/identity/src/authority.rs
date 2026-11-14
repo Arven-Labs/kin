@@ -389,8 +389,8 @@ mod tests {
         authority.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
         let loaded = AuthorityKey::load_with(&path, Some(PASS)).unwrap();
         assert_eq!(loaded.public_key(), authority.public_key());
-        let sig = loaded.sign(b"msg").unwrap();
-        assert!(authority.public_key().verify(b"msg", &sig));
+        // Mesma privada (não só a pública).
+        assert_eq!(loaded.to_bytes().unwrap(), authority.to_bytes().unwrap());
     }
 
     #[test]

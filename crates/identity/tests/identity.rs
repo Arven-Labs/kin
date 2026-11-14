@@ -1,14 +1,6 @@
 use kin_identity::{DeviceKey, IdentityProvider, NostrPublicKey, StandaloneIdentity};
 
 #[test]
-fn identity_signature_verifies_and_rejects_tampering() {
-    let id = StandaloneIdentity::generate();
-    let sig = id.sign(b"ola").unwrap();
-    assert!(id.id().public_key().verify(b"ola", &sig));
-    assert!(!id.id().public_key().verify(b"outra", &sig));
-}
-
-#[test]
 fn device_certificate_verifies() {
     let id = StandaloneIdentity::generate();
     let (mls, device) = (DeviceKey::generate(), DeviceKey::generate());
@@ -215,7 +207,7 @@ fn device_key_file_without_the_nostr_key_is_rejected() {
 mod pair_link {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use kin_identity::{IdentityProvider, StandaloneIdentity};
+    use kin_identity::{DeviceKey, IdentityProvider, StandaloneIdentity};
 
     fn link_of(bytes: &[u8]) -> String {
         format!("kin://pair/{}", URL_SAFE_NO_PAD.encode(bytes))
@@ -229,8 +221,18 @@ mod pair_link {
             StandaloneIdentity::from_pair_link(&original.to_pair_link().unwrap()).unwrap();
 
         assert_eq!(restored.id(), original.id());
-        let signature = restored.sign(b"ola").unwrap();
-        assert!(original.id().public_key().verify(b"ola", &signature));
+        // Mesma privada: o certificado que a restaurada assina verifica sob a pública da original.
+        let device = DeviceKey::generate();
+        let mut cert = restored
+            .authorize_device(
+                &device.public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1_000,
+            )
+            .unwrap();
+        cert.identity = original.id();
+        cert.verify().unwrap();
     }
 
     #[test]
