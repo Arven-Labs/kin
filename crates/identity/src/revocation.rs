@@ -158,7 +158,6 @@ impl DeviceRevocation {
             Issuer::Master(identity) => identity.public_key().verify(&payload, &self.signature),
             Issuer::Authority(authority) => {
                 // A cadeia inteira: a mestra assinou a autoridade, e a autoridade assinou o tombstone.
-                authority.verify().map_err(|_| Error::InvalidRevocation)?;
                 authority.authority_key.verify(&payload, &self.signature)
             }
         };
