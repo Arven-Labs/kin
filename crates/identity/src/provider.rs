@@ -23,6 +23,54 @@ impl IdentityId {
     pub fn as_peer_id(&self) -> PeerId {
         self.0.to_peer_id()
     }
+
+    /// Inverso de [`Self::to_base58`]: lê o texto que o primário imprime (P30 2d-ii-a2). Só aceita o
+    /// Peer ID de uma chave Ed25519 que carrega a própria chave (multihash identidade); qualquer outra
+    /// coisa é [`Error::InvalidIdentityId`], sem detalhe do que veio.
+    pub fn from_base58(text: &str) -> Result<Self, Error> {
+        let _ = text;
+        todo!("stub: from_base58")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StandaloneIdentity;
+
+    #[test]
+    fn base58_round_trips_the_identity() {
+        let id = StandaloneIdentity::generate().id();
+        assert_eq!(IdentityId::from_base58(&id.to_base58()).unwrap(), id);
+    }
+
+    #[test]
+    fn base58_trims_surrounding_whitespace_and_newline() {
+        let id = StandaloneIdentity::generate().id();
+        let padded = format!("  {}\n", id.to_base58());
+        assert_eq!(IdentityId::from_base58(&padded).unwrap(), id);
+    }
+
+    #[test]
+    fn base58_rejects_garbage_empty_and_oversized_input() {
+        for bad in ["", "   ", "não é base58", "0OIl", &"1".repeat(4096)] {
+            assert!(
+                matches!(IdentityId::from_base58(bad), Err(Error::InvalidIdentityId)),
+                "aceitou {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn base58_rejects_a_peer_id_that_is_not_an_ed25519_identity_multihash() {
+        // Peer ID de um hash qualquer (sha2-256 de bytes arbitrários): é um base58 válido de PeerId,
+        // mas não carrega uma chave Ed25519.
+        let not_a_key = PeerId::random().to_base58();
+        assert!(matches!(
+            IdentityId::from_base58(&not_a_key),
+            Err(Error::InvalidIdentityId)
+        ));
+    }
 }
 
 /// O que o Kin exige de uma identidade, seja qual for a origem (D7).

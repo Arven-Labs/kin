@@ -14,6 +14,9 @@ pub enum Error {
     /// Sem detalhe de propósito: o link carrega a chave mestra e não pode ser ecoado.
     #[error("link de pareamento inválido (esperado kin://pair/ + chave mestra em base64url)")]
     InvalidPairLink,
+    /// Sem detalhe de propósito: o texto veio de fora (digitado ou colado).
+    #[error("identidade inválida (esperado o ID em base58 de uma chave Ed25519)")]
+    InvalidIdentityId,
     #[error("certificado de device inválido")]
     InvalidCertificate,
     /// Sem detalhe de propósito: não dizer qual das três provas de posse falhou.

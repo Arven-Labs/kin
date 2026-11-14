@@ -23,6 +23,7 @@ tokio.workspace = true
 qrcode.workspace = true
 zeroize.workspace = true
 rpassword.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
