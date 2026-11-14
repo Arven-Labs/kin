@@ -68,7 +68,7 @@ fn proof_payload(
             &signing_key.encode_protobuf(),
             &network_key.encode_protobuf(),
             &nostr_key.to_bytes(),
-            nonce,
+            &nonce[..0],
         ],
     )
 }
