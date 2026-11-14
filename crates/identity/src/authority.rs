@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 use crate::device::{put, take};
 use crate::{
     DeviceCertificate, Error, IdentityId, IdentityProvider, Issuer, KdfParams, NostrPublicKey,
-    store,
+    PairRequest, store,
 };
 
 /// Domínio de assinatura do certificado de autoridade. Diferente do de `DeviceCertificate`, para uma
@@ -191,6 +191,16 @@ impl AuthorityIdentity {
 
     pub fn certificate(&self) -> &AuthorityCertificate {
         &self.certificate
+    }
+
+    /// Responde a um pedido de pareamento (P30 2c): confere as três provas de posse e certifica as
+    /// chaves do pedido em v4. A confirmação humana (comparar o `sas_code`) é de quem chama.
+    pub fn answer_pair_request(
+        &self,
+        _request: &PairRequest,
+        _created_at: u64,
+    ) -> Result<DeviceCertificate, Error> {
+        todo!("2c: verificar o pedido e certificar")
     }
 }
 

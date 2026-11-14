@@ -16,6 +16,9 @@ pub enum Error {
     InvalidPairLink,
     #[error("certificado de device inválido")]
     InvalidCertificate,
+    /// Sem detalhe de propósito: não dizer qual das três provas de posse falhou.
+    #[error("pedido de pareamento inválido")]
+    InvalidPairRequest,
     #[error("certificado de autoridade inválido")]
     InvalidAuthorityCertificate,
     #[error("arquivo de chave de autoridade inválido")]
