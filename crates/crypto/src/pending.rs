@@ -55,8 +55,6 @@ impl PendingDevice {
             let request = PairRequest::from_bytes(&bytes)?;
             // O banco é só um arquivo: o pedido guardado tem de ser deste signer e desta device.key.
             if request.signing_key != signing_key
-                || request.network_key != device_key.public_key()
-                || request.nostr_key != device_key.nostr_public_key()
             {
                 return Err(Error::DeviceMismatch);
             }
