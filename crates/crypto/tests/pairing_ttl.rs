@@ -233,6 +233,8 @@ fn discarding_the_request_also_discards_its_time() {
 #[test]
 fn a_time_without_a_request_is_overwritten_by_the_next_request() {
     let (_dir, db, key, _primary) = setup();
+    // Abrir cria o esquema do banco; só então dá para gravar a hora solta.
+    drop(PendingDevice::open(&db).unwrap());
     set_meta(&db, "pair_requested_at", Some(&5u64.to_be_bytes()));
     let pending = PendingDevice::open(&db).unwrap();
 
