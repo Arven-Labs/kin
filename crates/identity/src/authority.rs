@@ -194,10 +194,12 @@ impl AuthorityIdentity {
     }
 
     /// Responde a um pedido de pareamento (P30 2c): confere as três provas de posse e certifica as
-    /// chaves do pedido em v4. A confirmação humana (comparar o `sas_code`) é de quem chama.
+    /// chaves do pedido em v4. `confirmed_sas` é o código que a pessoa **leu no device novo e digitou**;
+    /// só certifica se for igual a `request.sas_code(&self.id())` (a API não emite sem confirmação).
     pub fn answer_pair_request(
         &self,
         request: &PairRequest,
+        _confirmed_sas: &str,
         created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
         request.verify()?;

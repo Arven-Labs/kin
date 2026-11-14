@@ -8,7 +8,7 @@ use libp2p_identity::PublicKey;
 use sha2::{Digest, Sha256};
 
 use crate::device::{put, take};
-use crate::{DeviceKey, Error, IdentityId, NostrPublicKey};
+use crate::{DeviceCertificate, DeviceKey, Error, IdentityId, NostrPublicKey};
 
 /// Tamanho do nonce do pedido, em bytes.
 pub const PAIR_NONCE_LEN: usize = 16;
@@ -94,6 +94,26 @@ impl PairRequest {
             nostr_key,
             nonce,
         })
+    }
+
+    /// Como [`Self::new`], mas sorteando o nonce do CSPRNG: é o caminho normal (auditoria da 2c-i, 8).
+    pub fn generate(
+        _device: &DeviceKey,
+        _signing_key: &PublicKey,
+        _sign_mls: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
+    ) -> Result<Self, Error> {
+        todo!("2c: nonce do CSPRNG")
+    }
+
+    /// Lado do device novo: aceita o certificado que voltou só se for da identidade `expected`
+    /// (recebida do primário **fora de banda, antes** de gerar o pedido), válido, e das mesmas chaves
+    /// deste pedido. Sem isso o device novo aceitaria a identidade de quem intercepta o canal.
+    pub fn accept_certificate(
+        &self,
+        _certificate: &DeviceCertificate,
+        _expected: &IdentityId,
+    ) -> Result<(), Error> {
+        todo!("2c: conferir cadeia, identidade esperada e chaves")
     }
 
     /// Confere as três provas de posse. Não diz qual falhou.

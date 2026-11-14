@@ -175,7 +175,8 @@ fn the_primary_certifies_the_keys_of_a_valid_request_in_v4() {
     let d = new_device();
     let request = request_of(&d, NONCE);
 
-    let cert = primary.answer_pair_request(&request, 2_000).unwrap();
+    let sas = request.sas_code(&primary.id());
+    let cert = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
 
     cert.verify().unwrap();
     assert_eq!(cert.identity(), &master.id());
@@ -190,47 +191,232 @@ fn the_primary_certifies_the_keys_of_a_valid_request_in_v4() {
 fn the_primary_refuses_a_request_without_proof_of_possession() {
     let primary = primary_of(&StandaloneIdentity::generate());
     let mut request = request_of(&new_device(), NONCE);
+    let sas = request.sas_code(&primary.id());
     request.nostr_proof[0] ^= 1;
 
     assert!(matches!(
-        primary.answer_pair_request(&request, 2_000),
+        primary.answer_pair_request(&request, &sas, 2_000),
         Err(Error::InvalidPairRequest)
     ));
+}
+
+/// Auditoria 2c-i, achado 3: a API não emite certificado sem a confirmação do código.
+#[test]
+fn the_primary_does_not_certify_without_the_right_confirmation_code() {
+    let primary = primary_of(&StandaloneIdentity::generate());
+    let request = request_of(&new_device(), NONCE);
+    let right = request.sas_code(&primary.id());
+
+    let other_identity = request.sas_code(&StandaloneIdentity::generate().id());
+    let other_request = request_of(&new_device(), NONCE).sas_code(&primary.id());
+    let off_by_one_digit = {
+        let mut chars: Vec<char> = right.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        chars.into_iter().collect::<String>()
+    };
+    for wrong in [
+        "",
+        "garbage",
+        &other_identity,
+        &other_request,
+        &off_by_one_digit,
+    ] {
+        assert!(
+            matches!(
+                primary.answer_pair_request(&request, wrong, 2_000),
+                Err(Error::InvalidPairRequest)
+            ),
+            "certificou com o código {wrong:?}"
+        );
+    }
+    // o certo continua valendo
+    primary
+        .answer_pair_request(&request, &right, 2_000)
+        .unwrap();
+}
+
+// ---- o device novo aceita só a identidade esperada (auditoria 2c-i, achado 1) ----
+
+#[test]
+fn the_new_device_accepts_the_certificate_of_the_expected_identity() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let request = request_of(&new_device(), NONCE);
+    let sas = request.sas_code(&primary.id());
+    let cert = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
+
+    request.accept_certificate(&cert, &master.id()).unwrap();
+}
+
+/// Ataque do aniversário: quem intercepta devolve um certificado de uma identidade **dele**. O device
+/// novo, que sabe a identidade esperada, recusa antes de qualquer comparação de código.
+#[test]
+fn the_new_device_refuses_a_certificate_of_another_identity() {
+    let expected = StandaloneIdentity::generate();
+    let intruder = StandaloneIdentity::generate();
+    let d = new_device();
+    let request = request_of(&d, NONCE);
+    let cert = intruder
+        .authorize_device(
+            &request.signing_key,
+            &request.network_key,
+            &request.nostr_key,
+            2_000,
+        )
+        .unwrap();
+    cert.verify().unwrap(); // o certificado é válido; só não é da identidade esperada
+
+    assert!(matches!(
+        request.accept_certificate(&cert, &expected.id()),
+        Err(Error::PairCertificateMismatch)
+    ));
+}
+
+#[test]
+fn the_new_device_refuses_a_certificate_for_other_keys() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let mine = request_of(&new_device(), NONCE);
+    let theirs = request_of(&new_device(), NONCE);
+    let sas = theirs.sas_code(&primary.id());
+    let cert_for_theirs = primary.answer_pair_request(&theirs, &sas, 2_000).unwrap();
+
+    assert!(matches!(
+        mine.accept_certificate(&cert_for_theirs, &master.id()),
+        Err(Error::PairCertificateMismatch)
+    ));
+}
+
+#[test]
+fn the_new_device_refuses_a_certificate_covering_only_some_of_its_keys() {
+    let master = StandaloneIdentity::generate();
+    let d = new_device();
+    let request = request_of(&d, NONCE);
+    let other = DeviceKey::generate();
+    // MLS e rede certas, Nostr trocada; e depois a chave MLS trocada.
+    for (signing, nostr) in [
+        (request.signing_key.clone(), other.nostr_public_key()),
+        (other.public_key(), request.nostr_key),
+    ] {
+        let cert = master
+            .authorize_device(&signing, &request.network_key, &nostr, 2_000)
+            .unwrap();
+        assert!(matches!(
+            request.accept_certificate(&cert, &master.id()),
+            Err(Error::PairCertificateMismatch)
+        ));
+    }
+}
+
+#[test]
+fn the_new_device_refuses_a_certificate_with_a_broken_signature() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let request = request_of(&new_device(), NONCE);
+    let sas = request.sas_code(&primary.id());
+    let mut cert = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
+    cert.signature[0] ^= 1;
+
+    assert!(request.accept_certificate(&cert, &master.id()).is_err());
 }
 
 // ---- código de comparação (SAS) ----
 
 fn is_sas_format(code: &str) -> bool {
     let groups: Vec<&str> = code.split('-').collect();
-    groups.len() == 3
+    groups.len() == 4
         && groups
             .iter()
             .all(|g| g.len() == 6 && g.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[test]
-fn the_sas_code_has_eighteen_digits_in_three_groups() {
+fn the_sas_code_has_twenty_four_digits_in_four_groups() {
     let request = request_of(&new_device(), NONCE);
     let identity = StandaloneIdentity::generate().id();
     let code = request.sas_code(&identity);
     assert!(is_sas_format(&code), "formato inesperado: {code}");
 }
 
-/// O primário calcula sobre o pedido que recebeu; o device novo, sobre o que mostrou, com a identidade
-/// do certificado que voltou. As duas telas só mostram o mesmo código se pedido e identidade batem.
+/// O primário calcula sobre o pedido que recebeu (bytes do canal); o device novo, sobre o que gerou, com
+/// a identidade que recebeu fora de banda **antes** (nunca a do certificado que voltou: achado 1).
 #[test]
 fn both_screens_show_the_same_code() {
-    let master = StandaloneIdentity::generate();
-    let primary = primary_of(&master);
+    let primary = primary_of(&StandaloneIdentity::generate());
+    let identity_received_out_of_band = primary.id();
     let request = request_of(&new_device(), NONCE);
 
     let on_primary = PairRequest::from_bytes(&request.to_bytes())
         .unwrap()
         .sas_code(&primary.id());
-    let cert = primary.answer_pair_request(&request, 2_000).unwrap();
-    let on_new_device = request.sas_code(cert.identity());
+    let on_new_device = request.sas_code(&identity_received_out_of_band);
 
     assert_eq!(on_primary, on_new_device);
+}
+
+/// Cada uma das 3 chaves entra no código: esquecer uma deixaria um atacante trocá-la sem mudar o que a
+/// pessoa compara.
+#[test]
+fn the_code_covers_each_of_the_three_keys() {
+    let identity = StandaloneIdentity::generate().id();
+    let base = request_of(&new_device(), NONCE);
+    let before = base.sas_code(&identity);
+    let other = DeviceKey::generate();
+
+    let mut a = base.clone();
+    a.signing_key = other.public_key();
+    let mut b = base.clone();
+    b.network_key = other.public_key();
+    let mut c = base;
+    c.nostr_key = other.nostr_public_key();
+
+    assert_ne!(a.sas_code(&identity), before, "sem a chave MLS");
+    assert_ne!(b.sas_code(&identity), before, "sem a chave de rede");
+    assert_ne!(c.sas_code(&identity), before, "sem a chave Nostr");
+}
+
+// ---- reforços da auditoria 2c-i ----
+
+/// Achado 4: cada chave tem um papel; a mesma chave nos dois slots (MLS = rede) não vale.
+#[test]
+fn a_request_using_the_same_key_for_two_roles_is_refused() {
+    let d = new_device();
+    let request = PairRequest::new(&d.net, &d.net.public_key(), NONCE, |payload| {
+        Ok(d.net.keypair().sign(payload)?)
+    })
+    .unwrap();
+    assert!(matches!(request.verify(), Err(Error::InvalidPairRequest)));
+}
+
+/// Achado 8: o caminho normal sorteia o nonce; dois pedidos do mesmo device nunca repetem.
+#[test]
+fn generate_draws_a_fresh_nonce_each_time() {
+    let d = new_device();
+    let sign = |payload: &[u8]| Ok(d.mls.keypair().sign(payload)?);
+    let a = PairRequest::generate(&d.net, &d.mls.public_key(), sign).unwrap();
+    let b = PairRequest::generate(&d.net, &d.mls.public_key(), sign).unwrap();
+
+    a.verify().unwrap();
+    b.verify().unwrap();
+    assert_ne!(a.nonce, b.nonce);
+    assert_ne!(a.nonce, [0; PAIR_NONCE_LEN]);
+}
+
+#[test]
+fn an_error_from_the_mls_signer_is_propagated() {
+    let d = new_device();
+    let result = PairRequest::new(&d.net, &d.mls.public_key(), NONCE, |_| {
+        Err(Error::InvalidPairRequest)
+    });
+    assert!(result.is_err());
+}
+
+/// Achado 7: uma prova absurda não pode virar panic no `to_bytes`; `new` a recusa.
+#[test]
+fn an_oversized_mls_proof_is_refused_when_building() {
+    let d = new_device();
+    let result = PairRequest::new(&d.net, &d.mls.public_key(), NONCE, |_| Ok(vec![0; 70_000]));
+    assert!(matches!(result, Err(Error::InvalidPairRequest)));
 }
 
 #[test]
