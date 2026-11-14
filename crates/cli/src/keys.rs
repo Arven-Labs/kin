@@ -20,24 +20,25 @@ pub enum LocalIdentity {
     Primary(Box<AuthorityIdentity>),
     /// Device **pareado** (P30 2d-ii-b, ADR 0021): só a identidade do primário (de `primary.id`), sem
     /// mestra nem autoridade; o certificado v4 já está no `mls.sqlite`.
-    #[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
     Paired(IdentityId),
 }
 
 impl LocalIdentity {
     pub fn id(&self) -> IdentityId {
         match self {
+            Self::Master(master) => master.id(),
+            Self::Primary(primary) => primary.id(),
             Self::Paired(id) => id.clone(),
-            _ => self.provider().id(),
         }
     }
 
-    /// O que o `Chat` usa para certificar o device (v3 pela mestra, v4 pela autoridade).
-    pub fn provider(&self) -> &dyn IdentityProvider {
+    /// O que o `Chat` usa para certificar o device (v3 pela mestra, v4 pela autoridade). **`None` no
+    /// pareado**: ele não certifica nada, o certificado já está no banco (`Chat::open_paired`).
+    pub fn provider(&self) -> Option<&dyn IdentityProvider> {
         match self {
-            Self::Master(master) => master.as_ref(),
-            Self::Primary(primary) => primary.as_ref(),
-            Self::Paired(_) => todo!("stub: provider do pareado"),
+            Self::Master(master) => Some(master.as_ref()),
+            Self::Primary(primary) => Some(primary.as_ref()),
+            Self::Paired(_) => None,
         }
     }
 
@@ -57,8 +58,20 @@ pub fn ensure_current_issuer(
     identity: &LocalIdentity,
     in_use: &kin_identity::DeviceCertificate,
 ) -> Result<(), String> {
-    let LocalIdentity::Primary(primary) = identity else {
-        return Ok(());
+    let primary = match identity {
+        LocalIdentity::Master(_) => return Ok(()),
+        // Pareado (ADR 0021): o certificado tem de ser v4, de uma autoridade. Um v3 (de um banco criado
+        // pela mestra) deixaria o device fora do regime novo; o trinco geral é da fatia 3 (P31(o)).
+        LocalIdentity::Paired(_) => {
+            return match &in_use.issuer {
+                Issuer::Authority(_) => Ok(()),
+                Issuer::Master(_) => Err(
+                    "o mls.sqlite deste device pareado guarda um certificado assinado pela mestra (v3), não por uma autoridade: use um --data-dir novo e pareie de novo com `kin pair`"
+                        .into(),
+                ),
+            };
+        }
+        LocalIdentity::Primary(primary) => primary,
     };
     match &in_use.issuer {
         Issuer::Authority(authority) if **authority == *primary.certificate() => Ok(()),
@@ -382,7 +395,6 @@ fn load_primary(
 
 /// Carrega um device **pareado** (P30 2d-ii-b, ADR 0021): `primary.id` + `device.key` já existente,
 /// sem mestra nem autoridade. Nunca cria chave.
-#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
 fn load_paired(
     dir: &Path,
     pairing: bool,
@@ -390,8 +402,40 @@ fn load_paired(
     protect: bool,
     params: KdfParams,
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
-    let _ = (dir, pairing, passphrase, protect, params);
-    todo!("stub: load_paired")
+    if pairing {
+        return Err(
+            "este --data-dir é de um device pareado (primary.id): --pair não importa a mestra aqui"
+                .into(),
+        );
+    }
+    for name in ["identity.key", AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+        if present(&dir.join(name))? {
+            return Err(format!(
+                "este --data-dir tem {name} e primary.id: um device pareado não guarda a mestra nem a autoridade; leve {name} para fora"
+            )
+            .into());
+        }
+    }
+    // A identidade esperada vem do arquivo (fora do banco); `Chat::open_paired` a confere contra o
+    // certificado a cada abertura (ADR 0017).
+    let expected = crate::pair::read_primary_id(dir)?
+        .ok_or("primary.id sumiu enquanto o diretório era aberto")?;
+    // Nunca cria chave: sem `device.key` o pareamento está incompleto (ou o arquivo foi perdido).
+    let device_path = dir.join("device.key");
+    if !present(&device_path)? {
+        return Err(
+            "device pareado sem device.key: restaure-o do backup ou pareie de novo num --data-dir novo (`kin pair request`)"
+                .into(),
+        );
+    }
+    if protect {
+        let pass = passphrase.ok_or("--protect exige uma senha")?;
+        if !kin_identity::key_file_is_sealed(&device_path)? {
+            DeviceKey::protect(&device_path, pass, params)?;
+        }
+    }
+    let device = DeviceKey::load_with(&device_path, passphrase)?;
+    Ok((LocalIdentity::Paired(expected), device))
 }
 
 /// Abre só a identidade do **primário** (`authority.key` + `authority.cert`), sem criar `device.key`
@@ -857,6 +901,7 @@ mod tests {
 
         let cert = loaded
             .provider()
+            .unwrap()
             .authorize_device(
                 &DeviceKey::generate().public_key(),
                 &device.public_key(),
@@ -982,7 +1027,7 @@ mod tests {
         let (primary, _) = cold_init(root.path());
         let (loaded, _) = primary_load(&primary).unwrap();
 
-        let own = device_cert(loaded.provider());
+        let own = device_cert(loaded.provider().unwrap());
 
         assert!(ensure_current_issuer(&loaded, &own).is_ok());
     }
@@ -1022,7 +1067,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
 
-        let own = device_cert(loaded.provider());
+        let own = device_cert(loaded.provider().unwrap());
 
         assert!(ensure_current_issuer(&loaded, &own).is_ok());
     }

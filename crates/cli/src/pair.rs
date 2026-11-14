@@ -204,7 +204,7 @@ fn read_bounded_line(reader: impl std::io::BufRead, limit: usize) -> Result<Stri
 }
 
 /// Lê `primary.id` (texto pequeno) e o converte; erro sem ecoar o conteúdo.
-fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
+pub(crate) fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
     let path = dir.join(PRIMARY_ID_FILE);
     use std::io::Read as _;
     let shown = path.display();
