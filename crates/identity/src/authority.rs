@@ -36,10 +36,6 @@ impl AuthorityKey {
         self.keypair.public()
     }
 
-    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(self.keypair.sign(message)?)
-    }
-
     /// Protobuf do keypair Ed25519 (o mesmo formato da mestra). É segredo: quem chama não registra nem copia.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         Ok(self.keypair.to_protobuf_encoding()?)
@@ -228,7 +224,9 @@ mod tests {
         let master = StandaloneIdentity::generate();
         let authority = AuthorityKey::generate();
         let mut cert = issue(&master, &authority);
+        // A API não assina bytes livres (S1): o atacante aqui usa a chave crua.
         cert.signature = authority
+            .keypair
             .sign(&AuthorityCertificate::signing_payload(
                 &cert.authority_key,
                 cert.created_at,
@@ -250,7 +248,9 @@ mod tests {
             &payload[AUTHORITY_DOMAIN.len()..],
         ]
         .concat();
-        cert.signature = master.sign(&forged).unwrap();
+        // A API não assina bytes livres (S1): o atacante aqui usa a chave crua da mestra.
+        let raw_master = Keypair::from_protobuf_encoding(&master.to_bytes().unwrap()).unwrap();
+        cert.signature = raw_master.sign(&forged).unwrap();
         assert!(cert.verify().is_err());
     }
 
@@ -389,8 +389,8 @@ mod tests {
         authority.save_sealed(&path, PASS, KdfParams::MIN).unwrap();
         let loaded = AuthorityKey::load_with(&path, Some(PASS)).unwrap();
         assert_eq!(loaded.public_key(), authority.public_key());
-        let sig = loaded.sign(b"msg").unwrap();
-        assert!(authority.public_key().verify(b"msg", &sig));
+        // Mesma privada (não só a pública).
+        assert_eq!(loaded.to_bytes().unwrap(), authority.to_bytes().unwrap());
     }
 
     #[test]
