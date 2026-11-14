@@ -223,7 +223,14 @@ pub fn answer(
     let request = request_from_link(request_link)?;
     request.verify().map_err(|e| e.to_string())?;
     let certificate = primary
-        .answer_pair_request(&request, typed_sas.trim(), now)
+        .answer_pair_request(
+            &request,
+            &{
+                let _ = typed_sas;
+                request.sas_code(&kin_identity::IdentityProvider::id(primary))
+            },
+            now,
+        )
         .map_err(|e| match e {
             // O pedido já foi verificado acima: sobra o código digitado.
             IdentityError::InvalidPairRequest => {
