@@ -11,7 +11,13 @@
 
 use std::path::{Path, PathBuf};
 
-use kin_identity::{AuthorityIdentity, DeviceCertificate, IdentityId, KdfParams, PairRequest};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use kin_crypto::PendingDevice;
+use kin_identity::{
+    AuthorityIdentity, DeviceCertificate, DeviceKey, Error as IdentityError, IdentityId, KdfParams,
+    PairRequest,
+};
 
 /// Arquivo (texto, 0600) com a identidade do primário, recebida fora de banda **antes** do pedido.
 /// Fica fora do `mls.sqlite` (ADR 0017: quem escreve no banco não troca a identidade esperada).
@@ -45,8 +51,60 @@ pub enum PairCommand {
 
 /// Lê os argumentos **depois** da palavra `pair`.
 pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<PairCommand, String> {
-    let _ = argv;
-    todo!("stub: parse")
+    let mut it = argv.into_iter();
+    let sub = it.next().ok_or("uso: kin pair request|answer|accept ...")?;
+    if !matches!(sub.as_str(), "request" | "answer" | "accept") {
+        return Err(format!("subcomando desconhecido: pair {sub}"));
+    }
+    // A flag que carrega o dado de cada subcomando; as outras duas só valem nos seus.
+    let own_flag = match sub.as_str() {
+        "request" => "--identity",
+        "answer" => "--request",
+        _ => "--certificate",
+    };
+    let mut data_dir = None;
+    let mut input = None;
+    let mut passphrase_file = None;
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or(format!("{flag} precisa de um valor"));
+        match flag.as_str() {
+            "--data-dir" => data_dir = Some(PathBuf::from(value()?)),
+            "--passphrase-file" => passphrase_file = Some(PathBuf::from(value()?)),
+            f if f == own_flag => input = Some(value()?),
+            other => {
+                // Só o nome: `--passphrase=segredo` não pode ser ecoado no terminal.
+                let name = other.split('=').next().unwrap_or(other);
+                return Err(format!("argumento desconhecido em pair {sub}: {name}"));
+            }
+        }
+    }
+    let data_dir = data_dir.ok_or(format!("pair {sub} exige --data-dir"))?;
+    let input = input.ok_or(format!("pair {sub} exige {own_flag}"))?;
+    Ok(match sub.as_str() {
+        "request" => PairCommand::Request {
+            data_dir,
+            identity: input,
+            passphrase_file,
+        },
+        "answer" => {
+            if input == "-" {
+                return Err(
+                    "pair answer: --request não aceita `-` (o stdin é do prompt do código); use um arquivo"
+                        .into(),
+                );
+            }
+            PairCommand::Answer {
+                data_dir,
+                request: PathBuf::from(input),
+                passphrase_file,
+            }
+        }
+        _ => PairCommand::Accept {
+            data_dir,
+            certificate: input,
+            passphrase_file,
+        },
+    })
 }
 
 /// O que o device novo mostra depois de `request`.
@@ -57,24 +115,54 @@ pub struct RequestShown {
     pub sas: String,
 }
 
+/// Teto do texto depois do prefixo (o pedido tem ≤ 1 KiB = ~1,4 mil caracteres; o certificado, bem menos).
+const LINK_BODY_LIMIT: usize = 8192;
+
+fn to_link(prefix: &str, bytes: &[u8]) -> String {
+    format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Tira o prefixo e decodifica. Sem detalhe no erro além do tipo de link: o conteúdo veio de fora.
+fn link_bytes(prefix: &str, what: &str, link: &str) -> Result<Vec<u8>, String> {
+    let invalid = || format!("{what} inválido (esperado {prefix}...)");
+    let body = link.trim().strip_prefix(prefix).ok_or_else(invalid)?;
+    if body.is_empty() || body.len() > LINK_BODY_LIMIT {
+        return Err(invalid());
+    }
+    URL_SAFE_NO_PAD.decode(body).map_err(|_| invalid())
+}
+
 pub fn request_to_link(request: &PairRequest) -> String {
-    let _ = request;
-    todo!("stub: request_to_link")
+    to_link(REQUEST_PREFIX, &request.to_bytes())
 }
 
 pub fn request_from_link(link: &str) -> Result<PairRequest, String> {
-    let _ = link;
-    todo!("stub: request_from_link")
+    let bytes = link_bytes(REQUEST_PREFIX, "link do pedido de pareamento", link)?;
+    PairRequest::from_bytes(&bytes).map_err(|e| e.to_string())
 }
 
 pub fn certificate_to_link(certificate: &DeviceCertificate) -> String {
-    let _ = certificate;
-    todo!("stub: certificate_to_link")
+    to_link(CERTIFICATE_PREFIX, &certificate.to_bytes())
 }
 
 pub fn certificate_from_link(link: &str) -> Result<DeviceCertificate, String> {
-    let _ = link;
-    todo!("stub: certificate_from_link")
+    let bytes = link_bytes(CERTIFICATE_PREFIX, "link do certificado", link)?;
+    DeviceCertificate::from_bytes(&bytes).map_err(|e| e.to_string())
+}
+
+/// Lê `primary.id` (texto pequeno) e o converte; erro sem ecoar o conteúdo.
+fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
+    let path = dir.join(PRIMARY_ID_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("ler {}: {e}", path.display())),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| format!("{} corrompido: peça o pareamento de novo", path.display()))?;
+    IdentityId::from_base58(text)
+        .map(Some)
+        .map_err(|_| format!("{} corrompido: peça o pareamento de novo", path.display()))
 }
 
 /// Device novo: grava `primary.id`, abre (ou cria) o `device.key` e o `mls.sqlite` pendente e devolve o
@@ -86,8 +174,42 @@ pub fn request(
     params: KdfParams,
     now: u64,
 ) -> Result<RequestShown, String> {
-    let _ = (dir, identity, passphrase, params, now);
-    todo!("stub: request")
+    // Diretório de primário ou de mestra nunca vira device pareado (e aqui não se cria nada nele).
+    for name in ["authority.key", "authority.cert", "identity.key"] {
+        if dir
+            .join(name)
+            .symlink_metadata()
+            .map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |_| true)
+        {
+            return Err(format!(
+                "este --data-dir tem {name}: use um diretório novo para o device a parear"
+            ));
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // A identidade esperada vem de fora de banda e é gravada ANTES do pedido; trocar de primário num
+    // diretório que já tem uma é erro (apague o diretório), nunca sobrescrita silenciosa.
+    match read_primary_id(dir)? {
+        Some(recorded) if &recorded != identity => {
+            return Err(format!(
+                "este --data-dir já está ligado à identidade {}: use um diretório novo para outro primário",
+                recorded.to_base58()
+            ));
+        }
+        Some(_) => {}
+        None => crate::write_private(&dir.join(PRIMARY_ID_FILE), identity.to_base58().as_bytes())
+            .map_err(|e| format!("gravar {PRIMARY_ID_FILE}: {e}"))?,
+    }
+    let device = crate::keys::load_or_create_device(&dir.join("device.key"), passphrase, params)
+        .map_err(|e| e.to_string())?;
+    let pending = PendingDevice::open(&dir.join("mls.sqlite")).map_err(|e| e.to_string())?;
+    let request = pending
+        .request_at(&device, now)
+        .map_err(|e| e.to_string())?;
+    Ok(RequestShown {
+        link: request_to_link(&request),
+        sas: request.sas_code(identity),
+    })
 }
 
 /// Primário: confere o pedido e só certifica se `typed_sas` for o código do pedido. Devolve o link do
@@ -98,8 +220,18 @@ pub fn answer(
     typed_sas: &str,
     now: u64,
 ) -> Result<String, String> {
-    let _ = (primary, request_link, typed_sas, now);
-    todo!("stub: answer")
+    let request = request_from_link(request_link)?;
+    request.verify().map_err(|e| e.to_string())?;
+    let certificate = primary
+        .answer_pair_request(&request, typed_sas.trim(), now)
+        .map_err(|e| match e {
+            // O pedido já foi verificado acima: sobra o código digitado.
+            IdentityError::InvalidPairRequest => {
+                "o código de comparação não confere com o do pedido".to_string()
+            }
+            other => other.to_string(),
+        })?;
+    Ok(certificate_to_link(&certificate))
 }
 
 /// Device novo: instala o certificado, conferindo a identidade de `primary.id` (nunca a do certificado).
@@ -109,14 +241,105 @@ pub fn accept(
     passphrase: Option<&[u8]>,
     now: u64,
 ) -> Result<(), String> {
-    let _ = (dir, certificate_link, passphrase, now);
-    todo!("stub: accept")
+    // Tudo o que não precisa do banco é conferido antes de abri-lo (abrir cria o arquivo se faltar).
+    let expected = read_primary_id(dir)?.ok_or(format!(
+        "falta {PRIMARY_ID_FILE} neste --data-dir: rode `kin pair request` antes"
+    ))?;
+    let certificate = certificate_from_link(certificate_link)?;
+    let device =
+        DeviceKey::load_with(&dir.join("device.key"), passphrase).map_err(|e| e.to_string())?;
+    let pending = PendingDevice::open(&dir.join("mls.sqlite")).map_err(|e| e.to_string())?;
+    // `expected` vem do `primary.id`, nunca do certificado (ADR 0016, item 4).
+    pending
+        .install_certificate_at(&device, &certificate, &expected, now)
+        .map(drop)
+        .map_err(|e| e.to_string())
+}
+
+fn now_secs() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| e.to_string())
+}
+
+/// Senha do arquivo da flag, senão de `KIN_PASSPHRASE_FILE`, senão do terminal.
+fn secret(
+    flag: Option<PathBuf>,
+    label: &str,
+    confirm: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    let file = flag.or_else(|| {
+        std::env::var("KIN_PASSPHRASE_FILE")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    });
+    crate::cold::passphrase(file, label, confirm)
 }
 
 /// Executa o subcomando (senhas e terminal ficam aqui; a lógica está nas funções acima).
 pub fn run(command: PairCommand) -> Result<(), String> {
-    let _ = command;
-    todo!("stub: run")
+    let read_link = |source: &str| crate::read_pair_link(source).map_err(|e| e.to_string());
+    match command {
+        PairCommand::Request {
+            data_dir,
+            identity,
+            passphrase_file,
+        } => {
+            let identity = IdentityId::from_base58(&identity).map_err(|e| e.to_string())?;
+            let confirm = !data_dir.join("device.key").exists();
+            let pass = secret(passphrase_file, "senha do device", confirm)?;
+            let shown = request(
+                &data_dir,
+                &identity,
+                Some(pass.as_slice()),
+                KdfParams::DEFAULT,
+                now_secs()?,
+            )?;
+            println!(
+                "Pedido de pareamento (válido por 15 minutos):\n{}",
+                shown.link
+            );
+            println!(
+                "\nCódigo de comparação: {}\nNo primário, rode `kin pair answer` com este link num arquivo e digite o código acima.",
+                shown.sas
+            );
+        }
+        PairCommand::Answer {
+            data_dir,
+            request,
+            passphrase_file,
+        } => {
+            let link = read_link(&request.to_string_lossy())?;
+            let pass = secret(passphrase_file, "senha da autoridade", false)?;
+            let primary = crate::keys::load_primary_identity(&data_dir, Some(pass.as_slice()))
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Primário da identidade {}.\nDigite o código de comparação que o device novo mostra (compare com a tela dele):",
+                kin_identity::IdentityProvider::id(&primary).to_base58()
+            );
+            let mut typed = String::new();
+            std::io::stdin()
+                .read_line(&mut typed)
+                .map_err(|e| e.to_string())?;
+            let certificate = answer(&primary, &link, &typed, now_secs()?)?;
+            println!("Certificado (leve ao device novo e rode `kin pair accept`):\n{certificate}");
+        }
+        PairCommand::Accept {
+            data_dir,
+            certificate,
+            passphrase_file,
+        } => {
+            let link = read_link(&certificate)?;
+            let pass = secret(passphrase_file, "senha do device", false)?;
+            accept(&data_dir, &link, Some(pass.as_slice()), now_secs()?)?;
+            println!(
+                "Certificado instalado: este device agora pertence à identidade registrada em {PRIMARY_ID_FILE}.\n(O chat em modo pareado vem na próxima fatia.)"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

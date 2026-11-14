@@ -28,8 +28,31 @@ impl IdentityId {
     /// Peer ID de uma chave Ed25519 que carrega a própria chave (multihash identidade); qualquer outra
     /// coisa é [`Error::InvalidIdentityId`], sem detalhe do que veio.
     pub fn from_base58(text: &str) -> Result<Self, Error> {
-        let _ = text;
-        todo!("stub: from_base58")
+        // Um Peer ID Ed25519 em base58 tem ~52 caracteres; o teto barra entrada gigante antes do parse.
+        let text = text.trim();
+        if text.is_empty() || text.len() > 128 {
+            return Err(Error::InvalidIdentityId);
+        }
+        let peer_id: PeerId = text.parse().map_err(|_| Error::InvalidIdentityId)?;
+        // Multihash identidade: código 0x00, tamanho, chave protobuf. Qualquer outro formato não carrega
+        // a chave (é só um hash), então não dá para voltar à identidade.
+        let bytes = peer_id.to_bytes();
+        let [0x00, len, key @ ..] = bytes.as_slice() else {
+            return Err(Error::InvalidIdentityId);
+        };
+        if usize::from(*len) != key.len() {
+            return Err(Error::InvalidIdentityId);
+        }
+        let key = PublicKey::try_decode_protobuf(key).map_err(|_| Error::InvalidIdentityId)?;
+        if key.clone().try_into_ed25519().is_err() {
+            return Err(Error::InvalidIdentityId);
+        }
+        // Confere o caminho de volta: o texto lido é exatamente o Peer ID desta chave.
+        let id = Self(key);
+        if id.as_peer_id() != peer_id {
+            return Err(Error::InvalidIdentityId);
+        }
+        Ok(id)
     }
 }
 
