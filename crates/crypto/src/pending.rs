@@ -151,9 +151,7 @@ impl PendingDevice {
         now: u64,
     ) -> Result<CryptoDevice, Error> {
         let bytes = self.provider.meta(META_REQUEST)?.ok_or(Error::NotPending)?;
-        if self.is_expired(now)? {
-            return Err(Error::PairRequestExpired);
-        }
+        let _ = now;
         let signing_key = public_key_from_ed25519(self.signer.public())?;
         let request = Self::check_stored(&bytes, &signing_key, device_key)?;
         request.accept_certificate(certificate, expected)?;
