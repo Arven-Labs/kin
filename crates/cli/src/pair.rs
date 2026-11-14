@@ -110,6 +110,9 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<PairCommand, Stri
 /// O que o device novo mostra depois de `request`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RequestShown {
+    /// A identidade gravada em `primary.id`, para conferir com a tela do primário (typo no base58 não
+    /// tem checksum: outra identidade válida seria gravada em silêncio).
+    pub identity: String,
     pub link: String,
     /// Código de comparação (24 dígitos), a ser digitado no primário.
     pub sas: String,
@@ -148,6 +151,23 @@ pub fn certificate_to_link(certificate: &DeviceCertificate) -> String {
 pub fn certificate_from_link(link: &str) -> Result<DeviceCertificate, String> {
     let bytes = link_bytes(CERTIFICATE_PREFIX, "link do certificado", link)?;
     DeviceCertificate::from_bytes(&bytes).map_err(|e| e.to_string())
+}
+
+/// Grava `bytes` em `path` (0600) **sem nunca substituir** e sem expor arquivo pela metade: escreve num
+/// temporário do mesmo diretório e o publica com `hard_link` (falha com `AlreadyExists` se `path`
+/// existe, mesmo que apareça no meio). O temporário some em qualquer desfecho. Auditoria da 2d-ii-a2, I1.
+#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
+fn write_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let _ = (path, bytes);
+    todo!("stub: write_new_atomic")
+}
+
+/// Lê uma linha de `reader` com teto de `limit` bytes (sem a quebra de linha). Mais que isso é erro:
+/// o código de comparação tem 27 caracteres. Auditoria da 2d-ii-a2, S2.
+#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
+fn read_bounded_line(reader: impl std::io::BufRead, limit: usize) -> Result<String, String> {
+    let _ = (reader, limit);
+    todo!("stub: read_bounded_line")
 }
 
 /// Lê `primary.id` (texto pequeno) e o converte; erro sem ecoar o conteúdo.
@@ -207,6 +227,7 @@ pub fn request(
         .request_at(&device, now)
         .map_err(|e| e.to_string())?;
     Ok(RequestShown {
+        identity: String::new(), // stub
         link: request_to_link(&request),
         sas: request.sas_code(identity),
     })
@@ -545,6 +566,79 @@ mod tests {
         let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
         let padded = format!("  {}\n", shown.link);
         assert!(request_from_link(&padded).is_ok());
+    }
+
+    // ---- achados da auditoria (I1, S2) ----
+
+    #[test]
+    fn request_shows_the_identity_it_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, identity) = primary_in(dir.path());
+        let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
+        assert_eq!(shown.identity, identity.to_base58());
+    }
+
+    #[test]
+    fn an_empty_primary_id_is_refused_with_a_message_that_says_what_to_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, identity) = primary_in(dir.path());
+        let new = dir.path().join("new");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join(PRIMARY_ID_FILE), "").unwrap();
+        let err = ask(&new, &identity, NOW).unwrap_err();
+        assert!(
+            err.contains(PRIMARY_ID_FILE) && err.contains("apague"),
+            "mensagem sem ação: {err}"
+        );
+    }
+
+    #[test]
+    fn write_new_atomic_creates_a_private_complete_file_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.id");
+        write_new_atomic(&path, b"12D3KooWexemplo").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"12D3KooWexemplo");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("primary.id")]);
+    }
+
+    #[test]
+    fn write_new_atomic_never_replaces_and_cleans_up_its_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.id");
+        std::fs::write(&path, b"original").unwrap();
+        let err = write_new_atomic(&path, b"outro").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "sobrou temp"
+        );
+    }
+
+    #[test]
+    fn read_bounded_line_reads_one_line_and_refuses_more_than_the_limit() {
+        use std::io::Cursor;
+        assert_eq!(
+            read_bounded_line(Cursor::new("123456\nresto"), 128).unwrap(),
+            "123456"
+        );
+        assert_eq!(
+            read_bounded_line(Cursor::new("123456\r\n"), 128).unwrap(),
+            "123456"
+        );
+        assert_eq!(read_bounded_line(Cursor::new(""), 128).unwrap(), "", "EOF");
+        assert!(read_bounded_line(Cursor::new("x".repeat(200)), 128).is_err());
+        assert!(read_bounded_line(Cursor::new(format!("{}\n", "x".repeat(200))), 128).is_err());
     }
 
     // ---- request (device novo) ----

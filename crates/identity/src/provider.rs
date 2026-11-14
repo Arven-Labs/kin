@@ -105,6 +105,26 @@ mod tests {
     }
 
     #[test]
+    fn base58_rejects_prefixes_and_an_identity_multihash_that_is_not_a_key() {
+        let id = StandaloneIdentity::generate().id();
+        let text = id.to_base58();
+        // multiaddr, caractere a mais e a mais na frente
+        for bad in [
+            format!("/p2p/{text}"),
+            format!("1{text}"),
+            format!("{text}1"),
+        ] {
+            assert!(IdentityId::from_base58(&bad).is_err(), "aceitou {bad}");
+        }
+        // multihash identidade (0x00) que carrega lixo no lugar da chave protobuf
+        let junk = PeerId::from_bytes(&[0x00, 0x04, 1, 2, 3, 4]).unwrap();
+        assert!(matches!(
+            IdentityId::from_base58(&junk.to_base58()),
+            Err(Error::InvalidIdentityId)
+        ));
+    }
+
+    #[test]
     fn base58_rejects_a_peer_id_that_is_not_an_ed25519_identity_multihash() {
         // Peer ID aleatório: base58 válido de PeerId, mas não carrega uma chave Ed25519.
         let not_a_key = PeerId::random().to_base58();
