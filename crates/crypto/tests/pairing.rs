@@ -343,6 +343,52 @@ fn open_paired_refuses_a_tampered_or_swapped_certificate_in_the_database() {
     assert!(CryptoDevice::open_paired(&net, &nostr, &swapped).is_err());
 }
 
+/// O pedido só existe enquanto o certificado não chegou: pareado, o banco não o guarda mais.
+#[test]
+fn pairing_removes_the_pending_request_from_the_database() {
+    let primary = primary_of(&StandaloneIdentity::generate());
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+
+    let before = {
+        let _ = PendingDevice::open(&db).unwrap().request(&key).unwrap();
+        stored_keys(&db)
+    };
+    let _ = pair(&db, &key, &primary);
+    let after = stored_keys(&db);
+
+    assert!(before.contains(&"pair_request".to_string()));
+    assert!(!after.contains(&"pair_request".to_string()), "{after:?}");
+    assert!(after.contains(&"device_certificate".to_string()));
+}
+
+fn stored_keys(db: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn.prepare("SELECT key FROM kin_meta").unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// O banco é só um arquivo: um pedido guardado de outra `device.key` não pode ser devolvido como se
+/// fosse deste device.
+#[test]
+fn a_stored_request_of_another_device_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+    PendingDevice::open(&db).unwrap().request(&key).unwrap();
+
+    let other = DeviceKey::generate();
+    let pending = PendingDevice::open(&db).unwrap();
+    assert!(matches!(
+        pending.request(&other),
+        Err(Error::DeviceMismatch)
+    ));
+}
+
 // ---- um banco pendente não vira mestra ou primário por engano ----
 
 #[test]
