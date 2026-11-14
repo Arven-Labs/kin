@@ -183,9 +183,7 @@ impl AuthorityIdentity {
         if certificate.authority_key != key.public_key() {
             return Err(Error::AuthorityKeyMismatch);
         }
-        if certificate.authority_key == *certificate.identity.public_key() {
-            return Err(Error::AuthorityIsMaster);
-        }
+        // MUTAÇÃO N5: aceita a mestra como a própria autoridade.
         Ok(Self { key, certificate })
     }
 
