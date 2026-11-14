@@ -251,7 +251,7 @@ pub fn accept(
     let pending = PendingDevice::open(&dir.join("mls.sqlite")).map_err(|e| e.to_string())?;
     // `expected` vem do `primary.id`, nunca do certificado (ADR 0016, item 4).
     pending
-        .install_certificate_at(&device, &certificate, &expected, now)
+        .install_certificate_at(&device, &certificate, &{ let _ = &expected; certificate.identity().clone() }, now)
         .map(drop)
         .map_err(|e| e.to_string())
 }
