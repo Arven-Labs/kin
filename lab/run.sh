@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -215,6 +215,13 @@ scenario_multi_device() {
   X=$(first a "conversa cifrada pronta com $A2_ID \(identidade [A-Za-z0-9]+" | awk '{print $NF}')
   check "a2 tem a mesma identidade de a1" wait_log a2 "conversa cifrada pronta com $A1_ID \(identidade ${X}\)" 5
 
+  contact_and_fanout
+}
+
+# Segunda metade do `multi-device` (compartilhada com `paired-device`): C (`b`) é um contato atrás do
+# `routerb` que convida A1; A2 só o acha depois do `/trust` (controle negativo), com furo direto, espelho
+# entre os irmãos e fan-out. Usa as globais A1_ID, A2_ID, RELAY_ADDR e KEY_ARGS, com `a` e `a2` de pé.
+contact_and_fanout() {
   export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR ${KEY_ARGS:-}"
   compose up -d b >/dev/null
   wait_log b "reserva aceita no relay" 30 || { fail "c sem reserva no relay"; logs b; return; }
@@ -272,6 +279,94 @@ scenario_multi_device() {
 # O mesmo cenário com as chaves em claro (`--no-passphrase`): cobre o caminho sem senha.
 scenario_multi_device_plain() {
   KEY_ARGS="--no-passphrase" scenario_multi_device
+}
+
+# P30 2d-iii (ADR 0020 e 0021): A1 (`a`) é o PRIMÁRIO (só authority.key + authority.cert, sem a mestra) e
+# A2 (`a2`) um device PAREADO (primary.id + device.key + mls.sqlite), sem copiar a mestra. O pareamento roda
+# no HOST com o binário real (`kin cold init`, `kin pair request/answer/accept` são offline; o `node.sh` dá
+# `exec kin`, então rodar `pair` no container exigiria mexer no entrypoint) e `compose cp` leva os arquivos,
+# como o `multi-device` faz com o identity.key. O SAS é lido da saída do `request` e digitado (pipe) no `answer`.
+# Depois vale a mesma conferência do `multi-device`: contato C, controle negativo do /trust, furo, espelho, fan-out.
+scenario_paired_device() {
+  echo "== Device pareado sem a mestra atrás de NAT (a = primário, a2 = pareado, c = contato)"
+  local t out LINK SAS CERT ID_X rc f
+  t=$(mktemp -d)
+  install -m 600 passphrase "$t/lab.pass"   # senha do lab (autoridade e device); git não guarda o modo 0600
+  (umask 077; echo "senha da mestra fria do lab" > "$t/master.pass")
+  # Os dois arquivos da autoridade e o diretório pareado não podem ter nada da mestra dentro dos containers.
+  absent_in_a2() { ! compose exec -T a2 sh -c 'ls /tmp/identity.key /tmp/authority.key /tmp/authority.cert' >/dev/null 2>&1; }
+
+  out=$("$BIN" cold init --master-out "$t/cold/master.key" --authority-dir "$t/primary" \
+    --master-passphrase-file "$t/master.pass" --passphrase-file "$t/lab.pass" 2>&1) \
+    || { fail "kin cold init"; echo "$out"; rm -rf "$t"; return; }
+  ID_X=$(echo "$out" | sed -n 's/^identidade: //p')
+  check "cold init gerou a identidade e a autoridade" [ -n "$ID_X" ] || { rm -rf "$t"; return; }
+
+  out=$("$BIN" pair request --data-dir "$t/paired" --identity "$ID_X" --passphrase-file "$t/lab.pass" 2>&1) \
+    || { fail "kin pair request"; echo "$out"; rm -rf "$t"; return; }
+  LINK=$(echo "$out" | grep -oE 'kin://pair-request/[A-Za-z0-9_-]+' | head -1)
+  SAS=$(echo "$out" | grep -oE '[0-9]{6}-[0-9]{6}-[0-9]{6}-[0-9]{6}' | head -1)
+  { [ -n "$LINK" ] && [ -n "$SAS" ]; } || { fail "pair request sem link ou código"; echo "$out"; rm -rf "$t"; return; }
+  echo "$LINK" > "$t/req.txt"
+
+  # Código errado: o primário não emite certificado (o SAS digitado é o único elo humano).
+  out=$(printf '%s\n' "000000-000000-000000-000000" | "$BIN" pair answer --data-dir "$t/primary" \
+    --request "$t/req.txt" --passphrase-file "$t/lab.pass" 2>&1); rc=$?
+  check "answer com o código errado falha e não imprime certificado" \
+    bash -c '[ "$1" -ne 0 ] && ! grep -q "kin://pair-cert/" <<<"$2"' _ "$rc" "$out"
+
+  out=$(printf '%s\n' "$SAS" | "$BIN" pair answer --data-dir "$t/primary" \
+    --request "$t/req.txt" --passphrase-file "$t/lab.pass" 2>&1) \
+    || { fail "kin pair answer com o código certo"; echo "$out"; rm -rf "$t"; return; }
+  CERT=$(echo "$out" | grep -oE 'kin://pair-cert/[A-Za-z0-9_-]+' | head -1)
+  [ -n "$CERT" ] || { fail "answer sem certificado"; echo "$out"; rm -rf "$t"; return; }
+  echo "$CERT" > "$t/cert.txt"
+  out=$("$BIN" pair accept --data-dir "$t/paired" --certificate "$t/cert.txt" --passphrase-file "$t/lab.pass" 2>&1) \
+    || { fail "kin pair accept"; echo "$out"; rm -rf "$t"; return; }
+  pass "pareamento no host: request -> answer (código digitado) -> accept"
+
+  # Um diretório com pedido pendente (sem accept) não pode virar mestra nem abrir o chat.
+  "$BIN" pair request --data-dir "$t/pending" --identity "$ID_X" --passphrase-file "$t/lab.pass" >/dev/null 2>&1
+  KIN_PASSPHRASE_FILE="$t/lab.pass" timeout 30 "$BIN" --data-dir "$t/pending" --no-mdns --no-nostr </dev/null >/dev/null 2>&1; rc=$?
+  check "kin normal num diretório pendente falha (e não trava: 124 seria timeout)" \
+    bash -c '[ "$1" -ne 0 ] && [ "$1" -ne 124 ]' _ "$rc"
+  check "o diretório pendente não ganhou identity.key" [ ! -e "$t/pending/identity.key" ]
+
+  infra cone || { fail "montar o laboratório"; rm -rf "$t"; return; }
+  # Primário: os dois arquivos da autoridade, copiados antes de ligar (como o identity.key no multi-device).
+  export A_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --listen /ip4/0.0.0.0/tcp/4002"
+  compose create a >/dev/null 2>&1
+  for f in authority.key authority.cert; do
+    compose cp "$t/primary/$f" "a:/tmp/$f" >/dev/null 2>&1 || { fail "copiar $f para a"; rm -rf "$t"; return; }
+  done
+  compose start a >/dev/null
+  wait_log a "peer id: [A-Za-z0-9]+" 15 || { fail "a não subiu"; logs a; rm -rf "$t"; return; }
+  check "a abre como primário da identidade do cold init" wait_log a "primário da identidade $ID_X" 10
+  wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; rm -rf "$t"; return; }
+  A1_ID=$(peer_id a)
+
+  # Pareado: SÓ o que o accept deixou (primary.id, device.key, mls.sqlite e o WAL do SQLite, se houver).
+  export A2_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
+  compose create a2 >/dev/null 2>&1
+  for f in primary.id device.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
+    [ -e "$t/paired/$f" ] || { case $f in *-wal|*-shm) continue ;; esac; fail "falta $f no diretório pareado"; rm -rf "$t"; return; }
+    compose cp "$t/paired/$f" "a2:/tmp/$f" >/dev/null 2>&1 || { fail "copiar $f para a2"; rm -rf "$t"; return; }
+  done
+  rm -rf "$t"
+  compose start a2 >/dev/null
+  wait_log a2 "peer id: [A-Za-z0-9]+" 15 || { fail "a2 não subiu"; logs a2; return; }
+  A2_ID=$(peer_id a2)
+  check "a2 abre como device pareado da identidade do cold init" wait_log a2 "device pareado da identidade $ID_X" 10
+  check "a2 não tem a mestra nem a autoridade" absent_in_a2
+
+  if wait_log a "conversa cifrada pronta com $A2_ID" 40 && wait_log a2 "conversa cifrada pronta com $A1_ID" 40; then
+    pass "a2 pareado a a1 (conversa pronta)"
+  else
+    fail "a2 e a1 não ficaram com conversa pronta"; logs a | tail -15; logs a2 | tail -15; return
+  fi
+  check "a2 tem a identidade do primário" wait_log a2 "conversa cifrada pronta com $A1_ID \(identidade ${ID_X}\)" 5
+
+  contact_and_fanout
 }
 
 # A1 (`a`) e C (`b`) conversam; SÓ DEPOIS entra A2 (`a2`), irmão de A1 com banco vazio, e deve receber o
@@ -355,12 +450,13 @@ run_scenario() {
     multi-device) scenario_multi_device ;;
     multi-device-plain) scenario_multi_device_plain ;;
     history-sync) scenario_history_sync ;;
+    paired-device) scenario_paired_device ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}
