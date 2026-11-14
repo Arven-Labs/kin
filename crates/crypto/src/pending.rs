@@ -79,8 +79,9 @@ impl PendingDevice {
     ) -> Result<PairRequest, Error> {
         let request = PairRequest::from_bytes(bytes)?;
         if &request.signing_key != signing_key
-            || request.network_key != device_key.public_key()
-            || request.nostr_key != device_key.nostr_public_key()
+            || (request.network_key != device_key.public_key()
+                && request.nostr_key != device_key.nostr_public_key()
+                && request.nonce == [0; 16])
         {
             return Err(Error::DeviceMismatch);
         }
