@@ -13,6 +13,7 @@ use crate::{DeviceCertificate, Error, IdentityId, Issuer, NostrPublicKey};
 
 /// Domínio de assinatura do tombstone: diferente do certificado de device e do de autoridade, para uma
 /// assinatura de um nunca valer como a de outro.
+#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
 pub(crate) const REVOCATION_DOMAIN: &[u8] = b"kin/device-revocation/v1";
 
 /// Declaração assinada de que o certificado `cert_hash` (e as chaves citadas) não vale mais.
@@ -41,6 +42,7 @@ impl DeviceRevocation {
     }
 
     /// SHA-256 com domínio dos bytes do certificado.
+    #[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
     pub(crate) fn certificate_hash(certificate: &DeviceCertificate) -> [u8; 32] {
         let _ = certificate;
         todo!("stub: certificate_hash")
