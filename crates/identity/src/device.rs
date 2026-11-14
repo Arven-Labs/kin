@@ -6,6 +6,12 @@ use secp256k1::{Keypair as SchnorrKeypair, Secp256k1, XOnlyPublicKey};
 use crate::{AuthorityCertificate, Error, IdentityId, KdfParams, store};
 
 const CERT_DOMAIN: &[u8] = b"kin/device-cert/v3";
+/// Domínio do certificado v4 (assinado pela autoridade, ADR 0014). Nenhum domínio do Kin é prefixo
+/// de outro.
+const CERT_DOMAIN_V4: &[u8] = b"kin/device-cert/v4";
+/// Magic e versão do certificado v4 no fio.
+const V4_MAGIC: &[u8; 3] = b"KDC";
+const V4_VERSION: u8 = 4;
 
 /// Versão do formato do arquivo de chave do device (`DeviceKey::to_bytes`). O formato antigo era só o
 /// protobuf do Ed25519 (começa por 0x08), então qualquer outro primeiro byte é recusado.
@@ -182,7 +188,6 @@ impl DeviceCertificate {
 
     /// Bytes que a autoridade assina no v4: domínio próprio, a identidade e a chave de autoridade
     /// (no v4 quem assina não é a identidade, então ela precisa estar no conteúdo) e as do device.
-    #[allow(dead_code)] // stub da etapa de testes; some na implementação
     pub(crate) fn signing_payload_v4(
         identity: &IdentityId,
         authority_key: &PublicKey,
@@ -191,21 +196,42 @@ impl DeviceCertificate {
         nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Vec<u8> {
-        let _ = (
-            identity,
-            authority_key,
-            signing_key,
-            network_key,
-            nostr_key,
-            created_at,
-        );
-        todo!("P30 2a: payload v4")
+        let mut payload = CERT_DOMAIN_V4.to_vec();
+        for encoded in [
+            identity.public_key().encode_protobuf(),
+            authority_key.encode_protobuf(),
+            signing_key.encode_protobuf(),
+            network_key.encode_protobuf(),
+            nostr_key.to_bytes().to_vec(),
+        ] {
+            payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&encoded);
+        }
+        payload.extend_from_slice(&created_at.to_be_bytes());
+        payload
     }
 
-    /// Confere a assinatura do certificado (e, no v4, a cadeia mestra → autoridade → device).
+    /// Confere a assinatura do certificado. No v4, confere a cadeia inteira: a mestra assinou a
+    /// autoridade, a identidade da cadeia é a do certificado, e a autoridade assinou o device.
     pub fn verify(&self) -> Result<(), Error> {
-        if let Issuer::Authority(_) = &self.issuer {
-            todo!("P30 2a: verificação do v4")
+        if let Issuer::Authority(authority) = &self.issuer {
+            authority.verify().map_err(|_| Error::InvalidCertificate)?;
+            if authority.identity != self.identity {
+                return Err(Error::InvalidCertificate);
+            }
+            let payload = Self::signing_payload_v4(
+                &self.identity,
+                &authority.authority_key,
+                &self.signing_key,
+                &self.network_key,
+                &self.nostr_key,
+                self.created_at,
+            );
+            return if authority.authority_key.verify(&payload, &self.signature) {
+                Ok(())
+            } else {
+                Err(Error::InvalidCertificate)
+            };
         }
         let payload = Self::signing_payload(
             &self.signing_key,
@@ -221,12 +247,20 @@ impl DeviceCertificate {
     }
 
     /// Serializa o certificado: `len16|identidade | len16|chave MLS | len16|chave de rede | len16|chave Nostr | created_at u64 BE | len16|assinatura`.
+    ///
+    /// v4: `"KDC" | 4 | len16|certificado de autoridade (`KAUT`) | len16|chave MLS | len16|chave de rede |
+    /// len16|chave Nostr | created_at u64 BE | len16|assinatura`. A identidade sai da cadeia. O v3
+    /// começa sempre por `0x00` (parte alta do tamanho da identidade), então o magic não colide.
     pub fn to_bytes(&self) -> Vec<u8> {
-        if let Issuer::Authority(_) = &self.issuer {
-            todo!("P30 2a: serialização do v4")
-        }
         let mut out = Vec::new();
-        put(&mut out, &self.identity.public_key().encode_protobuf());
+        match &self.issuer {
+            Issuer::Master => put(&mut out, &self.identity.public_key().encode_protobuf()),
+            Issuer::Authority(authority) => {
+                out.extend_from_slice(V4_MAGIC);
+                out.push(V4_VERSION);
+                put(&mut out, &authority.to_bytes());
+            }
+        }
         put(&mut out, &self.signing_key.encode_protobuf());
         put(&mut out, &self.network_key.encode_protobuf());
         put(&mut out, &self.nostr_key.to_bytes());
@@ -237,11 +271,24 @@ impl DeviceCertificate {
 
     /// Lê um certificado serializado por [`Self::to_bytes`]. Não confere a assinatura: use `verify`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.first().is_some_and(|&b| b != 0) {
-            todo!("P30 2a: leitura do v4")
-        }
         let mut cur = bytes;
-        let identity = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
+        let (identity, issuer) = match bytes.strip_prefix(V4_MAGIC.as_slice()) {
+            Some(rest) => {
+                cur = rest
+                    .strip_prefix(&[V4_VERSION])
+                    .ok_or(Error::InvalidCertificate)?;
+                let authority = AuthorityCertificate::from_bytes(take(&mut cur)?)
+                    .map_err(|_| Error::InvalidCertificate)?;
+                (
+                    authority.identity.clone(),
+                    Issuer::Authority(Box::new(authority)),
+                )
+            }
+            None => {
+                let identity = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
+                (IdentityId::new(identity), Issuer::Master)
+            }
+        };
         let signing_key = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
         let network_key = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
         let nostr_key =
@@ -258,8 +305,8 @@ impl DeviceCertificate {
             return Err(Error::InvalidCertificate);
         }
         Ok(Self {
-            identity: IdentityId::new(identity),
-            issuer: Issuer::Master,
+            identity,
+            issuer,
             signing_key,
             network_key,
             nostr_key,

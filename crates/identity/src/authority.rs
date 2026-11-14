@@ -11,7 +11,8 @@ use zeroize::Zeroizing;
 
 use crate::device::{put, take};
 use crate::{
-    DeviceCertificate, Error, IdentityId, IdentityProvider, KdfParams, NostrPublicKey, store,
+    DeviceCertificate, Error, IdentityId, IdentityProvider, Issuer, KdfParams, NostrPublicKey,
+    store,
 };
 
 /// Domínio de assinatura do certificado de autoridade. Diferente do de `DeviceCertificate`, para uma
@@ -177,8 +178,11 @@ impl AuthorityIdentity {
     /// Junta a chave e o certificado. Recusa certificado com assinatura inválida
     /// ([`Error::InvalidAuthorityCertificate`]) ou de outra chave ([`Error::AuthorityKeyMismatch`]).
     pub fn new(key: AuthorityKey, certificate: AuthorityCertificate) -> Result<Self, Error> {
-        let _ = (key, certificate);
-        todo!("P30 2a: AuthorityIdentity::new")
+        certificate.verify()?;
+        if certificate.authority_key != key.public_key() {
+            return Err(Error::AuthorityKeyMismatch);
+        }
+        Ok(Self { key, certificate })
     }
 
     pub fn certificate(&self) -> &AuthorityCertificate {
@@ -198,8 +202,24 @@ impl IdentityProvider for AuthorityIdentity {
         nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
-        let _ = (&self.key, signing_key, network_key, nostr_key, created_at);
-        todo!("P30 2a: certificado v4")
+        let identity = self.certificate.identity.clone();
+        let payload = DeviceCertificate::signing_payload_v4(
+            &identity,
+            &self.certificate.authority_key,
+            signing_key,
+            network_key,
+            nostr_key,
+            created_at,
+        );
+        Ok(DeviceCertificate {
+            identity,
+            issuer: Issuer::Authority(Box::new(self.certificate.clone())),
+            signing_key: signing_key.clone(),
+            network_key: network_key.clone(),
+            nostr_key: *nostr_key,
+            created_at,
+            signature: self.key.keypair.sign(&payload)?,
+        })
     }
 }
 
