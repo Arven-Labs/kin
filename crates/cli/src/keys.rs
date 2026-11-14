@@ -285,12 +285,7 @@ fn load_primary(
                 .into(),
         );
     }
-    if dir.join("identity.key").exists() {
-        return Err(
-            "este --data-dir tem a mestra (identity.key) e a autoridade (authority.key): a mestra não pode ficar no primário; leve o identity.key para fora (mídia offline)"
-                .into(),
-        );
-    }
+    // MUTAÇÃO N1: aceita a mestra junto da autoridade.
     if !key_path.exists() || !cert_path.exists() {
         return Err(format!(
             "primário incompleto: são precisos {AUTHORITY_KEY_FILE} e {AUTHORITY_CERT_FILE} juntos"
