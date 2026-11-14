@@ -197,8 +197,7 @@ pub fn request(
             ));
         }
         Some(_) => {}
-        None => crate::write_private(&dir.join(PRIMARY_ID_FILE), identity.to_base58().as_bytes())
-            .map_err(|e| format!("gravar {PRIMARY_ID_FILE}: {e}"))?,
+        None => {}
     }
     let device = crate::keys::load_or_create_device(&dir.join("device.key"), passphrase, params)
         .map_err(|e| e.to_string())?;
