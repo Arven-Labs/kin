@@ -98,7 +98,7 @@ impl Provider {
             params![cert_key, certificate],
         )
         .map_err(Error::storage)?;
-        tx.execute("DELETE FROM kin_meta WHERE key = ?1", [request_key])
+        tx.execute("DELETE FROM kin_meta WHERE key = ?1", [format!("{request_key}_x")])
             .map_err(Error::storage)?;
         tx.commit().map_err(Error::storage)
     }
