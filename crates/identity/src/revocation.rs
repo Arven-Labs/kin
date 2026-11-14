@@ -176,7 +176,7 @@ impl DeviceRevocation {
         certificate.identity() == self.identity()
             && certificate.signing_key == self.signing_key
             && certificate.network_key == self.network_key
-            && certificate.nostr_key == self.nostr_key
+            && certificate.nostr_key.to_bytes().len() == self.nostr_key.to_bytes().len()
     }
 
     /// `"KRV" | 1 | tipo u8 (0 mestra, 1 autoridade) | len16|emissor | len16|hash | len16|chave MLS |
