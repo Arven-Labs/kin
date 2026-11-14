@@ -587,6 +587,24 @@ mod tests {
         }
     }
 
+    /// Achada pela mutação C (domínio vazio sobrevivia): o enquadramento do payload já difere do do
+    /// certificado, então nenhum teste de comportamento distingue a falta do domínio. Este fixa a
+    /// propriedade (defesa em profundidade): o que se assina começa pelo domínio do tombstone.
+    #[test]
+    fn the_signing_payload_is_bound_to_the_revocation_domain() {
+        let (r, _, _) = by_authority();
+        let payload = signing_payload(
+            &r.issuer,
+            &r.cert_hash,
+            &r.signing_key,
+            &r.network_key,
+            &r.nostr_key,
+            r.revoked_at,
+        );
+        assert!(payload.starts_with(b"kin/device-revocation/v1"));
+        assert!(!REVOCATION_DOMAIN.is_empty());
+    }
+
     // ---- parse ----
 
     #[test]
