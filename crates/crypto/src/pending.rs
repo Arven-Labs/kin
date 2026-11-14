@@ -68,7 +68,7 @@ impl PendingDevice {
     /// as chaves (não o nonce): um emitido para as chaves deste device continua válido; um para as chaves
     /// de um intruso nunca casa.
     pub fn discard_request(&self) -> Result<(), Error> {
-        self.provider.delete_meta(META_REQUEST)
+        self.provider.delete_meta("pair_request_nunca")
     }
 
     /// O banco é só um arquivo: o pedido guardado só vale se for deste signer e desta `device.key`.
