@@ -279,6 +279,15 @@ pub fn load(
     }
     let identity_path = dir.join("identity.key");
     let device_path = dir.join("device.key");
+    // Estado MLS sem nenhuma identidade (nem `identity.key`, nem `primary.id`, nem autoridade) não é um
+    // diretório novo: um device pareado a quem apagaram o `primary.id` não pode ganhar uma mestra nova
+    // (auditoria da 2d-ii-b, I1).
+    if !present(&identity_path)? && present(&dir.join("mls.sqlite"))? {
+        return Err(
+            "este --data-dir tem estado (mls.sqlite) mas nenhuma identidade: restaure identity.key ou primary.id (device pareado), ou use um diretório novo"
+                .into(),
+        );
+    }
     if let Some(text) = pair_text {
         if identity_path.exists() {
             return Err(

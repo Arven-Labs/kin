@@ -184,17 +184,13 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
             println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
         }
     }
-    if loaded.0.master().is_none() {
-        match &loaded.0 {
-            keys::LocalIdentity::Paired(_) => println!(
-                "device pareado da identidade {} (certificado v4 do primário; sem mestra nem autoridade aqui)",
-                loaded.0.id().to_base58()
-            ),
-            _ => println!(
-                "primário da identidade {} (chave de autoridade; a mestra não está neste diretório)",
-                loaded.0.id().to_base58()
-            ),
-        }
+    // O pareado só se anuncia depois de o `Chat::open_paired` e o `ensure_current_issuer` passarem (em
+    // `main`): antes disso ainda pode ser um pareamento pendente ou um banco v3.
+    if matches!(loaded.0, keys::LocalIdentity::Primary(_)) {
+        println!(
+            "primário da identidade {} (chave de autoridade; a mestra não está neste diretório)",
+            loaded.0.id().to_base58()
+        );
         eprintln!(
             "aviso: o certificado deste device é v4; builds antigos do kin não o leem (atualize os outros devices)"
         );
@@ -309,6 +305,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
     keys::ensure_current_issuer(&identity, chat.certificate())?;
+    if matches!(identity, keys::LocalIdentity::Paired(_)) {
+        println!(
+            "device pareado da identidade {} (certificado v4 do primário; sem mestra nem autoridade aqui)",
+            identity.id().to_base58()
+        );
+        eprintln!(
+            "aviso: o certificado deste device é v4; builds antigos do kin não o leem (atualize os outros devices)"
+        );
+    }
     println!(
         "kin {} — peer id: {}",
         env!("CARGO_PKG_VERSION"),

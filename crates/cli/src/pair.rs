@@ -228,7 +228,7 @@ pub(crate) fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> 
     // conferir a identidade impressa pelo `request` com a tela do primário.
     let corrupted = || {
         format!(
-            "{shown} está vazio ou corrompido: apague o arquivo e rode `kin pair request` de novo, conferindo a identidade impressa com a do primário"
+            "{shown} está vazio ou corrompido: regrave-o com a identidade do primário (conferida na tela dele), ou use um diretório novo e rode `kin pair request` (apagar o arquivo deixaria o diretório sem identidade)"
         )
     };
     let text = std::str::from_utf8(&bytes).map_err(|_| corrupted())?;
@@ -410,7 +410,7 @@ pub fn run(command: PairCommand) -> Result<(), String> {
             let pass = secret(passphrase_file, "senha do device", false)?;
             let identity = accept(&data_dir, &link, Some(pass.as_slice()), now_secs()?)?;
             println!(
-                "Certificado instalado: este device agora pertence à identidade {}.\n(O chat em modo pareado vem na próxima fatia.)",
+                "Certificado instalado: este device agora pertence à identidade {}.\nAgora é só rodar `kin --data-dir` neste mesmo diretório.",
                 identity.to_base58()
             );
         }
