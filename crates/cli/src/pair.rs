@@ -634,17 +634,22 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_primary_id_is_refused_with_a_message_that_says_what_to_delete() {
+    fn an_empty_primary_id_is_refused_with_a_message_that_says_to_rewrite_it_not_delete_it() {
         let dir = tempfile::tempdir().unwrap();
         let (_, identity) = primary_in(dir.path());
         let new = dir.path().join("new");
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(new.join(PRIMARY_ID_FILE), "").unwrap();
         let err = ask(&new, &identity, NOW).unwrap_err();
+        // Apagar `primary.id` num diretório já pareado leva a um beco (e o `kin` normal o trataria como
+        // novo): a mensagem manda regravar com a identidade conferida, ou usar um diretório novo.
         assert!(
-            err.contains(PRIMARY_ID_FILE) && err.contains("apague"),
+            err.contains(PRIMARY_ID_FILE)
+                && err.contains("regrave")
+                && err.contains("diretório novo"),
             "mensagem sem ação: {err}"
         );
+        assert!(!err.contains("apague"), "manda apagar a âncora: {err}");
     }
 
     #[test]

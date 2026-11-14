@@ -1185,6 +1185,21 @@ mod tests {
         assert_eq!(paired_load(&dir).unwrap().1.peer_id(), device.peer_id());
     }
 
+    /// Auditoria da 2d-ii-b, I1: sem `primary.id` (apagado pelo usuário) o diretório pareado parecia novo e o
+    /// `load` gerava uma mestra. Estado (`mls.sqlite`) sem nenhuma identidade nunca é um diretório novo.
+    #[test]
+    fn state_without_any_identity_is_not_a_new_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _, _) = paired_dir(root.path());
+        std::fs::remove_file(dir.join(crate::pair::PRIMARY_ID_FILE)).unwrap();
+        let before = names(&dir);
+
+        assert!(paired_load(&dir).is_err());
+
+        assert!(!id_path(&dir).exists(), "gerou uma mestra");
+        assert_eq!(names(&dir), before, "criou ou apagou arquivo");
+    }
+
     #[test]
     fn a_directory_with_a_pending_request_is_also_recognized_as_paired_mode() {
         // Antes do `accept`, só há `primary.id` + `device.key` + banco pendente: o `load` não pode cair no
