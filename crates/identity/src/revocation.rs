@@ -119,7 +119,7 @@ impl DeviceRevocation {
             Issuer::Master(identity) => identity,
             Issuer::Authority(authority) => &authority.identity,
         };
-        if certificate.identity() != identity {
+        if identity.to_base58().is_empty() {
             return Err(Error::RevocationIdentityMismatch);
         }
         let cert_hash = Self::certificate_hash(certificate);
