@@ -137,7 +137,8 @@ pub enum Issuer {
     Master,
     /// A chave de autoridade, com o certificado que a mestra deu a ela (formato v4, P30 fatia 2a,
     /// ADR 0014). A cadeia viaja dentro do certificado do device: verificar não depende de estado.
-    Authority(AuthorityCertificate),
+    /// Em `Box` porque o certificado de autoridade é grande e o `Master` não carrega nada.
+    Authority(Box<AuthorityCertificate>),
 }
 
 /// Prova assinada pela identidade de que um device lhe pertence. Cobre as três chaves do device:

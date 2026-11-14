@@ -237,7 +237,7 @@ mod tests {
         );
         let cert = DeviceCertificate {
             identity: victim.id(),
-            issuer: crate::Issuer::Authority(chain),
+            issuer: crate::Issuer::Authority(Box::new(chain)),
             signing_key: d.public_key(),
             network_key: d.public_key(),
             nostr_key: d.nostr_public_key(),

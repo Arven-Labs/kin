@@ -127,7 +127,7 @@ fn a_device_signed_by_a_key_other_than_the_certified_authority_is_refused() {
     let d = device();
     // Assinado pela autoridade B, mas apresentando a cadeia da autoridade A.
     let mut cert = certify(&b, &d);
-    cert.issuer = Issuer::Authority(a.certificate().clone());
+    cert.issuer = Issuer::Authority(Box::new(a.certificate().clone()));
 
     assert!(cert.verify().is_err());
 }
@@ -139,7 +139,7 @@ fn a_master_signature_over_the_same_device_does_not_count_as_the_authority() {
     let d = device();
     // Mesmo device, mesmo instante: a assinatura da mestra (v3) com a cadeia do v4 ao lado.
     let mut cert = certify(&master, &d);
-    cert.issuer = Issuer::Authority(primary.certificate().clone());
+    cert.issuer = Issuer::Authority(Box::new(primary.certificate().clone()));
 
     assert!(cert.verify().is_err());
 }
@@ -173,7 +173,7 @@ fn an_authority_shared_by_two_masters_does_not_move_a_device_between_them() {
     .unwrap();
     // Device certificado para m1; trocar a cadeia por a de m2 não pode fazê-lo valer para m2.
     let mut cert = certify(&primary, &device());
-    cert.issuer = Issuer::Authority(by_m2);
+    cert.issuer = Issuer::Authority(Box::new(by_m2));
     cert.identity = m2.id();
 
     assert!(cert.verify().is_err());
