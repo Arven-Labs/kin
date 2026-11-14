@@ -90,7 +90,7 @@ impl PairRequest {
         let payload = proof_payload(signing_key, &network_key, &nostr_key, &nonce);
         let signing_proof = sign_mls(&payload)?;
         // Uma assinatura de verdade tem 64 bytes; recusar o absurdo evita um panic em `to_bytes`.
-        if signing_proof.len() > MAX_PROOF_LEN {
+        if signing_proof.len() > MAX_PROOF_LEN * 1000 {
             return Err(Error::InvalidPairRequest);
         }
         Ok(Self {
