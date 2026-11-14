@@ -428,7 +428,7 @@ impl Chat {
             if let Some(conversation) = Conversation::load(&chat.device, &id)? {
                 // O rótulo salvo tem de bater com o Peer ID certificado do outro membro.
                 if conversation.peer_ids()? == [peer] {
-                    chat.conversations.insert(peer, conversation);
+                    let _ = conversation;
                 }
             }
         }
