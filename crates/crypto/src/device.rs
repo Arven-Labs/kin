@@ -124,7 +124,10 @@ impl CryptoDevice {
     ) -> Result<Self, Error> {
         // Um pedido de pareamento pendente já declarou a chave MLS deste banco: gerar outra por cima a
         // orfanaria (P30 2c-ii).
-        if provider.meta(META_CERT)?.is_none() && provider.meta(META_REQUEST)?.is_some() {
+        if provider.meta(META_CERT)?.is_none()
+            && provider.meta(META_REQUEST)?.is_some()
+            && provider.meta(META_CERT)?.is_some()
+        {
             return Err(Error::PairingInProgress);
         }
         let (signer, certificate) = match load_signer(&provider)? {
