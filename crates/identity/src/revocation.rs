@@ -8,13 +8,68 @@
 //! v4) ou a **mestra**; `revoked_at` é informativo e nenhuma decisão de confiança o lê.
 
 use libp2p_identity::PublicKey;
+use sha2::{Digest, Sha256};
 
-use crate::{DeviceCertificate, Error, IdentityId, Issuer, NostrPublicKey};
+use crate::device::{put, take};
+use crate::{AuthorityCertificate, DeviceCertificate, Error, IdentityId, Issuer, NostrPublicKey};
 
 /// Domínio de assinatura do tombstone: diferente do certificado de device e do de autoridade, para uma
 /// assinatura de um nunca valer como a de outro.
-#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
 pub(crate) const REVOCATION_DOMAIN: &[u8] = b"kin/device-revocation/v1";
+
+/// Domínio do hash do certificado revogado (separado do de assinatura).
+const CERT_HASH_DOMAIN: &[u8] = b"kin/device-revocation-cert-hash/v1";
+
+/// Magic e versão do formato de fio (não entram na assinatura, que tem o seu domínio).
+const MAGIC: &[u8; 3] = b"KRV";
+const VERSION: u8 = 1;
+/// Tipo do emissor na serialização.
+const KIND_MASTER: u8 = 0;
+const KIND_AUTHORITY: u8 = 1;
+/// Teto do tombstone serializado (o real tem ~450 bytes com a cadeia). Barra entrada gigante antes do parse.
+const MAX_LEN: usize = 2048;
+
+/// `(len32 | campo)` acrescentado a `out`: o prefixo de tamanho impede que dois conjuntos diferentes de
+/// campos produzam os mesmos bytes.
+fn push(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    out.extend_from_slice(field);
+}
+
+/// Bytes que o emissor assina: domínio, emissor (no v4 a identidade, a chave de autoridade e o
+/// `created_at` dela, como no certificado de device, para amarrar **qual** emissão), hash, as três
+/// chaves e `revoked_at`.
+fn signing_payload(
+    issuer: &Issuer,
+    cert_hash: &[u8; 32],
+    signing_key: &PublicKey,
+    network_key: &PublicKey,
+    nostr_key: &NostrPublicKey,
+    revoked_at: u64,
+) -> Vec<u8> {
+    let mut payload = REVOCATION_DOMAIN.to_vec();
+    match issuer {
+        Issuer::Master(identity) => {
+            push(&mut payload, &[KIND_MASTER]);
+            push(&mut payload, &identity.public_key().encode_protobuf());
+        }
+        Issuer::Authority(authority) => {
+            push(&mut payload, &[KIND_AUTHORITY]);
+            push(
+                &mut payload,
+                &authority.identity.public_key().encode_protobuf(),
+            );
+            push(&mut payload, &authority.authority_key.encode_protobuf());
+            push(&mut payload, &authority.created_at.to_be_bytes());
+        }
+    }
+    push(&mut payload, cert_hash);
+    push(&mut payload, &signing_key.encode_protobuf());
+    push(&mut payload, &network_key.encode_protobuf());
+    push(&mut payload, &nostr_key.to_bytes());
+    push(&mut payload, &revoked_at.to_be_bytes());
+    payload
+}
 
 /// Declaração assinada de que o certificado `cert_hash` (e as chaves citadas) não vale mais.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,10 +97,13 @@ impl DeviceRevocation {
     }
 
     /// SHA-256 com domínio dos bytes do certificado.
-    #[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
     pub(crate) fn certificate_hash(certificate: &DeviceCertificate) -> [u8; 32] {
-        let _ = certificate;
-        todo!("stub: certificate_hash")
+        let mut input = CERT_HASH_DOMAIN.to_vec();
+        push(&mut input, &certificate.to_bytes());
+        let digest = Sha256::digest(&input);
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(digest.as_slice());
+        hash
     }
 
     /// Monta e assina o tombstone de `certificate`. Recusa certificado de **outra identidade** que a do
@@ -57,35 +115,153 @@ impl DeviceRevocation {
         revoked_at: u64,
         sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
     ) -> Result<Self, Error> {
-        let _ = (issuer, certificate, revoked_at, sign);
-        todo!("stub: build")
+        let identity = match &issuer {
+            Issuer::Master(identity) => identity,
+            Issuer::Authority(authority) => &authority.identity,
+        };
+        if certificate.identity() != identity {
+            return Err(Error::RevocationIdentityMismatch);
+        }
+        let cert_hash = Self::certificate_hash(certificate);
+        let payload = signing_payload(
+            &issuer,
+            &cert_hash,
+            &certificate.signing_key,
+            &certificate.network_key,
+            &certificate.nostr_key,
+            revoked_at,
+        );
+        let signature = sign(&payload)?;
+        Ok(Self {
+            issuer,
+            cert_hash,
+            signing_key: certificate.signing_key.clone(),
+            network_key: certificate.network_key.clone(),
+            nostr_key: certificate.nostr_key,
+            revoked_at,
+            signature,
+        })
     }
 
     /// Confere a assinatura (e, no caso da autoridade, a cadeia inteira). Não diz se a identidade é a
     /// que o chamador espera, nem se o tombstone se aplica a algum certificado: isso é com quem chama.
     pub fn verify(&self) -> Result<(), Error> {
-        todo!("stub: verify")
+        let payload = signing_payload(
+            &self.issuer,
+            &self.cert_hash,
+            &self.signing_key,
+            &self.network_key,
+            &self.nostr_key,
+            self.revoked_at,
+        );
+        let signed = match &self.issuer {
+            Issuer::Master(identity) => identity.public_key().verify(&payload, &self.signature),
+            Issuer::Authority(authority) => {
+                // A cadeia inteira: a mestra assinou a autoridade, e a autoridade assinou o tombstone.
+                authority.verify().map_err(|_| Error::InvalidRevocation)?;
+                authority.authority_key.verify(&payload, &self.signature)
+            }
+        };
+        if signed {
+            Ok(())
+        } else {
+            Err(Error::InvalidRevocation)
+        }
     }
 
     /// Este tombstone revoga `certificate`? Verdadeiro se for da **mesma identidade e das mesmas três
     /// chaves** (MLS, rede e Nostr), mesmo que o certificado seja outro (reemitido com outro
     /// `created_at`). Não confere a assinatura de nenhum dos dois: use [`Self::verify`].
     pub fn revokes(&self, certificate: &DeviceCertificate) -> bool {
-        let _ = certificate;
-        todo!("stub: revokes")
+        certificate.identity() == self.identity()
+            && certificate.signing_key == self.signing_key
+            && certificate.network_key == self.network_key
+            && certificate.nostr_key == self.nostr_key
     }
 
-    /// `"KRV" | 1 | len16|emissor | len16|hash | len16|chave MLS | len16|chave de rede | len16|chave Nostr |
-    /// revoked_at u64 BE | len16|assinatura`. O emissor é a identidade (mestra) ou o certificado de
-    /// autoridade (`KAUT`), como no certificado de device.
+    /// `"KRV" | 1 | tipo u8 (0 mestra, 1 autoridade) | len16|emissor | len16|hash | len16|chave MLS |
+    /// len16|chave de rede | len16|chave Nostr | revoked_at u64 BE | len16|assinatura`. O emissor é a
+    /// identidade (mestra) ou o certificado de autoridade (`KAUT`), como no certificado de device.
     pub fn to_bytes(&self) -> Vec<u8> {
-        todo!("stub: to_bytes")
+        let mut out = MAGIC.to_vec();
+        out.push(VERSION);
+        match &self.issuer {
+            Issuer::Master(identity) => {
+                out.push(KIND_MASTER);
+                put(&mut out, &identity.public_key().encode_protobuf());
+            }
+            Issuer::Authority(authority) => {
+                out.push(KIND_AUTHORITY);
+                put(&mut out, &authority.to_bytes());
+            }
+        }
+        put(&mut out, &self.cert_hash);
+        put(&mut out, &self.signing_key.encode_protobuf());
+        put(&mut out, &self.network_key.encode_protobuf());
+        put(&mut out, &self.nostr_key.to_bytes());
+        out.extend_from_slice(&self.revoked_at.to_be_bytes());
+        put(&mut out, &self.signature);
+        out
     }
 
     /// Lê um tombstone serializado. Não confere a assinatura: use [`Self::verify`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let _ = bytes;
-        todo!("stub: from_bytes")
+        // Genérica: serve ao erro do `take` e ao dos decodificadores de chave, sem expor o detalhe.
+        fn invalid<E>(_: E) -> Error {
+            Error::InvalidRevocation
+        }
+        if bytes.len() > MAX_LEN {
+            return Err(Error::InvalidRevocation);
+        }
+        let mut cur = bytes
+            .strip_prefix(MAGIC.as_slice())
+            .and_then(|rest| rest.strip_prefix(&[VERSION]))
+            .ok_or(Error::InvalidRevocation)?;
+        let (&kind, rest) = cur.split_first().ok_or(Error::InvalidRevocation)?;
+        cur = rest;
+        let issuer = match kind {
+            KIND_MASTER => {
+                let key = PublicKey::try_decode_protobuf(take(&mut cur).map_err(invalid)?)
+                    .map_err(invalid)?;
+                Issuer::Master(IdentityId::new(key))
+            }
+            KIND_AUTHORITY => {
+                let authority = AuthorityCertificate::from_bytes(take(&mut cur).map_err(invalid)?)
+                    .map_err(invalid)?;
+                Issuer::Authority(Box::new(authority))
+            }
+            _ => return Err(Error::InvalidRevocation),
+        };
+        let cert_hash: [u8; 32] = take(&mut cur)
+            .map_err(invalid)?
+            .try_into()
+            .map_err(invalid)?;
+        let signing_key =
+            PublicKey::try_decode_protobuf(take(&mut cur).map_err(invalid)?).map_err(invalid)?;
+        let network_key =
+            PublicKey::try_decode_protobuf(take(&mut cur).map_err(invalid)?).map_err(invalid)?;
+        let nostr_key =
+            NostrPublicKey::from_bytes(take(&mut cur).map_err(invalid)?).map_err(invalid)?;
+        let revoked_at = u64::from_be_bytes(
+            cur.get(..8)
+                .ok_or(Error::InvalidRevocation)?
+                .try_into()
+                .map_err(invalid)?,
+        );
+        cur = &cur[8..];
+        let signature = take(&mut cur).map_err(invalid)?.to_vec();
+        if !cur.is_empty() {
+            return Err(Error::InvalidRevocation);
+        }
+        Ok(Self {
+            issuer,
+            cert_hash,
+            signing_key,
+            network_key,
+            nostr_key,
+            revoked_at,
+            signature,
+        })
     }
 }
 
