@@ -335,7 +335,8 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
         "guarde a mestra fria FORA do disco do primário (mídia offline). Senha da mestra perdida = identidade perdida: não há recuperação."
     );
     println!(
-        "a CLI normal ainda não usa esses arquivos (o pareamento autenticado vem na fatia 2 do P30)."
+        "para usar o primário: kin --data-dir {} (com a senha da autoridade)",
+        authority_dir.display()
     );
     Ok(())
 }

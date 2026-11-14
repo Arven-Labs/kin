@@ -181,6 +181,15 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
             println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
         }
     }
+    if loaded.0.master().is_none() {
+        println!(
+            "primário da identidade {} (chave de autoridade; a mestra não está neste diretório)",
+            loaded.0.id().to_base58()
+        );
+        eprintln!(
+            "aviso: o certificado deste device é v4; builds antigos do kin não o leem (atualize os outros devices)"
+        );
+    }
     Ok(loaded)
 }
 

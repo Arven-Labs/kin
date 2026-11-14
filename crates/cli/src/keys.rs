@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use kin_identity::{
-    AuthorityIdentity, DeviceKey, IdentityId, IdentityProvider, KdfParams, StandaloneIdentity,
+    AuthorityCertificate, AuthorityIdentity, AuthorityKey, DeviceKey, IdentityId, IdentityProvider,
+    KdfParams, StandaloneIdentity,
 };
 use zeroize::Zeroizing;
 
@@ -16,7 +17,6 @@ use crate::cold::{AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE};
 /// As duas variantes em `Box`: as duas são grandes e de tamanhos diferentes (clippy `large_enum_variant`).
 pub enum LocalIdentity {
     Master(Box<StandaloneIdentity>),
-    #[allow(dead_code)] // stub da etapa de testes; some na implementação
     Primary(Box<AuthorityIdentity>),
 }
 
@@ -136,7 +136,8 @@ pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access,
 /// Estado dos arquivos de chave em `dir` (só os que existem).
 pub fn files_state(dir: &Path) -> Result<FilesState, Box<dyn std::error::Error>> {
     let mut sealed = Vec::new();
-    for name in ["identity.key", "device.key"] {
+    // O `authority.key` do primário (P30 2b) conta como os outros: cifrado = pedir a senha uma vez.
+    for name in ["identity.key", AUTHORITY_KEY_FILE, "device.key"] {
         let path = dir.join(name);
         if path.exists() {
             sealed.push(kin_identity::key_file_is_sealed(&path)?);
@@ -215,7 +216,7 @@ pub fn load(
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
     if dir.join(AUTHORITY_KEY_FILE).exists() || dir.join(AUTHORITY_CERT_FILE).exists() {
-        todo!("P30 2b: carregar o primário")
+        return load_primary(dir, pair_text.is_some(), passphrase, protect, params);
     }
     let identity_path = dir.join("identity.key");
     let device_path = dir.join("device.key");
@@ -259,17 +260,77 @@ pub fn load(
         }
         identity
     };
-    let device = if device_path.exists() {
-        DeviceKey::load_with(&device_path, passphrase)?
-    } else {
-        let device = DeviceKey::generate();
-        match passphrase {
-            Some(pass) => device.save_sealed(&device_path, pass, params)?,
-            None => crate::write_private(&device_path, &device.to_bytes()?)?,
-        }
-        device
-    };
+    let device = load_or_create_device(&device_path, passphrase, params)?;
     Ok((LocalIdentity::Master(Box::new(identity)), device))
+}
+
+/// Teto do `authority.cert` (o real tem ~160 bytes): arquivo gigante ou `/dev/zero` não é lido.
+const AUTHORITY_CERT_LIMIT: u64 = 4096;
+
+/// Carrega o **primário** (P30 2b, ADR 0015): `authority.key` + `authority.cert`, sem a mestra.
+/// Tudo o que pode recusar é conferido **antes** de criar o `device.key`.
+fn load_primary(
+    dir: &Path,
+    pairing: bool,
+    passphrase: Option<&[u8]>,
+    protect: bool,
+    params: KdfParams,
+) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+    let key_path = dir.join(AUTHORITY_KEY_FILE);
+    let cert_path = dir.join(AUTHORITY_CERT_FILE);
+    let device_path = dir.join("device.key");
+    if pairing {
+        return Err(
+            "este --data-dir é de um primário (authority.key): --pair não importa a mestra aqui"
+                .into(),
+        );
+    }
+    if dir.join("identity.key").exists() {
+        return Err(
+            "este --data-dir tem a mestra (identity.key) e a autoridade (authority.key): a mestra não pode ficar no primário; leve o identity.key para fora (mídia offline)"
+                .into(),
+        );
+    }
+    if !key_path.exists() || !cert_path.exists() {
+        return Err(format!(
+            "primário incompleto: são precisos {AUTHORITY_KEY_FILE} e {AUTHORITY_CERT_FILE} juntos"
+        )
+        .into());
+    }
+    if std::fs::metadata(&cert_path)?.len() > AUTHORITY_CERT_LIMIT {
+        return Err(format!("{AUTHORITY_CERT_FILE} grande demais").into());
+    }
+    if protect {
+        let pass = passphrase.ok_or("--protect exige uma senha")?;
+        if !kin_identity::key_file_is_sealed(&key_path)? {
+            AuthorityKey::protect(&key_path, pass, params)?;
+        }
+        if device_path.exists() && !kin_identity::key_file_is_sealed(&device_path)? {
+            DeviceKey::protect(&device_path, pass, params)?;
+        }
+    }
+    let key = AuthorityKey::load_with(&key_path, passphrase)?;
+    let certificate = AuthorityCertificate::from_bytes(&std::fs::read(&cert_path)?)?;
+    let primary = AuthorityIdentity::new(key, certificate)?;
+    let device = load_or_create_device(&device_path, passphrase, params)?;
+    Ok((LocalIdentity::Primary(Box::new(primary)), device))
+}
+
+/// Abre o `device.key` ou, se não existe, gera e grava um (cifrado com a senha, ou em claro sem ela).
+fn load_or_create_device(
+    path: &Path,
+    passphrase: Option<&[u8]>,
+    params: KdfParams,
+) -> Result<DeviceKey, Box<dyn std::error::Error>> {
+    if path.exists() {
+        return Ok(DeviceKey::load_with(path, passphrase)?);
+    }
+    let device = DeviceKey::generate();
+    match passphrase {
+        Some(pass) => device.save_sealed(path, pass, params)?,
+        None => crate::write_private(path, &device.to_bytes()?)?,
+    }
+    Ok(device)
 }
 
 #[cfg(test)]
