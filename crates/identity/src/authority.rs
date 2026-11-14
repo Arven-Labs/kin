@@ -10,7 +10,10 @@ use libp2p_identity::{Keypair, PublicKey};
 use zeroize::Zeroizing;
 
 use crate::device::{put, take};
-use crate::{Error, IdentityId, KdfParams, store};
+use crate::{
+    DeviceCertificate, Error, IdentityId, IdentityProvider, Issuer, KdfParams, NostrPublicKey,
+    store,
+};
 
 /// Domínio de assinatura do certificado de autoridade. Diferente do de `DeviceCertificate`, para uma
 /// assinatura de um nunca valer como a do outro.
@@ -164,10 +167,67 @@ impl AuthorityCertificate {
     }
 }
 
+/// A identidade vista do primário (P30 fatia 2a, ADR 0014): a chave de autoridade junto do certificado
+/// que a mestra deu a ela. Certifica devices no formato v4 sem a mestra estar presente.
+pub struct AuthorityIdentity {
+    key: AuthorityKey,
+    certificate: AuthorityCertificate,
+}
+
+impl AuthorityIdentity {
+    /// Junta a chave e o certificado. Recusa certificado com assinatura inválida
+    /// ([`Error::InvalidAuthorityCertificate`]) ou de outra chave ([`Error::AuthorityKeyMismatch`]).
+    pub fn new(key: AuthorityKey, certificate: AuthorityCertificate) -> Result<Self, Error> {
+        certificate.verify()?;
+        if certificate.authority_key != key.public_key() {
+            return Err(Error::AuthorityKeyMismatch);
+        }
+        Ok(Self { key, certificate })
+    }
+
+    pub fn certificate(&self) -> &AuthorityCertificate {
+        &self.certificate
+    }
+}
+
+impl IdentityProvider for AuthorityIdentity {
+    fn id(&self) -> IdentityId {
+        self.certificate.identity.clone()
+    }
+
+    fn authorize_device(
+        &self,
+        signing_key: &PublicKey,
+        network_key: &PublicKey,
+        nostr_key: &NostrPublicKey,
+        created_at: u64,
+    ) -> Result<DeviceCertificate, Error> {
+        let identity = self.certificate.identity.clone();
+        let payload = DeviceCertificate::signing_payload_v4(
+            &identity,
+            &self.certificate.authority_key,
+            self.certificate.created_at,
+            signing_key,
+            network_key,
+            nostr_key,
+            created_at,
+        );
+        Ok(DeviceCertificate {
+            identity,
+            issuer: Issuer::Authority(Box::new(self.certificate.clone())),
+            signing_key: signing_key.clone(),
+            network_key: network_key.clone(),
+            nostr_key: *nostr_key,
+            created_at,
+            signature: self.key.keypair.sign(&payload)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DeviceCertificate, DeviceKey, IdentityProvider, StandaloneIdentity};
+    use crate::{DeviceKey, StandaloneIdentity};
 
     const PASS: &[u8] = b"senha de teste";
 
@@ -175,6 +235,39 @@ mod tests {
         master
             .certify_authority(&authority.public_key(), 1_000)
             .unwrap()
+    }
+
+    // ---- certificado de device v4 (fatia 2a) ----
+
+    /// O ataque que a API pública não deixa montar: quem tem uma autoridade certificada por **outra**
+    /// mestra assina, com a chave crua, um payload v4 que já diz "a identidade é a vítima".
+    #[test]
+    fn an_intruder_authority_cannot_claim_another_identity_even_signing_the_right_payload() {
+        let victim = StandaloneIdentity::generate();
+        let intruder = StandaloneIdentity::generate();
+        let key = AuthorityKey::generate();
+        let chain = issue(&intruder, &key);
+        let d = DeviceKey::generate();
+        let payload = DeviceCertificate::signing_payload_v4(
+            &victim.id(),
+            &key.public_key(),
+            chain.created_at,
+            &d.public_key(),
+            &d.public_key(),
+            &d.nostr_public_key(),
+            2_000,
+        );
+        let cert = DeviceCertificate {
+            identity: victim.id(),
+            issuer: crate::Issuer::Authority(Box::new(chain)),
+            signing_key: d.public_key(),
+            network_key: d.public_key(),
+            nostr_key: d.nostr_public_key(),
+            created_at: 2_000,
+            signature: key.keypair.sign(&payload).unwrap(),
+        };
+
+        assert!(cert.verify().is_err());
     }
 
     // ---- certificado ----

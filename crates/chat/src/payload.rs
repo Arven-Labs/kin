@@ -518,6 +518,45 @@ mod tests {
         );
     }
 
+    /// Convite de um device certificado pela autoridade (v4, P30 fatia 2a).
+    fn invite_v4(master: &StandaloneIdentity, addrs: Vec<Multiaddr>) -> Invite {
+        let key = kin_identity::AuthorityKey::generate();
+        let chain = master.certify_authority(&key.public_key(), 1).unwrap();
+        let primary = kin_identity::AuthorityIdentity::new(key, chain).unwrap();
+        let device = DeviceKey::generate();
+        let cert = primary
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                2,
+            )
+            .unwrap();
+        Invite::new(cert, addrs)
+    }
+
+    #[test]
+    fn a_device_list_mixing_v3_and_v4_certificates_survives_encode_and_decode() {
+        let identity = StandaloneIdentity::generate();
+        let payload = Payload::DeviceList(vec![
+            invite(&identity, vec![]),
+            invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]),
+        ]);
+
+        assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
+    }
+
+    #[test]
+    fn an_invite_link_with_a_v4_certificate_roundtrips_with_the_master_identity() {
+        let identity = StandaloneIdentity::generate();
+        let invite = invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]);
+
+        let restored = Invite::from_link(&invite.to_link()).unwrap();
+
+        assert_eq!(restored, invite);
+        assert_eq!(restored.identity(), &identity.id());
+    }
+
     // 19
     #[test]
     fn an_empty_device_list_is_a_valid_empty_list() {

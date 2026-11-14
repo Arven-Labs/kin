@@ -146,6 +146,7 @@ impl IdentityProvider for StandaloneIdentity {
             DeviceCertificate::signing_payload(signing_key, network_key, nostr_key, created_at);
         Ok(DeviceCertificate {
             identity: self.id(),
+            issuer: crate::Issuer::Master,
             signing_key: signing_key.clone(),
             network_key: network_key.clone(),
             nostr_key: *nostr_key,
