@@ -422,7 +422,10 @@ fn load_paired(
         .ok_or("primary.id sumiu enquanto o diretório era aberto")?;
     // Nunca cria chave: sem `device.key` o pareamento está incompleto (ou o arquivo foi perdido).
     let device_path = dir.join("device.key");
-    if !present(&device_path)? {
+    if !present(&device_path)? && {
+        load_or_create_device(&device_path, passphrase, params)?;
+        false
+    } {
         return Err(
             "device pareado sem device.key: restaure-o do backup ou pareie de novo num --data-dir novo (`kin pair request`)"
                 .into(),
