@@ -52,16 +52,7 @@ impl PendingDevice {
     pub fn request(&self, device_key: &DeviceKey) -> Result<PairRequest, Error> {
         let signing_key = public_key_from_ed25519(self.signer.public())?;
         if let Some(bytes) = self.provider.meta(META_REQUEST)? {
-            let request = PairRequest::from_bytes(&bytes)?;
-            // O banco é só um arquivo: o pedido guardado tem de ser deste signer e desta device.key.
-            if request.signing_key != signing_key
-                || request.network_key != device_key.public_key()
-                || request.nostr_key != device_key.nostr_public_key()
-            {
-                return Err(Error::DeviceMismatch);
-            }
-            request.verify()?;
-            return Ok(request);
+            return Self::check_stored(&bytes, &signing_key, device_key);
         }
         let request = PairRequest::generate(device_key, &signing_key, |payload| {
             self.signer
@@ -76,7 +67,24 @@ impl PendingDevice {
     /// próximo [`Self::request`] gera um pedido novo, com outro nonce e outro código, e um certificado do
     /// pedido antigo deixa de valer.
     pub fn discard_request(&self) -> Result<(), Error> {
-        todo!("2c-ii: apagar o pedido guardado")
+        self.provider.delete_meta(META_REQUEST)
+    }
+
+    /// O banco é só um arquivo: o pedido guardado só vale se for deste signer e desta `device.key`.
+    fn check_stored(
+        bytes: &[u8],
+        signing_key: &kin_identity::PublicKey,
+        device_key: &DeviceKey,
+    ) -> Result<PairRequest, Error> {
+        let request = PairRequest::from_bytes(bytes)?;
+        if &request.signing_key != signing_key
+            || request.network_key != device_key.public_key()
+            || request.nostr_key != device_key.nostr_public_key()
+        {
+            return Err(Error::DeviceMismatch);
+        }
+        request.verify()?;
+        Ok(request)
     }
 
     /// Instala o certificado devolvido pelo primário, só se for da identidade `expected` (recebida fora de
@@ -84,19 +92,16 @@ impl PendingDevice {
     /// certificado e o fim do pedido só são gravados depois de tudo conferido, numa transação.
     pub fn install_certificate(
         self,
-        _device_key: &DeviceKey,
+        device_key: &DeviceKey,
         certificate: &DeviceCertificate,
         expected: &IdentityId,
     ) -> Result<CryptoDevice, Error> {
         let bytes = self.provider.meta(META_REQUEST)?.ok_or(Error::NotPending)?;
-        let request = PairRequest::from_bytes(&bytes)?;
-        request.verify()?;
-        if request.signing_key != public_key_from_ed25519(self.signer.public())? {
-            return Err(Error::DeviceMismatch);
-        }
+        let signing_key = public_key_from_ed25519(self.signer.public())?;
+        let request = Self::check_stored(&bytes, &signing_key, device_key)?;
         request.accept_certificate(certificate, expected)?;
         self.provider
-            .finish_pairing(&certificate.to_bytes(), META_CERT, META_REQUEST)?;
+            .finish_pairing(&certificate.to_bytes(), META_CERT, &bytes, META_REQUEST)?;
         Ok(CryptoDevice::assemble(
             self.provider,
             self.signer,

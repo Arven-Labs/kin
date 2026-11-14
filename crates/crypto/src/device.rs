@@ -71,11 +71,13 @@ impl CryptoDevice {
 
     /// Reabre um device **pareado** (P30 2c-ii): o certificado, instalado por
     /// [`crate::PendingDevice::install_certificate`], está no banco. Não pede `IdentityProvider` (o device
-    /// não tem a mestra nem a autoridade): a identidade é a do certificado, que é verificado a cada
-    /// abertura. Falha se o banco não tem certificado ([`Error::NotPaired`]) ou se as chaves de rede ou
-    /// Nostr não são as do certificado ([`Error::DeviceMismatch`]).
+    /// não tem a mestra nem a autoridade), mas pede a identidade `expected`, guardada **fora** deste banco
+    /// (o chamador a recebeu fora de banda no pareamento): o certificado é verificado a cada abertura e
+    /// tem de ser dela ([`Error::IdentityMismatch`]). Falha também se o banco não tem certificado
+    /// ([`Error::NotPaired`]) ou se as chaves de rede ou Nostr não são as do certificado
+    /// ([`Error::DeviceMismatch`]).
     pub fn open_paired(
-        _expected: &IdentityId,
+        expected: &IdentityId,
         network_key: &PublicKey,
         nostr_key: &NostrPublicKey,
         path: &std::path::Path,
@@ -87,6 +89,12 @@ impl CryptoDevice {
         // O banco é só um arquivo: o certificado é conferido a cada abertura (P31(b)), e a chave MLS dele
         // tem de ser a do signer guardado, senão o device falaria com uma credencial que não é a sua.
         certificate.verify()?;
+        // A identidade esperada vem de fora do banco (auditoria 2c-ii, I1): `authorize_device` não exige
+        // prova de posse, então um certificado válido de outra identidade, com as mesmas três chaves,
+        // passaria em todo o resto.
+        if certificate.identity() != expected {
+            return Err(Error::IdentityMismatch);
+        }
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
             return Err(Error::DeviceMismatch);
         }
