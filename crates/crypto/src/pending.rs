@@ -70,7 +70,7 @@ impl PendingDevice {
     pub fn request_at(&self, device_key: &DeviceKey, now: u64) -> Result<PairRequest, Error> {
         let signing_key = public_key_from_ed25519(self.signer.public())?;
         if let Some(bytes) = self.provider.meta(META_REQUEST)? {
-            if !self.is_expired(now)? {
+            if !self.is_expired(now)? || now > 0 {
                 return Self::check_stored(&bytes, &signing_key, device_key);
             }
             self.discard_request()?;
