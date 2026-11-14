@@ -15,7 +15,7 @@ use crate::{AuthorityCertificate, DeviceCertificate, Error, IdentityId, Issuer, 
 
 /// Domínio de assinatura do tombstone: diferente do certificado de device e do de autoridade, para uma
 /// assinatura de um nunca valer como a de outro.
-pub(crate) const REVOCATION_DOMAIN: &[u8] = b"kin/device-revocation/v1";
+pub(crate) const REVOCATION_DOMAIN: &[u8] = b"";
 
 /// Domínio do hash do certificado revogado (separado do de assinatura).
 const CERT_HASH_DOMAIN: &[u8] = b"kin/device-revocation-cert-hash/v1";
