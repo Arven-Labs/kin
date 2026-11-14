@@ -22,6 +22,9 @@ pub enum Error {
     InvalidAuthorityKey,
     #[error("a chave de autoridade não é a do certificado de autoridade")]
     AuthorityKeyMismatch,
+    /// A mestra certificada como a própria autoridade (P30 2b): ela ficaria quente no primário.
+    #[error("a chave de autoridade é a própria mestra: a mestra deve ficar fria, fora do primário")]
+    AuthorityIsMaster,
     /// Senha errada e arquivo adulterado são **o mesmo erro** de propósito: distinguir os dois seria um oráculo.
     #[error("senha errada ou arquivo de chave corrompido")]
     WrongPassphraseOrCorrupt,

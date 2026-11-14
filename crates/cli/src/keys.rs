@@ -3,8 +3,42 @@
 
 use std::path::{Path, PathBuf};
 
-use kin_identity::{DeviceKey, KdfParams, StandaloneIdentity};
+use kin_identity::{
+    AuthorityIdentity, DeviceKey, IdentityId, IdentityProvider, KdfParams, StandaloneIdentity,
+};
 use zeroize::Zeroizing;
+
+use crate::cold::{AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE};
+
+/// A identidade que este `--data-dir` carrega (P30 2b, ADR 0015): a mestra (modo de sempre) ou o
+/// **primário**, que tem só a chave de autoridade e o certificado dela, sem a mestra.
+pub enum LocalIdentity {
+    Master(StandaloneIdentity),
+    #[allow(dead_code)] // stub da etapa de testes; some na implementação
+    Primary(AuthorityIdentity),
+}
+
+impl LocalIdentity {
+    pub fn id(&self) -> IdentityId {
+        self.provider().id()
+    }
+
+    /// O que o `Chat` usa para certificar o device (v3 pela mestra, v4 pela autoridade).
+    pub fn provider(&self) -> &dyn IdentityProvider {
+        match self {
+            Self::Master(master) => master,
+            Self::Primary(primary) => primary,
+        }
+    }
+
+    /// A mestra, se este diretório a tem (só o modo antigo; o primário nunca).
+    pub fn master(&self) -> Option<&StandaloneIdentity> {
+        match self {
+            Self::Master(master) => Some(master),
+            Self::Primary(_) => None,
+        }
+    }
+}
 
 /// O que o usuário pediu na linha de comando (e `KIN_PASSPHRASE_FILE`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -176,8 +210,11 @@ pub fn load(
     passphrase: Option<&[u8]>,
     protect: bool,
     params: KdfParams,
-) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
+    if dir.join(AUTHORITY_KEY_FILE).exists() || dir.join(AUTHORITY_CERT_FILE).exists() {
+        todo!("P30 2b: carregar o primário")
+    }
     let identity_path = dir.join("identity.key");
     let device_path = dir.join("device.key");
     if let Some(text) = pair_text {
@@ -230,7 +267,7 @@ pub fn load(
         }
         device
     };
-    Ok((identity, device))
+    Ok((LocalIdentity::Master(identity), device))
 }
 
 #[cfg(test)]
@@ -607,5 +644,155 @@ mod tests {
             .is_err()
         );
         assert!(!id_path(dir.path()).exists());
+    }
+
+    // ---- primário (P30 2b, ADR 0015): authority.key + authority.cert, sem a mestra ----
+
+    const MASTER_PASS: &[u8] = b"senha da mestra fria";
+
+    /// Roda o `kin cold init` de verdade: mestra em `root/offline`, primário em `root/primary`.
+    /// A senha do primário é `PASS` (a "senha da autoridade").
+    fn cold_init(root: &Path) -> (PathBuf, kin_identity::IdentityId) {
+        let primary = root.join("primary");
+        let outcome = crate::cold::init(
+            &root.join("offline/master.key"),
+            &primary,
+            MASTER_PASS,
+            PASS,
+            KdfParams::MIN,
+            1_000,
+        )
+        .unwrap();
+        (primary, outcome.identity)
+    }
+
+    fn primary_load(dir: &Path) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+        load(dir, None, Some(PASS), false, KdfParams::MIN)
+    }
+
+    #[test]
+    fn a_cold_init_directory_opens_as_the_primary_of_the_master_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+
+        let (loaded, device) = primary_load(&primary).unwrap();
+
+        assert!(matches!(loaded, LocalIdentity::Primary(_)));
+        assert_eq!(loaded.id(), identity);
+        assert!(loaded.master().is_none(), "primário com a mestra");
+        assert!(!id_path(&primary).exists(), "não pode criar identity.key");
+        assert!(is_sealed(&std::fs::read(dev_path(&primary)).unwrap()));
+        // Reabrir dá o mesmo device e a mesma identidade.
+        let (again, device_again) = primary_load(&primary).unwrap();
+        assert_eq!(again.id(), identity);
+        assert_eq!(device_again.peer_id(), device.peer_id());
+    }
+
+    #[test]
+    fn the_primary_certifies_its_device_in_v4_under_the_master_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+        let (loaded, device) = primary_load(&primary).unwrap();
+
+        let cert = loaded
+            .provider()
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                2_000,
+            )
+            .unwrap();
+
+        cert.verify().unwrap();
+        assert_eq!(cert.identity, identity);
+        assert!(matches!(cert.issuer, kin_identity::Issuer::Authority(_)));
+    }
+
+    #[test]
+    fn a_primary_directory_counts_as_sealed_before_the_device_key_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        assert!(!dev_path(&primary).exists());
+
+        // Assim a CLI pede a senha uma vez (sem confirmar) em vez de tratar como diretório novo.
+        assert_eq!(files_state(&primary).unwrap(), FilesState::Sealed);
+    }
+
+    #[test]
+    fn a_directory_with_the_master_and_the_authority_is_refused_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        StandaloneIdentity::generate()
+            .save_sealed(&id_path(&primary), PASS, KdfParams::MIN)
+            .unwrap();
+
+        assert!(primary_load(&primary).is_err());
+        assert!(!dev_path(&primary).exists(), "não pode criar device.key");
+    }
+
+    #[test]
+    fn half_an_authority_is_refused() {
+        for missing in [AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+            let root = tempfile::tempdir().unwrap();
+            let (primary, _) = cold_init(root.path());
+            std::fs::remove_file(primary.join(missing)).unwrap();
+
+            assert!(primary_load(&primary).is_err(), "aceitou sem {missing}");
+            assert!(!id_path(&primary).exists(), "sem {missing}: mestra nova");
+            assert!(!dev_path(&primary).exists());
+        }
+    }
+
+    #[test]
+    fn pairing_into_a_primary_directory_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let link = StandaloneIdentity::generate().to_pair_link().unwrap();
+
+        assert!(load(&primary, Some(&link), Some(PASS), false, KdfParams::MIN).is_err());
+        assert!(!id_path(&primary).exists(), "--pair gravou a mestra");
+    }
+
+    #[test]
+    fn an_authority_certificate_for_another_key_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let other = tempfile::tempdir().unwrap();
+        let (other_primary, _) = cold_init(other.path());
+        std::fs::remove_file(primary.join(AUTHORITY_CERT_FILE)).unwrap();
+        std::fs::copy(
+            other_primary.join(AUTHORITY_CERT_FILE),
+            primary.join(AUTHORITY_CERT_FILE),
+        )
+        .unwrap();
+
+        let err = primary_load(&primary).err().expect("aceitou o cert");
+
+        assert!(matches!(
+            err.downcast_ref::<Error>(),
+            Some(Error::AuthorityKeyMismatch)
+        ));
+        assert!(!dev_path(&primary).exists());
+    }
+
+    #[test]
+    fn a_primary_with_the_wrong_passphrase_fails_and_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+
+        assert!(load(&primary, None, Some(b"errada"), false, KdfParams::MIN).is_err());
+        assert!(load(&primary, None, None, false, KdfParams::MIN).is_err());
+        assert!(!dev_path(&primary).exists());
+        assert!(!id_path(&primary).exists());
+    }
+
+    #[test]
+    fn a_directory_without_authority_files_still_opens_with_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+
+        assert!(matches!(loaded, LocalIdentity::Master(_)));
+        assert!(loaded.master().is_some());
     }
 }
