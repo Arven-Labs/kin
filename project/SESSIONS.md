@@ -1482,3 +1482,26 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `signature_key == cert.signing_key` nos 3 caminhos de entrada); 5 sugestões (tabela no ADR).
 - **Não verificado**: uso real pela CLI; lab; `Update` do openmls sem `credential::verify` (pré-existente, vai no P31).
 - **Próximo passo**: 2d-ii (CLI: pedido, resposta com SAS, `primary.id`, modo pareado no `--data-dir`, TTL do pedido), em plan mode.
+
+#### Prazo do pedido de pareamento (P30, fatia 2d-ii-a1, PR #188, ADR 0019)
+
+- **Decisões do dono** (plan mode + 3 perguntas + 1 da auditoria): 2d-ii cortada em **a (comandos + TTL)** e **b (modo pareado)**;
+  transporte por **links de texto** (sem QR); TTL de **15 min**, local no `PendingDevice`; por causa do tamanho, a 2d-ii-a se
+  dividiu em **a1 (TTL no `crypto`, este PR)** e **a2 (CLI `kin pair`)**. Auditoria: hora no futuro **falha fechado** com
+  tolerância de 300 s.
+- **Feito**: `PAIR_REQUEST_TTL_SECS = 900`; `PendingDevice::request_at` e `install_certificate_at` (as simples usam o relógio do
+  sistema; acrescentei as `_at` em vez de mudar a assinatura, para não tocar ~40 chamadas de teste); `Error::PairRequestExpired` e
+  `Error::Clock`; hora em `kin_meta` gravada antes do pedido e apagada na transação do `finish_pairing`. ADR 0019; ADRs 0016/0017
+  ajustados.
+- **Prova de que testam algo**: stubs, **6 de 7 falharam** (o de relógio do sistema já passava; run 43622144121); depois da
+  auditoria, **4 de 5 novos falharam** antes da correção (run 43623210121; o quinto era bug do meu teste, gravava no SQLite antes
+  de existir o esquema); verde (run 43623514348).
+- **Mutações** (PRs #189 a #193, fechados e apagados, 5 de 5 pegas): `>=` no prazo, hora ausente não expira, instalar sem checar o
+  prazo, hora ilegível não expira, `request_at` sempre devolve o guardado. A correção da auditoria não teve mutação própria: a
+  prova é o vermelho antes (tolerância de 300 s coberta pelo teste de 300/301 s).
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; 1 importante (hora no futuro deixava o pedido imortal),
+  corrigido; itens 3 e 4 viraram P31; o resto feito.
+- **Tropeços**: um `Write` com o parâmetro errado deixou o ADR 0019 com texto de enchimento por um instante (sobrescrito antes de
+  commitar); o teste da hora órfã gravava no SQLite sem esquema.
+- **Não verificado**: `now_secs` com erro; tipo SQLite inesperado na hora; concorrência entre processos; uso pela CLI (a2).
+- **Próximo passo**: 2d-ii-a2 (`kin pair request/answer/accept`, `primary.id`, links de texto), em plan mode curto.

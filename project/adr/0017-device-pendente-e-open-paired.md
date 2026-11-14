@@ -67,6 +67,6 @@ Sem bypass da verificação do certificado, sem panic novo; a atomicidade do `fi
 | S1: dois `request()` concorrentes | sugestão | **pendência** (P31) |
 | S2: matriz de estados parciais no `build` | sugestão | **pendência** (P31) |
 | S3: `build` sem `verify()` | sugestão | **pendência** (P31(b)) |
-| S4: pedido eterno, sem descarte | sugestão | **feito**: `discard_request`; TTL é da 2d |
+| S4: pedido eterno, sem descarte | sugestão | **feito**: `discard_request`; o TTL de 15 min ficou no `PendingDevice` (ADR 0019) |
 | S5: certificado v3 aceito no secundário | sugestão | **pendência** (fatia 3) |
 | S6: nome `AlreadyPaired` enganoso | sugestão | **feito**: mensagem ajustada |
