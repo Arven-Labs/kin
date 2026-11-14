@@ -1505,3 +1505,25 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   commitar); o teste da hora órfã gravava no SQLite sem esquema.
 - **Não verificado**: `now_secs` com erro; tipo SQLite inesperado na hora; concorrência entre processos; uso pela CLI (a2).
 - **Próximo passo**: 2d-ii-a2 (`kin pair request/answer/accept`, `primary.id`, links de texto), em plan mode curto.
+
+#### CLI `kin pair` (P30, fatia 2d-ii-a2, PR #194, ADR 0020)
+
+- **Decisões do dono** (plan mode + perguntas): links só no crate `cli`; SAS por prompt interativo; `IdentityId::from_base58` no
+  `identity` (desvio do plano); `base64` do workspace no `kin-cli`; para o achado I1 da auditoria, **gravação atômica de
+  `primary.id` (temporário + `hard_link`)**.
+- **Feito**: `kin pair request | answer | accept` (offline, links `kin://pair-request/` e `kin://pair-cert/`), `primary.id` fora do
+  `mls.sqlite`, `load_primary_identity` (abre o primário sem criar `device.key`), `IdentityId::from_base58`. O `answer` não aceita `-`
+  (o stdin é do prompt). ADR 0020.
+- **Prova de que testam algo**: stubs, **27 de 27 falharam** (23 do `cli`, 4 do `identity`; run 43635384775); verde (run 43636333889).
+  Depois da auditoria, **5 de 5 testes novos do `cli` falharam** (run 43637478087; os 2 do `identity` eram de caracterização e já
+  passavam); verde (run 43637966527).
+- **Mutações** (PRs #195 a #197, fechados e apagados, 3 de 3 pegas): `answer` ignora o SAS digitado (2 testes), `accept` usa a
+  identidade do certificado (3), `request` não grava `primary.id` (8). Não fiz mutação das correções da auditoria.
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; I1 (`primary.id` vazio após queda e sem checksum no base58) e I2
+  (lacuna de teste no `from_base58`) importantes; I1 corrigido, I2 parcial; o resto na tabela do ADR e no P31 (w a aa).
+- **Tropeços**: módulo de testes antes do `trait` (clippy `items-after-test-module`); teste do intruso usava o SAS da identidade
+  errada (o `answer` recusava com razão); `allow(dead_code)` temporário dos stubs; um import `Read` sobrando.
+- **Não verificado**: uso real em 2 máquinas e o lab (2d-iii); o `run` (prompt, senhas); `/dev/zero` em `primary.id` (sem vermelho);
+  proptest do `from_base58`.
+- **Próximo passo**: 2d-ii-b (o `kin` normal abre o diretório pareado com `Chat::open_paired` e `primary.id`; decidir os contatos
+  confiáveis iniciais, P30 (s)), em plan mode.

@@ -2083,6 +2083,7 @@ dependencies = [
 name = "kin-cli"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "kin-chat",
  "kin-crypto",
  "kin-identity",

@@ -368,8 +368,28 @@ fn load_primary(
     Ok((LocalIdentity::Primary(Box::new(primary)), device))
 }
 
+/// Abre só a identidade do **primário** (`authority.key` + `authority.cert`), sem criar `device.key`
+/// (P30 2d-ii-a2): o `kin pair answer` só precisa certificar, não de um device.
+pub fn load_primary_identity(
+    dir: &Path,
+    passphrase: Option<&[u8]>,
+) -> Result<AuthorityIdentity, Box<dyn std::error::Error>> {
+    let key_path = dir.join(AUTHORITY_KEY_FILE);
+    let cert_path = dir.join(AUTHORITY_CERT_FILE);
+    if !present(&key_path)? || !present(&cert_path)? {
+        return Err(format!(
+            "não é um diretório de primário: são precisos {AUTHORITY_KEY_FILE} e {AUTHORITY_CERT_FILE}"
+        )
+        .into());
+    }
+    let certificate_bytes = read_authority_cert(&cert_path)?;
+    let key = AuthorityKey::load_with(&key_path, passphrase)?;
+    let certificate = AuthorityCertificate::from_bytes(&certificate_bytes)?;
+    Ok(AuthorityIdentity::new(key, certificate)?)
+}
+
 /// Abre o `device.key` ou, se não existe, gera e grava um (cifrado com a senha, ou em claro sem ela).
-fn load_or_create_device(
+pub(crate) fn load_or_create_device(
     path: &Path,
     passphrase: Option<&[u8]>,
     params: KdfParams,
@@ -1010,5 +1030,25 @@ mod tests {
 
         assert!(primary_load(&primary).is_err());
         assert!(!dev_path(&primary).exists());
+    }
+
+    #[test]
+    fn load_primary_identity_opens_the_authority_without_creating_a_device_key() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+
+        let loaded = load_primary_identity(&primary, Some(PASS)).unwrap();
+        assert_eq!(loaded.id(), identity);
+        assert!(!dev_path(&primary).exists(), "criou device.key");
+        assert!(load_primary_identity(&primary, Some(b"senha errada")).is_err());
+    }
+
+    #[test]
+    fn load_primary_identity_refuses_a_directory_that_is_not_a_primary() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(load_primary_identity(root.path(), Some(PASS)).is_err());
+        let (primary, _) = cold_init(root.path());
+        std::fs::remove_file(primary.join(AUTHORITY_CERT_FILE)).unwrap();
+        assert!(load_primary_identity(&primary, Some(PASS)).is_err());
     }
 }
