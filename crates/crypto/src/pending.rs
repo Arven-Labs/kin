@@ -96,7 +96,7 @@ impl PendingDevice {
             return Ok(true);
         };
         let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) else {
-            return Ok(true);
+            return Ok(false);
         };
         Ok(now.saturating_sub(u64::from_be_bytes(bytes)) > PAIR_REQUEST_TTL_SECS)
     }
