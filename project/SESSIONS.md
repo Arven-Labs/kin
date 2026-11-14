@@ -1441,3 +1441,25 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: revisão externa do formato; interoperação real; features do `libp2p-identity` (chave não Ed25519);
   `cargo audit` do `sha2`.
 - **Próximo passo**: 2c-ii (`CryptoDevice` pendente), em plan mode.
+
+#### Device pendente e `open_paired` no `crypto` (P30, fatia 2c-ii, PR #174, ADR 0017)
+
+- **Decisões do dono** (plan mode + 3 da auditoria): tipo `PendingDevice` separado, com o pedido guardado no banco; `open_paired`
+  pedindo a identidade esperada fora do banco (I1); `discard_request` já nesta fatia (S4); certificado v4 obrigatório fica para a
+  fatia 3 (S5). A instalação com a `device.key` e o compare-and-swap (I2) entraram sem pergunta.
+- **Feito**: `PendingDevice` (`open`, `request`, `install_certificate`, `discard_request`), `CryptoDevice::open_paired`,
+  `assemble` extraído do `build`, guarda `PairingInProgress` em `build`, `finish_pairing` atômico no `Provider`. ADR 0017.
+- **Prova de que testam algo**: stubs, **13 de 13 falharam** (run 43609141456); depois da auditoria, **4 de 19 falharam** antes
+  da correção (run 43610640575); verde com 19 testes (run 43611206530).
+- **Mutações** (PRs #175 a #184, fechados e apagados, 10 de 10 pegas): instalar sem `accept_certificate`; `open_paired` sem
+  `verify`; `build` sem a guarda do pedido pendente; pedido regenerado a cada `request`; pedido não apagado; chave MLS do
+  certificado não conferida com o signer; pedido guardado sem conferir a `device.key`; identidade esperada ignorada; descarte sem
+  efeito; `device.key` não conferida na instalação.
+- **Auditoria** (`security-auditor`, somente leitura): sem bypass; 2 importantes feitos (I1, I2); o resto virou o P31 (l) a (p).
+- **Tropeços**: meu teste do descarte afirmava que o certificado do pedido antigo deixava de valer, mas o certificado cobre as
+  chaves e não o nonce; corrigi o teste e o doc. Dois testes só existiam depois que a mutação não foi pega (pedido apagado e
+  `device.key` do pedido guardado). Anexei a entrada da sessão 24 ao `SESSIONS.md` uma vez com `cat >>` no Bash, contra a regra
+  do CLAUDE.md; esta entrada foi feita com `Edit`.
+- **Não verificado**: compare-and-swap sem prova de vermelho (precisa de dois processos); corrida entre processos e
+  `busy_timeout` do `rusqlite`; se o peer confere `credential.signature_key == cert.signing_key`; revisão externa do formato.
+- **Próximo passo**: 2d (CLI e lab; `Chat` para device pareado; TTL do pedido), em plan mode.
