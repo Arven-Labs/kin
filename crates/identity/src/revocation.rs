@@ -587,6 +587,100 @@ mod tests {
         }
     }
 
+    /// Auditoria da 3a, S2: a identidade, a chave de autoridade e o `created_at` da cadeia entram no
+    /// payload. Trocar a cadeia por **outra válida da mesma chave de autoridade** (certificada por outra
+    /// mestra, ou pela mesma em outro instante) tem de quebrar a assinatura; só trocar campos soltos da
+    /// cadeia quebra a própria cadeia primeiro e não isola isto (`certify_authority` não exige prova de
+    /// posse da chave de autoridade).
+    #[test]
+    fn rewrapping_the_signature_in_another_valid_chain_of_the_same_authority_key_fails() {
+        let (revocation, _, master) = by_authority();
+        let Issuer::Authority(chain) = &revocation.issuer else {
+            unreachable!("by_authority devolve emissor autoridade");
+        };
+        let key = chain.authority_key.clone();
+        let other_master = StandaloneIdentity::generate().certify_authority(&key, 1_000);
+        let other_time = master.certify_authority(&key, 2_000);
+        for rewrapped in [other_master.unwrap(), other_time.unwrap()] {
+            rewrapped.verify().unwrap(); // a cadeia nova é válida por si só
+            let mut copy = revocation.clone();
+            copy.issuer = Issuer::Authority(Box::new(rewrapped));
+            assert!(copy.verify().is_err(), "reembrulhou numa cadeia válida");
+        }
+    }
+
+    /// Auditoria da 3a, I1: o formato nasce canônico. O `prost` aceita campo desconhecido e varint não
+    /// mínimo dentro do protobuf da chave; sem isto, o mesmo tombstone (mesma assinatura válida) teria
+    /// N encodings, e qualquer dedup por hash dos bytes na 3b/3c seria burlável.
+    #[test]
+    fn a_non_canonical_encoding_of_a_valid_revocation_is_refused() {
+        let (r, _, _) = by_master();
+        let Issuer::Master(identity) = &r.issuer else {
+            unreachable!("by_master devolve emissor mestra");
+        };
+        // Remonta o tombstone na ordem do fio, deixando a chave MLS ser alterada por `tweak`.
+        let build = |tweak: &dyn Fn(Vec<u8>) -> Vec<u8>| {
+            let mut out = MAGIC.to_vec();
+            out.push(VERSION);
+            out.push(KIND_MASTER);
+            put(&mut out, &identity.public_key().encode_protobuf());
+            put(&mut out, &r.cert_hash);
+            put(&mut out, &tweak(r.signing_key.encode_protobuf()));
+            put(&mut out, &r.network_key.encode_protobuf());
+            put(&mut out, &r.nostr_key.to_bytes());
+            out.extend_from_slice(&r.revoked_at.to_be_bytes());
+            put(&mut out, &r.signature);
+            out
+        };
+        // Controle: a remontagem sem alteração é exatamente o `to_bytes` e é aceita.
+        let canonical = build(&|key| key);
+        assert_eq!(canonical, r.to_bytes());
+        assert!(DeviceRevocation::from_bytes(&canonical).is_ok());
+        // Campo desconhecido (tag 3, varint 0) no fim do protobuf da chave.
+        let unknown_field = build(&|mut key| {
+            key.extend_from_slice(&[0x18, 0x00]);
+            key
+        });
+        assert!(DeviceRevocation::from_bytes(&unknown_field).is_err());
+        // Varint não mínimo: o tipo de chave `08 01` vira `08 81 00`.
+        let long_varint = build(&|key| {
+            let mut out = vec![0x08, 0x81, 0x00];
+            out.extend_from_slice(&key[2..]);
+            out
+        });
+        assert!(DeviceRevocation::from_bytes(&long_varint).is_err());
+    }
+
+    /// Auditoria da 3a, I2. **Limite honesto**: com a checagem canônica o teto de tamanho é redundante
+    /// para a correção (qualquer entrada maior que o `to_bytes` real já é recusada), então nenhuma
+    /// mutação distingue o teto; ele só barra o custo do parse antes de ele começar. Este teste fixa que
+    /// uma entrada estruturalmente válida mas maior que o teto é recusada, e que o real cabe com folga.
+    #[test]
+    fn an_oversized_but_well_formed_input_is_refused_and_the_real_one_fits() {
+        let (r, _, _) = by_authority();
+        let real = r.to_bytes();
+        assert!(real.len() < MAX_LEN / 2, "o real devia caber com folga");
+        // Campo desconhecido de 3000 bytes (tag 4, delimitado) dentro do protobuf da chave MLS.
+        let mut padded_key = r.signing_key.encode_protobuf();
+        padded_key.extend_from_slice(&[0x22, 0xB8, 0x17]);
+        padded_key.extend(std::iter::repeat_n(0u8, 3000));
+        let mut out = MAGIC.to_vec();
+        out.push(VERSION);
+        out.push(KIND_AUTHORITY);
+        let Issuer::Authority(chain) = &r.issuer else {
+            unreachable!("by_authority devolve emissor autoridade");
+        };
+        put(&mut out, &chain.to_bytes());
+        put(&mut out, &r.cert_hash);
+        put(&mut out, &padded_key);
+        put(&mut out, &r.network_key.encode_protobuf());
+        put(&mut out, &r.nostr_key.to_bytes());
+        out.extend_from_slice(&r.revoked_at.to_be_bytes());
+        put(&mut out, &r.signature);
+        assert!(out.len() > MAX_LEN);
+        assert!(DeviceRevocation::from_bytes(&out).is_err());
+    }
+
     /// Achada pela mutação C (domínio vazio sobrevivia): o enquadramento do payload já difere do do
     /// certificado, então nenhum teste de comportamento distingue a falta do domínio. Este fixa a
     /// propriedade (defesa em profundidade): o que se assina começa pelo domínio do tombstone.
