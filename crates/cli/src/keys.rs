@@ -309,10 +309,11 @@ fn load_primary(
             DeviceKey::protect(&device_path, pass, params)?;
         }
     }
+    // MUTAÇÃO N6: cria o device.key antes de conferir a autoridade.
+    let device = load_or_create_device(&device_path, passphrase, params)?;
     let key = AuthorityKey::load_with(&key_path, passphrase)?;
     let certificate = AuthorityCertificate::from_bytes(&std::fs::read(&cert_path)?)?;
     let primary = AuthorityIdentity::new(key, certificate)?;
-    let device = load_or_create_device(&device_path, passphrase, params)?;
     Ok((LocalIdentity::Primary(Box::new(primary)), device))
 }
 
