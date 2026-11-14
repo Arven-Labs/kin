@@ -127,7 +127,7 @@ fn to_link(prefix: &str, bytes: &[u8]) -> String {
 
 /// Tira o prefixo e decodifica. Sem detalhe no erro além do tipo de link: o conteúdo veio de fora.
 fn link_bytes(prefix: &str, what: &str, link: &str) -> Result<Vec<u8>, String> {
-    let invalid = || format!("{what} inválido (esperado {prefix}...)");
+    let invalid = || format!("{what} inválido (esperado {prefix}... inteiro, numa linha só)");
     let body = link.trim().strip_prefix(prefix).ok_or_else(invalid)?;
     if body.is_empty() || body.len() > LINK_BODY_LIMIT {
         return Err(invalid());
@@ -156,33 +156,85 @@ pub fn certificate_from_link(link: &str) -> Result<DeviceCertificate, String> {
 /// Grava `bytes` em `path` (0600) **sem nunca substituir** e sem expor arquivo pela metade: escreve num
 /// temporário do mesmo diretório e o publica com `hard_link` (falha com `AlreadyExists` se `path`
 /// existe, mesmo que apareça no meio). O temporário some em qualquer desfecho. Auditoria da 2d-ii-a2, I1.
-#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
 fn write_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let _ = (path, bytes);
-    todo!("stub: write_new_atomic")
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "caminho sem nome de arquivo",
+        )
+    })?;
+    // Nome por processo: uma sobra de queda do mesmo PID faz o `create_new` falhar (erro claro), em vez
+    // de ser apagada às cegas.
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::hard_link(&tmp, path));
+    drop(file);
+    let _ = std::fs::remove_file(&tmp);
+    result
 }
 
 /// Lê uma linha de `reader` com teto de `limit` bytes (sem a quebra de linha). Mais que isso é erro:
 /// o código de comparação tem 27 caracteres. Auditoria da 2d-ii-a2, S2.
-#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
 fn read_bounded_line(reader: impl std::io::BufRead, limit: usize) -> Result<String, String> {
-    let _ = (reader, limit);
-    todo!("stub: read_bounded_line")
+    use std::io::{BufRead as _, Read as _};
+    let mut raw = Vec::new();
+    // Lê no máximo `limit + 1` bytes (a quebra de linha não conta): mais que isso não é um código.
+    reader
+        .take(limit as u64 + 1)
+        .read_until(b'\n', &mut raw)
+        .map_err(|e| e.to_string())?;
+    let line = raw.strip_suffix(b"\n").unwrap_or(&raw);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.len() > limit {
+        return Err(format!("entrada longa demais (máximo {limit} caracteres)"));
+    }
+    String::from_utf8(line.to_vec()).map_err(|_| "entrada não é UTF-8".to_string())
 }
 
 /// Lê `primary.id` (texto pequeno) e o converte; erro sem ecoar o conteúdo.
 fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
     let path = dir.join(PRIMARY_ID_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    use std::io::Read as _;
+    let shown = path.display();
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("ler {}: {e}", path.display())),
+        Err(e) => return Err(format!("ler {shown}: {e}")),
     };
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_| format!("{} corrompido: peça o pareamento de novo", path.display()))?;
+    // Só arquivo regular e no máximo 256 bytes na leitura: `primary.id` como link para `/dev/zero`,
+    // FIFO ou arquivo enorme não pode travar nem alocar (auditoria S1).
+    let metadata = file.metadata().map_err(|e| format!("ler {shown}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{shown} não é um arquivo regular"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(257)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("ler {shown}: {e}"))?;
+    // Vazio, truncado ou lixo: não adivinhar. Apagar muda a âncora de confiança, então a mensagem manda
+    // conferir a identidade impressa pelo `request` com a tela do primário.
+    let corrupted = || {
+        format!(
+            "{shown} está vazio ou corrompido: apague o arquivo e rode `kin pair request` de novo, conferindo a identidade impressa com a do primário"
+        )
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| corrupted())?;
     IdentityId::from_base58(text)
         .map(Some)
-        .map_err(|_| format!("{} corrompido: peça o pareamento de novo", path.display()))
+        .map_err(|_| corrupted())
 }
 
 /// Device novo: grava `primary.id`, abre (ou cria) o `device.key` e o `mls.sqlite` pendente e devolve o
@@ -217,7 +269,8 @@ pub fn request(
             ));
         }
         Some(_) => {}
-        None => crate::write_private(&dir.join(PRIMARY_ID_FILE), identity.to_base58().as_bytes())
+        // Atômico: nunca fica um `primary.id` vazio ou pela metade depois de uma queda (auditoria I1).
+        None => write_new_atomic(&dir.join(PRIMARY_ID_FILE), identity.to_base58().as_bytes())
             .map_err(|e| format!("gravar {PRIMARY_ID_FILE}: {e}"))?,
     }
     let device = crate::keys::load_or_create_device(&dir.join("device.key"), passphrase, params)
@@ -227,7 +280,7 @@ pub fn request(
         .request_at(&device, now)
         .map_err(|e| e.to_string())?;
     Ok(RequestShown {
-        identity: String::new(), // stub
+        identity: identity.to_base58(),
         link: request_to_link(&request),
         sas: request.sas_code(identity),
     })
@@ -261,7 +314,7 @@ pub fn accept(
     certificate_link: &str,
     passphrase: Option<&[u8]>,
     now: u64,
-) -> Result<(), String> {
+) -> Result<IdentityId, String> {
     // Tudo o que não precisa do banco é conferido antes de abri-lo (abrir cria o arquivo se faltar).
     let expected = read_primary_id(dir)?.ok_or(format!(
         "falta {PRIMARY_ID_FILE} neste --data-dir: rode `kin pair request` antes"
@@ -273,8 +326,8 @@ pub fn accept(
     // `expected` vem do `primary.id`, nunca do certificado (ADR 0016, item 4).
     pending
         .install_certificate_at(&device, &certificate, &expected, now)
-        .map(drop)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(expected)
 }
 
 fn now_secs() -> Result<u64, String> {
@@ -323,6 +376,10 @@ pub fn run(command: PairCommand) -> Result<(), String> {
                 shown.link
             );
             println!(
+                "\nIdentidade do primário gravada: {}\n(confira com a que o primário mostra: um erro de digitação gera outra identidade válida)",
+                shown.identity
+            );
+            println!(
                 "\nCódigo de comparação: {}\nNo primário, rode `kin pair answer` com este link num arquivo e digite o código acima.",
                 shown.sas
             );
@@ -340,10 +397,7 @@ pub fn run(command: PairCommand) -> Result<(), String> {
                 "Primário da identidade {}.\nDigite o código de comparação que o device novo mostra (compare com a tela dele):",
                 kin_identity::IdentityProvider::id(&primary).to_base58()
             );
-            let mut typed = String::new();
-            std::io::stdin()
-                .read_line(&mut typed)
-                .map_err(|e| e.to_string())?;
+            let typed = read_bounded_line(std::io::stdin().lock(), 128)?;
             let certificate = answer(&primary, &link, &typed, now_secs()?)?;
             println!("Certificado (leve ao device novo e rode `kin pair accept`):\n{certificate}");
         }
@@ -354,9 +408,10 @@ pub fn run(command: PairCommand) -> Result<(), String> {
         } => {
             let link = read_link(&certificate)?;
             let pass = secret(passphrase_file, "senha do device", false)?;
-            accept(&data_dir, &link, Some(pass.as_slice()), now_secs()?)?;
+            let identity = accept(&data_dir, &link, Some(pass.as_slice()), now_secs()?)?;
             println!(
-                "Certificado instalado: este device agora pertence à identidade registrada em {PRIMARY_ID_FILE}.\n(O chat em modo pareado vem na próxima fatia.)"
+                "Certificado instalado: este device agora pertence à identidade {}.\n(O chat em modo pareado vem na próxima fatia.)",
+                identity.to_base58()
             );
         }
     }
@@ -639,6 +694,47 @@ mod tests {
         assert_eq!(read_bounded_line(Cursor::new(""), 128).unwrap(), "", "EOF");
         assert!(read_bounded_line(Cursor::new("x".repeat(200)), 128).is_err());
         assert!(read_bounded_line(Cursor::new(format!("{}\n", "x".repeat(200))), 128).is_err());
+    }
+
+    #[test]
+    fn accept_returns_the_identity_from_primary_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (primary, identity) = primary_in(dir.path());
+        let new = dir.path().join("new");
+        let shown = ask(&new, &identity, NOW).unwrap();
+        let link = answer(&primary, &shown.link, &shown.sas, NOW).unwrap();
+        assert_eq!(accept(&new, &link, Some(PASS), NOW).unwrap(), identity);
+    }
+
+    /// Sem prova de vermelho do `/dev/zero`: antes da correção (`fs::read`) este teste não terminaria.
+    #[test]
+    fn primary_id_that_is_not_a_small_regular_file_is_refused_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, identity) = primary_in(dir.path());
+        // link para /dev/zero
+        let zero = dir.path().join("zero");
+        std::fs::create_dir_all(&zero).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", zero.join(PRIMARY_ID_FILE)).unwrap();
+        assert!(ask(&zero, &identity, NOW).is_err());
+        // arquivo regular enorme
+        let big = dir.path().join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(big.join(PRIMARY_ID_FILE), vec![b'1'; 1 << 20]).unwrap();
+        assert!(ask(&big, &identity, NOW).is_err());
+        // diretório no lugar do arquivo
+        let as_dir = dir.path().join("as_dir");
+        std::fs::create_dir_all(as_dir.join(PRIMARY_ID_FILE)).unwrap();
+        assert!(ask(&as_dir, &identity, NOW).is_err());
+    }
+
+    #[test]
+    fn a_link_with_an_inner_line_break_is_refused_with_a_message_that_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, identity) = primary_in(dir.path());
+        let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
+        let (head, tail) = shown.link.split_at(shown.link.len() / 2);
+        let err = request_from_link(&format!("{head}\n{tail}")).unwrap_err();
+        assert!(err.contains("numa linha só"), "{err}");
     }
 
     // ---- request (device novo) ----
