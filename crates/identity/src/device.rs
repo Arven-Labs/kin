@@ -169,7 +169,10 @@ impl DeviceCertificate {
     pub fn identity(&self) -> &IdentityId {
         match &self.issuer {
             Issuer::Master(identity) => identity,
-            Issuer::Authority(authority) => &authority.identity,
+            // MUTAÇÃO: o v4 devolve a chave de autoridade como identidade.
+            Issuer::Authority(authority) => Box::leak(Box::new(IdentityId::new(
+                authority.authority_key.clone(),
+            ))),
         }
     }
 
