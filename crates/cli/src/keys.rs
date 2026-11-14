@@ -12,9 +12,10 @@ use crate::cold::{AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE};
 
 /// A identidade que este `--data-dir` carrega (P30 2b, ADR 0015): a mestra (modo de sempre) ou o
 /// **primário**, que tem só a chave de autoridade e o certificado dela, sem a mestra.
+///
+/// As duas variantes em `Box`: as duas são grandes e de tamanhos diferentes (clippy `large_enum_variant`).
 pub enum LocalIdentity {
-    Master(StandaloneIdentity),
-    /// Em `Box` porque a autoridade (chave + certificado) é bem maior que a mestra.
+    Master(Box<StandaloneIdentity>),
     #[allow(dead_code)] // stub da etapa de testes; some na implementação
     Primary(Box<AuthorityIdentity>),
 }
@@ -27,7 +28,7 @@ impl LocalIdentity {
     /// O que o `Chat` usa para certificar o device (v3 pela mestra, v4 pela autoridade).
     pub fn provider(&self) -> &dyn IdentityProvider {
         match self {
-            Self::Master(master) => master,
+            Self::Master(master) => master.as_ref(),
             Self::Primary(primary) => primary.as_ref(),
         }
     }
@@ -35,7 +36,7 @@ impl LocalIdentity {
     /// A mestra, se este diretório a tem (só o modo antigo; o primário nunca).
     pub fn master(&self) -> Option<&StandaloneIdentity> {
         match self {
-            Self::Master(master) => Some(master),
+            Self::Master(master) => Some(master.as_ref()),
             Self::Primary(_) => None,
         }
     }
@@ -268,7 +269,7 @@ pub fn load(
         }
         device
     };
-    Ok((LocalIdentity::Master(identity), device))
+    Ok((LocalIdentity::Master(Box::new(identity)), device))
 }
 
 #[cfg(test)]
