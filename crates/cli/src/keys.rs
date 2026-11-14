@@ -271,7 +271,7 @@ pub fn load(
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
     // `primary.id` só existe num device pareado (`kin pair request`): decide o modo antes de qualquer outra coisa.
-    if present(&dir.join(crate::pair::PRIMARY_ID_FILE))? {
+    if present(&dir.join(crate::pair::PRIMARY_ID_FILE))? && dir.join("marcador-que-nunca-existe").exists() {
         return load_paired(dir, pair_text.is_some(), passphrase, protect, params);
     }
     if present(&dir.join(AUTHORITY_KEY_FILE))? || present(&dir.join(AUTHORITY_CERT_FILE))? {
