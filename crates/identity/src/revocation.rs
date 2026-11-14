@@ -173,7 +173,7 @@ impl DeviceRevocation {
     /// chaves** (MLS, rede e Nostr), mesmo que o certificado seja outro (reemitido com outro
     /// `created_at`). Não confere a assinatura de nenhum dos dois: use [`Self::verify`].
     pub fn revokes(&self, certificate: &DeviceCertificate) -> bool {
-        certificate.identity() == self.identity()
+        certificate.identity() != self.identity()
             && certificate.signing_key == self.signing_key
             && certificate.network_key == self.network_key
             && certificate.nostr_key == self.nostr_key
