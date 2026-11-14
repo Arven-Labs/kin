@@ -108,7 +108,9 @@ impl DeviceRevocation {
 
     /// Monta e assina o tombstone de `certificate`. Recusa certificado de **outra identidade** que a do
     /// emissor ([`Error::RevocationIdentityMismatch`]). `sign` assina os bytes com o domínio já imposto
-    /// aqui (a chave da identidade nunca assina bytes livres, ADR 0013 S1).
+    /// aqui (a chave da identidade nunca assina bytes livres, ADR 0013 S1). **Não chama
+    /// `certificate.verify()` de propósito** (auditoria da 3a, S4): dá para revogar um certificado de
+    /// emissão antiga ou corrompido, e o dono só assina para a **própria** identidade.
     pub(crate) fn build(
         issuer: Issuer,
         certificate: &DeviceCertificate,
@@ -253,7 +255,7 @@ impl DeviceRevocation {
         if !cur.is_empty() {
             return Err(Error::InvalidRevocation);
         }
-        Ok(Self {
+        let parsed = Self {
             issuer,
             cert_hash,
             signing_key,
@@ -261,7 +263,15 @@ impl DeviceRevocation {
             nostr_key,
             revoked_at,
             signature,
-        })
+        };
+        // Forma canônica (auditoria da 3a, I1): o decodificador de chave do libp2p (`prost`) aceita campo
+        // desconhecido e varint não mínimo, e a assinatura cobre a chave **decodificada**, não os bytes
+        // recebidos. Sem esta volta, o mesmo tombstone teria N encodings com a mesma assinatura válida
+        // (fuga de dedup por hash dos bytes). `to_bytes` nunca produz o que isto recusa.
+        if parsed.to_bytes() != bytes {
+            return Err(Error::InvalidRevocation);
+        }
+        Ok(parsed)
     }
 }
 
