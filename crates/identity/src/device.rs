@@ -196,19 +196,9 @@ impl DeviceCertificate {
         nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Vec<u8> {
-        let mut payload = CERT_DOMAIN_V4.to_vec();
-        for encoded in [
-            identity.public_key().encode_protobuf(),
-            authority_key.encode_protobuf(),
-            signing_key.encode_protobuf(),
-            network_key.encode_protobuf(),
-            nostr_key.to_bytes().to_vec(),
-        ] {
-            payload.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            payload.extend_from_slice(&encoded);
-        }
-        payload.extend_from_slice(&created_at.to_be_bytes());
-        payload
+        // MUTAÇÃO M3: payload v4 igual ao v3 (sem domínio próprio, sem identidade e autoridade).
+        let _ = (identity, authority_key, CERT_DOMAIN_V4);
+        Self::signing_payload(signing_key, network_key, nostr_key, created_at)
     }
 
     /// Confere a assinatura do certificado. No v4, confere a cadeia inteira: a mestra assinou a
