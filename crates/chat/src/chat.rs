@@ -397,7 +397,7 @@ impl Chat {
         db: &Path,
     ) -> Result<Self, Error> {
         let device = CryptoDevice::open_paired(
-            expected,
+            &kin_identity::StandaloneIdentity::generate().id(),
             &device_key.public_key(),
             &device_key.nostr_public_key(),
             db,
