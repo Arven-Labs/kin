@@ -294,7 +294,7 @@ scenario_paired_device() {
   install -m 600 passphrase "$t/lab.pass"   # senha do lab (autoridade e device); git não guarda o modo 0600
   (umask 077; echo "senha da mestra fria do lab" > "$t/master.pass")
   # Os dois arquivos da autoridade e o diretório pareado não podem ter nada da mestra dentro dos containers.
-  absent_in_a2() { ! compose exec -T a2 sh -c 'ls /tmp/identity.key /tmp/authority.key /tmp/authority.cert' >/dev/null 2>&1; }
+  absent_in_a2() { ! compose exec -T a2 sh -c 'ls /root/identity.key /root/authority.key /root/authority.cert' >/dev/null 2>&1; }
 
   out=$("$BIN" cold init --master-out "$t/cold/master.key" --authority-dir "$t/primary" \
     --master-passphrase-file "$t/master.pass" --passphrase-file "$t/lab.pass" 2>&1) \
@@ -346,11 +346,15 @@ scenario_paired_device() {
   A1_ID=$(peer_id a)
 
   # Pareado: SÓ o que o accept deixou (primary.id, device.key, mls.sqlite e o WAL do SQLite, se houver).
-  export A2_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
+  # O diretório de dados do `a2` é `/root`, NÃO `/tmp`: o `compose cp` deixa os arquivos com o uid do host (1000) e
+  # o SQLite do `mls.sqlite` abre com O_CREAT; em diretório com sticky bit (`/tmp`) o kernel com
+  # `fs.protected_regular` ligado (Arch) nega isso até para o root ("Accessing storage failed"). Os outros
+  # cenários só LEEM o arquivo copiado (identity.key), por isso não sofrem.
+  export A2_ARGS="--data-dir /root --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
   compose create a2 >/dev/null 2>&1
   for f in primary.id device.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
     [ -e "$t/paired/$f" ] || { case $f in *-wal|*-shm) continue ;; esac; fail "falta $f no diretório pareado"; rm -rf "$t"; return; }
-    compose cp "$t/paired/$f" "a2:/tmp/$f" >/dev/null 2>&1 || { fail "copiar $f para a2"; rm -rf "$t"; return; }
+    compose cp "$t/paired/$f" "a2:/root/$f" >/dev/null 2>&1 || { fail "copiar $f para a2"; rm -rf "$t"; return; }
   done
   rm -rf "$t"
   compose start a2 >/dev/null
