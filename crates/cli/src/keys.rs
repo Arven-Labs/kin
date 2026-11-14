@@ -18,11 +18,18 @@ use crate::cold::{AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE};
 pub enum LocalIdentity {
     Master(Box<StandaloneIdentity>),
     Primary(Box<AuthorityIdentity>),
+    /// Device **pareado** (P30 2d-ii-b, ADR 0021): só a identidade do primário (de `primary.id`), sem
+    /// mestra nem autoridade; o certificado v4 já está no `mls.sqlite`.
+    #[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
+    Paired(IdentityId),
 }
 
 impl LocalIdentity {
     pub fn id(&self) -> IdentityId {
-        self.provider().id()
+        match self {
+            Self::Paired(id) => id.clone(),
+            _ => self.provider().id(),
+        }
     }
 
     /// O que o `Chat` usa para certificar o device (v3 pela mestra, v4 pela autoridade).
@@ -30,6 +37,7 @@ impl LocalIdentity {
         match self {
             Self::Master(master) => master.as_ref(),
             Self::Primary(primary) => primary.as_ref(),
+            Self::Paired(_) => todo!("stub: provider do pareado"),
         }
     }
 
@@ -37,7 +45,7 @@ impl LocalIdentity {
     pub fn master(&self) -> Option<&StandaloneIdentity> {
         match self {
             Self::Master(master) => Some(master.as_ref()),
-            Self::Primary(_) => None,
+            Self::Primary(_) | Self::Paired(_) => None,
         }
     }
 }
@@ -249,6 +257,10 @@ pub fn load(
     params: KdfParams,
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
+    // `primary.id` só existe num device pareado (`kin pair request`): decide o modo antes de qualquer outra coisa.
+    if present(&dir.join(crate::pair::PRIMARY_ID_FILE))? {
+        return load_paired(dir, pair_text.is_some(), passphrase, protect, params);
+    }
     if present(&dir.join(AUTHORITY_KEY_FILE))? || present(&dir.join(AUTHORITY_CERT_FILE))? {
         return load_primary(dir, pair_text.is_some(), passphrase, protect, params);
     }
@@ -366,6 +378,20 @@ fn load_primary(
     let primary = AuthorityIdentity::new(key, certificate)?;
     let device = load_or_create_device(&device_path, passphrase, params)?;
     Ok((LocalIdentity::Primary(Box::new(primary)), device))
+}
+
+/// Carrega um device **pareado** (P30 2d-ii-b, ADR 0021): `primary.id` + `device.key` já existente,
+/// sem mestra nem autoridade. Nunca cria chave.
+#[allow(dead_code)] // TEMPORÁRIO (fase de stubs)
+fn load_paired(
+    dir: &Path,
+    pairing: bool,
+    passphrase: Option<&[u8]>,
+    protect: bool,
+    params: KdfParams,
+) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+    let _ = (dir, pairing, passphrase, protect, params);
+    todo!("stub: load_paired")
 }
 
 /// Abre só a identidade do **primário** (`authority.key` + `authority.cert`), sem criar `device.key`
@@ -1050,5 +1076,150 @@ mod tests {
         let (primary, _) = cold_init(root.path());
         std::fs::remove_file(primary.join(AUTHORITY_CERT_FILE)).unwrap();
         assert!(load_primary_identity(&primary, Some(PASS)).is_err());
+    }
+
+    // ---- device pareado (P30 2d-ii-b, ADR 0021) ----
+
+    /// Um device pareado de verdade: `cold init` + `kin pair request`, `answer` e `accept` (a senha do
+    /// device é `PASS`, a mesma da autoridade). Devolve o diretório, a identidade e o certificado v4.
+    fn paired_dir(
+        root: &Path,
+    ) -> (
+        PathBuf,
+        kin_identity::IdentityId,
+        kin_identity::DeviceCertificate,
+    ) {
+        let (primary_dir, identity) = cold_init(root);
+        let primary = load_primary_identity(&primary_dir, Some(PASS)).unwrap();
+        let dir = root.join("paired");
+        let shown =
+            crate::pair::request(&dir, &identity, Some(PASS), KdfParams::MIN, 1_000).unwrap();
+        let link = crate::pair::answer(&primary, &shown.link, &shown.sas, 1_000).unwrap();
+        crate::pair::accept(&dir, &link, Some(PASS), 1_000).unwrap();
+        (
+            dir,
+            identity,
+            crate::pair::certificate_from_link(&link).unwrap(),
+        )
+    }
+
+    fn paired_load(dir: &Path) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+        load(dir, None, Some(PASS), false, KdfParams::MIN)
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_paired_directory_opens_as_the_primary_identity_and_creates_no_key() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, identity, _) = paired_dir(root.path());
+        let files_before = names(&dir);
+        let device_bytes = std::fs::read(dev_path(&dir)).unwrap();
+        let id_file = std::fs::read(dir.join(crate::pair::PRIMARY_ID_FILE)).unwrap();
+
+        let (loaded, device) = paired_load(&dir).unwrap();
+
+        assert!(matches!(loaded, LocalIdentity::Paired(_)));
+        assert_eq!(loaded.id(), identity);
+        assert!(loaded.master().is_none(), "pareado com a mestra");
+        assert_eq!(names(&dir), files_before, "criou ou apagou arquivo");
+        assert!(!id_path(&dir).exists() && !dir.join(AUTHORITY_KEY_FILE).exists());
+        assert_eq!(std::fs::read(dev_path(&dir)).unwrap(), device_bytes);
+        assert_eq!(
+            std::fs::read(dir.join(crate::pair::PRIMARY_ID_FILE)).unwrap(),
+            id_file
+        );
+        // reabrir dá o mesmo device
+        assert_eq!(paired_load(&dir).unwrap().1.peer_id(), device.peer_id());
+    }
+
+    #[test]
+    fn a_directory_with_a_pending_request_is_also_recognized_as_paired_mode() {
+        // Antes do `accept`, só há `primary.id` + `device.key` + banco pendente: o `load` não pode cair no
+        // ramo "diretório novo" e gerar uma mestra; quem recusa depois é o `Chat::open_paired`.
+        let root = tempfile::tempdir().unwrap();
+        let (_, identity) = cold_init(root.path());
+        let dir = root.path().join("pending");
+        crate::pair::request(&dir, &identity, Some(PASS), KdfParams::MIN, 1_000).unwrap();
+
+        let (loaded, _) = paired_load(&dir).unwrap();
+
+        assert_eq!(loaded.id(), identity);
+        assert!(!id_path(&dir).exists(), "gerou uma mestra");
+    }
+
+    #[test]
+    fn paired_mode_refuses_what_it_must_never_mix() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _, _) = paired_dir(root.path());
+        // mestra, autoridade ou certificado de autoridade no mesmo diretório
+        for name in ["identity.key", AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+            assert!(paired_load(&dir).is_err(), "aceitou com {name}");
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        // `--pair` não importa a mestra num pareado
+        let link = StandaloneIdentity::generate().to_pair_link().unwrap();
+        assert!(load(&dir, Some(&link), Some(PASS), false, KdfParams::MIN).is_err());
+        assert!(!id_path(&dir).exists(), "--pair gravou a mestra");
+        // senha errada
+        assert!(load(&dir, None, Some(b"senha errada"), false, KdfParams::MIN).is_err());
+        // ainda abre depois de tudo isso
+        assert!(paired_load(&dir).is_ok());
+    }
+
+    #[test]
+    fn paired_mode_without_a_device_key_fails_and_never_creates_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _, _) = paired_dir(root.path());
+        std::fs::remove_file(dev_path(&dir)).unwrap();
+        assert!(paired_load(&dir).is_err());
+        assert!(!dev_path(&dir).exists(), "criou device.key");
+        assert!(!id_path(&dir).exists());
+    }
+
+    #[test]
+    fn paired_mode_with_an_unreadable_primary_id_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, _, _) = paired_dir(root.path());
+        for bad in [
+            "",
+            "lixo",
+            "12D3KooWnaoeumaidentidadevalidaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            std::fs::write(dir.join(crate::pair::PRIMARY_ID_FILE), bad).unwrap();
+            assert!(paired_load(&dir).is_err(), "aceitou primary.id {bad:?}");
+        }
+        assert!(!id_path(&dir).exists());
+    }
+
+    #[test]
+    fn a_paired_device_only_runs_with_a_certificate_issued_by_an_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, identity, v4) = paired_dir(root.path());
+        let (loaded, _) = paired_load(&dir).unwrap();
+        // v4 (da autoridade): passa
+        ensure_current_issuer(&loaded, &v4).unwrap();
+        // v3 (da mestra, como a de um banco criado pelo modo antigo): recusa
+        let master = StandaloneIdentity::generate();
+        let device = DeviceKey::generate();
+        let signing = DeviceKey::generate().public_key();
+        let v3 = master
+            .authorize_device(
+                &signing,
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1,
+            )
+            .unwrap();
+        assert!(matches!(v3.issuer, Issuer::Master(_)));
+        assert!(ensure_current_issuer(&LocalIdentity::Paired(identity), &v3).is_err());
     }
 }
