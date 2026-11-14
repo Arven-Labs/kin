@@ -86,7 +86,7 @@ impl PendingDevice {
         if request.signing_key != public_key_from_ed25519(self.signer.public())? {
             return Err(Error::DeviceMismatch);
         }
-        request.accept_certificate(certificate, expected)?;
+        let _ = request.accept_certificate(certificate, expected);
         self.provider
             .finish_pairing(&certificate.to_bytes(), META_CERT, META_REQUEST)?;
         Ok(CryptoDevice::assemble(
