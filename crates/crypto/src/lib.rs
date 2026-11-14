@@ -14,8 +14,10 @@ mod conversation;
 mod credential;
 mod device;
 mod error;
+mod pending;
 mod provider;
 
 pub use conversation::{Conversation, Decrypted, Expected, Invite};
 pub use device::CryptoDevice;
 pub use error::Error;
+pub use pending::PendingDevice;

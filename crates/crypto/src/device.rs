@@ -69,6 +69,19 @@ impl CryptoDevice {
         )
     }
 
+    /// Reabre um device **pareado** (P30 2c-ii): o certificado, instalado por
+    /// [`crate::PendingDevice::install_certificate`], está no banco. Não pede `IdentityProvider` (o device
+    /// não tem a mestra nem a autoridade): a identidade é a do certificado, que é verificado a cada
+    /// abertura. Falha se o banco não tem certificado ([`Error::NotPaired`]) ou se as chaves de rede ou
+    /// Nostr não são as do certificado ([`Error::DeviceMismatch`]).
+    pub fn open_paired(
+        _network_key: &PublicKey,
+        _nostr_key: &NostrPublicKey,
+        _path: &std::path::Path,
+    ) -> Result<Self, Error> {
+        todo!("2c-ii: recarregar signer e certificado, verificar")
+    }
+
     fn build(
         provider: Provider,
         identity: &dyn IdentityProvider,
