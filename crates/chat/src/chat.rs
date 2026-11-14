@@ -455,6 +455,11 @@ impl Chat {
         self.node.peer_id()
     }
 
+    /// O certificado em uso por este device (o guardado no banco, se já existia).
+    pub fn certificate(&self) -> &kin_identity::DeviceCertificate {
+        self.device.certificate()
+    }
+
     pub fn listen(&mut self) -> Result<(), Error> {
         Ok(self.node.listen()?)
     }

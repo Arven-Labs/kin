@@ -3,8 +3,77 @@
 
 use std::path::{Path, PathBuf};
 
-use kin_identity::{DeviceKey, KdfParams, StandaloneIdentity};
+use kin_identity::{
+    AuthorityCertificate, AuthorityIdentity, AuthorityKey, DeviceKey, IdentityId, IdentityProvider,
+    Issuer, KdfParams, StandaloneIdentity,
+};
 use zeroize::Zeroizing;
+
+use crate::cold::{AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE};
+
+/// A identidade que este `--data-dir` carrega (P30 2b, ADR 0015): a mestra (modo de sempre) ou o
+/// **primário**, que tem só a chave de autoridade e o certificado dela, sem a mestra.
+///
+/// As duas variantes em `Box`: as duas são grandes e de tamanhos diferentes (clippy `large_enum_variant`).
+pub enum LocalIdentity {
+    Master(Box<StandaloneIdentity>),
+    Primary(Box<AuthorityIdentity>),
+}
+
+impl LocalIdentity {
+    pub fn id(&self) -> IdentityId {
+        self.provider().id()
+    }
+
+    /// O que o `Chat` usa para certificar o device (v3 pela mestra, v4 pela autoridade).
+    pub fn provider(&self) -> &dyn IdentityProvider {
+        match self {
+            Self::Master(master) => master.as_ref(),
+            Self::Primary(primary) => primary.as_ref(),
+        }
+    }
+
+    /// A mestra, se este diretório a tem (só o modo antigo; o primário nunca).
+    pub fn master(&self) -> Option<&StandaloneIdentity> {
+        match self {
+            Self::Master(master) => Some(master.as_ref()),
+            Self::Primary(_) => None,
+        }
+    }
+}
+
+/// Auditoria da 2b, achado 1: o primário só roda se o certificado **em uso** (o guardado no
+/// `mls.sqlite`, se já existia) é da autoridade atual. Um v3 da mestra (migração no mesmo diretório)
+/// ou um v4 de uma autoridade anterior (rotate) deixariam o primário fora da cadeia atual.
+pub fn ensure_current_issuer(
+    identity: &LocalIdentity,
+    in_use: &kin_identity::DeviceCertificate,
+) -> Result<(), String> {
+    let LocalIdentity::Primary(primary) = identity else {
+        return Ok(());
+    };
+    match &in_use.issuer {
+        Issuer::Authority(authority) if **authority == *primary.certificate() => Ok(()),
+        Issuer::Master => Err(
+            "o mls.sqlite deste primário guarda um certificado de device assinado pela mestra (de quando ela estava aqui): use um --data-dir novo para o primário"
+                .into(),
+        ),
+        Issuer::Authority(_) => Err(
+            "o mls.sqlite deste primário guarda um certificado de device de outra autoridade (anterior a esta): use um --data-dir novo para o primário"
+                .into(),
+        ),
+    }
+}
+
+/// Se `path` existe **como entrada do diretório**, mesmo um link quebrado (auditoria da 2b, achado 5):
+/// um volume não montado não pode fazer o primário parecer um diretório novo. Erro de E/S propaga.
+fn present(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 
 /// O que o usuário pediu na linha de comando (e `KIN_PASSPHRASE_FILE`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -100,9 +169,11 @@ pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access,
 /// Estado dos arquivos de chave em `dir` (só os que existem).
 pub fn files_state(dir: &Path) -> Result<FilesState, Box<dyn std::error::Error>> {
     let mut sealed = Vec::new();
-    for name in ["identity.key", "device.key"] {
+    // O `authority.key` do primário (P30 2b) conta como os outros: cifrado = pedir a senha uma vez.
+    for name in ["identity.key", AUTHORITY_KEY_FILE, "device.key"] {
         let path = dir.join(name);
-        if path.exists() {
+        // `present`, não `exists`: um link quebrado falha aqui em vez de contar como ausente.
+        if present(&path)? {
             sealed.push(kin_identity::key_file_is_sealed(&path)?);
         }
     }
@@ -176,8 +247,11 @@ pub fn load(
     passphrase: Option<&[u8]>,
     protect: bool,
     params: KdfParams,
-) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
+    if present(&dir.join(AUTHORITY_KEY_FILE))? || present(&dir.join(AUTHORITY_CERT_FILE))? {
+        return load_primary(dir, pair_text.is_some(), passphrase, protect, params);
+    }
     let identity_path = dir.join("identity.key");
     let device_path = dir.join("device.key");
     if let Some(text) = pair_text {
@@ -220,17 +294,95 @@ pub fn load(
         }
         identity
     };
-    let device = if device_path.exists() {
-        DeviceKey::load_with(&device_path, passphrase)?
-    } else {
-        let device = DeviceKey::generate();
-        match passphrase {
-            Some(pass) => device.save_sealed(&device_path, pass, params)?,
-            None => crate::write_private(&device_path, &device.to_bytes()?)?,
+    let device = load_or_create_device(&device_path, passphrase, params)?;
+    Ok((LocalIdentity::Master(Box::new(identity)), device))
+}
+
+/// Teto do `authority.cert` (o real tem ~160 bytes).
+const AUTHORITY_CERT_LIMIT: u64 = 4096;
+
+/// Lê o `authority.cert`: só arquivo regular (recusa `/dev/zero`, FIFO, dispositivo) e no máximo
+/// `AUTHORITY_CERT_LIMIT` bytes **na leitura**, não só no `stat` (auditoria da 2b, achado 2: o arquivo
+/// pode ser trocado entre os dois).
+fn read_authority_cert(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(format!("{AUTHORITY_CERT_FILE} não é um arquivo regular").into());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(AUTHORITY_CERT_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > AUTHORITY_CERT_LIMIT {
+        return Err(format!("{AUTHORITY_CERT_FILE} grande demais").into());
+    }
+    Ok(bytes)
+}
+
+/// Carrega o **primário** (P30 2b, ADR 0015): `authority.key` + `authority.cert`, sem a mestra.
+/// Tudo o que este passo recusa é conferido **antes** de criar o `device.key`. O `Chat::open` ainda
+/// pode recusar depois (estado MLS de outra identidade, `ensure_current_issuer`), com o `device.key`
+/// já criado, como no modo mestra.
+fn load_primary(
+    dir: &Path,
+    pairing: bool,
+    passphrase: Option<&[u8]>,
+    protect: bool,
+    params: KdfParams,
+) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+    let key_path = dir.join(AUTHORITY_KEY_FILE);
+    let cert_path = dir.join(AUTHORITY_CERT_FILE);
+    let device_path = dir.join("device.key");
+    if pairing {
+        return Err(
+            "este --data-dir é de um primário (authority.key): --pair não importa a mestra aqui"
+                .into(),
+        );
+    }
+    if present(&dir.join("identity.key"))? {
+        return Err(
+            "este --data-dir tem a mestra (identity.key) e a autoridade (authority.key): a mestra não pode ficar no primário; leve o identity.key para fora (mídia offline)"
+                .into(),
+        );
+    }
+    if !present(&key_path)? || !present(&cert_path)? {
+        return Err(format!(
+            "primário incompleto: são precisos {AUTHORITY_KEY_FILE} e {AUTHORITY_CERT_FILE} juntos"
+        )
+        .into());
+    }
+    let certificate_bytes = read_authority_cert(&cert_path)?;
+    if protect {
+        let pass = passphrase.ok_or("--protect exige uma senha")?;
+        if !kin_identity::key_file_is_sealed(&key_path)? {
+            AuthorityKey::protect(&key_path, pass, params)?;
         }
-        device
-    };
-    Ok((identity, device))
+        if device_path.exists() && !kin_identity::key_file_is_sealed(&device_path)? {
+            DeviceKey::protect(&device_path, pass, params)?;
+        }
+    }
+    let key = AuthorityKey::load_with(&key_path, passphrase)?;
+    let certificate = AuthorityCertificate::from_bytes(&certificate_bytes)?;
+    let primary = AuthorityIdentity::new(key, certificate)?;
+    let device = load_or_create_device(&device_path, passphrase, params)?;
+    Ok((LocalIdentity::Primary(Box::new(primary)), device))
+}
+
+/// Abre o `device.key` ou, se não existe, gera e grava um (cifrado com a senha, ou em claro sem ela).
+fn load_or_create_device(
+    path: &Path,
+    passphrase: Option<&[u8]>,
+    params: KdfParams,
+) -> Result<DeviceKey, Box<dyn std::error::Error>> {
+    if path.exists() {
+        return Ok(DeviceKey::load_with(path, passphrase)?);
+    }
+    let device = DeviceKey::generate();
+    match passphrase {
+        Some(pass) => device.save_sealed(path, pass, params)?,
+        None => crate::write_private(path, &device.to_bytes()?)?,
+    }
+    Ok(device)
 }
 
 #[cfg(test)]
@@ -607,5 +759,256 @@ mod tests {
             .is_err()
         );
         assert!(!id_path(dir.path()).exists());
+    }
+
+    // ---- primário (P30 2b, ADR 0015): authority.key + authority.cert, sem a mestra ----
+
+    const MASTER_PASS: &[u8] = b"senha da mestra fria";
+
+    /// Roda o `kin cold init` de verdade: mestra em `root/offline`, primário em `root/primary`.
+    /// A senha do primário é `PASS` (a "senha da autoridade").
+    fn cold_init(root: &Path) -> (PathBuf, kin_identity::IdentityId) {
+        let primary = root.join("primary");
+        let outcome = crate::cold::init(
+            &root.join("offline/master.key"),
+            &primary,
+            MASTER_PASS,
+            PASS,
+            KdfParams::MIN,
+            1_000,
+        )
+        .unwrap();
+        (primary, outcome.identity)
+    }
+
+    fn primary_load(dir: &Path) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+        load(dir, None, Some(PASS), false, KdfParams::MIN)
+    }
+
+    #[test]
+    fn a_cold_init_directory_opens_as_the_primary_of_the_master_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+
+        let (loaded, device) = primary_load(&primary).unwrap();
+
+        assert!(matches!(loaded, LocalIdentity::Primary(_)));
+        assert_eq!(loaded.id(), identity);
+        assert!(loaded.master().is_none(), "primário com a mestra");
+        assert!(!id_path(&primary).exists(), "não pode criar identity.key");
+        assert!(is_sealed(&std::fs::read(dev_path(&primary)).unwrap()));
+        // Reabrir dá o mesmo device e a mesma identidade.
+        let (again, device_again) = primary_load(&primary).unwrap();
+        assert_eq!(again.id(), identity);
+        assert_eq!(device_again.peer_id(), device.peer_id());
+    }
+
+    #[test]
+    fn the_primary_certifies_its_device_in_v4_under_the_master_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+        let (loaded, device) = primary_load(&primary).unwrap();
+
+        let cert = loaded
+            .provider()
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                2_000,
+            )
+            .unwrap();
+
+        cert.verify().unwrap();
+        assert_eq!(cert.identity, identity);
+        assert!(matches!(cert.issuer, kin_identity::Issuer::Authority(_)));
+    }
+
+    #[test]
+    fn a_primary_directory_counts_as_sealed_before_the_device_key_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        assert!(!dev_path(&primary).exists());
+
+        // Assim a CLI pede a senha uma vez (sem confirmar) em vez de tratar como diretório novo.
+        assert_eq!(files_state(&primary).unwrap(), FilesState::Sealed);
+    }
+
+    #[test]
+    fn a_directory_with_the_master_and_the_authority_is_refused_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        StandaloneIdentity::generate()
+            .save_sealed(&id_path(&primary), PASS, KdfParams::MIN)
+            .unwrap();
+
+        assert!(primary_load(&primary).is_err());
+        assert!(!dev_path(&primary).exists(), "não pode criar device.key");
+    }
+
+    #[test]
+    fn half_an_authority_is_refused() {
+        for missing in [AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+            let root = tempfile::tempdir().unwrap();
+            let (primary, _) = cold_init(root.path());
+            std::fs::remove_file(primary.join(missing)).unwrap();
+
+            assert!(primary_load(&primary).is_err(), "aceitou sem {missing}");
+            assert!(!id_path(&primary).exists(), "sem {missing}: mestra nova");
+            assert!(!dev_path(&primary).exists());
+        }
+    }
+
+    #[test]
+    fn pairing_into_a_primary_directory_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let link = StandaloneIdentity::generate().to_pair_link().unwrap();
+
+        assert!(load(&primary, Some(&link), Some(PASS), false, KdfParams::MIN).is_err());
+        assert!(!id_path(&primary).exists(), "--pair gravou a mestra");
+    }
+
+    #[test]
+    fn an_authority_certificate_for_another_key_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let other = tempfile::tempdir().unwrap();
+        let (other_primary, _) = cold_init(other.path());
+        std::fs::remove_file(primary.join(AUTHORITY_CERT_FILE)).unwrap();
+        std::fs::copy(
+            other_primary.join(AUTHORITY_CERT_FILE),
+            primary.join(AUTHORITY_CERT_FILE),
+        )
+        .unwrap();
+
+        let err = primary_load(&primary).err().expect("aceitou o cert");
+
+        assert!(matches!(
+            err.downcast_ref::<Error>(),
+            Some(Error::AuthorityKeyMismatch)
+        ));
+        assert!(!dev_path(&primary).exists());
+    }
+
+    #[test]
+    fn a_primary_with_the_wrong_passphrase_fails_and_creates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+
+        assert!(load(&primary, None, Some(b"errada"), false, KdfParams::MIN).is_err());
+        assert!(load(&primary, None, None, false, KdfParams::MIN).is_err());
+        assert!(!dev_path(&primary).exists());
+        assert!(!id_path(&primary).exists());
+    }
+
+    #[test]
+    fn a_directory_without_authority_files_still_opens_with_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+
+        assert!(matches!(loaded, LocalIdentity::Master(_)));
+        assert!(loaded.master().is_some());
+    }
+
+    // ---- auditoria da 2b ----
+
+    /// Certificado de um device qualquer, emitido por `issuer`.
+    fn device_cert(issuer: &dyn IdentityProvider) -> kin_identity::DeviceCertificate {
+        let device = DeviceKey::generate();
+        issuer
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                2_000,
+            )
+            .unwrap()
+    }
+
+    fn cold_master(root: &Path) -> StandaloneIdentity {
+        StandaloneIdentity::load_with(&root.join("offline/master.key"), Some(MASTER_PASS)).unwrap()
+    }
+
+    #[test]
+    fn the_primary_runs_with_a_certificate_from_its_own_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let (loaded, _) = primary_load(&primary).unwrap();
+
+        let own = device_cert(loaded.provider());
+
+        assert!(ensure_current_issuer(&loaded, &own).is_ok());
+    }
+
+    /// Achado 1: migração no mesmo diretório (o `mls.sqlite` guardou o v3 de quando a mestra estava ali).
+    #[test]
+    fn the_primary_refuses_a_stored_certificate_signed_by_the_master() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let (loaded, _) = primary_load(&primary).unwrap();
+
+        let v3 = device_cert(&cold_master(root.path()));
+
+        assert!(ensure_current_issuer(&loaded, &v3).is_err());
+    }
+
+    /// Achado 1: rotate no mesmo diretório (o `mls.sqlite` guardou o v4 da autoridade anterior).
+    #[test]
+    fn the_primary_refuses_a_stored_certificate_from_a_previous_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let (loaded, _) = primary_load(&primary).unwrap();
+        let master = cold_master(root.path());
+        let previous_key = kin_identity::AuthorityKey::generate();
+        let previous_cert = master
+            .certify_authority(&previous_key.public_key(), 500)
+            .unwrap();
+        let previous = AuthorityIdentity::new(previous_key, previous_cert).unwrap();
+
+        let old = device_cert(&previous);
+
+        assert!(ensure_current_issuer(&loaded, &old).is_err());
+    }
+
+    #[test]
+    fn the_master_mode_does_not_check_the_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+
+        let own = device_cert(loaded.provider());
+
+        assert!(ensure_current_issuer(&loaded, &own).is_ok());
+    }
+
+    /// Achado 5: com os arquivos da autoridade apontando para um volume não montado, o diretório não
+    /// pode virar "novo" e ganhar uma mestra nova.
+    #[test]
+    fn dangling_authority_links_are_refused_instead_of_creating_a_new_master() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let gone = root.path().join("volume-desmontado");
+        for name in [AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+            std::fs::remove_file(primary.join(name)).unwrap();
+            std::os::unix::fs::symlink(gone.join(name), primary.join(name)).unwrap();
+        }
+
+        assert!(!matches!(files_state(&primary), Ok(FilesState::New)));
+        assert!(primary_load(&primary).is_err());
+        assert!(!id_path(&primary).exists(), "virou uma mestra nova");
+        assert!(!dev_path(&primary).exists());
+    }
+
+    /// Achado 2: um `authority.cert` que aponta para `/dev/zero` (tamanho 0 no `stat`) é recusado sem
+    /// ler até a memória acabar. Sem prova de vermelho: antes da correção, este teste não terminaria.
+    #[test]
+    fn an_authority_certificate_that_is_not_a_regular_file_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        std::fs::remove_file(primary.join(AUTHORITY_CERT_FILE)).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", primary.join(AUTHORITY_CERT_FILE)).unwrap();
+
+        assert!(primary_load(&primary).is_err());
+        assert!(!dev_path(&primary).exists());
     }
 }

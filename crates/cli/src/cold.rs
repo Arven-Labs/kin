@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use kin_identity::{AuthorityKey, IdentityId, IdentityProvider, KdfParams, StandaloneIdentity};
 use zeroize::Zeroizing;
 
-const AUTHORITY_KEY_FILE: &str = "authority.key";
-const AUTHORITY_CERT_FILE: &str = "authority.cert";
+pub(crate) const AUTHORITY_KEY_FILE: &str = "authority.key";
+pub(crate) const AUTHORITY_CERT_FILE: &str = "authority.cert";
 
 /// Subcomando pedido, já com os caminhos.
 #[derive(Debug, PartialEq, Eq)]
@@ -335,7 +335,8 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
         "guarde a mestra fria FORA do disco do primário (mídia offline). Senha da mestra perdida = identidade perdida: não há recuperação."
     );
     println!(
-        "a CLI normal ainda não usa esses arquivos (o pareamento autenticado vem na fatia 2 do P30)."
+        "para usar o primário: kin --data-dir {} (com a senha da autoridade)",
+        authority_dir.display()
     );
     Ok(())
 }

@@ -291,6 +291,20 @@ fn the_primary_refuses_an_authority_certificate_for_another_key() {
     assert!(matches!(result, Err(Error::AuthorityKeyMismatch)));
 }
 
+/// P30 2b: a mestra certificando a si mesma como autoridade a deixaria quente no primário.
+#[test]
+fn the_primary_refuses_the_master_as_its_own_authority() {
+    let master = StandaloneIdentity::generate();
+    let as_authority = AuthorityKey::from_bytes(&master.to_bytes().unwrap()).unwrap();
+    let cert = master
+        .certify_authority(&as_authority.public_key(), 1_000)
+        .unwrap();
+
+    let result = AuthorityIdentity::new(as_authority, cert);
+
+    assert!(matches!(result, Err(Error::AuthorityIsMaster)));
+}
+
 #[test]
 fn the_primary_refuses_an_authority_certificate_with_a_bad_signature() {
     let master = StandaloneIdentity::generate();

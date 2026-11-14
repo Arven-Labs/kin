@@ -35,7 +35,7 @@ mod keys;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Error, HistoryEntry, Invite, Message, MessageId};
-use kin_identity::{DeviceKey, IdentityId, IdentityProvider, StandaloneIdentity};
+use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -137,7 +137,7 @@ fn parse_from(
 /// (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com `identity.key`
 /// já existente falha, em vez de sobrescrever uma identidade. O device continua com `device.key`
 /// próprio, gerado aqui.
-fn open_keys(args: &Args) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std::error::Error>> {
+fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     let dir = &args.data_dir;
     std::fs::create_dir_all(dir)?;
     let state = keys::files_state(dir)?;
@@ -180,6 +180,15 @@ fn open_keys(args: &Args) -> Result<(StandaloneIdentity, DeviceKey), Box<dyn std
         if source != "-" {
             println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
         }
+    }
+    if loaded.0.master().is_none() {
+        println!(
+            "primário da identidade {} (chave de autoridade; a mestra não está neste diretório)",
+            loaded.0.id().to_base58()
+        );
+        eprintln!(
+            "aviso: o certificado deste device é v4; builds antigos do kin não o leem (atualize os outros devices)"
+        );
     }
     Ok(loaded)
 }
@@ -274,11 +283,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let mut chat = Chat::open(
-        &identity,
+        identity.provider(),
         &device,
         config,
         &args.data_dir.join("mls.sqlite"),
     )?;
+    keys::ensure_current_issuer(&identity, chat.certificate())?;
     println!(
         "kin {} — peer id: {}",
         env!("CARGO_PKG_VERSION"),
@@ -338,7 +348,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
-                    print_pair(&identity, line == "/pair confirmo");
+                    match identity.master() {
+                        Some(master) => print_pair(master, line == "/pair confirmo"),
+                        None => println!(
+                            "(este é o primário: a mestra não está aqui, então não há link de pareamento.\n \
+                             O pareamento autenticado, sem copiar a mestra, vem na fatia 2c/2d do P30)"
+                        ),
+                    }
                     continue;
                 }
                 if let Some(link) = line.strip_prefix("/accept ") {
@@ -787,6 +803,7 @@ fn on_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kin_identity::IdentityProvider;
 
     fn parse(argv: &[&str], env: Option<&str>) -> Result<Args, String> {
         parse_from(argv.iter().map(|s| s.to_string()), env.map(str::to_string))

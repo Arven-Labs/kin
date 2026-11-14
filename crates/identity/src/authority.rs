@@ -176,11 +176,15 @@ pub struct AuthorityIdentity {
 
 impl AuthorityIdentity {
     /// Junta a chave e o certificado. Recusa certificado com assinatura inválida
-    /// ([`Error::InvalidAuthorityCertificate`]) ou de outra chave ([`Error::AuthorityKeyMismatch`]).
+    /// ([`Error::InvalidAuthorityCertificate`]), de outra chave ([`Error::AuthorityKeyMismatch`]) ou
+    /// que faz da própria mestra a autoridade ([`Error::AuthorityIsMaster`], P30 2b).
     pub fn new(key: AuthorityKey, certificate: AuthorityCertificate) -> Result<Self, Error> {
         certificate.verify()?;
         if certificate.authority_key != key.public_key() {
             return Err(Error::AuthorityKeyMismatch);
+        }
+        if certificate.authority_key == *certificate.identity.public_key() {
+            return Err(Error::AuthorityIsMaster);
         }
         Ok(Self { key, certificate })
     }

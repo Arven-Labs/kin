@@ -1384,4 +1384,25 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Auditoria** (`security-auditor`, somente leitura): sem críticos nem importantes; A1 feito; A2, A3, A5 e o fuzz viraram o **P31**;
   A4 segue na S4; A6 (build antigo descarta a `DeviceList` inteira) registrado no ADR para o rollout da 2b.
 - **Não verificado**: revisão externa do formato; interoperação real entre builds v3 e v4 (lab na 2d); fuzz do parser.
-- **Próximo passo**: 2b (o primário roda com `authority.key`/`authority.cert`), em plan mode.
+
+#### Primário com a chave de autoridade, sem a mestra (P30, fatia 2b, PR #153, ADR 0015)
+
+- **Decisões do dono** (plan mode + 2 perguntas + 1 da auditoria): mestra como a própria autoridade **recusada no `identity`**;
+  P31(a) (fechar a struct do certificado) num **PR próprio**; certificado em uso de outro emissor **recusado** (não só avisado).
+- **Feito**: `keys::LocalIdentity` (`Master` | `Primary`, as duas em `Box`), detecção pelo conteúdo do `--data-dir`,
+  `load_primary` (recusa `--pair`, mestra junto, metade da autoridade, cert que não é arquivo regular ou passa de 4 KiB, cert de
+  outra chave, mestra como autoridade), presença por `symlink_metadata`, `files_state` conta o `authority.key`,
+  `ensure_current_issuer` depois do `Chat::open` (getter `Chat::certificate()`), `/pair` recusa no primário, avisos de v4 e
+  mensagem do `kin cold`.
+- **Prova de que testam algo**: os stubs caíram **duas vezes** no clippy `large_enum_variant` (primeiro no `Box` de um lado só,
+  que só inverteu o maior); depois, **9 de 10** falharam (run 43542781542). Correções da auditoria: **3 de 5** falharam antes (run
+  43544115201); o teste do `/dev/zero` não tem prova de vermelho (antes da correção não terminaria).
+- **Mutações** (PRs #154 a #159, fechados e apagados, 6 de 6 pegas nos testes): mestra junto aceita; `--pair` aceito;
+  `files_state` sem `authority.key`; detecção só pelo `authority.key`; mestra como autoridade aceita; `device.key` antes da
+  conferência.
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; 1 importante (certificado em uso de outro emissor) feito;
+  link quebrado e teto do `authority.cert` feitos; `device.key` antes da recusa do `Chat::open`, `--protect` antes de validar,
+  `--serve-relay` decifrando a chave e a corrida do primeiro uso viraram P31 (e) a (h).
+- **Tropeço**: o mesmo `large_enum_variant` da 2a, que eu devia ter previsto; e errei a leitura do lint no primeiro `Box`.
+- **Não verificado**: abrir o primário num terminal real (prompt, `KdfParams::DEFAULT`); FIFO no `authority.cert`; lab.
+- **Próximo passo**: P31(a) (PR próprio) e depois a 2c (pedido e resposta de pareamento), em plan mode.
