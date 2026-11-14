@@ -55,12 +55,7 @@ fn signing_payload(
         }
         Issuer::Authority(authority) => {
             push(&mut payload, &[KIND_AUTHORITY]);
-            push(
-                &mut payload,
-                &authority.identity.public_key().encode_protobuf(),
-            );
             push(&mut payload, &authority.authority_key.encode_protobuf());
-            push(&mut payload, &authority.created_at.to_be_bytes());
         }
     }
     push(&mut payload, cert_hash);
