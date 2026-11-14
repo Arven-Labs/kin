@@ -51,6 +51,12 @@ pub enum Error {
     /// Não há pedido de pareamento guardado neste banco para instalar um certificado.
     #[error("não há pedido de pareamento pendente neste banco")]
     NotPending,
+    /// O pedido de pareamento passou do prazo (P30 2d-ii): descarte-o e peça de novo.
+    #[error("o pedido de pareamento expirou: peça de novo")]
+    PairRequestExpired,
+    /// O relógio do sistema está antes de 1970: sem hora confiável não há prazo (P30 2d-ii).
+    #[error("o relógio do sistema está antes de 1970")]
+    Clock,
     /// O banco não tem um device pareado (certificado instalado) para reabrir.
     #[error("este banco não tem um device pareado")]
     NotPaired,

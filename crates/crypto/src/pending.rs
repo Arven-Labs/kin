@@ -14,9 +14,25 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider as _;
 use openmls_traits::signatures::Signer as _;
 
-use crate::device::{META_CERT, META_REQUEST, META_SIGNER};
+use crate::device::{META_CERT, META_REQUEST, META_REQUESTED_AT, META_SIGNER};
 use crate::provider::Provider;
 use crate::{CryptoDevice, Error};
+
+/// Quanto o pedido de pareamento vale, em segundos (15 min): tempo de levar o link ao primário, comparar
+/// o código e voltar com a resposta, sem deixar um pedido esquecido aberto (P30 2d-ii, decisão do dono).
+pub const PAIR_REQUEST_TTL_SECS: u64 = 900;
+
+/// Quanto uma hora gravada pode estar à frente de `now` sem expirar o pedido (5 min).
+const FUTURE_TOLERANCE_SECS: u64 = 300;
+
+/// Segundos Unix do relógio do sistema. Relógio antes de 1970 é erro, não "hora 0": com 0 o prazo
+/// nunca venceria (auditoria da 2d-ii-a1, item 1).
+fn now_secs() -> Result<u64, Error> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| Error::Clock)
+}
 
 /// Banco com a chave MLS e o pedido de pareamento, à espera do certificado.
 pub struct PendingDevice {
@@ -49,18 +65,51 @@ impl PendingDevice {
 
     /// O pedido de pareamento deste device: o guardado, se já houve um (mesmo nonce, mesmo código de
     /// comparação depois de reabrir), ou um novo, que fica guardado.
+    ///
+    /// O pedido vale [`PAIR_REQUEST_TTL_SECS`] a partir de quando foi criado; passado o prazo, este método
+    /// o descarta e gera outro (novo nonce, novo código de comparação). Usa o relógio do sistema.
     pub fn request(&self, device_key: &DeviceKey) -> Result<PairRequest, Error> {
+        self.request_at(device_key, now_secs()?)
+    }
+
+    /// Como [`Self::request`], com o instante `now` (segundos Unix) passado de fora, para testar o prazo.
+    pub fn request_at(&self, device_key: &DeviceKey, now: u64) -> Result<PairRequest, Error> {
         let signing_key = public_key_from_ed25519(self.signer.public())?;
         if let Some(bytes) = self.provider.meta(META_REQUEST)? {
-            return Self::check_stored(&bytes, &signing_key, device_key);
+            if !self.is_expired(now)? {
+                return Self::check_stored(&bytes, &signing_key, device_key);
+            }
+            self.discard_request()?;
         }
         let request = PairRequest::generate(device_key, &signing_key, |payload| {
             self.signer
                 .sign(payload)
                 .map_err(|_| kin_identity::Error::InvalidPairRequest)
         })?;
+        // A hora primeiro: um corte entre as duas gravações deixa a hora sem pedido (inofensivo), nunca um
+        // pedido sem hora (que contaria como expirado e obrigaria a pedir de novo).
+        self.provider
+            .set_meta(META_REQUESTED_AT, &now.to_be_bytes())?;
         self.provider.set_meta(META_REQUEST, &request.to_bytes())?;
         Ok(request)
+    }
+
+    /// O pedido guardado passou do prazo? **Falha fechado** (auditoria da 2d-ii-a1, item 1): hora ausente
+    /// (um banco da 2c-ii), ilegível ou **no futuro além de [`FUTURE_TOLERANCE_SECS`]** (relógio que estava
+    /// adiantado, arquivo editado) conta como expirada, e o pedido se renova. Até 300 s à frente vale: um
+    /// relógio um pouco atrasado entre dois ajustes não derruba o pedido.
+    fn is_expired(&self, now: u64) -> Result<bool, Error> {
+        let Some(raw) = self.provider.meta(META_REQUESTED_AT)? else {
+            return Ok(true);
+        };
+        let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) else {
+            return Ok(true);
+        };
+        let requested_at = u64::from_be_bytes(bytes);
+        if requested_at > now.saturating_add(FUTURE_TOLERANCE_SECS) {
+            return Ok(true);
+        }
+        Ok(now.saturating_sub(requested_at) > PAIR_REQUEST_TTL_SECS)
     }
 
     /// Descarta o pedido guardado (a pessoa viu um código diferente, ou desistiu). A chave MLS fica; o
@@ -68,7 +117,8 @@ impl PendingDevice {
     /// as chaves (não o nonce): um emitido para as chaves deste device continua válido; um para as chaves
     /// de um intruso nunca casa.
     pub fn discard_request(&self) -> Result<(), Error> {
-        self.provider.delete_meta(META_REQUEST)
+        self.provider.delete_meta(META_REQUEST)?;
+        self.provider.delete_meta(META_REQUESTED_AT)
     }
 
     /// O banco é só um arquivo: o pedido guardado só vale se for deste signer e desta `device.key`.
@@ -91,18 +141,40 @@ impl PendingDevice {
     /// Instala o certificado devolvido pelo primário, só se for da identidade `expected` (recebida fora de
     /// banda), válido e das chaves do pedido guardado. Se algo falhar, o banco **continua pendente**: o
     /// certificado e o fim do pedido só são gravados depois de tudo conferido, numa transação.
+    ///
+    /// Recusa com [`Error::PairRequestExpired`] se o pedido passou do prazo ([`PAIR_REQUEST_TTL_SECS`]).
+    /// Usa o relógio do sistema.
     pub fn install_certificate(
         self,
         device_key: &DeviceKey,
         certificate: &DeviceCertificate,
         expected: &IdentityId,
     ) -> Result<CryptoDevice, Error> {
+        self.install_certificate_at(device_key, certificate, expected, now_secs()?)
+    }
+
+    /// Como [`Self::install_certificate`], com o instante `now` (segundos Unix) passado de fora.
+    pub fn install_certificate_at(
+        self,
+        device_key: &DeviceKey,
+        certificate: &DeviceCertificate,
+        expected: &IdentityId,
+        now: u64,
+    ) -> Result<CryptoDevice, Error> {
         let bytes = self.provider.meta(META_REQUEST)?.ok_or(Error::NotPending)?;
+        if self.is_expired(now)? {
+            return Err(Error::PairRequestExpired);
+        }
         let signing_key = public_key_from_ed25519(self.signer.public())?;
         let request = Self::check_stored(&bytes, &signing_key, device_key)?;
         request.accept_certificate(certificate, expected)?;
-        self.provider
-            .finish_pairing(&certificate.to_bytes(), META_CERT, &bytes, META_REQUEST)?;
+        self.provider.finish_pairing(
+            &certificate.to_bytes(),
+            META_CERT,
+            &bytes,
+            META_REQUEST,
+            &[META_REQUESTED_AT],
+        )?;
         Ok(CryptoDevice::assemble(
             self.provider,
             self.signer,

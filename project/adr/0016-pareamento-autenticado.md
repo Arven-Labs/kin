@@ -43,7 +43,7 @@ protocolo de pareamento sem copiar segredo: o device novo gera as chaves e mostr
 - O fluxo manual tem um passo a mais: o primário entrega a identidade (QR/link) **antes** do pedido, e a pessoa digita no
   primário o código lido no device novo.
 - O código tem 24 dígitos: mais longo de comparar; é o preço dos ~80 bits sem commit-reveal.
-- Pedido sem `created_at`: não expira sozinho; **TTL e descarte de pedido já respondido são da CLI (2d)**, o primário não guarda
+- Pedido sem `created_at`: não expira sozinho; **o TTL é local ao device novo (`PendingDevice`, ADR 0019) e o descarte de pedido já respondido é da CLI (2d)**, o primário não guarda
   estado.
 
 ## Limites conhecidos e o que não foi validado
@@ -72,6 +72,6 @@ Sem bypass criptográfico da prova de posse e sem panic alcançável por bytes d
 | 5: chave de ordem pequena passa na prova | sugestão | **pendência** (P31(c)) |
 | 6: Schnorr sem aux_rand | sugestão | **feito** |
 | 7: `put` com `expect` pode dar panic | sugestão | **feito**: teto da prova em `new` |
-| 8: nonce injetado pelo chamador; sem frescor | sugestão | **feito** (`generate`); TTL é da 2d |
+| 8: nonce injetado pelo chamador; sem frescor | sugestão | **feito** (`generate`); o TTL ficou no `PendingDevice`, local ao device novo (ADR 0019) |
 | 9: viés do `u64 % 10^18` | sugestão | **feito**: `u128 % 10^24` |
 | 10: lacunas de teste | sugestão | **parcial**: um teste por chave no SAS, teto, erro do signer; sem vetor fixo |

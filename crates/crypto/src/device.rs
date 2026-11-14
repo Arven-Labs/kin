@@ -201,6 +201,8 @@ pub(crate) const META_SIGNER: &str = "signer_public";
 pub(crate) const META_CERT: &str = "device_certificate";
 /// Pedido de pareamento pendente (P30 2c-ii): existe só enquanto o certificado não chegou.
 pub(crate) const META_REQUEST: &str = "pair_request";
+/// Instante (segundos Unix, u64 BE) em que o pedido pendente foi criado: o prazo conta daqui (P30 2d-ii).
+pub(crate) const META_REQUESTED_AT: &str = "pair_requested_at";
 
 /// Recarrega a chave de assinatura e o certificado salvos, se existirem.
 fn load_signer(
