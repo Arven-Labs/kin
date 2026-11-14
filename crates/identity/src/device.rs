@@ -215,7 +215,7 @@ impl DeviceCertificate {
     /// autoridade, a identidade da cadeia é a do certificado, e a autoridade assinou o device.
     pub fn verify(&self) -> Result<(), Error> {
         if let Issuer::Authority(authority) = &self.issuer {
-            authority.verify().map_err(|_| Error::InvalidCertificate)?;
+            // MUTAÇÃO M1: sem conferir a mestra sobre a autoridade.
             if authority.identity != self.identity {
                 return Err(Error::InvalidCertificate);
             }
