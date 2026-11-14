@@ -288,6 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         &args.data_dir.join("mls.sqlite"),
     )?;
+    keys::ensure_current_issuer(&identity, chat.certificate())?;
     println!(
         "kin {} — peer id: {}",
         env!("CARGO_PKG_VERSION"),

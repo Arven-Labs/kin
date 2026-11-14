@@ -42,6 +42,17 @@ impl LocalIdentity {
     }
 }
 
+/// Auditoria da 2b, achado 1: o primário só roda se o certificado **em uso** (o guardado no
+/// `mls.sqlite`, se já existia) é da autoridade atual. Um v3 da mestra (migração no mesmo diretório)
+/// ou um v4 de uma autoridade anterior (rotate) deixariam o primário fora da cadeia atual.
+pub fn ensure_current_issuer(
+    identity: &LocalIdentity,
+    in_use: &kin_identity::DeviceCertificate,
+) -> Result<(), String> {
+    let _ = (identity, in_use);
+    Ok(()) // stub da etapa de testes
+}
+
 /// O que o usuário pediu na linha de comando (e `KIN_PASSPHRASE_FILE`).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct KeyOptions {
@@ -857,5 +868,93 @@ mod tests {
 
         assert!(matches!(loaded, LocalIdentity::Master(_)));
         assert!(loaded.master().is_some());
+    }
+
+    // ---- auditoria da 2b ----
+
+    /// Certificado de um device qualquer, emitido por `issuer`.
+    fn device_cert(issuer: &dyn IdentityProvider) -> kin_identity::DeviceCertificate {
+        let device = DeviceKey::generate();
+        issuer
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                2_000,
+            )
+            .unwrap()
+    }
+
+    fn cold_master(root: &Path) -> StandaloneIdentity {
+        StandaloneIdentity::load_with(&root.join("offline/master.key"), Some(MASTER_PASS)).unwrap()
+    }
+
+    #[test]
+    fn the_primary_runs_with_a_certificate_from_its_own_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let (loaded, _) = primary_load(&primary).unwrap();
+
+        let own = device_cert(loaded.provider());
+
+        assert!(ensure_current_issuer(&loaded, &own).is_ok());
+    }
+
+    /// Achado 1: migração no mesmo diretório (o `mls.sqlite` guardou o v3 de quando a mestra estava ali).
+    #[test]
+    fn the_primary_refuses_a_stored_certificate_signed_by_the_master() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let (loaded, _) = primary_load(&primary).unwrap();
+
+        let v3 = device_cert(&cold_master(root.path()));
+
+        assert!(ensure_current_issuer(&loaded, &v3).is_err());
+    }
+
+    /// Achado 1: rotate no mesmo diretório (o `mls.sqlite` guardou o v4 da autoridade anterior).
+    #[test]
+    fn the_primary_refuses_a_stored_certificate_from_a_previous_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let (loaded, _) = primary_load(&primary).unwrap();
+        let master = cold_master(root.path());
+        let previous_key = kin_identity::AuthorityKey::generate();
+        let previous_cert = master
+            .certify_authority(&previous_key.public_key(), 500)
+            .unwrap();
+        let previous = AuthorityIdentity::new(previous_key, previous_cert).unwrap();
+
+        let old = device_cert(&previous);
+
+        assert!(ensure_current_issuer(&loaded, &old).is_err());
+    }
+
+    #[test]
+    fn the_master_mode_does_not_check_the_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+
+        let own = device_cert(loaded.provider());
+
+        assert!(ensure_current_issuer(&loaded, &own).is_ok());
+    }
+
+    /// Achado 5: com os arquivos da autoridade apontando para um volume não montado, o diretório não
+    /// pode virar "novo" e ganhar uma mestra nova.
+    #[test]
+    fn dangling_authority_links_are_refused_instead_of_creating_a_new_master() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        let gone = root.path().join("volume-desmontado");
+        for name in [AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
+            std::fs::remove_file(primary.join(name)).unwrap();
+            std::os::unix::fs::symlink(gone.join(name), primary.join(name)).unwrap();
+        }
+
+        assert!(!matches!(files_state(&primary), Ok(FilesState::New)));
+        assert!(primary_load(&primary).is_err());
+        assert!(!id_path(&primary).exists(), "virou uma mestra nova");
+        assert!(!dev_path(&primary).exists());
     }
 }
