@@ -427,6 +427,19 @@ mod tests {
         for different in [&only_signing, &only_network_and_nostr, &other] {
             assert!(!revocation.revokes(&cert_for(&master, different, NOW)));
         }
+        // E cada uma das três chaves sozinha (as outras duas iguais): nenhuma pode ser ignorada.
+        let (net, nostr) = (other.key.public_key(), other.key.nostr_public_key());
+        let issue = |s: &PublicKey, n: &PublicKey, x: &NostrPublicKey| {
+            master.authorize_device(s, n, x, NOW).unwrap()
+        };
+        let (s0, n0, x0) = (&d.signing, &d.key.public_key(), &d.key.nostr_public_key());
+        assert!(revocation.revokes(&issue(s0, n0, x0)), "controle positivo");
+        assert!(
+            !revocation.revokes(&issue(&other.signing, n0, x0)),
+            "só MLS"
+        );
+        assert!(!revocation.revokes(&issue(s0, &net, x0)), "só rede");
+        assert!(!revocation.revokes(&issue(s0, n0, &nostr)), "só Nostr");
     }
 
     #[test]
