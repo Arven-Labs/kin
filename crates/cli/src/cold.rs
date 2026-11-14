@@ -341,7 +341,7 @@ pub fn run(command: ColdCommand) -> Result<(), String> {
     Ok(())
 }
 
-fn passphrase(
+pub(crate) fn passphrase(
     file: Option<PathBuf>,
     label: &str,
     confirm: bool,

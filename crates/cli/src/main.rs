@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 mod cold;
 mod keys;
+mod pair;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{Chat, ChatEvent, Error, HistoryEntry, Invite, Message, MessageId};
@@ -262,6 +263,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e
         })?;
         return cold::run(command).map_err(Into::into);
+    }
+    // `kin pair ...` (P30 fatia 2d-ii-a2): pareamento autenticado por links de texto, sem rede nem chat.
+    if std::env::args().nth(1).as_deref() == Some("pair") {
+        let command = pair::parse(std::env::args().skip(2)).map_err(|e| {
+            eprintln!(
+                "{e}\nuso: kin pair request --data-dir DIR --identity BASE58 [--passphrase-file ARQ]\n     kin pair answer --data-dir DIR_DO_PRIMARIO --request ARQUIVO [--passphrase-file ARQ]\n     kin pair accept --data-dir DIR --certificate ARQUIVO|- [--passphrase-file ARQ]"
+            );
+            e
+        })?;
+        return pair::run(command).map_err(Into::into);
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
