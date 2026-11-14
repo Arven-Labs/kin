@@ -33,6 +33,27 @@ impl IdentityId {
     }
 }
 
+
+/// O que o Kin exige de uma identidade, seja qual for a origem (D7).
+pub trait IdentityProvider {
+    /// ID estável da identidade.
+    fn id(&self) -> IdentityId;
+
+    // Sem `sign` livre (auditoria da fatia 1b, S1, ADR 0013): a chave da identidade só assina por
+    // métodos com domínio, como este, para ninguém obter dela uma assinatura sobre bytes escolhidos.
+
+    /// Autoriza um device ("este device pertence a esta identidade"), certificando a chave de
+    /// assinatura MLS, a chave de rede e a chave Nostr juntas.
+    /// `created_at` é o instante em segundos Unix, passado de fora para manter o código testável.
+    fn authorize_device(
+        &self,
+        signing_key: &PublicKey,
+        network_key: &PublicKey,
+        nostr_key: &NostrPublicKey,
+        created_at: u64,
+    ) -> Result<DeviceCertificate, Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,32 +84,11 @@ mod tests {
 
     #[test]
     fn base58_rejects_a_peer_id_that_is_not_an_ed25519_identity_multihash() {
-        // Peer ID de um hash qualquer (sha2-256 de bytes arbitrários): é um base58 válido de PeerId,
-        // mas não carrega uma chave Ed25519.
+        // Peer ID aleatório: base58 válido de PeerId, mas não carrega uma chave Ed25519.
         let not_a_key = PeerId::random().to_base58();
         assert!(matches!(
             IdentityId::from_base58(&not_a_key),
             Err(Error::InvalidIdentityId)
         ));
     }
-}
-
-/// O que o Kin exige de uma identidade, seja qual for a origem (D7).
-pub trait IdentityProvider {
-    /// ID estável da identidade.
-    fn id(&self) -> IdentityId;
-
-    // Sem `sign` livre (auditoria da fatia 1b, S1, ADR 0013): a chave da identidade só assina por
-    // métodos com domínio, como este, para ninguém obter dela uma assinatura sobre bytes escolhidos.
-
-    /// Autoriza um device ("este device pertence a esta identidade"), certificando a chave de
-    /// assinatura MLS, a chave de rede e a chave Nostr juntas.
-    /// `created_at` é o instante em segundos Unix, passado de fora para manter o código testável.
-    fn authorize_device(
-        &self,
-        signing_key: &PublicKey,
-        network_key: &PublicKey,
-        nostr_key: &NostrPublicKey,
-        created_at: u64,
-    ) -> Result<DeviceCertificate, Error>;
 }
