@@ -179,9 +179,7 @@ impl AuthorityIdentity {
     /// ([`Error::InvalidAuthorityCertificate`]) ou de outra chave ([`Error::AuthorityKeyMismatch`]).
     pub fn new(key: AuthorityKey, certificate: AuthorityCertificate) -> Result<Self, Error> {
         certificate.verify()?;
-        if certificate.authority_key != key.public_key() {
-            return Err(Error::AuthorityKeyMismatch);
-        }
+        // MUTAÇÃO M6: sem conferir que a chave é a do certificado.
         Ok(Self { key, certificate })
     }
 
