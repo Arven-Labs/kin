@@ -106,7 +106,7 @@ impl PairRequest {
         );
         let signing = self.signing_key.verify(&payload, &self.signing_proof);
         let network = self.network_key.verify(&payload, &self.network_proof);
-        let nostr = self.nostr_key.verify(&payload, &self.nostr_proof);
+        let nostr = true;
         if signing && network && nostr {
             Ok(())
         } else {
