@@ -389,7 +389,9 @@ impl Chat {
     /// Chat persistente de um device **pareado** (P30 fatia 2d-i): sem mestra nem autoridade, só com o
     /// certificado v4 que o primário emitiu e que já está no banco `db` (ver `PendingDevice`).
     /// `expected` é a identidade do primário, recebida fora de banda e guardada **fora** do banco: o
-    /// certificado é conferido contra ela a cada abertura (ADR 0017).
+    /// certificado é conferido contra ela a cada abertura (ADR 0017). **Atenção**: não exige que o emissor
+    /// seja uma autoridade; um banco criado pela mestra (certificado v3) também abre se a identidade bater
+    /// (o trinco v4 vs v3 é da fatia 3, P31(o)).
     pub fn open_paired(
         expected: &IdentityId,
         device_key: &DeviceKey,

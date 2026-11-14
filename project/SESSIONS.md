@@ -1463,3 +1463,22 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: compare-and-swap sem prova de vermelho (precisa de dois processos); corrida entre processos e
   `busy_timeout` do `rusqlite`; se o peer confere `credential.signature_key == cert.signing_key`; revisão externa do formato.
 - **Próximo passo**: 2d (CLI e lab; `Chat` para device pareado; TTL do pedido), em plan mode.
+
+### 2026-11-14 — Sessão 25
+
+#### `Chat::open_paired` (P30, fatia 2d-i, PR #185, ADR 0018)
+
+- **Decisões do dono** (plan mode + 3 perguntas): 2d cortada em **2d-i só `Chat::open_paired`** (depois 2d-ii CLI e 2d-iii lab);
+  identidade esperada em `primary.id` ao lado do `device.key` e TTL local no `PendingDevice` (ambos para a 2d-ii); sugestão 1 da
+  auditoria: **só documentar** que `open_paired` abre banco de mestra (trinco na fatia 3).
+- **Feito**: `Chat::open_paired(expected, device_key, config, db)` e helper privado `open_with_device` (trecho comum com `open`,
+  movido sem mudar comportamento). ADR 0018.
+- **Prova de que testam algo**: stub com `todo!`, **6 de 6 falharam** (run 43619208215); verde com os 6 e os 211 unitários (run
+  43619499239). Plano inicial desta sessão (fatia 2a) estava obsoleto: o `git pull` trouxe 2a a 2c-ii já feitas.
+- **Mutações** (PRs #186 e #187, fechados e apagados, 2 de 2 pegas): conversas não recarregadas (13 testes, entre eles o do
+  device pareado); identidade esperada trocada por uma aleatória (4 testes). A primeira versão da B não compilou
+  (`unused variable`, `-D warnings`): não valeu e foi refeita (mesmo tropeço de sessões anteriores).
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos nem importantes; P31(p) resolvido (o `credential::verify` confere
+  `signature_key == cert.signing_key` nos 3 caminhos de entrada); 5 sugestões (tabela no ADR).
+- **Não verificado**: uso real pela CLI; lab; `Update` do openmls sem `credential::verify` (pré-existente, vai no P31).
+- **Próximo passo**: 2d-ii (CLI: pedido, resposta com SAS, `primary.id`, modo pareado no `--data-dir`, TTL do pedido), em plan mode.
