@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use kin_identity::{
     AuthorityCertificate, AuthorityIdentity, AuthorityKey, DeviceKey, IdentityId, IdentityProvider,
-    KdfParams, StandaloneIdentity,
+    Issuer, KdfParams, StandaloneIdentity,
 };
 use zeroize::Zeroizing;
 
@@ -49,8 +49,30 @@ pub fn ensure_current_issuer(
     identity: &LocalIdentity,
     in_use: &kin_identity::DeviceCertificate,
 ) -> Result<(), String> {
-    let _ = (identity, in_use);
-    Ok(()) // stub da etapa de testes
+    let LocalIdentity::Primary(primary) = identity else {
+        return Ok(());
+    };
+    match &in_use.issuer {
+        Issuer::Authority(authority) if **authority == *primary.certificate() => Ok(()),
+        Issuer::Master => Err(
+            "o mls.sqlite deste primário guarda um certificado de device assinado pela mestra (de quando ela estava aqui): use um --data-dir novo para o primário"
+                .into(),
+        ),
+        Issuer::Authority(_) => Err(
+            "o mls.sqlite deste primário guarda um certificado de device de outra autoridade (anterior a esta): use um --data-dir novo para o primário"
+                .into(),
+        ),
+    }
+}
+
+/// Se `path` existe **como entrada do diretório**, mesmo um link quebrado (auditoria da 2b, achado 5):
+/// um volume não montado não pode fazer o primário parecer um diretório novo. Erro de E/S propaga.
+fn present(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// O que o usuário pediu na linha de comando (e `KIN_PASSPHRASE_FILE`).
@@ -150,7 +172,8 @@ pub fn files_state(dir: &Path) -> Result<FilesState, Box<dyn std::error::Error>>
     // O `authority.key` do primário (P30 2b) conta como os outros: cifrado = pedir a senha uma vez.
     for name in ["identity.key", AUTHORITY_KEY_FILE, "device.key"] {
         let path = dir.join(name);
-        if path.exists() {
+        // `present`, não `exists`: um link quebrado falha aqui em vez de contar como ausente.
+        if present(&path)? {
             sealed.push(kin_identity::key_file_is_sealed(&path)?);
         }
     }
@@ -226,7 +249,7 @@ pub fn load(
     params: KdfParams,
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
-    if dir.join(AUTHORITY_KEY_FILE).exists() || dir.join(AUTHORITY_CERT_FILE).exists() {
+    if present(&dir.join(AUTHORITY_KEY_FILE))? || present(&dir.join(AUTHORITY_CERT_FILE))? {
         return load_primary(dir, pair_text.is_some(), passphrase, protect, params);
     }
     let identity_path = dir.join("identity.key");
@@ -275,11 +298,31 @@ pub fn load(
     Ok((LocalIdentity::Master(Box::new(identity)), device))
 }
 
-/// Teto do `authority.cert` (o real tem ~160 bytes): arquivo gigante ou `/dev/zero` não é lido.
+/// Teto do `authority.cert` (o real tem ~160 bytes).
 const AUTHORITY_CERT_LIMIT: u64 = 4096;
 
+/// Lê o `authority.cert`: só arquivo regular (recusa `/dev/zero`, FIFO, dispositivo) e no máximo
+/// `AUTHORITY_CERT_LIMIT` bytes **na leitura**, não só no `stat` (auditoria da 2b, achado 2: o arquivo
+/// pode ser trocado entre os dois).
+fn read_authority_cert(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(format!("{AUTHORITY_CERT_FILE} não é um arquivo regular").into());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(AUTHORITY_CERT_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > AUTHORITY_CERT_LIMIT {
+        return Err(format!("{AUTHORITY_CERT_FILE} grande demais").into());
+    }
+    Ok(bytes)
+}
+
 /// Carrega o **primário** (P30 2b, ADR 0015): `authority.key` + `authority.cert`, sem a mestra.
-/// Tudo o que pode recusar é conferido **antes** de criar o `device.key`.
+/// Tudo o que este passo recusa é conferido **antes** de criar o `device.key`. O `Chat::open` ainda
+/// pode recusar depois (estado MLS de outra identidade, `ensure_current_issuer`), com o `device.key`
+/// já criado, como no modo mestra.
 fn load_primary(
     dir: &Path,
     pairing: bool,
@@ -296,21 +339,19 @@ fn load_primary(
                 .into(),
         );
     }
-    if dir.join("identity.key").exists() {
+    if present(&dir.join("identity.key"))? {
         return Err(
             "este --data-dir tem a mestra (identity.key) e a autoridade (authority.key): a mestra não pode ficar no primário; leve o identity.key para fora (mídia offline)"
                 .into(),
         );
     }
-    if !key_path.exists() || !cert_path.exists() {
+    if !present(&key_path)? || !present(&cert_path)? {
         return Err(format!(
             "primário incompleto: são precisos {AUTHORITY_KEY_FILE} e {AUTHORITY_CERT_FILE} juntos"
         )
         .into());
     }
-    if std::fs::metadata(&cert_path)?.len() > AUTHORITY_CERT_LIMIT {
-        return Err(format!("{AUTHORITY_CERT_FILE} grande demais").into());
-    }
+    let certificate_bytes = read_authority_cert(&cert_path)?;
     if protect {
         let pass = passphrase.ok_or("--protect exige uma senha")?;
         if !kin_identity::key_file_is_sealed(&key_path)? {
@@ -321,7 +362,7 @@ fn load_primary(
         }
     }
     let key = AuthorityKey::load_with(&key_path, passphrase)?;
-    let certificate = AuthorityCertificate::from_bytes(&std::fs::read(&cert_path)?)?;
+    let certificate = AuthorityCertificate::from_bytes(&certificate_bytes)?;
     let primary = AuthorityIdentity::new(key, certificate)?;
     let device = load_or_create_device(&device_path, passphrase, params)?;
     Ok((LocalIdentity::Primary(Box::new(primary)), device))
@@ -955,6 +996,19 @@ mod tests {
         assert!(!matches!(files_state(&primary), Ok(FilesState::New)));
         assert!(primary_load(&primary).is_err());
         assert!(!id_path(&primary).exists(), "virou uma mestra nova");
+        assert!(!dev_path(&primary).exists());
+    }
+
+    /// Achado 2: um `authority.cert` que aponta para `/dev/zero` (tamanho 0 no `stat`) é recusado sem
+    /// ler até a memória acabar. Sem prova de vermelho: antes da correção, este teste não terminaria.
+    #[test]
+    fn an_authority_certificate_that_is_not_a_regular_file_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        std::fs::remove_file(primary.join(AUTHORITY_CERT_FILE)).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", primary.join(AUTHORITY_CERT_FILE)).unwrap();
+
+        assert!(primary_load(&primary).is_err());
         assert!(!dev_path(&primary).exists());
     }
 }
