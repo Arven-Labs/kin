@@ -206,6 +206,7 @@ impl IdentityProvider for AuthorityIdentity {
         let payload = DeviceCertificate::signing_payload_v4(
             &identity,
             &self.certificate.authority_key,
+            self.certificate.created_at,
             signing_key,
             network_key,
             nostr_key,
@@ -250,6 +251,7 @@ mod tests {
         let payload = DeviceCertificate::signing_payload_v4(
             &victim.id(),
             &key.public_key(),
+            chain.created_at,
             &d.public_key(),
             &d.public_key(),
             &d.nostr_public_key(),

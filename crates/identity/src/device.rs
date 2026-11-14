@@ -187,10 +187,12 @@ impl DeviceCertificate {
     }
 
     /// Bytes que a autoridade assina no v4: domínio próprio, a identidade e a chave de autoridade
-    /// (no v4 quem assina não é a identidade, então ela precisa estar no conteúdo) e as do device.
+    /// (no v4 quem assina não é a identidade, então ela precisa estar no conteúdo), o `created_at`
+    /// do certificado de autoridade (amarra **qual** emissão; auditoria da 2a, A1) e as do device.
     pub(crate) fn signing_payload_v4(
         identity: &IdentityId,
         authority_key: &PublicKey,
+        authority_created_at: u64,
         signing_key: &PublicKey,
         network_key: &PublicKey,
         nostr_key: &NostrPublicKey,
@@ -200,6 +202,7 @@ impl DeviceCertificate {
         for encoded in [
             identity.public_key().encode_protobuf(),
             authority_key.encode_protobuf(),
+            authority_created_at.to_be_bytes().to_vec(),
             signing_key.encode_protobuf(),
             network_key.encode_protobuf(),
             nostr_key.to_bytes().to_vec(),
@@ -222,6 +225,7 @@ impl DeviceCertificate {
             let payload = Self::signing_payload_v4(
                 &self.identity,
                 &authority.authority_key,
+                authority.created_at,
                 &self.signing_key,
                 &self.network_key,
                 &self.nostr_key,

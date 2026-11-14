@@ -1365,4 +1365,23 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Prova**: não há "falha antes" (comportamento igual; sai uma API). Commit só de testes verde com o `sign` presente (run
   43535311392); o segundo commit remove o `sign`. A ausência do método não tem teste (exigiria `trybuild`); fica no grep e no diff.
 - **Tropeço**: o primeiro grep filtrou `authority.rs` inteiro e escondeu dois testes que usavam `sign`; achados antes do push.
-- **Próximo passo**: fatia 2 (pareamento autenticado), em plan mode.
+
+#### Certificado de device v4 assinado pela autoridade (P30, fatia 2a, PR #145, ADR 0014)
+
+- **Decisões do dono** (plan mode + 3 perguntas + 1 da auditoria): fatia 2 em **4 sub-fatias** (2a formato, 2b primário com a
+  autoridade, 2c pedido de pareamento, 2d CLI e lab); pareamento **manual, sem rede**; v4 **com a cadeia embutida** (descartada a
+  referência por hash); depois da auditoria, **amarrar a emissão do `KAUT`** no payload (A1). Mestra como a própria autoridade: não
+  proibida na 2a, tratar na 2b.
+- **Feito**: `Issuer` (`Master` | `Authority(Box<AuthorityCertificate>)`), fio v4 (`KDC` 4 + `KAUT`), payload `kin/device-cert/v4`
+  com identidade, chave e `created_at` do `KAUT`; `verify` confere a cadeia; `AuthorityIdentity` (recusa `KAUT` inválido ou de outra
+  chave, `Error::AuthorityKeyMismatch`); `crypto` e `chat` sem mudança de código, só testes.
+- **Prova de que testam algo**: o 1º commit de stubs nem compilou no clippy (`large_enum_variant`; o `Issuer` passou a usar `Box`);
+  o 2º, contra os stubs, **20 de 21 falharam** (o de v3 já passava) e 2 testes antigos caíram no `todo!` do stub (run 43538082397);
+  a implementação ficou verde (run 43538514857). O teste do A1 falhou sozinho antes da correção (run 43539973828).
+- **Mutações** (PRs #146 a #152, fechados e apagados, 7 de 7 pegas nos testes): sem conferir a mestra sobre a autoridade; sem
+  conferir a identidade da cadeia; payload v4 igual ao v3; payload sem a identidade; bytes sobrando aceitos; primário sem conferir
+  a chave; versão do v4 ignorada.
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos nem importantes; A1 feito; A2, A3, A5 e o fuzz viraram o **P31**;
+  A4 segue na S4; A6 (build antigo descarta a `DeviceList` inteira) registrado no ADR para o rollout da 2b.
+- **Não verificado**: revisão externa do formato; interoperação real entre builds v3 e v4 (lab na 2d); fuzz do parser.
+- **Próximo passo**: 2b (o primário roda com `authority.key`/`authority.cert`), em plan mode.
