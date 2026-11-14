@@ -19,7 +19,9 @@
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
 //! deixa de valer (um irmão que o repasse não o faz voltar); a conversa e as mensagens seguem.
-//! Segundo device da mesma identidade: `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
+//! Device pareado sem copiar a mestra: `kin pair request/answer/accept` (ADR 0020) e depois `kin --data-dir DIR`
+//! normal; o diretório com `primary.id` abre como device da identidade do primário (ADR 0021).
+//! Segundo device da mesma identidade (modo antigo, com a mestra): `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
 //! `kin://pair/...`; no device novo, `--pair ARQUIVO` (ou `-` para stdin) a importa na primeira execução
 //! e recusa se já houver identidade. É o segredo inteiro, sem cifra: use só em terminal privado.
 //! Linhas digitadas vão à identidade da conversa atual (a todos os devices dela) e são espelhadas
@@ -182,7 +184,9 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
             println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
         }
     }
-    if loaded.0.master().is_none() {
+    // O pareado só se anuncia depois de o `Chat::open_paired` e o `ensure_current_issuer` passarem (em
+    // `main`): antes disso ainda pode ser um pareamento pendente ou um banco v3.
+    if matches!(loaded.0, keys::LocalIdentity::Primary(_)) {
         println!(
             "primário da identidade {} (chave de autoridade; a mestra não está neste diretório)",
             loaded.0.id().to_base58()
@@ -293,13 +297,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         external_addrs: args.external_addrs.clone(),
         ..Default::default()
     };
-    let mut chat = Chat::open(
-        identity.provider(),
-        &device,
-        config,
-        &args.data_dir.join("mls.sqlite"),
-    )?;
+    let db = args.data_dir.join("mls.sqlite");
+    let mut chat = match identity.provider() {
+        Some(provider) => Chat::open(provider, &device, config, &db)?,
+        // Device pareado (ADR 0021): sem provider; o certificado v4 já está no banco e é conferido
+        // contra a identidade de `primary.id` a cada abertura.
+        None => Chat::open_paired(&identity.id(), &device, config, &db)?,
+    };
     keys::ensure_current_issuer(&identity, chat.certificate())?;
+    if matches!(identity, keys::LocalIdentity::Paired(_)) {
+        println!(
+            "device pareado da identidade {} (certificado v4 do primário; sem mestra nem autoridade aqui)",
+            identity.id().to_base58()
+        );
+        eprintln!(
+            "aviso: o certificado deste device é v4; builds antigos do kin não o leem (atualize os outros devices)"
+        );
+    }
     println!(
         "kin {} — peer id: {}",
         env!("CARGO_PKG_VERSION"),
@@ -362,8 +376,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match identity.master() {
                         Some(master) => print_pair(master, line == "/pair confirmo"),
                         None => println!(
-                            "(este é o primário: a mestra não está aqui, então não há link de pareamento.\n \
-                             O pareamento autenticado, sem copiar a mestra, vem na fatia 2c/2d do P30)"
+                            "(a mestra não está neste diretório (primário ou device pareado), então não há link de pareamento.\n \
+                             Para parear outro device sem copiar a mestra, use `kin pair request/answer/accept`)"
                         ),
                     }
                     continue;

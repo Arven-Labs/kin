@@ -204,7 +204,7 @@ fn read_bounded_line(reader: impl std::io::BufRead, limit: usize) -> Result<Stri
 }
 
 /// Lê `primary.id` (texto pequeno) e o converte; erro sem ecoar o conteúdo.
-fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
+pub(crate) fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
     let path = dir.join(PRIMARY_ID_FILE);
     use std::io::Read as _;
     let shown = path.display();
@@ -228,7 +228,7 @@ fn read_primary_id(dir: &Path) -> Result<Option<IdentityId>, String> {
     // conferir a identidade impressa pelo `request` com a tela do primário.
     let corrupted = || {
         format!(
-            "{shown} está vazio ou corrompido: apague o arquivo e rode `kin pair request` de novo, conferindo a identidade impressa com a do primário"
+            "{shown} está vazio ou corrompido: regrave-o com a identidade do primário (conferida na tela dele), ou use um diretório novo e rode `kin pair request` (apagar o arquivo deixaria o diretório sem identidade)"
         )
     };
     let text = std::str::from_utf8(&bytes).map_err(|_| corrupted())?;
@@ -410,7 +410,7 @@ pub fn run(command: PairCommand) -> Result<(), String> {
             let pass = secret(passphrase_file, "senha do device", false)?;
             let identity = accept(&data_dir, &link, Some(pass.as_slice()), now_secs()?)?;
             println!(
-                "Certificado instalado: este device agora pertence à identidade {}.\n(O chat em modo pareado vem na próxima fatia.)",
+                "Certificado instalado: este device agora pertence à identidade {}.\nAgora é só rodar `kin --data-dir` neste mesmo diretório.",
                 identity.to_base58()
             );
         }
@@ -634,17 +634,22 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_primary_id_is_refused_with_a_message_that_says_what_to_delete() {
+    fn an_empty_primary_id_is_refused_with_a_message_that_says_to_rewrite_it_not_delete_it() {
         let dir = tempfile::tempdir().unwrap();
         let (_, identity) = primary_in(dir.path());
         let new = dir.path().join("new");
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(new.join(PRIMARY_ID_FILE), "").unwrap();
         let err = ask(&new, &identity, NOW).unwrap_err();
+        // Apagar `primary.id` num diretório já pareado leva a um beco (e o `kin` normal o trataria como
+        // novo): a mensagem manda regravar com a identidade conferida, ou usar um diretório novo.
         assert!(
-            err.contains(PRIMARY_ID_FILE) && err.contains("apague"),
+            err.contains(PRIMARY_ID_FILE)
+                && err.contains("regrave")
+                && err.contains("diretório novo"),
             "mensagem sem ação: {err}"
         );
+        assert!(!err.contains("apague"), "manda apagar a âncora: {err}");
     }
 
     #[test]
