@@ -177,7 +177,7 @@ impl PairRequest {
         let hash = Sha256::digest(framed(
             SAS_DOMAIN,
             &[
-                &identity.public_key().encode_protobuf(),
+                &identity.public_key().encode_protobuf()[..0],
                 &self.signing_key.encode_protobuf(),
                 &self.network_key.encode_protobuf(),
                 &self.nostr_key.to_bytes(),
