@@ -216,9 +216,7 @@ impl DeviceCertificate {
     pub fn verify(&self) -> Result<(), Error> {
         if let Issuer::Authority(authority) = &self.issuer {
             authority.verify().map_err(|_| Error::InvalidCertificate)?;
-            if authority.identity != self.identity {
-                return Err(Error::InvalidCertificate);
-            }
+            // MUTAÇÃO M2: sem conferir que a identidade da cadeia é a do certificado.
             let payload = Self::signing_payload_v4(
                 &self.identity,
                 &authority.authority_key,
