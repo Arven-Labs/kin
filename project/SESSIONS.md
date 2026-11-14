@@ -1417,3 +1417,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `identity()` do v4 devolvendo a chave de autoridade foi pega por 8 testes em 5 crates (run 43546101795).
 - **Tropeço**: o primeiro push não compilou: `parse(credential)?.identity` (acesso depois de `?`) escapou do meu grep.
 - **Próximo passo**: 2c (pedido e resposta de pareamento), em plan mode.
+
+### 2026-11-14 — Sessão 24
+
+#### Pedido de pareamento e código de comparação no `identity` (P30, fatia 2c-i, PR #162, ADR 0016)
+
+- **Decisões do dono** (plan mode + 3 perguntas + 3 da auditoria): SAS por hash longo com `sha2` (aprovado depois de avaliar a
+  dependência); escopo 2c-i só `identity` (o `CryptoDevice` pendente vira 2c-ii); o device novo só aceita a identidade esperada
+  fora de banda; o primário só certifica com o SAS digitado; 24 dígitos.
+- **Feito**: `PairRequest` (`KPR` 1, prova de posse das 3 chaves, `generate`, `verify`, `accept_certificate`, `sas_code`),
+  `AuthorityIdentity::answer_pair_request`, `sha2 =0.11.0`. ADR 0016. Nenhum formato existente mudou.
+- **Correção minha**: no plano escrevi "~60 bits, 12 dígitos"; 12 dígitos decimais são ~40 bits. Passou a 18 e, depois da
+  auditoria, a **24 dígitos** (~80 bits).
+- **Prova de que testam algo**: stubs, **21 de 21 falharam** (run 43599507790); depois da auditoria, **10 de 32 falharam** antes
+  da correção (run 43605386544); verde com 32 testes (run 43605683446).
+- **Mutações** (PRs #163 a #173, fechados e apagados, 11 de 11 pegas): prova Nostr, MLS e de rede não conferidas; SAS sem a
+  identidade; bytes sobrando; prova sem nonce; primário sem `verify`; primário sem comparar o SAS; identidade esperada ignorada;
+  mesma chave em dois papéis; teto da prova. A primeira mutação da prova Nostr não valia (clippy `dead_code`) e foi refeita.
+- **Auditoria** (`security-auditor`, somente leitura): sem bypass da prova de posse; 3 importantes feitos (identidade esperada,
+  SAS confirmado, 24 dígitos). Os demais viraram o P31 (i) a (k) e a 2d (TTL).
+- **Tropeços**: dois erros de compilação no primeiro push (closure de erro não genérica; `serialize` deprecado do secp256k1); o
+  teste de mdns (`chats_find_each_other_via_mdns_and_talk`) falhou numa das mutações, sem relação com a mudança.
+- **Não verificado**: revisão externa do formato; interoperação real; features do `libp2p-identity` (chave não Ed25519);
+  `cargo audit` do `sha2`.
+- **Próximo passo**: 2c-ii (`CryptoDevice` pendente), em plan mode.
