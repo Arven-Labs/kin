@@ -301,9 +301,7 @@ impl DeviceCertificate {
         );
         cur = &cur[8..];
         let signature = take(&mut cur)?.to_vec();
-        if !cur.is_empty() {
-            return Err(Error::InvalidCertificate);
-        }
+        // MUTAÇÃO M5: aceita bytes sobrando.
         Ok(Self {
             identity,
             issuer,
