@@ -384,6 +384,25 @@ mod tests {
         request(dir, identity, Some(PASS), KdfParams::MIN, now)
     }
 
+    /// O intruso certifica o pedido interceptado digitando o SAS calculado com a **identidade dele**
+    /// (com o SAS da identidade verdadeira o próprio `answer` recusa: o SAS cobre a identidade).
+    fn forge(intruder: &AuthorityIdentity, shown: &RequestShown) -> String {
+        let req = request_from_link(&shown.link).unwrap();
+        answer(intruder, &shown.link, &req.sas_code(&intruder.id()), NOW).unwrap()
+    }
+
+    #[test]
+    fn answer_with_the_sas_of_another_identity_is_refused() {
+        // O SAS cobre a identidade: o código mostrado no device novo (da identidade esperada) não
+        // serve a um primário de outra identidade.
+        let dir = tempfile::tempdir().unwrap();
+        let (_, identity) = primary_in(dir.path());
+        let other_dir = tempfile::tempdir().unwrap();
+        let (intruder, _) = primary_in(other_dir.path());
+        let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
+        assert!(answer(&intruder, &shown.link, &shown.sas, NOW).is_err());
+    }
+
     // ---- parse ----
 
     #[test]
@@ -713,7 +732,7 @@ mod tests {
         let (intruder, _) = primary_in(other_dir.path());
         let new = dir.path().join("new");
         let shown = ask(&new, &identity, NOW).unwrap();
-        let forged = answer(&intruder, &shown.link, &shown.sas, NOW).unwrap();
+        let forged = forge(&intruder, &shown);
         assert!(accept(&new, &forged, Some(PASS), NOW).is_err());
     }
 
@@ -725,7 +744,7 @@ mod tests {
         let (intruder, _) = primary_in(other_dir.path());
         let new = dir.path().join("new");
         let shown = ask(&new, &identity, NOW).unwrap();
-        let forged = answer(&intruder, &shown.link, &shown.sas, NOW).unwrap();
+        let forged = forge(&intruder, &shown);
         let real = answer(&primary, &shown.link, &shown.sas, NOW).unwrap();
         assert!(accept(&new, &forged, Some(PASS), NOW).is_err());
         assert!(accept(&new, "kin://pair-cert/AAAA", Some(PASS), NOW).is_err());
