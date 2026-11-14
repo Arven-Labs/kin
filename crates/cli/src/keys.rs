@@ -215,7 +215,8 @@ pub fn load(
     params: KdfParams,
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
-    if dir.join(AUTHORITY_KEY_FILE).exists() || dir.join(AUTHORITY_CERT_FILE).exists() {
+    // MUTAÇÃO N4: detecta o primário só pelo authority.key.
+    if dir.join(AUTHORITY_KEY_FILE).exists() {
         return load_primary(dir, pair_text.is_some(), passphrase, protect, params);
     }
     let identity_path = dir.join("identity.key");
