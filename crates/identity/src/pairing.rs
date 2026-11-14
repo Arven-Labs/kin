@@ -5,6 +5,7 @@
 //! nas duas telas) é de quem chama: sem ela, quem intercepta o canal troca o pedido por um seu.
 
 use libp2p_identity::PublicKey;
+use secp256k1::rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::device::{put, take};
@@ -21,8 +22,10 @@ const MAGIC: &[u8; 3] = b"KPR";
 const VERSION: u8 = 1;
 /// Teto do pedido serializado (o real tem ~330 bytes): recusa lixo grande antes de ler.
 const MAX_REQUEST_LEN: usize = 1024;
-/// 10^18: o código tem 18 dígitos (~59,8 bits).
-const SAS_MODULUS: u64 = 1_000_000_000_000_000_000;
+/// Teto de uma prova na construção (Ed25519 e Schnorr têm 64 bytes).
+const MAX_PROOF_LEN: usize = 128;
+/// 10^24: o código tem 24 dígitos (~79,7 bits). Sobre 128 bits do hash, o viés do módulo é ~2^-48.
+const SAS_MODULUS: u128 = 1_000_000_000_000_000_000_000_000;
 
 /// Pedido autoassinado de um device novo. Cada chave assina (com domínio próprio) o conjunto das três
 /// chaves e o nonce: prova de posse, sem a qual alguém poderia pôr a chave de outro no pedido.
@@ -85,9 +88,14 @@ impl PairRequest {
         let network_key = device.public_key();
         let nostr_key = device.nostr_public_key();
         let payload = proof_payload(signing_key, &network_key, &nostr_key, &nonce);
+        let signing_proof = sign_mls(&payload)?;
+        // Uma assinatura de verdade tem 64 bytes; recusar o absurdo evita um panic em `to_bytes`.
+        if signing_proof.len() > MAX_PROOF_LEN {
+            return Err(Error::InvalidPairRequest);
+        }
         Ok(Self {
             signing_key: signing_key.clone(),
-            signing_proof: sign_mls(&payload)?,
+            signing_proof,
             network_proof: device.keypair().sign(&payload)?,
             nostr_proof: device.sign_nostr(&payload),
             network_key,
@@ -98,11 +106,13 @@ impl PairRequest {
 
     /// Como [`Self::new`], mas sorteando o nonce do CSPRNG: é o caminho normal (auditoria da 2c-i, 8).
     pub fn generate(
-        _device: &DeviceKey,
-        _signing_key: &PublicKey,
-        _sign_mls: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
+        device: &DeviceKey,
+        signing_key: &PublicKey,
+        sign_mls: impl FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
     ) -> Result<Self, Error> {
-        todo!("2c: nonce do CSPRNG")
+        let mut nonce = [0u8; PAIR_NONCE_LEN];
+        secp256k1::rand::thread_rng().fill_bytes(&mut nonce);
+        Self::new(device, signing_key, nonce, sign_mls)
     }
 
     /// Lado do device novo: aceita o certificado que voltou só se for da identidade `expected`
@@ -110,14 +120,25 @@ impl PairRequest {
     /// deste pedido. Sem isso o device novo aceitaria a identidade de quem intercepta o canal.
     pub fn accept_certificate(
         &self,
-        _certificate: &DeviceCertificate,
-        _expected: &IdentityId,
+        certificate: &DeviceCertificate,
+        expected: &IdentityId,
     ) -> Result<(), Error> {
-        todo!("2c: conferir cadeia, identidade esperada e chaves")
+        certificate.verify()?;
+        if certificate.identity() != expected
+            || certificate.signing_key != self.signing_key
+            || certificate.network_key != self.network_key
+            || certificate.nostr_key != self.nostr_key
+        {
+            return Err(Error::PairCertificateMismatch);
+        }
+        Ok(())
     }
 
-    /// Confere as três provas de posse. Não diz qual falhou.
+    /// Confere as três provas de posse. Não diz qual falhou. Recusa a mesma chave em dois papéis.
     pub fn verify(&self) -> Result<(), Error> {
+        if self.signing_key == self.network_key {
+            return Err(Error::InvalidPairRequest);
+        }
         let payload = proof_payload(
             &self.signing_key,
             &self.network_key,
@@ -190,9 +211,12 @@ impl PairRequest {
         })
     }
 
-    /// Código de comparação que as duas telas mostram: 18 dígitos em três grupos de seis
-    /// (`123456-123456-123456`, ~60 bits), derivados das chaves, do nonce e da identidade para a qual o
-    /// primário vai certificar. **Não** cobre as provas (a Schnorr pode não ser determinística).
+    /// Código de comparação que as duas telas mostram: 24 dígitos em quatro grupos de seis
+    /// (`123456-123456-123456-123456`, ~80 bits), derivados das chaves, do nonce e da identidade para a
+    /// qual o primário vai certificar. **Não** cobre as provas (a Schnorr não é determinística).
+    ///
+    /// `identity` é a que o device novo recebeu **do primário, fora de banda, antes** de gerar o pedido;
+    /// nunca a do certificado que voltou (quem intercepta escolheria a identidade e o código: achado 1).
     pub fn sas_code(&self, identity: &IdentityId) -> String {
         let hash = Sha256::digest(framed(
             SAS_DOMAIN,
@@ -204,11 +228,17 @@ impl PairRequest {
                 &self.nonce,
             ],
         ));
-        let head: [u8; 8] = hash.as_slice()[..8]
+        let head: [u8; 16] = hash.as_slice()[..16]
             .try_into()
             .expect("SHA-256 tem 32 bytes");
-        let digits = u64::from_be_bytes(head) % SAS_MODULUS;
-        let text = format!("{digits:018}");
-        format!("{}-{}-{}", &text[..6], &text[6..12], &text[12..])
+        let digits = u128::from_be_bytes(head) % SAS_MODULUS;
+        let text = format!("{digits:024}");
+        format!(
+            "{}-{}-{}-{}",
+            &text[..6],
+            &text[6..12],
+            &text[12..18],
+            &text[18..]
+        )
     }
 }

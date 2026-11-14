@@ -199,10 +199,13 @@ impl AuthorityIdentity {
     pub fn answer_pair_request(
         &self,
         request: &PairRequest,
-        _confirmed_sas: &str,
+        confirmed_sas: &str,
         created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
         request.verify()?;
+        if request.sas_code(&self.id()) != confirmed_sas {
+            return Err(Error::InvalidPairRequest);
+        }
         self.authorize_device(
             &request.signing_key,
             &request.network_key,

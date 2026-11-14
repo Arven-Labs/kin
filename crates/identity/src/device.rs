@@ -85,7 +85,7 @@ impl DeviceKey {
     /// para fora do crate (S1, ADR 0013); o pareamento impõe o domínio antes de chamar.
     pub(crate) fn sign_nostr(&self, message: &[u8]) -> Vec<u8> {
         Secp256k1::signing_only()
-            .sign_schnorr_no_aux_rand(message, &self.nostr)
+            .sign_schnorr(message, &self.nostr)
             .to_byte_array()
             .to_vec()
     }
