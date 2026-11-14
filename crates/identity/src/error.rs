@@ -17,6 +17,12 @@ pub enum Error {
     /// Sem detalhe de propósito: o texto veio de fora (digitado ou colado).
     #[error("identidade inválida (esperado o ID em base58 de uma chave Ed25519)")]
     InvalidIdentityId,
+    /// Sem detalhe de propósito: o tombstone pode vir da rede.
+    #[error("tombstone de device inválido")]
+    InvalidRevocation,
+    /// Só se revoga um device da **própria** identidade.
+    #[error("o certificado a revogar é de outra identidade")]
+    RevocationIdentityMismatch,
     #[error("certificado de device inválido")]
     InvalidCertificate,
     /// Sem detalhe de propósito: não dizer qual das três provas de posse falhou.

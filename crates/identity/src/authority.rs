@@ -193,6 +193,22 @@ impl AuthorityIdentity {
         &self.certificate
     }
 
+    /// Revoga `certificate` (P30 3a, ADR 0022): tombstone assinado pela autoridade, com a cadeia dentro.
+    /// Recusa certificado de outra identidade. A autoridade antiga (de antes de um `rotate`) também
+    /// consegue revogar enquanto não for revogada: risco T7 aceito no ADR.
+    pub fn revoke_device(
+        &self,
+        certificate: &DeviceCertificate,
+        revoked_at: u64,
+    ) -> Result<crate::DeviceRevocation, Error> {
+        crate::DeviceRevocation::build(
+            Issuer::Authority(Box::new(self.certificate.clone())),
+            certificate,
+            revoked_at,
+            |payload| Ok(self.key.keypair.sign(payload)?),
+        )
+    }
+
     /// Responde a um pedido de pareamento (P30 2c): confere as três provas de posse e certifica as
     /// chaves do pedido em v4. `confirmed_sas` é o código que a pessoa **leu no device novo e digitou**;
     /// só certifica se for igual a `request.sas_code(&self.id())` (a API não emite sem confirmação).

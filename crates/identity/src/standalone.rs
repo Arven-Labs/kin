@@ -123,6 +123,21 @@ impl StandaloneIdentity {
         })
     }
 
+    /// Revoga `certificate` (P30 3a, ADR 0022): tombstone assinado pela mestra. Recusa certificado de
+    /// outra identidade.
+    pub fn revoke_device(
+        &self,
+        certificate: &DeviceCertificate,
+        revoked_at: u64,
+    ) -> Result<crate::DeviceRevocation, Error> {
+        crate::DeviceRevocation::build(
+            crate::Issuer::Master(self.id()),
+            certificate,
+            revoked_at,
+            |payload| Ok(self.master.sign(payload)?),
+        )
+    }
+
     /// Lê a chave mestra de um arquivo cifrado ou em claro (formato antigo). Cifrado sem senha:
     /// [`Error::PassphraseRequired`]; em claro **com** senha: [`Error::PlainFileWhereSealedExpected`].
     pub fn load_with(path: &Path, passphrase: Option<&[u8]>) -> Result<Self, Error> {
