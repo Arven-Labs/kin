@@ -65,10 +65,7 @@ pub fn ensure_current_issuer(
         LocalIdentity::Paired(_) => {
             return match &in_use.issuer {
                 Issuer::Authority(_) => Ok(()),
-                Issuer::Master(_) => Err(
-                    "o mls.sqlite deste device pareado guarda um certificado assinado pela mestra (v3), não por uma autoridade: use um --data-dir novo e pareie de novo com `kin pair`"
-                        .into(),
-                ),
+                Issuer::Master(_) => Ok(()),
             };
         }
         LocalIdentity::Primary(primary) => primary,
