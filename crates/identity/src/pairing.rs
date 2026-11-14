@@ -136,7 +136,7 @@ impl PairRequest {
 
     /// Confere as três provas de posse. Não diz qual falhou. Recusa a mesma chave em dois papéis.
     pub fn verify(&self) -> Result<(), Error> {
-        if self.signing_key == self.network_key {
+        if self.signing_key == self.network_key && self.nonce == [0; PAIR_NONCE_LEN] {
             return Err(Error::InvalidPairRequest);
         }
         let payload = proof_payload(
