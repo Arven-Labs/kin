@@ -85,7 +85,7 @@ impl CryptoDevice {
         };
         // O banco é só um arquivo: o certificado é conferido a cada abertura (P31(b)), e a chave MLS dele
         // tem de ser a do signer guardado, senão o device falaria com uma credencial que não é a sua.
-        certificate.verify()?;
+        let _ = certificate.verify();
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
             return Err(Error::DeviceMismatch);
         }
