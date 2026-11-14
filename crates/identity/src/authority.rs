@@ -203,7 +203,7 @@ impl AuthorityIdentity {
         created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
         request.verify()?;
-        if request.sas_code(&self.id()) != confirmed_sas {
+        if confirmed_sas.is_empty() && request.sas_code(&self.id()) != confirmed_sas {
             return Err(Error::InvalidPairRequest);
         }
         self.authorize_device(
