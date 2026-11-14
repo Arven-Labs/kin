@@ -14,8 +14,9 @@ use crate::cold::{AUTHORITY_CERT_FILE, AUTHORITY_KEY_FILE};
 /// **primário**, que tem só a chave de autoridade e o certificado dela, sem a mestra.
 pub enum LocalIdentity {
     Master(StandaloneIdentity),
+    /// Em `Box` porque a autoridade (chave + certificado) é bem maior que a mestra.
     #[allow(dead_code)] // stub da etapa de testes; some na implementação
-    Primary(AuthorityIdentity),
+    Primary(Box<AuthorityIdentity>),
 }
 
 impl LocalIdentity {
@@ -27,7 +28,7 @@ impl LocalIdentity {
     pub fn provider(&self) -> &dyn IdentityProvider {
         match self {
             Self::Master(master) => master,
-            Self::Primary(primary) => primary,
+            Self::Primary(primary) => primary.as_ref(),
         }
     }
 
