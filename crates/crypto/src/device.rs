@@ -75,11 +75,44 @@ impl CryptoDevice {
     /// abertura. Falha se o banco não tem certificado ([`Error::NotPaired`]) ou se as chaves de rede ou
     /// Nostr não são as do certificado ([`Error::DeviceMismatch`]).
     pub fn open_paired(
-        _network_key: &PublicKey,
-        _nostr_key: &NostrPublicKey,
-        _path: &std::path::Path,
+        network_key: &PublicKey,
+        nostr_key: &NostrPublicKey,
+        path: &std::path::Path,
     ) -> Result<Self, Error> {
-        todo!("2c-ii: recarregar signer e certificado, verificar")
+        let provider = Provider::open(Some(path))?;
+        let Some((signer, certificate)) = load_signer(&provider)? else {
+            return Err(Error::NotPaired);
+        };
+        // O banco é só um arquivo: o certificado é conferido a cada abertura (P31(b)), e a chave MLS dele
+        // tem de ser a do signer guardado, senão o device falaria com uma credencial que não é a sua.
+        certificate.verify()?;
+        if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
+            return Err(Error::DeviceMismatch);
+        }
+        if certificate.signing_key != public_key_from_ed25519(signer.public())? {
+            return Err(Error::InvalidCredential);
+        }
+        Ok(Self::assemble(provider, signer, certificate))
+    }
+
+    /// Monta o device a partir do que já foi conferido: o signer, o certificado dele e o banco.
+    pub(crate) fn assemble(
+        provider: Provider,
+        signer: SignatureKeyPair,
+        certificate: DeviceCertificate,
+    ) -> Self {
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(certificate.to_bytes()).into(),
+            signature_key: signer.public().into(),
+        };
+        let identity = certificate.identity().clone();
+        Self(Rc::new(Inner {
+            provider,
+            signer,
+            credential,
+            certificate,
+            identity,
+        }))
     }
 
     fn build(
@@ -89,6 +122,11 @@ impl CryptoDevice {
         nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Result<Self, Error> {
+        // Um pedido de pareamento pendente já declarou a chave MLS deste banco: gerar outra por cima a
+        // orfanaria (P30 2c-ii).
+        if provider.meta(META_CERT)?.is_none() && provider.meta(META_REQUEST)?.is_some() {
+            return Err(Error::PairingInProgress);
+        }
         let (signer, certificate) = match load_signer(&provider)? {
             Some(found) => found,
             None => {
@@ -108,17 +146,7 @@ impl CryptoDevice {
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
             return Err(Error::DeviceMismatch);
         }
-        let credential = CredentialWithKey {
-            credential: BasicCredential::new(certificate.to_bytes()).into(),
-            signature_key: signer.public().into(),
-        };
-        Ok(Self(Rc::new(Inner {
-            provider,
-            signer,
-            credential,
-            certificate,
-            identity: identity.id(),
-        })))
+        Ok(Self::assemble(provider, signer, certificate))
     }
 
     /// Guarda que a conversa `conversation_id` pertence a `label` (ex.: um Peer ID), para
@@ -160,8 +188,10 @@ impl CryptoDevice {
     }
 }
 
-const META_SIGNER: &str = "signer_public";
-const META_CERT: &str = "device_certificate";
+pub(crate) const META_SIGNER: &str = "signer_public";
+pub(crate) const META_CERT: &str = "device_certificate";
+/// Pedido de pareamento pendente (P30 2c-ii): existe só enquanto o certificado não chegou.
+pub(crate) const META_REQUEST: &str = "pair_request";
 
 /// Recarrega a chave de assinatura e o certificado salvos, se existirem.
 fn load_signer(

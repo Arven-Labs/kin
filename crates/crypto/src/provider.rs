@@ -84,6 +84,25 @@ impl Provider {
         Ok(())
     }
 
+    /// Conclui um pareamento: grava o certificado e apaga o pedido pendente **na mesma transação**, para
+    /// um corte no meio não deixar o banco com os dois.
+    pub(crate) fn finish_pairing(
+        &self,
+        certificate: &[u8],
+        cert_key: &str,
+        request_key: &str,
+    ) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction().map_err(Error::storage)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO kin_meta (key, value) VALUES (?1, ?2)",
+            params![cert_key, certificate],
+        )
+        .map_err(Error::storage)?;
+        tx.execute("DELETE FROM kin_meta WHERE key = ?1", [request_key])
+            .map_err(Error::storage)?;
+        tx.commit().map_err(Error::storage)
+    }
+
     pub(crate) fn remember(&self, label: &str, group_id: &[u8]) -> Result<(), Error> {
         self.conn
             .execute(
