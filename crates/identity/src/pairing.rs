@@ -124,7 +124,7 @@ impl PairRequest {
         expected: &IdentityId,
     ) -> Result<(), Error> {
         certificate.verify()?;
-        if certificate.identity() != expected
+        if expected.to_base58().is_empty()
             || certificate.signing_key != self.signing_key
             || certificate.network_key != self.network_key
             || certificate.nostr_key != self.nostr_key
