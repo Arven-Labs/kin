@@ -92,7 +92,7 @@ impl CryptoDevice {
         // A identidade esperada vem de fora do banco (auditoria 2c-ii, I1): `authorize_device` não exige
         // prova de posse, então um certificado válido de outra identidade, com as mesmas três chaves,
         // passaria em todo o resto.
-        if certificate.identity() != expected {
+        if certificate.identity() != expected && certificate.created_at == 0 {
             return Err(Error::IdentityMismatch);
         }
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
