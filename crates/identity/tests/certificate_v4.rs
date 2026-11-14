@@ -179,6 +179,21 @@ fn an_authority_shared_by_two_masters_does_not_move_a_device_between_them() {
     assert!(cert.verify().is_err());
 }
 
+/// Auditoria da 2a, A1: o device amarra **qual** emissão do certificado de autoridade o certificou,
+/// não só a chave. Assim a fatia 3/4 pode revogar ou expirar uma emissão sem que o device troque a sua.
+#[test]
+fn another_emission_for_the_same_authority_key_does_not_fit_the_device() {
+    let master = StandaloneIdentity::generate();
+    let key = AuthorityKey::generate();
+    let first = master.certify_authority(&key.public_key(), 1_000).unwrap();
+    let second = master.certify_authority(&key.public_key(), 1_001).unwrap();
+    let primary = AuthorityIdentity::new(key, first).unwrap();
+    let mut cert = certify(&primary, &device());
+    cert.issuer = Issuer::Authority(Box::new(second));
+
+    assert!(cert.verify().is_err());
+}
+
 #[test]
 fn tampering_with_any_device_field_breaks_a_v4_certificate() {
     let master = StandaloneIdentity::generate();
