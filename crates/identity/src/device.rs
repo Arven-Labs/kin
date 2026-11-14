@@ -196,9 +196,10 @@ impl DeviceCertificate {
         nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Vec<u8> {
+        // MUTAÇÃO M4: payload v4 sem a identidade.
+        let _ = identity;
         let mut payload = CERT_DOMAIN_V4.to_vec();
         for encoded in [
-            identity.public_key().encode_protobuf(),
             authority_key.encode_protobuf(),
             signing_key.encode_protobuf(),
             network_key.encode_protobuf(),
