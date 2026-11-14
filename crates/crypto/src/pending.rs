@@ -93,7 +93,7 @@ impl PendingDevice {
     /// antes da criação do pedido o trata como recém-criado.
     fn is_expired(&self, now: u64) -> Result<bool, Error> {
         let Some(raw) = self.provider.meta(META_REQUESTED_AT)? else {
-            return Ok(true);
+            return Ok(false);
         };
         let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) else {
             return Ok(true);
