@@ -72,11 +72,19 @@ impl PendingDevice {
         Ok(request)
     }
 
+    /// Descarta o pedido guardado (a pessoa viu um código diferente, ou desistiu). A chave MLS fica; o
+    /// próximo [`Self::request`] gera um pedido novo, com outro nonce e outro código, e um certificado do
+    /// pedido antigo deixa de valer.
+    pub fn discard_request(&self) -> Result<(), Error> {
+        todo!("2c-ii: apagar o pedido guardado")
+    }
+
     /// Instala o certificado devolvido pelo primário, só se for da identidade `expected` (recebida fora de
     /// banda), válido e das chaves do pedido guardado. Se algo falhar, o banco **continua pendente**: o
     /// certificado e o fim do pedido só são gravados depois de tudo conferido, numa transação.
     pub fn install_certificate(
         self,
+        _device_key: &DeviceKey,
         certificate: &DeviceCertificate,
         expected: &IdentityId,
     ) -> Result<CryptoDevice, Error> {

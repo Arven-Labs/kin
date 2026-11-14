@@ -32,7 +32,9 @@ fn pair(db: &Path, key: &DeviceKey, primary: &AuthorityIdentity) -> CryptoDevice
     let pending = PendingDevice::open(db).unwrap();
     let request = pending.request(key).unwrap();
     let cert = answer(primary, &request);
-    pending.install_certificate(&cert, &primary.id()).unwrap()
+    pending
+        .install_certificate(key, &cert, &primary.id())
+        .unwrap()
 }
 
 /// Um device normal (com a mestra), para conversar com o pareado.
@@ -119,7 +121,9 @@ fn installing_works_after_reopening_the_pending_device() {
     let pending = PendingDevice::open(&db).unwrap();
     assert_eq!(pending.request(&key).unwrap(), request);
 
-    let device = pending.install_certificate(&cert, &primary.id()).unwrap();
+    let device = pending
+        .install_certificate(&key, &cert, &primary.id())
+        .unwrap();
     assert_eq!(device.identity(), &master.id());
 }
 
@@ -172,7 +176,7 @@ fn a_wrong_certificate_is_refused_and_the_database_stays_pending() {
 
     for (what, cert) in wrong_certificates(&request, &primary) {
         let pending = PendingDevice::open(&db).unwrap();
-        let result = pending.install_certificate(&cert, &primary.id());
+        let result = pending.install_certificate(&key, &cert, &primary.id());
         assert!(result.is_err(), "instalou: {what}");
     }
 
@@ -180,7 +184,7 @@ fn a_wrong_certificate_is_refused_and_the_database_stays_pending() {
     let pending = PendingDevice::open(&db).unwrap();
     assert_eq!(pending.request(&key).unwrap(), request);
     let device = pending
-        .install_certificate(&answer(&primary, &request), &primary.id())
+        .install_certificate(&key, &answer(&primary, &request), &primary.id())
         .unwrap();
     assert_eq!(device.identity(), &master.id());
 }
@@ -190,13 +194,76 @@ fn a_certificate_of_another_expected_identity_is_refused() {
     let master = StandaloneIdentity::generate();
     let primary = primary_of(&master);
     let dir = tempfile::tempdir().unwrap();
+    let key = DeviceKey::generate();
     let pending = PendingDevice::open(&db_in(&dir, "new.db")).unwrap();
-    let request = pending.request(&DeviceKey::generate()).unwrap();
+    let request = pending.request(&key).unwrap();
     let cert = answer(&primary, &request);
 
     // o certificado é bom, mas a pessoa esperava outra identidade
     let expected = StandaloneIdentity::generate().id();
-    assert!(pending.install_certificate(&cert, &expected).is_err());
+    assert!(pending.install_certificate(&key, &cert, &expected).is_err());
+}
+
+/// Auditoria 2c-ii, I2: o pedido guardado é de uma `device.key`; se a que está em uso agora é outra
+/// (regenerada ou restaurada), instalar deixaria o banco pareado com chaves que o device não tem.
+#[test]
+fn installing_with_another_device_key_is_refused_and_the_database_stays_pending() {
+    let primary = primary_of(&StandaloneIdentity::generate());
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+    let pending = PendingDevice::open(&db).unwrap();
+    let request = pending.request(&key).unwrap();
+    let cert = answer(&primary, &request);
+
+    let other = DeviceKey::generate();
+    assert!(matches!(
+        pending.install_certificate(&other, &cert, &primary.id()),
+        Err(Error::DeviceMismatch)
+    ));
+
+    // segue pendente, e com a chave certa ainda instala
+    let pending = PendingDevice::open(&db).unwrap();
+    assert_eq!(pending.request(&key).unwrap(), request);
+    pending
+        .install_certificate(&key, &cert, &primary.id())
+        .unwrap();
+}
+
+// ---- descartar o pedido (auditoria 2c-ii, S4) ----
+
+/// A pessoa viu um código diferente no primário e desistiu: o pedido some, o próximo é outro, e o
+/// certificado do pedido antigo não serve mais.
+#[test]
+fn a_discarded_request_is_replaced_and_its_certificate_stops_working() {
+    let primary = primary_of(&StandaloneIdentity::generate());
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+    let pending = PendingDevice::open(&db).unwrap();
+    let old = pending.request(&key).unwrap();
+    let old_cert = answer(&primary, &old);
+
+    pending.discard_request().unwrap();
+    let new = pending.request(&key).unwrap();
+
+    new.verify().unwrap();
+    assert_ne!(new.nonce, old.nonce);
+    assert_ne!(new.sas_code(&primary.id()), old.sas_code(&primary.id()));
+    assert_eq!(new.signing_key, old.signing_key, "a chave MLS é a mesma");
+    assert!(
+        pending
+            .install_certificate(&key, &old_cert, &primary.id())
+            .is_err()
+    );
+}
+
+#[test]
+fn discarding_without_a_request_is_harmless() {
+    let dir = tempfile::tempdir().unwrap();
+    let pending = PendingDevice::open(&db_in(&dir, "new.db")).unwrap();
+    pending.discard_request().unwrap();
+    pending.request(&DeviceKey::generate()).unwrap();
 }
 
 #[test]
@@ -210,7 +277,7 @@ fn installing_without_a_request_is_an_error() {
 
     let empty = PendingDevice::open(&db_in(&dir, "empty.db")).unwrap();
     assert!(matches!(
-        empty.install_certificate(&cert, &primary.id()),
+        empty.install_certificate(&DeviceKey::generate(), &cert, &primary.id()),
         Err(Error::NotPending)
     ));
 }
@@ -237,8 +304,13 @@ fn a_paired_device_reopens_without_an_identity_provider_and_keeps_its_conversati
         (paired.certificate().clone(), on_paired.id())
     };
 
-    let reopened =
-        CryptoDevice::open_paired(&key.public_key(), &key.nostr_public_key(), &db).unwrap();
+    let reopened = CryptoDevice::open_paired(
+        &master.id(),
+        &key.public_key(),
+        &key.nostr_public_key(),
+        &db,
+    )
+    .unwrap();
     assert_eq!(reopened.certificate(), &cert);
     assert_eq!(reopened.identity(), &master.id());
     assert!(Conversation::load(&reopened, &id).unwrap().is_some());
@@ -264,6 +336,7 @@ fn open_paired_refuses_a_pending_or_empty_database() {
     let dir = tempfile::tempdir().unwrap();
     let key = DeviceKey::generate();
     let (net, nostr) = (key.public_key(), key.nostr_public_key());
+    let who = StandaloneIdentity::generate().id();
 
     let pending_db = db_in(&dir, "pending.db");
     PendingDevice::open(&pending_db)
@@ -271,12 +344,12 @@ fn open_paired_refuses_a_pending_or_empty_database() {
         .request(&key)
         .unwrap();
     assert!(matches!(
-        CryptoDevice::open_paired(&net, &nostr, &pending_db),
+        CryptoDevice::open_paired(&who, &net, &nostr, &pending_db),
         Err(Error::NotPaired)
     ));
 
     assert!(matches!(
-        CryptoDevice::open_paired(&net, &nostr, &db_in(&dir, "empty.db")),
+        CryptoDevice::open_paired(&who, &net, &nostr, &db_in(&dir, "empty.db")),
         Err(Error::NotPaired)
     ));
 }
@@ -289,15 +362,52 @@ fn open_paired_refuses_other_network_or_nostr_keys() {
     let key = DeviceKey::generate();
     let _ = pair(&db, &key, &primary);
     let other = DeviceKey::generate();
+    let me = primary.id();
 
     assert!(matches!(
-        CryptoDevice::open_paired(&other.public_key(), &key.nostr_public_key(), &db),
+        CryptoDevice::open_paired(&me, &other.public_key(), &key.nostr_public_key(), &db),
         Err(Error::DeviceMismatch)
     ));
     assert!(matches!(
-        CryptoDevice::open_paired(&key.public_key(), &other.nostr_public_key(), &db),
+        CryptoDevice::open_paired(&me, &key.public_key(), &other.nostr_public_key(), &db),
         Err(Error::DeviceMismatch)
     ));
+}
+
+/// Auditoria 2c-ii, I1: um certificado **válido** de outra identidade, para as mesmas três chaves,
+/// colocado no banco. `authorize_device` não exige prova de posse, então qualquer um o emite. Sem fixar a
+/// identidade esperada (guardada fora do banco), a reabertura o aceitaria.
+#[test]
+fn open_paired_refuses_a_certificate_of_another_identity_for_the_same_keys() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+    let paired = pair(&db, &key, &primary);
+    let mls = paired.certificate().signing_key.clone();
+    drop(paired);
+
+    let intruder = StandaloneIdentity::generate();
+    let forged = intruder
+        .authorize_device(&mls, &key.public_key(), &key.nostr_public_key(), 2_000)
+        .unwrap();
+    forged.verify().unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE kin_meta SET value = ?1 WHERE key = 'device_certificate'",
+        [forged.to_bytes()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let result = CryptoDevice::open_paired(
+        &master.id(),
+        &key.public_key(),
+        &key.nostr_public_key(),
+        &db,
+    );
+    assert!(matches!(result, Err(Error::IdentityMismatch)));
 }
 
 /// P31(b): o certificado do banco é verificado a cada abertura, e a chave MLS dele é a do signer.
@@ -330,7 +440,7 @@ fn open_paired_refuses_a_tampered_or_swapped_certificate_in_the_database() {
         cert.signature[0] ^= 1;
         cert.to_bytes()
     });
-    assert!(CryptoDevice::open_paired(&net, &nostr, &broken).is_err());
+    assert!(CryptoDevice::open_paired(&master.id(), &net, &nostr, &broken).is_err());
 
     // certificado válido, das mesmas chaves de rede e Nostr, mas de outra chave MLS
     let other_mls = DeviceKey::generate();
@@ -340,7 +450,7 @@ fn open_paired_refuses_a_tampered_or_swapped_certificate_in_the_database() {
             .unwrap()
             .to_bytes()
     });
-    assert!(CryptoDevice::open_paired(&net, &nostr, &swapped).is_err());
+    assert!(CryptoDevice::open_paired(&master.id(), &net, &nostr, &swapped).is_err());
 }
 
 /// O pedido só existe enquanto o certificado não chegou: pareado, o banco não o guarda mais.

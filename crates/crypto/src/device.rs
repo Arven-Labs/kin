@@ -75,6 +75,7 @@ impl CryptoDevice {
     /// abertura. Falha se o banco não tem certificado ([`Error::NotPaired`]) ou se as chaves de rede ou
     /// Nostr não são as do certificado ([`Error::DeviceMismatch`]).
     pub fn open_paired(
+        _expected: &IdentityId,
         network_key: &PublicKey,
         nostr_key: &NostrPublicKey,
         path: &std::path::Path,
