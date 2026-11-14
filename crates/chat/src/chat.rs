@@ -383,6 +383,37 @@ impl Chat {
             db,
             now_secs(),
         )?;
+        Self::open_with_device(device, device_key, config, db)
+    }
+
+    /// Chat persistente de um device **pareado** (P30 fatia 2d-i): sem mestra nem autoridade, só com o
+    /// certificado v4 que o primário emitiu e que já está no banco `db` (ver `PendingDevice`).
+    /// `expected` é a identidade do primário, recebida fora de banda e guardada **fora** do banco: o
+    /// certificado é conferido contra ela a cada abertura (ADR 0017). **Atenção**: não exige que o emissor
+    /// seja uma autoridade; um banco criado pela mestra (certificado v3) também abre se a identidade bater
+    /// (o trinco v4 vs v3 é da fatia 3, P31(o)).
+    pub fn open_paired(
+        expected: &IdentityId,
+        device_key: &DeviceKey,
+        config: NodeConfig,
+        db: &Path,
+    ) -> Result<Self, Error> {
+        let device = CryptoDevice::open_paired(
+            expected,
+            &device_key.public_key(),
+            &device_key.nostr_public_key(),
+            db,
+        )?;
+        Self::open_with_device(device, device_key, config, db)
+    }
+
+    /// O que `open` e `open_paired` têm em comum: outbox, confiança e conversas recarregadas do banco.
+    fn open_with_device(
+        device: CryptoDevice,
+        device_key: &DeviceKey,
+        config: NodeConfig,
+        db: &Path,
+    ) -> Result<Self, Error> {
         // A outbox fica num arquivo ao lado do banco do `crypto` (`a.db` → `a.outbox.db`).
         let outbox = Outbox::open(&db.with_extension("outbox.db"))?;
         let mut chat = Self::with_device(device, device_key, config, outbox)?;
