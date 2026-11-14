@@ -136,14 +136,15 @@ impl DeviceKey {
     }
 }
 
-/// Quem assinou um [`DeviceCertificate`].
+/// Quem assinou um [`DeviceCertificate`]. A identidade do certificado sai daqui (P31(a)): não há um
+/// segundo campo que possa discordar do emissor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Issuer {
-    /// A própria mestra (formato v3, o de todos os devices até o P30).
-    Master,
+    /// A própria mestra, que é a identidade (formato v3, o de todos os devices até o P30).
+    Master(IdentityId),
     /// A chave de autoridade, com o certificado que a mestra deu a ela (formato v4, P30 fatia 2a,
-    /// ADR 0014). A cadeia viaja dentro do certificado do device: verificar não depende de estado.
-    /// Em `Box` porque o certificado de autoridade é grande e o `Master` não carrega nada.
+    /// ADR 0014); a identidade é a do certificado de autoridade. A cadeia viaja dentro do certificado
+    /// do device: verificar não depende de estado. Em `Box` porque o certificado de autoridade é grande.
     Authority(Box<AuthorityCertificate>),
 }
 
@@ -151,8 +152,7 @@ pub enum Issuer {
 /// a de assinatura MLS, a de rede (libp2p, de onde sai o Peer ID) e a Nostr, ligando-as (P15, ADR 0004).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceCertificate {
-    pub identity: IdentityId,
-    /// Quem assinou: a mestra (v3) ou a autoridade certificada por ela (v4).
+    /// Quem assinou: a mestra (v3) ou a autoridade certificada por ela (v4). Define a identidade.
     pub issuer: Issuer,
     /// Chave de assinatura MLS do device.
     pub signing_key: PublicKey,
@@ -165,6 +165,14 @@ pub struct DeviceCertificate {
 }
 
 impl DeviceCertificate {
+    /// A identidade dona do device: a mestra (v3) ou a identidade da cadeia (v4).
+    pub fn identity(&self) -> &IdentityId {
+        match &self.issuer {
+            Issuer::Master(identity) => identity,
+            Issuer::Authority(authority) => &authority.identity,
+        }
+    }
+
     /// Bytes que a identidade assina (com separador de domínio para evitar reuso da assinatura).
     pub(crate) fn signing_payload(
         signing_key: &PublicKey,
@@ -215,35 +223,35 @@ impl DeviceCertificate {
     }
 
     /// Confere a assinatura do certificado. No v4, confere a cadeia inteira: a mestra assinou a
-    /// autoridade, a identidade da cadeia é a do certificado, e a autoridade assinou o device.
+    /// autoridade, e a autoridade assinou o device em nome da identidade da cadeia.
     pub fn verify(&self) -> Result<(), Error> {
-        if let Issuer::Authority(authority) = &self.issuer {
-            authority.verify().map_err(|_| Error::InvalidCertificate)?;
-            if authority.identity != self.identity {
-                return Err(Error::InvalidCertificate);
+        let identity = match &self.issuer {
+            Issuer::Master(identity) => identity,
+            Issuer::Authority(authority) => {
+                authority.verify().map_err(|_| Error::InvalidCertificate)?;
+                let payload = Self::signing_payload_v4(
+                    &authority.identity,
+                    &authority.authority_key,
+                    authority.created_at,
+                    &self.signing_key,
+                    &self.network_key,
+                    &self.nostr_key,
+                    self.created_at,
+                );
+                return if authority.authority_key.verify(&payload, &self.signature) {
+                    Ok(())
+                } else {
+                    Err(Error::InvalidCertificate)
+                };
             }
-            let payload = Self::signing_payload_v4(
-                &self.identity,
-                &authority.authority_key,
-                authority.created_at,
-                &self.signing_key,
-                &self.network_key,
-                &self.nostr_key,
-                self.created_at,
-            );
-            return if authority.authority_key.verify(&payload, &self.signature) {
-                Ok(())
-            } else {
-                Err(Error::InvalidCertificate)
-            };
-        }
+        };
         let payload = Self::signing_payload(
             &self.signing_key,
             &self.network_key,
             &self.nostr_key,
             self.created_at,
         );
-        if self.identity.public_key().verify(&payload, &self.signature) {
+        if identity.public_key().verify(&payload, &self.signature) {
             Ok(())
         } else {
             Err(Error::InvalidCertificate)
@@ -258,7 +266,7 @@ impl DeviceCertificate {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match &self.issuer {
-            Issuer::Master => put(&mut out, &self.identity.public_key().encode_protobuf()),
+            Issuer::Master(identity) => put(&mut out, &identity.public_key().encode_protobuf()),
             Issuer::Authority(authority) => {
                 out.extend_from_slice(V4_MAGIC);
                 out.push(V4_VERSION);
@@ -276,21 +284,18 @@ impl DeviceCertificate {
     /// Lê um certificado serializado por [`Self::to_bytes`]. Não confere a assinatura: use `verify`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let mut cur = bytes;
-        let (identity, issuer) = match bytes.strip_prefix(V4_MAGIC.as_slice()) {
+        let issuer = match bytes.strip_prefix(V4_MAGIC.as_slice()) {
             Some(rest) => {
                 cur = rest
                     .strip_prefix(&[V4_VERSION])
                     .ok_or(Error::InvalidCertificate)?;
                 let authority = AuthorityCertificate::from_bytes(take(&mut cur)?)
                     .map_err(|_| Error::InvalidCertificate)?;
-                (
-                    authority.identity.clone(),
-                    Issuer::Authority(Box::new(authority)),
-                )
+                Issuer::Authority(Box::new(authority))
             }
             None => {
                 let identity = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
-                (IdentityId::new(identity), Issuer::Master)
+                Issuer::Master(IdentityId::new(identity))
             }
         };
         let signing_key = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
@@ -309,7 +314,6 @@ impl DeviceCertificate {
             return Err(Error::InvalidCertificate);
         }
         Ok(Self {
-            identity,
             issuer,
             signing_key,
             network_key,

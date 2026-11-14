@@ -206,9 +206,8 @@ impl IdentityProvider for AuthorityIdentity {
         nostr_key: &NostrPublicKey,
         created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
-        let identity = self.certificate.identity.clone();
         let payload = DeviceCertificate::signing_payload_v4(
-            &identity,
+            &self.certificate.identity,
             &self.certificate.authority_key,
             self.certificate.created_at,
             signing_key,
@@ -217,7 +216,6 @@ impl IdentityProvider for AuthorityIdentity {
             created_at,
         );
         Ok(DeviceCertificate {
-            identity,
             issuer: Issuer::Authority(Box::new(self.certificate.clone())),
             signing_key: signing_key.clone(),
             network_key: network_key.clone(),
@@ -244,7 +242,9 @@ mod tests {
     // ---- certificado de device v4 (fatia 2a) ----
 
     /// O ataque que a API pública não deixa montar: quem tem uma autoridade certificada por **outra**
-    /// mestra assina, com a chave crua, um payload v4 que já diz "a identidade é a vítima".
+    /// mestra assina, com a chave crua, um payload v4 que já diz "a identidade é a vítima". Com a
+    /// identidade derivada da cadeia (P31(a)), o certificado nem consegue dizer "vítima": ele é do
+    /// intruso, e a assinatura (feita sobre "vítima") não confere.
     #[test]
     fn an_intruder_authority_cannot_claim_another_identity_even_signing_the_right_payload() {
         let victim = StandaloneIdentity::generate();
@@ -262,7 +262,6 @@ mod tests {
             2_000,
         );
         let cert = DeviceCertificate {
-            identity: victim.id(),
             issuer: crate::Issuer::Authority(Box::new(chain)),
             signing_key: d.public_key(),
             network_key: d.public_key(),
@@ -271,6 +270,7 @@ mod tests {
             signature: key.keypair.sign(&payload).unwrap(),
         };
 
+        assert_eq!(cert.identity(), &intruder.id());
         assert!(cert.verify().is_err());
     }
 

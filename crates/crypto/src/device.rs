@@ -89,7 +89,7 @@ impl CryptoDevice {
                 (signer, certificate)
             }
         };
-        if certificate.identity != identity.id() {
+        if *certificate.identity() != identity.id() {
             return Err(Error::IdentityMismatch);
         }
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {

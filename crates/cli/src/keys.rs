@@ -54,7 +54,7 @@ pub fn ensure_current_issuer(
     };
     match &in_use.issuer {
         Issuer::Authority(authority) if **authority == *primary.certificate() => Ok(()),
-        Issuer::Master => Err(
+        Issuer::Master(_) => Err(
             "o mls.sqlite deste primário guarda um certificado de device assinado pela mestra (de quando ela estava aqui): use um --data-dir novo para o primário"
                 .into(),
         ),
@@ -820,7 +820,7 @@ mod tests {
             .unwrap();
 
         cert.verify().unwrap();
-        assert_eq!(cert.identity, identity);
+        assert_eq!(cert.identity(), &identity);
         assert!(matches!(cert.issuer, kin_identity::Issuer::Authority(_)));
     }
 

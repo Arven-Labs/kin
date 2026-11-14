@@ -13,7 +13,7 @@ fn device_certificate_verifies() {
         )
         .unwrap();
     cert.verify().unwrap();
-    assert_eq!(cert.identity, id.id());
+    assert_eq!(cert.identity(), &id.id());
     assert_eq!(cert.signing_key, mls.public_key());
     assert_eq!(cert.network_peer_id(), device.peer_id());
 }
@@ -34,7 +34,7 @@ fn certificate_from_another_identity_or_tampered_fails() {
     assert!(cert.verify().is_err());
 
     let mut forged = issue();
-    forged.identity = other.id();
+    forged.issuer = kin_identity::Issuer::Master(other.id());
     assert!(forged.verify().is_err());
 
     let mut swapped = issue();
@@ -231,7 +231,7 @@ mod pair_link {
                 1_000,
             )
             .unwrap();
-        cert.identity = original.id();
+        cert.issuer = kin_identity::Issuer::Master(original.id());
         cert.verify().unwrap();
     }
 
