@@ -46,7 +46,7 @@ pub(crate) fn verify(
 
 /// Lê a identidade de uma credencial já validada pelo MLS (sem rechecar a chave do membro).
 pub(crate) fn identity_of(credential: &Credential) -> Result<IdentityId, Error> {
-    Ok(parse(credential)?.identity)
+    Ok(parse(credential)?.identity().clone())
 }
 
 /// Lê o Peer ID de rede certificado numa credencial já validada pelo MLS.
