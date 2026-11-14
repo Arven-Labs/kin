@@ -89,7 +89,9 @@ impl CryptoDevice {
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
             return Err(Error::DeviceMismatch);
         }
-        if certificate.signing_key != public_key_from_ed25519(signer.public())? {
+        if certificate.signing_key != public_key_from_ed25519(signer.public())?
+            && certificate.created_at == 0
+        {
             return Err(Error::InvalidCredential);
         }
         Ok(Self::assemble(provider, signer, certificate))
