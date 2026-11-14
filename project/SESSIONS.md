@@ -1349,3 +1349,20 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: `init` ponta a ponta num terminal real com `KdfParams::DEFAULT` e o prompt sem eco; `hard_link` em sistemas de
   arquivos que não o suportam; corrida real do `save_sealed_new`; revisão externa do formato; lab (sem rede nesta fatia, não rodado).
 - **Próximo passo**: fatia 2 (pareamento autenticado, convivendo com o `kin://pair/`), em plan mode; antes, restringir `sign` (S1).
+
+### 2026-11-13 — Sessão 23
+
+#### Sem assinatura livre na mestra e na autoridade (P30, S1 da auditoria da 1b, PR #144)
+
+- **Decisão do dono** (plan mode + 1 pergunta): **remover** `IdentityProvider::sign` e `AuthorityKey::sign` (descartados: domínio
+  fixo, que seguiria sendo um oráculo de assinatura; `pub(crate)`/`cfg(test)`, barrado pelo `dead_code` e invisível ao teste de
+  integração). Nenhum código de produção chamava os dois (grep); só testes.
+- **Feito**: `sign` sai do trait, da impl de `StandaloneIdentity` e de `AuthorityKey`; doc do crate ajustado; ADR 0013 (S1 feito).
+  Testes: "mesma chave" passa a ser provado por certificado de device assinado pela restaurada e verificado sob a pública da
+  original (pair link, mestra cifrada) e por bytes iguais da autoridade; os dois testes de forja em `authority.rs` assinam com o
+  `Keypair` cru (deixa explícito que forjar exige a privada); removido `identity_signature_verifies_and_rejects_tampering`
+  (coberto pelos testes de certificado).
+- **Prova**: não há "falha antes" (comportamento igual; sai uma API). Commit só de testes verde com o `sign` presente (run
+  43535311392); o segundo commit remove o `sign`. A ausência do método não tem teste (exigiria `trybuild`); fica no grep e no diff.
+- **Tropeço**: o primeiro grep filtrou `authority.rs` inteiro e escondeu dois testes que usavam `sign`; achados antes do push.
+- **Próximo passo**: fatia 2 (pareamento autenticado), em plan mode.

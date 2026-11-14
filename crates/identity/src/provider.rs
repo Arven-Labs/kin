@@ -30,8 +30,8 @@ pub trait IdentityProvider {
     /// ID estável da identidade.
     fn id(&self) -> IdentityId;
 
-    /// Assina `message` com a chave da identidade.
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error>;
+    // Sem `sign` livre (auditoria da fatia 1b, S1, ADR 0013): a chave da identidade só assina por
+    // métodos com domínio, como este, para ninguém obter dela uma assinatura sobre bytes escolhidos.
 
     /// Autoriza um device ("este device pertence a esta identidade"), certificando a chave de
     /// assinatura MLS, a chave de rede e a chave Nostr juntas.

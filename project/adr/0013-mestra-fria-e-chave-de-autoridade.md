@@ -58,7 +58,6 @@ rotaciona a autoridade **sem mudar o `IdentityId`** (contatos, `trust`, lista ne
 - A garantia de `hard_link` em sistemas de arquivos sem suporte (FAT, alguns de rede): falha em vez de substituir, mas não testei.
 - O prompt sem eco e o `init` ponta a ponta com `KdfParams::DEFAULT` num terminal real (os testes usam `MIN`).
 - Zeroização é melhor esforço (ressalvas do ADR 0012; `to_bytes` devolve `Vec<u8>` simples).
-- Se `IdentityProvider::sign` (assinatura livre da mestra) é chamado fora de `crates/` ou de testes.
 
 ## Parecer do `security-auditor` e como foi tratado
 
@@ -69,7 +68,7 @@ Sem críticos; a separação de domínios foi confirmada correta (nenhum domíni
 | I1: "mestra dentro do diretório do primário" comparava só componentes (`..`, link e `./` contornavam) | importante | `resolve` canonicaliza o ancestral existente e normaliza o resto; testes com `..` e symlink |
 | I2: "não sobrescrevo" com corrida (`exists()` e depois `rename`) | importante | `save_sealed_new` por `hard_link`; testes de que não substitui e não deixa temporário |
 | I3: falha parcial no `init` (mestra sem autoridade, chave sem cert; senha vazia pela API pública) | importante | senha vazia recusada antes de escrever; limpeza da `authority.key`; erro cita a mestra |
-| S1: `sign` livre na mestra e na autoridade | sugestão | **pendência**: a mestra nunca deve assinar bytes não estruturados; `sign` vira restrito antes da fatia 2 |
+| S1: `sign` livre na mestra e na autoridade | sugestão | **feito na Sessão 23 (PR #144)**: `IdentityProvider::sign` e `AuthorityKey::sign` removidos (decisão do dono; descartados domínio fixo e `pub(crate)`); a mestra e a autoridade só assinam por métodos com domínio |
 | S2: sem magic e versão | sugestão | decisão do dono: `KAUT` + versão 1 |
 | S3: aceita chaves que não são Ed25519 | sugestão | **sem efeito nesta build** (só a feature `ed25519` do `libp2p-identity`): outro tipo nem decodifica; sem teste possível |
 | S4: maleabilidade dos bytes (campos desconhecidos no protobuf) | sugestão | **pendência**: só importa se alguém usar hash dos bytes como identidade do certificado |

@@ -135,10 +135,6 @@ impl IdentityProvider for StandaloneIdentity {
         IdentityId::new(self.master.public())
     }
 
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(self.master.sign(message)?)
-    }
-
     fn authorize_device(
         &self,
         signing_key: &PublicKey,

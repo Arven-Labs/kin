@@ -1,7 +1,7 @@
 //! Identidade com provedores (D7): standalone e TruthID opcional, chaves de device, Peer ID.
 //!
-//! O resto do Kin só enxerga [`IdentityProvider`]: um ID estável, a capacidade de assinar e a
-//! autorização de devices. Quem está por trás (keypair local, TruthID) é detalhe do provedor.
+//! O resto do Kin só enxerga [`IdentityProvider`]: um ID estável e a autorização de devices. A chave
+//! da identidade não assina bytes livres, só formatos com domínio (S1, ADR 0013). Quem está por trás (keypair local, TruthID) é detalhe do provedor.
 
 mod authority;
 mod device;
