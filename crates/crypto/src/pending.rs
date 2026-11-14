@@ -98,7 +98,7 @@ impl PendingDevice {
         let Ok(bytes) = <[u8; 8]>::try_from(raw.as_slice()) else {
             return Ok(true);
         };
-        Ok(now.saturating_sub(u64::from_be_bytes(bytes)) > PAIR_REQUEST_TTL_SECS)
+        Ok(now.saturating_sub(u64::from_be_bytes(bytes)) >= PAIR_REQUEST_TTL_SECS)
     }
 
     /// Descarta o pedido guardado (a pessoa viu um código diferente, ou desistiu). A chave MLS fica; o
