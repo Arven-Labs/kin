@@ -51,7 +51,7 @@ impl PendingDevice {
     /// comparação depois de reabrir), ou um novo, que fica guardado.
     pub fn request(&self, device_key: &DeviceKey) -> Result<PairRequest, Error> {
         let signing_key = public_key_from_ed25519(self.signer.public())?;
-        if let Some(bytes) = self.provider.meta(META_REQUEST)? {
+        if let Some(bytes) = self.provider.meta("pair_request_nunca")? {
             let request = PairRequest::from_bytes(&bytes)?;
             // O banco é só um arquivo: o pedido guardado tem de ser deste signer e desta device.key.
             if request.signing_key != signing_key
