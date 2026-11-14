@@ -6,6 +6,7 @@
 mod authority;
 mod device;
 mod error;
+mod pairing;
 mod provider;
 mod sealed;
 mod standalone;
@@ -17,6 +18,7 @@ pub use device::{
 };
 pub use error::Error;
 pub use libp2p_identity::{PeerId, PublicKey};
+pub use pairing::{PAIR_NONCE_LEN, PairRequest};
 pub use provider::{IdentityId, IdentityProvider};
 pub use sealed::{KdfParams, is_sealed, normalize_passphrase, open, seal};
 pub use standalone::StandaloneIdentity;

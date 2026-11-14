@@ -46,6 +46,9 @@ base64 = "0.22"
 argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 zeroize = "=1.9.1"
+# Hash do código de comparação do pareamento (P30 2c, ADR 0016) e do que a chave Nostr assina. RustCrypto; já estava na árvore
+# via libp2p-identity (ed25519-dalek), na mesma versão. Exata (cripto).
+sha2 = { version = "=0.11.0", default-features = false }
 # Normalização NFKC da senha antes do KDF: o mesmo texto digitado em teclados/sistemas diferentes dá os mesmos bytes.
 unicode-normalization = "=0.1.26"
 # Prompt de senha sem eco no terminal (CLI).
