@@ -34,6 +34,16 @@ impl NostrPublicKey {
     pub fn to_bytes(&self) -> [u8; 32] {
         self.0.serialize()
     }
+
+    /// Confere uma assinatura Schnorr (BIP-340) de 64 bytes sobre `message`. Só o pareamento a usa.
+    pub(crate) fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        let Ok(signature) = secp256k1::schnorr::Signature::from_slice(signature) else {
+            return false;
+        };
+        Secp256k1::verification_only()
+            .verify_schnorr(&signature, message, &self.0)
+            .is_ok()
+    }
 }
 
 /// Chaves de um device: a de rede (Ed25519, de onde sai o Peer ID) e a Nostr (Schnorr secp256k1).
@@ -69,6 +79,15 @@ impl DeviceKey {
     /// tratá-la como segredo: nunca registrar, nunca serializar fora do `device.key`.
     pub fn nostr_secret_bytes(&self) -> [u8; 32] {
         self.nostr.secret_bytes()
+    }
+
+    /// Assinatura Schnorr da chave Nostr sobre `message`. `pub(crate)`: a chave não assina bytes livres
+    /// para fora do crate (S1, ADR 0013); o pareamento impõe o domínio antes de chamar.
+    pub(crate) fn sign_nostr(&self, message: &[u8]) -> Vec<u8> {
+        Secp256k1::signing_only()
+            .sign_schnorr_no_aux_rand(message, &self.nostr)
+            .serialize()
+            .to_vec()
     }
 
     /// Acesso ao keypair para o transporte (libp2p) assinar o handshake.

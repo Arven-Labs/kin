@@ -197,10 +197,16 @@ impl AuthorityIdentity {
     /// chaves do pedido em v4. A confirmação humana (comparar o `sas_code`) é de quem chama.
     pub fn answer_pair_request(
         &self,
-        _request: &PairRequest,
-        _created_at: u64,
+        request: &PairRequest,
+        created_at: u64,
     ) -> Result<DeviceCertificate, Error> {
-        todo!("2c: verificar o pedido e certificar")
+        request.verify()?;
+        self.authorize_device(
+            &request.signing_key,
+            &request.network_key,
+            &request.nostr_key,
+            created_at,
+        )
     }
 }
 

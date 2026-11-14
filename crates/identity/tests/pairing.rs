@@ -205,11 +205,11 @@ fn is_sas_format(code: &str) -> bool {
     groups.len() == 3
         && groups
             .iter()
-            .all(|g| g.len() == 4 && g.bytes().all(|b| b.is_ascii_digit()))
+            .all(|g| g.len() == 6 && g.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[test]
-fn the_sas_code_has_twelve_digits_in_three_groups() {
+fn the_sas_code_has_eighteen_digits_in_three_groups() {
     let request = request_of(&new_device(), NONCE);
     let identity = StandaloneIdentity::generate().id();
     let code = request.sas_code(&identity);
