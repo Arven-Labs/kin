@@ -20,6 +20,8 @@ pub enum Error {
     InvalidAuthorityCertificate,
     #[error("arquivo de chave de autoridade inválido")]
     InvalidAuthorityKey,
+    #[error("a chave de autoridade não é a do certificado de autoridade")]
+    AuthorityKeyMismatch,
     /// Senha errada e arquivo adulterado são **o mesmo erro** de propósito: distinguir os dois seria um oráculo.
     #[error("senha errada ou arquivo de chave corrompido")]
     WrongPassphraseOrCorrupt,

@@ -11,9 +11,9 @@ mod sealed;
 mod standalone;
 mod store;
 
-pub use authority::{AuthorityCertificate, AuthorityKey};
+pub use authority::{AuthorityCertificate, AuthorityIdentity, AuthorityKey};
 pub use device::{
-    DeviceCertificate, DeviceKey, NostrPublicKey, ed25519_bytes, public_key_from_ed25519,
+    DeviceCertificate, DeviceKey, Issuer, NostrPublicKey, ed25519_bytes, public_key_from_ed25519,
 };
 pub use error::Error;
 pub use libp2p_identity::{PeerId, PublicKey};

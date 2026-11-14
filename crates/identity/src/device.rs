@@ -3,7 +3,7 @@ use std::path::Path;
 use libp2p_identity::{Keypair, PeerId, PublicKey};
 use secp256k1::{Keypair as SchnorrKeypair, Secp256k1, XOnlyPublicKey};
 
-use crate::{Error, IdentityId, KdfParams, store};
+use crate::{AuthorityCertificate, Error, IdentityId, KdfParams, store};
 
 const CERT_DOMAIN: &[u8] = b"kin/device-cert/v3";
 
@@ -130,11 +130,23 @@ impl DeviceKey {
     }
 }
 
+/// Quem assinou um [`DeviceCertificate`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Issuer {
+    /// A própria mestra (formato v3, o de todos os devices até o P30).
+    Master,
+    /// A chave de autoridade, com o certificado que a mestra deu a ela (formato v4, P30 fatia 2a,
+    /// ADR 0014). A cadeia viaja dentro do certificado do device: verificar não depende de estado.
+    Authority(AuthorityCertificate),
+}
+
 /// Prova assinada pela identidade de que um device lhe pertence. Cobre as três chaves do device:
 /// a de assinatura MLS, a de rede (libp2p, de onde sai o Peer ID) e a Nostr, ligando-as (P15, ADR 0004).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceCertificate {
     pub identity: IdentityId,
+    /// Quem assinou: a mestra (v3) ou a autoridade certificada por ela (v4).
+    pub issuer: Issuer,
     /// Chave de assinatura MLS do device.
     pub signing_key: PublicKey,
     /// Chave de rede do device (a mesma do [`DeviceKey`]).
@@ -167,8 +179,33 @@ impl DeviceCertificate {
         payload
     }
 
-    /// Confere a assinatura do certificado.
+    /// Bytes que a autoridade assina no v4: domínio próprio, a identidade e a chave de autoridade
+    /// (no v4 quem assina não é a identidade, então ela precisa estar no conteúdo) e as do device.
+    #[allow(dead_code)] // stub da etapa de testes; some na implementação
+    pub(crate) fn signing_payload_v4(
+        identity: &IdentityId,
+        authority_key: &PublicKey,
+        signing_key: &PublicKey,
+        network_key: &PublicKey,
+        nostr_key: &NostrPublicKey,
+        created_at: u64,
+    ) -> Vec<u8> {
+        let _ = (
+            identity,
+            authority_key,
+            signing_key,
+            network_key,
+            nostr_key,
+            created_at,
+        );
+        todo!("P30 2a: payload v4")
+    }
+
+    /// Confere a assinatura do certificado (e, no v4, a cadeia mestra → autoridade → device).
     pub fn verify(&self) -> Result<(), Error> {
+        if let Issuer::Authority(_) = &self.issuer {
+            todo!("P30 2a: verificação do v4")
+        }
         let payload = Self::signing_payload(
             &self.signing_key,
             &self.network_key,
@@ -184,6 +221,9 @@ impl DeviceCertificate {
 
     /// Serializa o certificado: `len16|identidade | len16|chave MLS | len16|chave de rede | len16|chave Nostr | created_at u64 BE | len16|assinatura`.
     pub fn to_bytes(&self) -> Vec<u8> {
+        if let Issuer::Authority(_) = &self.issuer {
+            todo!("P30 2a: serialização do v4")
+        }
         let mut out = Vec::new();
         put(&mut out, &self.identity.public_key().encode_protobuf());
         put(&mut out, &self.signing_key.encode_protobuf());
@@ -196,6 +236,9 @@ impl DeviceCertificate {
 
     /// Lê um certificado serializado por [`Self::to_bytes`]. Não confere a assinatura: use `verify`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.first().is_some_and(|&b| b != 0) {
+            todo!("P30 2a: leitura do v4")
+        }
         let mut cur = bytes;
         let identity = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
         let signing_key = PublicKey::try_decode_protobuf(take(&mut cur)?)?;
@@ -215,6 +258,7 @@ impl DeviceCertificate {
         }
         Ok(Self {
             identity: IdentityId::new(identity),
+            issuer: Issuer::Master,
             signing_key,
             network_key,
             nostr_key,

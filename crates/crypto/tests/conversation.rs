@@ -1,5 +1,8 @@
 use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error, Expected};
-use kin_identity::{DeviceKey, IdentityId, IdentityProvider, PeerId, StandaloneIdentity};
+use kin_identity::{
+    AuthorityIdentity, AuthorityKey, DeviceKey, IdentityId, IdentityProvider, PeerId,
+    StandaloneIdentity,
+};
 
 struct Person {
     identity: StandaloneIdentity,
@@ -370,4 +373,64 @@ fn a_key_rotation_commit_is_still_accepted_between_the_two_members() {
     let result = conv_bia.decrypt(&commit);
 
     assert!(matches!(result, Ok(Decrypted::EpochChanged)), "{result:?}");
+}
+
+// ---- certificado v4 (P30 fatia 2a): device certificado pela autoridade ----
+
+/// Device da identidade de `master`, certificado pela autoridade (v4), sem a mestra presente.
+fn device_v4(master: &StandaloneIdentity) -> (PeerId, CryptoDevice) {
+    let key = AuthorityKey::generate();
+    let cert = master.certify_authority(&key.public_key(), 1_000).unwrap();
+    let primary = AuthorityIdentity::new(key, cert).unwrap();
+    let network = DeviceKey::generate();
+    let device = CryptoDevice::new(
+        &primary,
+        &network.public_key(),
+        &network.nostr_public_key(),
+        2_000,
+    )
+    .unwrap();
+    (network.peer_id(), device)
+}
+
+#[test]
+fn a_v3_device_and_a_v4_device_of_the_same_identity_talk_as_that_identity() {
+    let ana = person();
+    let (peer_v4, ana_v4) = device_v4(&ana.identity);
+    let mut conv = Conversation::create(&ana.device).unwrap();
+
+    let invite = conv
+        .invite(
+            &ana_v4.key_package().unwrap(),
+            &Expected {
+                identity: Some(&ana.id),
+                peer: Some(&peer_v4),
+            },
+        )
+        .unwrap();
+    let mut conv_v4 = Conversation::join(&ana_v4, &invite.welcome, &identity(&ana)).unwrap();
+
+    assert_eq!(conv.peers().unwrap(), vec![ana.id.clone()]);
+    assert_eq!(conv_v4.peers().unwrap(), vec![ana.id.clone()]);
+    match conv_v4.decrypt(&conv.encrypt(b"oi").unwrap()).unwrap() {
+        Decrypted::Message { sender, plaintext } => {
+            assert_eq!(sender, ana.id);
+            assert_eq!(plaintext, b"oi");
+        }
+        other => panic!("{other:?}"),
+    }
+    let back = conv_v4.encrypt(b"oi de volta").unwrap();
+    assert_eq!(text(conv.decrypt(&back).unwrap()), b"oi de volta");
+}
+
+#[test]
+fn a_v4_device_of_another_identity_is_refused_when_an_identity_is_expected() {
+    let (ana, bia) = (person(), person());
+    let (_, stranger_v4) = device_v4(&StandaloneIdentity::generate());
+    let mut conv = Conversation::create(&ana.device).unwrap();
+
+    assert!(matches!(
+        conv.invite(&stranger_v4.key_package().unwrap(), &identity(&bia)),
+        Err(Error::UnexpectedIdentity)
+    ));
 }
