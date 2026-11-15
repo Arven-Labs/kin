@@ -297,7 +297,7 @@ mod tests {
             (
                 "nostr",
                 Keys {
-                    nostr: fresh.nostr.clone(),
+                    nostr: fresh.nostr,
                     ..k.clone()
                 },
             ),
