@@ -77,3 +77,68 @@ async fn a_revocation_emitted_by_one_device_reaches_the_owners_other_device_thro
 
     assert!(chat_b.is_revoked(&certificate).unwrap());
 }
+
+/// P30 3c-ii-b (ADR 0026): quem conecta DEPOIS recebe o que já estava gravado, sem ninguém emitir de novo.
+/// A grava 10 tombstones de devices seus sem ninguém conectado; B (que A aceita e que aceita A) conecta e
+/// recebe só os 8 mais recentes, que são os que o reenvio manda.
+#[tokio::test]
+async fn a_peer_that_connects_later_gets_the_eight_most_recent_revocations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let (mut a, mut b) = (pa.open(), pb.open());
+    b.trust(pa.identity.id()).unwrap();
+    a.trust(pb.identity.id()).unwrap();
+
+    let certificates: Vec<_> = (0..10)
+        .map(|_| {
+            let device = DeviceKey::generate();
+            let certificate = pa
+                .identity
+                .authorize_device(
+                    &DeviceKey::generate().public_key(),
+                    &device.public_key(),
+                    &device.nostr_public_key(),
+                    1,
+                )
+                .unwrap();
+            a.broadcast_revocation(&pa.identity.revoke_device(&certificate, 2).unwrap())
+                .unwrap();
+            certificate
+        })
+        .collect();
+
+    connect(&mut a, &mut b).await;
+
+    let newest = &certificates[2..];
+    let result = timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                _ = a.next_event() => {}
+                _ = b.next_event() => {}
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if newest.iter().all(|c| b.is_revoked(c).unwrap()) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "B não recebeu os 8 mais recentes ao conectar"
+    );
+    // Dá tempo de um nono chegar, se o reenvio passasse do limite.
+    let _ = timeout(Duration::from_millis(500), async {
+        loop {
+            tokio::select! {
+                _ = a.next_event() => {}
+                _ = b.next_event() => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        !b.is_revoked(&certificates[0]).unwrap() && !b.is_revoked(&certificates[1]).unwrap(),
+        "os 2 mais antigos ficam de fora (limite de 8)"
+    );
+}

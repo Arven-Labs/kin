@@ -179,6 +179,10 @@ const REVOCATIONS_GLOBAL_PER_WINDOW: u32 = 64;
 /// Teto de devoluções de cota por janela (auditoria 3c-ii, I2): com o armazenamento falhando para sempre, a
 /// devolução ilimitada deixaria o limite sem efeito justamente quando cada tentativa já pagou a assinatura.
 const REVOCATION_REFUNDS_PER_WINDOW: u32 = 16;
+/// Tombstones reenviados a um peer por conexão (3c-ii-b): abaixo da cota de 16 por peer do receptor, para
+/// sobrar espaço para repasses novos e para outros remetentes. Quem tem mais recebe só os mais recentes.
+#[allow(dead_code)]
+const REVOCATIONS_RESEND_MAX: usize = 8;
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Teto de linhas de histórico importadas de um irmão por sessão de sincronização (P10a). Um irmão
@@ -345,6 +349,9 @@ pub struct Chat {
     revocation_window: Duration,
     /// Devoluções de cota já feitas na janela (teto `REVOCATION_REFUNDS_PER_WINDOW`): início e contagem.
     revocation_refunds: (Instant, u32),
+    /// Quando reenviei tombstones a cada peer (3c-ii-b): no máximo um reenvio por janela por peer.
+    #[allow(dead_code)]
+    revocations_sent: HashMap<PeerId, Instant>,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
     /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
@@ -486,6 +493,7 @@ impl Chat {
             revocations_global: (Instant::now(), 0),
             revocation_window: REVOCATION_WINDOW,
             revocation_refunds: (Instant::now(), 0),
+            revocations_sent: HashMap::new(),
             sibling_pending: Default::default(),
             sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
             history_cap: MAX_SYNC_ENTRIES,
@@ -1637,19 +1645,37 @@ impl Chat {
     /// - contato que eu aceitei, **só se `identity` é a minha** (um contato não aceita uma terceira por
     ///   mim: mandar o tombstone dela revelaria em quem eu confio e gastaria a cota de quem o recusa).
     fn revocation_targets(&self, identity: &IdentityId, except: Option<PeerId>) -> Vec<PeerId> {
-        let own = self.device.identity();
         self.connected
             .iter()
             .copied()
             .filter(|peer| {
                 Some(*peer) != except
-                    && self.conversation_identity(peer).is_some_and(|who| {
-                        who == *own
-                            || who == *identity
-                            || (identity == own && self.is_trusted(&who))
-                    })
+                    && self
+                        .conversation_identity(peer)
+                        .is_some_and(|who| self.accepts_identity(&who, identity))
             })
             .collect()
+    }
+
+    /// Um device da identidade `who` aceita o tombstone da identidade `identity`? A regra de destino do ADR 0025.
+    fn accepts_identity(&self, who: &IdentityId, identity: &IdentityId) -> bool {
+        let own = self.device.identity();
+        who == own || who == identity || (identity == own && self.is_trusted(who))
+    }
+
+    /// O inverso de [`Self::accepts_identity`]: as identidades de tombstone que um device de `who` aceita.
+    /// `None` = todas (irmão); senão `who` e, se eu aceito `who`, a minha.
+    #[allow(dead_code)]
+    fn revocation_identities_for(&self, _who: &IdentityId) -> Option<Vec<IdentityId>> {
+        todo!("3c-ii-b: identidades que o peer aceita")
+    }
+
+    /// Reenvia ao `peer` até [`REVOCATIONS_RESEND_MAX`] tombstones gravados, os mais recentes entre os que ele
+    /// aceita (3c-ii-b, ADR 0026), no máximo uma vez por janela por peer: a cota do receptor não zera ao
+    /// reconectar, e reenviar a cada conexão a esgotaria. Idempotente no receptor (não repassa o repetido).
+    #[allow(dead_code)]
+    fn announce_revocations(&mut self, _peer: PeerId) {
+        todo!("3c-ii-b: reenviar tombstones ao conectar")
     }
 
     /// A identidade do único device do outro lado da conversa com `peer` (conversa com vários membros: `None`;
@@ -5781,6 +5807,190 @@ mod tests {
 
         bia.broadcast_revocation(&revocation).unwrap();
         assert_eq!(bia.pending.len(), before + 6, "reenvio explícito");
+    }
+
+    // ---- P30 3c-ii-b: reenviar ao conectar (ADR 0026) ----
+
+    /// Grava `count` tombstones novos de `owner` direto no store da Bia (sem passar pela admissão).
+    fn store_revocations_of(bia: &Chat, owner: &StandaloneIdentity, count: usize) {
+        for _ in 0..count {
+            let (revocation, _) = revocation_by(owner);
+            bia.device.store_revocation(&revocation).unwrap();
+        }
+    }
+
+    /// Quantos envios cifrados a Bia tem em andamento (cada `transmit` entra em `pending`).
+    fn sent(bia: &Chat) -> usize {
+        bia.pending.len()
+    }
+
+    /// O irmão recebe o reenvio de tombstones de QUALQUER identidade (da Bia, da Ana e da Carol).
+    #[tokio::test]
+    async fn a_sibling_gets_the_stored_revocations_of_every_identity() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            ana_key,
+            carol_key,
+            sibling: (sibling, _),
+            ..
+        } = fanout();
+        for owner in [&bia_key, &ana_key, &carol_key] {
+            store_revocations_of(&bia, owner, 1);
+        }
+        let before = sent(&bia);
+
+        bia.announce_revocations(sibling);
+
+        assert_eq!(sent(&bia), before + 3);
+    }
+
+    /// Um contato aceito (a Ana) recebe só os tombstones da identidade DELA e da minha; nada de terceira
+    /// identidade (da Carol ou do Dan), que revelaria em quem eu confio (ADR 0025).
+    #[tokio::test]
+    async fn a_contact_gets_only_its_own_identity_and_mine() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            ana_key,
+            carol_key,
+            ana: (ana_peer, _),
+            ..
+        } = fanout();
+        store_revocations_of(&bia, &bia_key, 2);
+        store_revocations_of(&bia, &ana_key, 1);
+        store_revocations_of(&bia, &carol_key, 4);
+        let before = sent(&bia);
+
+        bia.announce_revocations(ana_peer);
+
+        assert_eq!(
+            sent(&bia),
+            before + 3,
+            "2 da Bia e 1 da Ana, nenhum da Carol"
+        );
+    }
+
+    /// Um peer que eu não aceitei (o estranho) não recebe nada dos tombstones da Bia ou de contatos.
+    #[tokio::test]
+    async fn a_stranger_gets_nothing() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            ana_key,
+            stranger: (stranger, _),
+            ..
+        } = fanout();
+        store_revocations_of(&bia, &bia_key, 2);
+        store_revocations_of(&bia, &ana_key, 2);
+        let before = sent(&bia);
+
+        bia.announce_revocations(stranger);
+
+        assert_eq!(sent(&bia), before);
+    }
+
+    /// No máximo 8 por reenvio (os mais recentes).
+    #[tokio::test]
+    async fn at_most_eight_revocations_are_resent() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            sibling: (sibling, _),
+            ..
+        } = fanout();
+        store_revocations_of(&bia, &bia_key, 10);
+        let before = sent(&bia);
+
+        bia.announce_revocations(sibling);
+
+        assert_eq!(sent(&bia), before + REVOCATIONS_RESEND_MAX);
+    }
+
+    /// No máximo um reenvio por janela por peer; com a janela vencida, reenvia; peers diferentes têm
+    /// intervalos separados.
+    #[tokio::test]
+    async fn resending_to_the_same_peer_waits_for_the_window() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            sibling: (sibling, _),
+            ana: (ana_peer, _),
+            ..
+        } = fanout();
+        store_revocations_of(&bia, &bia_key, 1);
+        let before = sent(&bia);
+
+        bia.announce_revocations(sibling);
+        assert_eq!(sent(&bia), before + 1);
+        bia.announce_revocations(sibling);
+        assert_eq!(sent(&bia), before + 1, "dentro da janela: nada");
+
+        bia.announce_revocations(ana_peer);
+        assert_eq!(sent(&bia), before + 2, "outro peer tem o próprio intervalo");
+
+        bia.revocation_window = Duration::ZERO;
+        bia.announce_revocations(sibling);
+        assert_eq!(sent(&bia), before + 3, "janela vencida: reenvia");
+    }
+
+    /// Sem nada a enviar, o intervalo não é gasto: um tombstone gravado logo depois sai no próximo gatilho.
+    #[tokio::test]
+    async fn an_empty_resend_does_not_spend_the_interval() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            sibling: (sibling, _),
+            ..
+        } = fanout();
+        let before = sent(&bia);
+        bia.announce_revocations(sibling);
+        assert_eq!(sent(&bia), before);
+
+        store_revocations_of(&bia, &bia_key, 1);
+        bia.announce_revocations(sibling);
+
+        assert_eq!(sent(&bia), before + 1);
+    }
+
+    /// Peer desconectado (a Carol) ou sem conversa: nada, e não gasta o intervalo.
+    #[tokio::test]
+    async fn nothing_is_resent_to_a_disconnected_peer() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            carol: (carol, _),
+            ..
+        } = fanout();
+        store_revocations_of(&bia, &bia_key, 1);
+        let before = sent(&bia);
+
+        bia.announce_revocations(carol);
+        bia.announce_revocations(PeerId::random());
+
+        assert_eq!(sent(&bia), before);
+    }
+
+    /// As duas formas da regra de destino (`accepts_identity` e `revocation_identities_for`) concordam,
+    /// para toda combinação de peer e identidade do fixture.
+    #[tokio::test]
+    async fn the_two_forms_of_the_destination_rule_agree() {
+        let f = fanout();
+        let whos = [&f.bia_key, &f.ana_key, &f.carol_key];
+        let stranger = StandaloneIdentity::generate().id();
+        let mut all: Vec<IdentityId> = whos.iter().map(|k| k.id()).collect();
+        all.push(stranger.clone());
+
+        for who in &all {
+            let listed = f.bia.revocation_identities_for(who);
+            for identity in &all {
+                let expected = f.bia.accepts_identity(who, identity);
+                let got = listed
+                    .as_ref()
+                    .is_none_or(|identities| identities.contains(identity));
+                assert_eq!(got, expected, "who={who:?} identity={identity:?}");
+            }
+        }
     }
 
     /// Auditoria 3c-ii, I2: a devolução de cota em erro de armazenamento tem teto por janela (senão, com o
