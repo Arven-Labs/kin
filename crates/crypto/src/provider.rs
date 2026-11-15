@@ -101,7 +101,6 @@ impl Provider {
     /// Grava um tombstone de device (P30, fatia 3b, ADR 0023). Confere a assinatura (`verify`) e usa a
     /// identidade da **cadeia assinada**, nunca um parâmetro do chamador. Idempotente, cumulativo e **sem
     /// despejo**: não passa por teto nenhum.
-    #[allow(dead_code)]
     pub(crate) fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<(), Error> {
         revocation.verify()?;
         let key = RevocationKey::new(
@@ -133,7 +132,6 @@ impl Provider {
     /// **Pré-condição:** o certificado já passou por `DeviceCertificate::verify` (em `credential::verify`).
     /// Um certificado não verificado traz identidade e cadeia à escolha do atacante, e a consulta
     /// devolveria "não revogado" para um device revogado (auditoria da 3b, I2).
-    #[allow(dead_code)]
     pub(crate) fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
         let key = RevocationKey::new(
             certificate.identity(),

@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use kin_identity::{
-    DeviceCertificate, IdentityId, IdentityProvider, NostrPublicKey, PublicKey,
+    DeviceCertificate, DeviceRevocation, IdentityId, IdentityProvider, NostrPublicKey, PublicKey,
     public_key_from_ed25519,
 };
 use openmls::prelude::tls_codec::Serialize as _;
@@ -167,6 +167,17 @@ impl CryptoDevice {
     /// Pares `(label, conversation_id)` guardados com [`Self::remember`].
     pub fn remembered(&self) -> Result<Vec<(String, Vec<u8>)>, Error> {
         self.0.provider.remembered()
+    }
+
+    /// Grava um tombstone de device recebido (P30, 3c; ADR 0023): confere a assinatura e é idempotente.
+    pub fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<(), Error> {
+        self.0.provider.store_revocation(revocation)
+    }
+
+    /// O device deste certificado tem tombstone gravado? (**Pré-condição:** o certificado já foi
+    /// verificado; ver `Provider::is_revoked`.) Erro de leitura é erro, não "não revogado".
+    pub fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
+        self.0.provider.is_revoked(certificate)
     }
 
     /// Certificado deste device (identidade + chave MLS + chave de rede): é o que um convite carrega

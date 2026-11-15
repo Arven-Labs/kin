@@ -13,7 +13,12 @@
 //! e endereços, para o contato achá-los (3.5). Cada certificado é conferido ao ler (assinatura); que a
 //! identidade seja a do remetente é política do `chat`.
 
-use kin_identity::{IdentityId, PublicKey};
+//!
+//! `Revocation` (tag 7), o tombstone de device (P30, 3c): `7 | DeviceRevocation (formato KRV)`. O codec só
+//! lê os bytes (forma canônica e teto de 2048 ficam no `DeviceRevocation::from_bytes`); a assinatura é
+//! conferida ao gravar e a admissão (identidade conhecida, limite por peer) é política do `chat`.
+
+use kin_identity::{DeviceRevocation, IdentityId, PublicKey};
 
 use crate::{Error, Invite, Message};
 
@@ -22,6 +27,7 @@ const TAG_SENT: u8 = 3;
 const TAG_DEVICE_LIST: u8 = 4;
 const TAG_HISTORY_REQUEST: u8 = 5;
 const TAG_HISTORY_CHUNK: u8 = 6;
+const TAG_REVOCATION: u8 = 7;
 
 /// Teto de itens por `HistoryChunk`, na leitura e na escrita: evita alocar com base num número hostil.
 pub(crate) const MAX_DECODED_HISTORY: usize = 256;
@@ -66,6 +72,9 @@ pub(crate) enum Payload {
         next: u64,
         done: bool,
     },
+    /// Tombstone de um device (P30, 3c): este device deixou de valer. Em `Box`: é bem maior que as
+    /// outras variantes (carrega a cadeia da autoridade).
+    Revocation(Box<DeviceRevocation>),
 }
 
 impl Payload {
@@ -124,11 +133,20 @@ impl Payload {
                 }
                 out
             }
+            Self::Revocation(revocation) => {
+                let mut out = vec![TAG_REVOCATION];
+                out.extend_from_slice(&revocation.to_bytes());
+                out
+            }
         }
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         match bytes.first() {
+            // Forma canônica e teto de 2048 bytes já são do `from_bytes`; o erro vira `Malformed` sem detalhe.
+            Some(&TAG_REVOCATION) => DeviceRevocation::from_bytes(&bytes[1..])
+                .map(|revocation| Self::Revocation(Box::new(revocation)))
+                .map_err(|_| Error::Malformed),
             Some(&TAG_RELAY_LIST) => Self::decode_relay_list(&bytes[1..]),
             Some(&TAG_SENT) => Self::decode_sent(&bytes[1..]),
             Some(&TAG_DEVICE_LIST) => Self::decode_device_list(&bytes[1..]),
@@ -263,6 +281,64 @@ fn take(bytes: &[u8]) -> Result<(&[u8], &[u8]), Error> {
 mod tests {
     use super::*;
     use crate::{Error, Message, MessageId};
+    use kin_identity::{AuthorityIdentity, AuthorityKey};
+
+    /// Um tombstone de um device novo, assinado pela mestra (v3) ou por uma autoridade (v4).
+    fn revocation(by_authority: bool) -> DeviceRevocation {
+        let master = StandaloneIdentity::generate();
+        let device = DeviceKey::generate();
+        let issue = |issuer: &dyn IdentityProvider| {
+            issuer
+                .authorize_device(
+                    &DeviceKey::generate().public_key(),
+                    &device.public_key(),
+                    &device.nostr_public_key(),
+                    1,
+                )
+                .unwrap()
+        };
+        if by_authority {
+            let key = AuthorityKey::generate();
+            let cert = master.certify_authority(&key.public_key(), 1).unwrap();
+            let authority = AuthorityIdentity::new(key, cert).unwrap();
+            let certificate = issue(&authority);
+            authority.revoke_device(&certificate, 2).unwrap()
+        } else {
+            let certificate = issue(&master);
+            master.revoke_device(&certificate, 2).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_revocation_survives_encode_and_decode_from_the_master_and_from_an_authority() {
+        for by_authority in [false, true] {
+            let payload = Payload::Revocation(Box::new(revocation(by_authority)));
+
+            assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn a_revocation_payload_that_is_empty_truncated_garbage_or_non_canonical_is_malformed() {
+        let good = Payload::Revocation(Box::new(revocation(true))).encode();
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let mut oversized = good.clone();
+        oversized.resize(3000, 0);
+        let cases = [
+            ("só a tag", vec![TAG_REVOCATION]),
+            ("truncado", good[..good.len() - 1].to_vec()),
+            ("lixo", [vec![TAG_REVOCATION], vec![0xAB; 64]].concat()),
+            ("byte sobrando", trailing),
+            ("acima de 2048", oversized),
+        ];
+        for (name, bytes) in cases {
+            assert!(
+                matches!(Payload::decode(&bytes), Err(Error::Malformed)),
+                "{name}"
+            );
+        }
+    }
 
     // 1
     #[test]
