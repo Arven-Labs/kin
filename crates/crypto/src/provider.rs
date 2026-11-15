@@ -52,7 +52,6 @@ impl Provider {
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 250;
              CREATE TABLE IF NOT EXISTS kin_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_conversations (
                  label TEXT PRIMARY KEY, group_id BLOB NOT NULL);
@@ -199,11 +198,6 @@ impl Provider {
     #[cfg(test)]
     pub(crate) fn break_revocation_store_for_test(&self) {
         self.conn.execute("DROP TABLE kin_revocations", []).unwrap();
-    }
-
-    /// Falha fechada: na dúvida (erro de leitura), trata como revogado.
-    pub(crate) fn is_revoked_or_unknown(&self, certificate: &DeviceCertificate) -> bool {
-        self.is_revoked(certificate).unwrap_or(true)
     }
 
     /// Conclui um pareamento: grava o certificado e apaga o pedido pendente **na mesma transação**, para
@@ -369,7 +363,6 @@ mod tests {
         let master = StandaloneIdentity::generate();
         let (provider, cert) = revoked(&master, &keys());
         assert!(provider.is_revoked(&cert).unwrap());
-        assert!(provider.is_revoked_or_unknown(&cert));
     }
 
     #[test]
@@ -378,7 +371,6 @@ mod tests {
         let (provider, _) = revoked(&master, &keys());
         let other = cert_for(&master, &keys());
         assert!(!provider.is_revoked(&other).unwrap());
-        assert!(!provider.is_revoked_or_unknown(&other));
     }
 
     #[test]
@@ -435,7 +427,6 @@ mod tests {
         let (provider, _) = revoked(&StandaloneIdentity::generate(), &k);
         let cert = cert_for(&victim, &k);
         assert!(!provider.is_revoked(&cert).unwrap());
-        assert!(!provider.is_revoked_or_unknown(&cert));
     }
 
     /// Auditoria 3b, I3: a identidade faz parte da chave primária. Duas identidades revogando as MESMAS
@@ -586,9 +577,9 @@ mod tests {
         assert!(provider.revocations(None, 8).is_err());
     }
 
-    /// Fail-closed: se não dá para ler o banco, o device conta como revogado.
+    /// Se não dá para ler o banco, a consulta é erro (nunca "não revogado"); o `verify` recusa (3d-i).
     #[test]
-    fn a_read_error_counts_as_revoked() {
+    fn a_read_error_is_an_error_not_not_revoked() {
         let master = StandaloneIdentity::generate();
         let (provider, _) = revoked(&master, &keys());
         let unrelated = cert_for(&master, &keys());
@@ -597,7 +588,6 @@ mod tests {
             .execute("DROP TABLE kin_revocations", [])
             .unwrap();
         assert!(provider.is_revoked(&unrelated).is_err());
-        assert!(provider.is_revoked_or_unknown(&unrelated));
     }
 
     #[test]

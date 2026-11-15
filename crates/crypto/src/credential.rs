@@ -36,8 +36,8 @@ pub(crate) fn verify(
     }
     // Ponto único da consulta (ADR 0023 I2): só depois de `parse` ter conferido a assinatura do
     // certificado, porque `is_revoked` assume um certificado verificado. Falha fechada: erro de
-    // leitura do store conta como revogado.
-    if provider.is_revoked_or_unknown(&cert) {
+    // leitura do store recusa com `Error::Storage` (diagnosticável, sem fingir que foi revogado).
+    if provider.is_revoked(&cert)? {
         return Err(Error::Revoked);
     }
     let who = Verified {
@@ -53,7 +53,8 @@ pub(crate) fn verify(
     Ok(who)
 }
 
-/// Lê a identidade de uma credencial já validada pelo MLS (sem rechecar a chave do membro).
+/// Lê a identidade de uma credencial de um membro que já entrou. **Não é uma verificação**: o MLS não
+/// confere revogação nem continuidade de identidade; quem decide aceitar um membro é [`verify`].
 pub(crate) fn identity_of(credential: &Credential) -> Result<IdentityId, Error> {
     Ok(parse(credential)?.identity().clone())
 }
@@ -214,6 +215,32 @@ mod tests {
         assert!(verify(&credential_for(&other), &raw, &ANY, &provider).is_ok());
     }
 
+    /// A chave da consulta tem as 3 chaves: mesma identidade e mesma chave de assinatura, mas rede (ou
+    /// Nostr) diferente, é outro device (auditoria da 3d-i).
+    #[test]
+    fn a_tombstone_matches_all_three_keys_not_just_the_signing_key() {
+        let id = StandaloneIdentity::generate();
+        let key = DeviceKey::generate().public_key();
+        let revoked = issue(&id, &key, &DeviceKey::generate().public_key());
+        let same_signing_other_network = issue(&id, &key, &DeviceKey::generate().public_key());
+        let raw = ed25519_bytes(&key).unwrap();
+        let provider = fresh();
+        provider
+            .store_revocation(&id.revoke_device(&revoked, 2).unwrap())
+            .unwrap();
+
+        // `issue` sorteia a chave Nostr, então também difere nela.
+        assert!(
+            verify(
+                &credential_for(&same_signing_other_network),
+                &raw,
+                &ANY,
+                &provider
+            )
+            .is_ok()
+        );
+    }
+
     /// Ordem (auditoria I2 da 3b): a consulta vem DEPOIS da verificação do certificado. Um certificado
     /// com as chaves de um device revogado e a assinatura adulterada tem de ser `InvalidCredential`;
     /// consultar antes de verificar devolveria `Revoked` (e, com chaves sem tombstone, deixaria passar
@@ -235,9 +262,9 @@ mod tests {
         ));
     }
 
-    /// Falha fechada: se o store não pode ser lido, o device conta como revogado.
+    /// Falha fechada: se o store não pode ser lido, recusa com `Storage` (não aceita, e não finge `Revoked`).
     #[test]
-    fn rejects_when_the_revocation_store_cannot_be_read() {
+    fn rejects_with_a_storage_error_when_the_revocation_store_cannot_be_read() {
         let id = StandaloneIdentity::generate();
         let (cert, raw) = device_of(&id);
         let provider = fresh();
@@ -245,7 +272,7 @@ mod tests {
 
         assert!(matches!(
             verify(&credential_for(&cert), &raw, &ANY, &provider),
-            Err(Error::Revoked)
+            Err(Error::Storage(_))
         ));
     }
 }
