@@ -1562,3 +1562,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   (P31 ab).
 - **Próximo passo**: fatia 3 do P30 (tombstones e revogação), em plan mode; antes, `/dependencias kin` se o `cargo audit` (P22) ainda
   estiver aberto.
+
+#### Tombstone de device (P30, fatia 3a, PR #203, ADR 0022)
+
+- **Decisões do dono** (plan mode + 2 perguntas): a fatia 3 do ADR 0011 (~6 partes) foi **cortada em 3a a 3e**, e esta é só o **formato**
+  no `identity`; quem assina é a **autoridade ou a mestra**. Decisão minha confirmada na aprovação do plano: `revokes` casa por
+  identidade e pelas três chaves, não pelo hash.
+- **Feito** (só `identity`): `DeviceRevocation` (`KRV` 1) com `verify` sem estado (cadeia da autoridade dentro), `revokes`,
+  `to_bytes`/`from_bytes` e `revoke_device` na autoridade e na mestra; forma canônica no parse (auditoria I1). ADR 0022. Nada mudou em
+  `crypto`, `chat` e `cli`.
+- **Prova de que testam algo**: stubs, **14 de 14 falharam** (run 43652914962); verde (run 43653220890). Depois da auditoria, **1 de 1
+  teste novo falhou** (o de canonicidade, run 43654724998; os outros 2 eram de caracterização e já passavam); verde (run 43654975252).
+- **Mutações** (PRs #204 a #210, fechados e apagados): A (`!=` em `revokes`, 5 testes), B (ignora a chave Nostr, 1), D (não confere a
+  cadeia, 2), E (`build` não recusa outra identidade, 1) e F (payload sem identidade nem `created_at` da cadeia, 1) pegas. **C (domínio
+  de assinatura vazio) sobreviveu**, o que virou um teste do prefixo do payload; a C2 passou a ser pega.
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; I1 (parse aceitava encodings que o `to_bytes` nunca produz) e I2
+  (teste do teto não testa o teto); I1 corrigido, I2 parcial (o teto é redundante após o I1); S1 a S5 na tabela do ADR e no P31 (af a ak).
+- **Achados meus antes das mutações**: o teste `it_does_not_revoke_another_device` não isolava cada chave sozinha (a mutação B
+  passaria); fechado.
+- **Tropeços**: dead code dos stubs travou o clippy (resolvido com `allow(dead_code)` temporário); o comando de PR com o texto
+  "cargo build" foi barrado pelo hook `guard-heavy` (nada rodou).
+- **Não verificado**: revisão externa do formato `KRV` (ADR 0011); vetor fixo do payload e do `cert_hash` (P31 ag); consumo do
+  tombstone por `crypto`/`chat` (3b a 3d).
+- **Próximo passo**: 3b (armazenar tombstones sem despejo e consultar fail-closed, chave `(identity, 3 chaves)`; `credential::verify`
+  com oráculo), em plan mode.
