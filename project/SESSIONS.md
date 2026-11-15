@@ -1677,3 +1677,28 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: uso real (nada consulta o store); o que cada mutação 1 a 3 mudou (sem registro); resultado da auditoria desta
   fatia além dos commits; revisão externa.
 - **Próximo passo**: 3d (ligar `is_revoked_or_unknown` na `credential::verify` e derrubar o par), em plan mode.
+
+#### Recusar device revogado no `verify` (P30, fatia 3d-i, ADR 0027)
+
+- **Decisões do dono** (plan mode + 2 perguntas + 2 depois da auditoria): 3d cortada em **3d-i (`crypto`)** e **3d-ii (`chat`)**; na 3d-ii a
+  outbox do peer revogado é apagada com `Dropped{reason: revoked}`; self-revoke fora da 3d; `Add` em `decrypt` ligado mesmo sem teste;
+  depois da auditoria, **sem `busy_timeout` próprio** e erro de leitura do store como **`Error::Storage`** (não `Revoked`).
+- **Feito** (só `crypto`): `credential::verify` recebe `&Provider` e recusa com `Error::Revoked` depois do `parse` e da conferência da
+  chave MLS, nos 3 chamadores; `is_revoked_or_unknown` removido; comentário de `identity_of` corrigido. ADR **0027** (o código da
+  3c-ii-b cita um "ADR 0026" que nunca foi escrito; não o criei).
+- **Prova de que testam algo**: stubs, **4 de 4** testes de revogação falharam e os 4 que deviam passar passaram (run 43767773390; o run
+  anterior, 43767657185, parou no clippy por tipo errado num helper meu); verde (43768170329); verde depois da auditoria (43770056544).
+- **Mutações** (branches descartáveis, 4 de 4 pegas, apagadas): `verify` ignora a revogação (43768498330, 4 testes); erro de leitura
+  como "não revogado" no `Provider` (43768510609, 2); `parse` sem `cert.verify()` (43768525594, 2: ordem e forjado); erro de leitura como
+  "não revogado" no `verify` pós-auditoria (43770378414, 1).
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 2 importantes. I1: `Update`/`UpdatePath` sem `verify` (já existia, P31 q,
+  vai para a 3d-ii). I2: o `busy_timeout = 250` que eu pus **reduzia** o padrão de 5 s do rusqlite (eu tinha escrito no plano que a conexão
+  não definia nenhum) e um BUSY viraria "revogado": corrigido.
+- **Tropeços**: o plano dizia "retry de BUSY com log", mas `Error::storage` guarda só a string, não há `log` e não dá para testar sem dois
+  processos: troquei, com sua aprovação, por `busy_timeout` e depois pela remoção; o helper de teste declarou `Vec<u8>` onde era
+  `[u8; 32]`; o meu resumo de abertura da sessão veio de um `kin` desatualizado (o `git pull` tinha rodado no workspace e não no projeto) e a
+  2d-i que eu ia planejar já estava na `main`.
+- **Não verificado**: `busy_timeout` e corrida entre processos (precisa de dois processos); a consulta do `Add` em `decrypt` (nenhum teste
+  a alcança, teto de 2 membros); `cert.identity()` e `revocation.identity()` convergirem em todas as cadeias; uso real; revisão externa.
+- **Próximo passo**: 3d-ii (derrubar o par: conversa, outbox, mailbox, evento; reconsultar ao reabrir; `verify` do leaf de `Update`),
+  em plan mode.

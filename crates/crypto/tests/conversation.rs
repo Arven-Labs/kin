@@ -435,7 +435,7 @@ fn a_v4_device_of_another_identity_is_refused_when_an_identity_is_expected() {
     ));
 }
 
-// ---- revogação (P30 3d-i, ADR 0026) ----
+// ---- revogação (P30 3d-i, ADR 0027) ----
 
 /// Quem tem o tombstone do device de Bia não a convida.
 #[test]
