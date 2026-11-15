@@ -440,17 +440,45 @@ mod tests {
 
     /// Ana (committer) e Bia na mesma conversa; devolve também a identidade de Bia.
     fn pair() -> (StandaloneIdentity, Conversation, Conversation) {
+        let p = pair_full();
+        (p.bia_id, p.conv_ana, p.conv_bia)
+    }
+
+    /// A conversa de Ana e Bia com tudo o que os testes de continuidade precisam.
+    struct Pair {
+        ana: CryptoDevice,
+        bia_id: StandaloneIdentity,
+        bia_net: DeviceKey,
+        conv_ana: Conversation,
+        conv_bia: Conversation,
+    }
+
+    fn pair_full() -> Pair {
         let (ana_id, bia_id) = (
             StandaloneIdentity::generate(),
             StandaloneIdentity::generate(),
         );
-        let (ana, bia) = (device_of(&ana_id), device_of(&bia_id));
+        let bia_net = DeviceKey::generate();
+        let ana = device_of(&ana_id);
+        let bia = CryptoDevice::new(
+            &bia_id,
+            &bia_net.public_key(),
+            &bia_net.nostr_public_key(),
+            1,
+        )
+        .unwrap();
         let mut conv_ana = Conversation::create(&ana).unwrap();
         let invite = conv_ana
             .invite(&bia.key_package().unwrap(), &Expected::default())
             .unwrap();
         let conv_bia = Conversation::join(&bia, &invite.welcome, &Expected::default()).unwrap();
-        (bia_id, conv_ana, conv_bia)
+        Pair {
+            ana,
+            bia_id,
+            bia_net,
+            conv_ana,
+            conv_bia,
+        }
     }
 
     /// Um Update de `conv` cujo leaf novo traz a credencial de `rogue` (assinado pela chave de `rogue`),
@@ -527,6 +555,100 @@ mod tests {
         assert!(matches!(
             conv_ana.decrypt(&forged),
             Err(Error::UnexpectedIdentity)
+        ));
+    }
+
+    /// Mesma identidade e mesmo Peer ID, mas **outra chave Nostr** (certificado novo e válido): o `Update`
+    /// não pode trocar para onde os relays entregam o que é do membro (auditoria da 3d-ii-a, I1).
+    #[test]
+    fn an_update_proposal_with_another_nostr_key_is_refused() {
+        let mut p = pair_full();
+        let rogue = CryptoDevice::new(
+            &p.bia_id,
+            &p.bia_net.public_key(),
+            &DeviceKey::generate().nostr_public_key(),
+            2,
+        )
+        .unwrap();
+
+        let forged = forged_update(&mut p.conv_bia, &rogue);
+
+        assert!(matches!(
+            p.conv_ana.decrypt(&forged),
+            Err(Error::DeviceKeysChanged)
+        ));
+    }
+
+    /// Mesma identidade, Peer ID e chave Nostr, mas **outra chave de assinatura** (certificado novo): a
+    /// rotação de chave MLS com certificado novo ainda não existe (decisão do dono: as 4 chaves iguais).
+    #[test]
+    fn an_update_proposal_with_another_signing_key_is_refused() {
+        let mut p = pair_full();
+        let rogue = CryptoDevice::new(
+            &p.bia_id,
+            &p.bia_net.public_key(),
+            &p.bia_net.nostr_public_key(),
+            2,
+        )
+        .unwrap();
+
+        let forged = forged_update(&mut p.conv_bia, &rogue);
+
+        assert!(matches!(
+            p.conv_ana.decrypt(&forged),
+            Err(Error::DeviceKeysChanged)
+        ));
+    }
+
+    /// O mesmo para o `UpdatePath` de um commit.
+    #[test]
+    fn a_commit_with_an_update_path_with_another_nostr_key_is_refused() {
+        let mut p = pair_full();
+        let rogue = CryptoDevice::new(
+            &p.bia_id,
+            &p.bia_net.public_key(),
+            &DeviceKey::generate().nostr_public_key(),
+            2,
+        )
+        .unwrap();
+
+        let forged = forged_commit(&mut p.conv_bia, &rogue);
+
+        assert!(matches!(
+            p.conv_ana.decrypt(&forged),
+            Err(Error::DeviceKeysChanged)
+        ));
+    }
+
+    /// Um Update do mesmo device cujo certificado tem tombstone é `Revoked` (ADR 0027 dentro da continuidade).
+    #[test]
+    fn a_legitimate_rotation_from_a_revoked_device_is_refused() {
+        let mut p = pair_full();
+        let cert = p.conv_ana.peer_certificates().unwrap().remove(0);
+        p.ana
+            .store_revocation(&p.bia_id.revoke_device(&cert, 2_000).unwrap())
+            .unwrap();
+
+        let proposal = p.conv_bia.propose_rotation().unwrap();
+
+        assert!(matches!(p.conv_ana.decrypt(&proposal), Err(Error::Revoked)));
+    }
+
+    /// A rejeição não mexe no estado: a época e a conversa seguem como estavam e a seguinte mensagem boa passa.
+    #[test]
+    fn a_refused_update_leaves_the_conversation_usable() {
+        let mut p = pair_full();
+        let rogue = device_of(&StandaloneIdentity::generate());
+        let epoch = p.conv_ana.epoch();
+
+        let forged = forged_update(&mut p.conv_bia, &rogue);
+        assert!(p.conv_ana.decrypt(&forged).is_err());
+
+        assert_eq!(p.conv_ana.epoch(), epoch);
+        let hello = p.conv_bia.encrypt(b"oi").unwrap();
+        assert!(matches!(
+            p.conv_ana.decrypt(&hello),
+            Ok(Decrypted::Message { .. })
         ));
     }
 
