@@ -6122,7 +6122,7 @@ mod tests {
         } = fanout();
         assert!(!bia.revocations_checked.contains(&sibling));
         let wire = sibling_raw
-            .encrypt(&Payload::RelayList(vec![]).encode())
+            .encrypt(&Message::new("oi".into(), None).encode())
             .unwrap();
 
         bia.on_mls(sibling, &wire).unwrap();
