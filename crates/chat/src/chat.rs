@@ -173,6 +173,9 @@ const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
 /// Tombstones aceitos por peer em cada janela (P30, 3c; ADR 0024). Conta toda tentativa recebida, não só as
 /// gravadas: conferir a assinatura custa CPU, e repetir um tombstone já gravado também é inundar.
 const REVOCATIONS_PER_WINDOW: u32 = 16;
+/// Teto de todos os peers somados na mesma janela (auditoria 3c-i: só o limite por peer não segura quem
+/// abre várias conexões).
+const REVOCATIONS_GLOBAL_PER_WINDOW: u32 = 64;
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Teto de linhas de histórico importadas de um irmão por sessão de sincronização (P10a). Um irmão
@@ -331,8 +334,10 @@ pub struct Chat {
     /// Quando anunciei a lista de devices a cada irmão por causa de algo aprendido (limite de taxa).
     last_sibling_announce: HashMap<PeerId, Instant>,
     /// Limite de taxa dos tombstones (P30, 3c): por peer, o início da janela e quantos chegaram nela.
-    /// Só em memória; zera ao desconectar.
+    /// Só em memória. **Não** zera ao desconectar (senão reconectar devolveria a cota); expira pela janela.
     revocations_seen: HashMap<PeerId, (Instant, u32)>,
+    /// Teto global dos tombstones, de todos os peers somados: início da janela e contagem.
+    revocations_global: (Instant, u32),
     /// Duração da janela do limite de tombstones (campo, para o teste não esperar 60 s).
     revocation_window: Duration,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
@@ -473,6 +478,7 @@ impl Chat {
             contact_devices: HashMap::new(),
             last_sibling_announce: HashMap::new(),
             revocations_seen: HashMap::new(),
+            revocations_global: (Instant::now(), 0),
             revocation_window: REVOCATION_WINDOW,
             sibling_pending: Default::default(),
             sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
@@ -1100,7 +1106,6 @@ impl Chat {
                 self.devices_announced.remove(&peer);
                 self.lists_acted.remove(&peer);
                 self.last_sibling_announce.remove(&peer);
-                self.revocations_seen.remove(&peer);
                 self.sibling_pending.remove(&peer);
                 self.history_requested.remove(&peer);
                 self.history_sessions.remove(&peer);
@@ -1555,30 +1560,27 @@ impl Chat {
     fn on_revocation(&mut self, peer: PeerId, revocation: &DeviceRevocation) -> Result<(), Error> {
         let now = Instant::now();
         let window = self.revocation_window;
-        let seen = self.revocations_seen.entry(peer).or_insert((now, 0));
-        if now.duration_since(seen.0) >= window {
-            *seen = (now, 0);
+        // A cota do peer só expira pela janela (reconectar não a devolve); as vencidas são podadas aqui.
+        self.revocations_seen
+            .retain(|_, (start, _)| now.duration_since(*start) < window);
+        if now.duration_since(self.revocations_global.0) >= window {
+            self.revocations_global = (now, 0);
         }
-        if seen.1 >= REVOCATIONS_PER_WINDOW {
+        let seen = self.revocations_seen.entry(peer).or_insert((now, 0));
+        if seen.1 >= REVOCATIONS_PER_WINDOW
+            || self.revocations_global.1 >= REVOCATIONS_GLOBAL_PER_WINDOW
+        {
             return Err(Error::RevocationRateLimited);
         }
         seen.1 += 1;
-        if !self.is_known(revocation.identity()) {
+        self.revocations_global.1 += 1;
+        // Só a minha identidade ou uma que aceitei: "ter conversa" não filtra ninguém (um estranho que
+        // conecta ganha uma), e `untrust` precisa cortar a escrita no disco (auditoria 3c-i, C1 e I3).
+        if !self.is_trusted(revocation.identity()) {
             return Err(Error::UnauthorizedRevocation);
         }
         // A gravação confere a assinatura. Falha de armazenamento sobe como erro, não vira "inválido".
         Ok(self.device.store_revocation(revocation)?)
-    }
-
-    /// Identidade que a minha admissão de tombstones conhece: a minha, uma aceita (`trust`/`accept`) ou
-    /// uma com quem já tenho conversa (ADR 0023, I1).
-    fn is_known(&self, identity: &IdentityId) -> bool {
-        self.is_trusted(identity)
-            || self.conversations.values().any(|conversation| {
-                conversation
-                    .peers()
-                    .is_ok_and(|peers| peers.contains(identity))
-            })
     }
 
     /// Um device irmão diz que enviou `message` a `to`. Só vale se quem **assinou esta mensagem**

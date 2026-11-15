@@ -23,13 +23,13 @@ pub enum Error {
     /// da minha identidade, ou uma página chegou sem eu ter pedido.
     #[error("histórico recusado: não é de um device desta identidade, ou não foi pedido")]
     UnauthorizedHistory,
-    /// Um tombstone de device (`Payload::Revocation`) de uma identidade que não é a minha, não aceitei e
-    /// com quem não tenho conversa: não grava (limita o crescimento da tabela ao meu grafo social, ADR 0023).
-    #[error("revogação recusada: identidade desconhecida")]
+    /// Um tombstone de device (`Payload::Revocation`) de uma identidade que não é a minha nem aceitei
+    /// (`trust`/`accept`): não grava. Ter conversa não basta, pois um estranho que conecta ganha uma.
+    #[error("revogação recusada: identidade não aceita")]
     UnauthorizedRevocation,
-    /// Um peer mandou tombstones demais na janela; o excedente é descartado (chega de novo na próxima
-    /// conexão).
-    #[error("revogação descartada: limite de taxa do peer")]
+    /// Tombstones demais na janela (por peer ou no total); o excedente é descartado. **Não há reenvio
+    /// nesta fatia** (3c-ii): quem precisa da revogação depende de o remetente reenviá-la.
+    #[error("revogação descartada: limite de taxa")]
     RevocationRateLimited,
     /// A sincronização de histórico com um irmão passou do teto de linhas por sessão ou não avança (o
     /// irmão devolve o mesmo cursor sem terminar): parada para não encher o disco nem girar sem fim.
