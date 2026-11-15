@@ -25,6 +25,11 @@ KEEP=1 lab/run.sh cone          # deixa os containers de pé para olhar os logs
 | `multi-device` | `a` e `a2` (mesma identidade, mesma LAN) e `b` como contato atrás de outro NAT: `a2` **não** acha `b` antes do `/trust` (controle negativo) e acha sozinho depois, furo direto `a2` ↔ `b`, espelho nos dois sentidos com o mesmo `MessageId`, e `b` falando com a identidade chega nos dois |
 | `multi-device-plain` | o mesmo cenário com `--no-passphrase` (chaves em claro), para cobrir o caminho sem senha |
 | `history-sync` | `a` e `b` trocam 3 mensagens (uma resposta com `/r`) e **só depois** entra o `a2` (irmão, banco vazio): recebe `3 novas, completo`; depois do `/trust` de `b`, o `/history` do `a2` mostra as 3 linhas com os mesmos `MessageId` e direções, e uma mensagem nova de `b` chega 1 vez em cada irmão sem duplicar no histórico. **Não cobre** reconectar o `a2` sem reimportar (reiniciar esbarra no P16) |
+| `paired-device` | **sem copiar a mestra** (P30 2d-iii, ADR 0020 e 0021): `a` é o **primário** (só `authority.key` + `authority.cert`) e `a2` um device **pareado** (`primary.id`, `device.key`, `mls.sqlite`). O pareamento roda no **host** com o binário real (`kin cold init`, `kin pair request/answer/accept`, com o código de comparação lido da saída e digitado por pipe; um código errado não emite certificado; um diretório com pedido pendente não abre o chat nem ganha `identity.key`) e `compose cp` leva os arquivos. Depois vale a conferência do `multi-device`: `a2` não acha o contato `c` antes do `/trust`, acha sozinho depois, furo direto, espelho com o mesmo `MessageId` e fan-out |
+
+No `paired-device`, o `a2` usa `--data-dir /root` (não `/tmp`): o `compose cp` deixa o `mls.sqlite` com o uid do host e o SQLite o abre
+com `O_CREAT`; em diretório com sticky bit (`/tmp`) um kernel com `fs.protected_regular` ligado nega isso até ao root ("Accessing
+storage failed"). Cenários que só leem o arquivo copiado (como o `identity.key` do `multi-device`) não sofrem.
 
 `REPEAT=5 lab/run.sh` roda cada cenário 5 vezes e imprime `x/5` por cenário (o hole punching varia de rodada para rodada).
 

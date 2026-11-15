@@ -1542,3 +1542,23 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Tropeços**: tentei `sed -i` num arquivo de código (proibido pelo `CLAUDE.md`; o hook barrou) e refiz com `Edit`.
 - **Não verificado**: o `Chat` aberto pela CLI e o lab (2d-iii); o prompt de senha em diretório pareado/pendente.
 - **Próximo passo**: 2d-iii (cenário de lab: parear um device atrás de NAT e conversar; 1:1 e multi-device), em plan mode.
+
+#### Lab do device pareado (P30, fatia 2d-iii, PR #202)
+
+- **Decisões do dono** (plan mode + 1 pergunta): pareamento no host com o binário real e `compose cp` para os containers; extrair a
+  segunda metade do `multi-device` em `contact_and_fanout` (compartilhada, em vez de duplicar ~50 linhas).
+- **Feito** (só `lab/run.sh` e `lab/README.md`; nenhum código Rust): cenário `paired-device` (`a` primário só com
+  `authority.key`/`authority.cert`, `a2` pareado com `primary.id`/`device.key`/`mls.sqlite`, `c` contato atrás de outro NAT): `cold init`,
+  `pair request/answer/accept` (código digitado por pipe; código errado não emite certificado), `kin` normal num diretório pendente falha
+  sem criar `identity.key`, mesma identidade nos dois devices, `a2` sem mestra nem autoridade, e a conferência do `multi-device`.
+- **Resultado real** (rodado pelo dono e por mim, Docker local): `paired-device` **18/18** e `REPEAT=5` **5/5**; regressão da
+  extração: `multi-device`, `multi-device-plain` e `history-sync` seguem passando (29 PASS, 0 FAIL).
+- **Achado do lab (não é bug do Kin)**: a primeira execução falhou ("a2 e a1 não ficaram com conversa pronta", log do a2:
+  `falha no MLS: Accessing storage failed`). Diagnóstico: reproduzi no host (funciona), depois no container: o `compose cp` deixa o
+  `mls.sqlite` com uid 1000 e o SQLite o abre com `O_CREAT`; em `/tmp` (sticky bit) o kernel com `fs.protected_regular` ligado (valor 1
+  no Arch) nega até ao root. O `multi-device` não sofre porque só lê o `identity.key` copiado. Correção no lab: o `a2` usa
+  `--data-dir /root`.
+- **Não verificado**: QUIC (P17); reiniciar o `a2` pareado (P16); relay real e Nostr; o prompt de senha em diretório pareado/pendente
+  (P31 ab).
+- **Próximo passo**: fatia 3 do P30 (tombstones e revogação), em plan mode; antes, `/dependencias kin` se o `cargo audit` (P22) ainda
+  estiver aberto.
