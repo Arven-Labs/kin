@@ -1586,3 +1586,28 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   tombstone por `crypto`/`chat` (3b a 3d).
 - **Próximo passo**: 3b (armazenar tombstones sem despejo e consultar fail-closed, chave `(identity, 3 chaves)`; `credential::verify`
   com oráculo), em plan mode.
+
+### 2026-11-15 — Sessão 26
+
+#### Store de tombstones (P30, fatia 3b, ADR 0023)
+
+- **Decisões do dono** (plan mode + 3 perguntas): tabela **no `crypto`**, ao lado de `kin_meta`; escopo **só store + consulta** (o
+  oráculo na `credential::verify` vai para a 3d); `is_revoked` devolve `Result` e o erro conta como revogado num helper. Desvio meu,
+  avisado antes dos testes: `is_revoked` recebe o `DeviceCertificate`, não os 4 campos soltos.
+- **Feito** (só `crypto`, `provider.rs`): tabela `kin_revocations` com chave `(identity, 3 chaves)`, `store_revocation` (confere
+  `verify`, identidade da cadeia, `ON CONFLICT DO NOTHING`, sem despejo), `is_revoked`, `is_revoked_or_unknown`. ADR 0023. Nada mudou
+  em `identity`, `chat`, `cli`; nenhum chamador usa o store ainda.
+- **Prova de que testam algo**: stubs, **10 de 10 falharam** (run 43703802252; o run anterior, 43703737117, parou no clippy por
+  `clone_on_copy` num teste meu); verde (run 43704158505). Depois da auditoria, o teste novo do I3 já passava (caracterização).
+- **Mutações** (branches descartáveis, 4 de 4 pegas): A, consulta ignora a identidade (run 43704489665, 1 teste); B, erro vira "não
+  revogado" (43704498583, 1); C, gravação sem `verify` (43704508809, 1); D, identidade fora da chave primária (43705352300, **só o teste
+  do I3**).
+- **Auditoria** (`security-auditor`, somente leitura): sem críticos; I1 (sem admissão nem teto), I2 (pré-condição de verificado), I3
+  (teste da identidade na PK); I2 e I3 corrigidos, S1 corrigido; I1 e S2 a S7 viraram requisitos da 3c/3d no ADR. Verde após a
+  correção: run 43705051581.
+- **Tropeços**: tentei gravar os testes por heredoc no Bash (barrado pelo hook, regra do `CLAUDE.md`: só `Edit`/`Write`); clippy
+  `clone_on_copy` e `type_complexity` (tupla trocada pela struct `RevocationKey`); o CI não dispara em push de branch, então os runs
+  foram por `workflow_dispatch`.
+- **Não verificado**: uso real (nenhum chamador); `busy_timeout` e `synchronous` no WAL; caminho `NotEd25519`; revisão externa.
+- **Próximo passo**: decidir a **política de admissão e o teto** (I1) antes da 3c; depois 3c (canal), em plan mode. A 3d liga o
+  `is_revoked_or_unknown` na `credential::verify` e derruba o par.
