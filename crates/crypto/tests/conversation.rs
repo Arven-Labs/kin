@@ -435,6 +435,74 @@ fn a_v4_device_of_another_identity_is_refused_when_an_identity_is_expected() {
     ));
 }
 
+// ---- derrubar o par (P30 3d-ii-a, ADR 0028) ----
+
+/// Os certificados dos outros membros dão as 3 chaves do par (e só do par, não o próprio).
+#[test]
+fn peer_certificates_are_the_other_members_certificates() {
+    let (ana, bia, conv_ana, conv_bia) = pair();
+
+    let of_bia = conv_ana.peer_certificates().unwrap();
+    let of_ana = conv_bia.peer_certificates().unwrap();
+
+    assert_eq!(of_bia.len(), 1);
+    assert_eq!(of_bia[0].to_bytes(), bia.device.certificate().to_bytes());
+    assert_eq!(of_ana.len(), 1);
+    assert_eq!(of_ana[0].to_bytes(), ana.device.certificate().to_bytes());
+}
+
+/// O certificado devolvido é o que `is_revoked` consulta: com o tombstone de Bia, ele vale "revogado".
+#[test]
+fn a_peer_certificate_is_what_the_revocation_store_answers_about() {
+    let (ana, bia, conv_ana, _) = pair();
+    let cert = &conv_ana.peer_certificates().unwrap()[0];
+    assert!(!ana.device.is_revoked(cert).unwrap());
+
+    ana.device
+        .store_revocation(
+            &bia.identity
+                .revoke_device(bia.device.certificate(), 2_000)
+                .unwrap(),
+        )
+        .unwrap();
+
+    assert!(ana.device.is_revoked(cert).unwrap());
+}
+
+/// Depois de `delete` o grupo não carrega mais (e outro grupo do mesmo banco não é tocado).
+#[test]
+fn deleting_a_conversation_removes_it_from_the_database() {
+    let (ana, _, conv_ana, _) = pair();
+    let other = Conversation::create(&ana.device).unwrap();
+    let (id, other_id) = (conv_ana.id(), other.id());
+    assert!(Conversation::load(&ana.device, &id).unwrap().is_some());
+
+    conv_ana.delete().unwrap();
+
+    assert!(Conversation::load(&ana.device, &id).unwrap().is_none());
+    assert!(
+        Conversation::load(&ana.device, &other_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// `forget_conversation` tira só o label pedido de `remembered` e não falha se ele não existe.
+#[test]
+fn forgetting_a_conversation_drops_only_that_label() {
+    let ana = person();
+    ana.device.remember("a", b"grupo-a").unwrap();
+    ana.device.remember("b", b"grupo-b").unwrap();
+
+    ana.device.forget_conversation("a").unwrap();
+    ana.device.forget_conversation("nunca-existiu").unwrap();
+
+    assert_eq!(
+        ana.device.remembered().unwrap(),
+        vec![("b".to_string(), b"grupo-b".to_vec())]
+    );
+}
+
 // ---- revogação (P30 3d-i, ADR 0027) ----
 
 /// Quem tem o tombstone do device de Bia não a convida.

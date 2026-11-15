@@ -1,4 +1,4 @@
-use kin_identity::{IdentityId, NostrPublicKey, PeerId};
+use kin_identity::{DeviceCertificate, IdentityId, NostrPublicKey, PeerId};
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{
     GroupId, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
@@ -187,6 +187,19 @@ impl Conversation {
             .collect()
     }
 
+    /// Certificados (já verificados) dos outros membros: dão as 3 chaves do par, para o `chat` consultar a
+    /// revogação com [`CryptoDevice::is_revoked`] (P30 3d-ii-a, ADR 0028).
+    pub fn peer_certificates(&self) -> Result<Vec<DeviceCertificate>, Error> {
+        Ok(Vec::new())
+    }
+
+    /// Apaga este grupo do banco (estado, segredos de época e propostas; a chave de assinatura fica).
+    /// Irreversível: é o que derruba um par revogado (P30 3d-ii-a, ADR 0028). Quem chama apaga o label
+    /// depois, com [`CryptoDevice::forget_conversation`].
+    pub fn delete(self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Convida o dono do KeyPackage. Valida o KeyPackage e a credencial dele antes de aceitar;
     /// `expected` exige identidade e/ou Peer ID de rede específicos.
     pub fn invite(&mut self, key_package: &[u8], expected: &Expected) -> Result<Invite, Error> {
@@ -363,5 +376,132 @@ fn map_process_error<S: std::error::Error>(e: openmls::prelude::ProcessMessageEr
         P::ValidationError(V::WrongGroupId) => Error::WrongConversation,
         P::ValidationError(V::WrongEpoch) => Error::UnknownEpoch,
         _ => Error::mls(e),
+    }
+}
+
+/// Testes que precisam do grupo MLS (campo privado) para forjar um `Update`: o MLS assina o leaf novo
+/// com a chave nova e o enquadramento com a antiga, então só dá para forjar por baixo da API pública
+/// (P30 3d-ii-a, ADR 0028; P31 q).
+#[cfg(test)]
+mod tests {
+    use kin_identity::{DeviceKey, StandaloneIdentity};
+    use openmls::credentials::NewSignerBundle;
+    use openmls::prelude::LeafNodeParameters;
+
+    use super::*;
+
+    fn device_of(identity: &StandaloneIdentity) -> CryptoDevice {
+        let net = DeviceKey::generate();
+        CryptoDevice::new(identity, &net.public_key(), &net.nostr_public_key(), 1).unwrap()
+    }
+
+    /// Ana (committer) e Bia na mesma conversa; devolve também a identidade de Bia.
+    fn pair() -> (StandaloneIdentity, Conversation, Conversation) {
+        let (ana_id, bia_id) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (ana, bia) = (device_of(&ana_id), device_of(&bia_id));
+        let mut conv_ana = Conversation::create(&ana).unwrap();
+        let invite = conv_ana
+            .invite(&bia.key_package().unwrap(), &Expected::default())
+            .unwrap();
+        let conv_bia = Conversation::join(&bia, &invite.welcome, &Expected::default()).unwrap();
+        (bia_id, conv_ana, conv_bia)
+    }
+
+    /// Um Update de `conv` cujo leaf novo traz a credencial de `rogue` (assinado pela chave de `rogue`),
+    /// com o enquadramento ainda assinado pela chave atual de `conv`.
+    fn forged_update(conv: &mut Conversation, rogue: &CryptoDevice) -> Vec<u8> {
+        let inner = &conv.device.0;
+        let (message, _) = conv
+            .group
+            .propose_self_update_with_new_signer(
+                &inner.provider,
+                &inner.signer,
+                NewSignerBundle {
+                    signer: &rogue.0.signer,
+                    credential_with_key: rogue.0.credential.clone(),
+                },
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        message.to_bytes().unwrap()
+    }
+
+    /// Um commit de `conv` com `UpdatePath` cujo leaf novo traz a credencial de `rogue`.
+    fn forged_commit(conv: &mut Conversation, rogue: &CryptoDevice) -> Vec<u8> {
+        let inner = &conv.device.0;
+        let bundle = conv
+            .group
+            .self_update_with_new_signer(
+                &inner.provider,
+                &inner.signer,
+                NewSignerBundle {
+                    signer: &rogue.0.signer,
+                    credential_with_key: rogue.0.credential.clone(),
+                },
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        bundle.into_commit().to_bytes().unwrap()
+    }
+
+    #[test]
+    fn an_update_proposal_with_another_identity_is_refused() {
+        let (_, mut conv_ana, mut conv_bia) = pair();
+        let rogue = device_of(&StandaloneIdentity::generate());
+
+        let forged = forged_update(&mut conv_bia, &rogue);
+
+        assert!(matches!(
+            conv_ana.decrypt(&forged),
+            Err(Error::UnexpectedIdentity)
+        ));
+    }
+
+    /// Mesma identidade, mas outro device (outro Peer ID): também não é a continuação de Bia.
+    #[test]
+    fn an_update_proposal_with_another_peer_id_is_refused() {
+        let (bia_id, mut conv_ana, mut conv_bia) = pair();
+        let other_device = device_of(&bia_id);
+
+        let forged = forged_update(&mut conv_bia, &other_device);
+
+        assert!(matches!(
+            conv_ana.decrypt(&forged),
+            Err(Error::UnexpectedPeer)
+        ));
+    }
+
+    #[test]
+    fn a_commit_with_an_update_path_with_another_identity_is_refused() {
+        let (_, mut conv_ana, mut conv_bia) = pair();
+        let rogue = device_of(&StandaloneIdentity::generate());
+
+        let forged = forged_commit(&mut conv_bia, &rogue);
+
+        assert!(matches!(
+            conv_ana.decrypt(&forged),
+            Err(Error::UnexpectedIdentity)
+        ));
+    }
+
+    /// A rotação legítima (mesma credencial) segue aceita, como proposta e como commit.
+    #[test]
+    fn a_legitimate_rotation_is_still_accepted() {
+        let (_, mut conv_ana, mut conv_bia) = pair();
+
+        let proposal = conv_bia.propose_rotation().unwrap();
+        assert!(matches!(
+            conv_ana.decrypt(&proposal),
+            Ok(Decrypted::ProposalQueued)
+        ));
+
+        let commit = conv_ana.rotate_keys().unwrap();
+        assert!(matches!(
+            conv_bia.decrypt(&commit),
+            Ok(Decrypted::EpochChanged)
+        ));
     }
 }

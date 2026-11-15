@@ -164,6 +164,12 @@ impl CryptoDevice {
         self.0.provider.remember(label, conversation_id)
     }
 
+    /// Esquece o `label` guardado com [`Self::remember`] (não falha se não existe). Não apaga o grupo MLS:
+    /// quem derruba uma conversa chama antes [`crate::Conversation::delete`] (P30 3d-ii-a, ADR 0028).
+    pub fn forget_conversation(&self, _label: &str) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Pares `(label, conversation_id)` guardados com [`Self::remember`].
     pub fn remembered(&self) -> Result<Vec<(String, Vec<u8>)>, Error> {
         self.0.provider.remembered()
