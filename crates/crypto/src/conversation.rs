@@ -1,8 +1,9 @@
 use kin_identity::{DeviceCertificate, IdentityId, NostrPublicKey, PeerId};
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{
-    GroupId, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
-    ProcessedMessageContent, Proposal, ProtocolVersion, SenderRatchetConfiguration, StagedWelcome,
+    GroupId, KeyPackageIn, LeafNode, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn,
+    MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolVersion, Sender,
+    SenderRatchetConfiguration, StagedWelcome,
 };
 
 use openmls_traits::OpenMlsProvider as _;
@@ -190,13 +191,43 @@ impl Conversation {
     /// Certificados (já verificados) dos outros membros: dão as 3 chaves do par, para o `chat` consultar a
     /// revogação com [`CryptoDevice::is_revoked`] (P30 3d-ii-a, ADR 0028).
     pub fn peer_certificates(&self) -> Result<Vec<DeviceCertificate>, Error> {
-        Ok(Vec::new())
+        let own = self.group.own_leaf_index();
+        self.group
+            .members()
+            .filter(|m| m.index != own)
+            .map(|m| credential::certificate_of(&m.credential))
+            .collect()
     }
 
     /// Apaga este grupo do banco (estado, segredos de época e propostas; a chave de assinatura fica).
     /// Irreversível: é o que derruba um par revogado (P30 3d-ii-a, ADR 0028). Quem chama apaga o label
     /// depois, com [`CryptoDevice::forget_conversation`].
-    pub fn delete(self) -> Result<(), Error> {
+    pub fn delete(mut self) -> Result<(), Error> {
+        self.group
+            .delete(self.device.0.provider.storage())
+            .map_err(Error::mls)
+    }
+
+    /// O leaf novo de um `Update` (proposta, ou `UpdatePath` de um commit) de `sender` tem de continuar
+    /// sendo o **mesmo device**: `verify` com a identidade e o Peer ID que ele tem hoje no grupo, e sem
+    /// tombstone. A chave MLS pode mudar (é para isso que o Update existe). O MLS não confere isso:
+    /// sem a checagem, um par revogado "viraria" outro certificado válido dentro do grupo (P31 q).
+    fn verify_continuity(&self, leaf: &LeafNode, sender: &Sender) -> Result<(), Error> {
+        let Sender::Member(index) = sender else {
+            return Err(Error::Unsupported);
+        };
+        let member = self.group.member_at(*index).ok_or(Error::Malformed)?;
+        let current = credential::certificate_of(&member.credential)?;
+        let (identity, peer) = (current.identity().clone(), current.network_peer_id());
+        credential::verify(
+            leaf.credential(),
+            leaf.signature_key().as_slice(),
+            &Expected {
+                identity: Some(&identity),
+                peer: Some(&peer),
+            },
+            &self.device.0.provider,
+        )?;
         Ok(())
     }
 
@@ -319,6 +350,7 @@ impl Conversation {
             .map_err(map_process_error)?;
 
         let sender = credential::identity_of(processed.credential())?;
+        let framing_sender = processed.sender().clone();
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(m) => Ok(Decrypted::Message {
                 sender,
@@ -338,6 +370,14 @@ impl Conversation {
                         &inner.provider,
                     )?;
                 }
+                // Os leaves novos de Update (o `UpdatePath` do commit e as propostas Update que ele
+                // efetiva) continuam sendo o mesmo device de quem os enviou (P31 q).
+                if let Some(leaf) = staged.update_path_leaf_node() {
+                    self.verify_continuity(leaf, &framing_sender)?;
+                }
+                for update in staged.update_proposals() {
+                    self.verify_continuity(update.update_proposal().leaf_node(), update.sender())?;
+                }
                 self.group
                     .merge_staged_commit(&inner.provider, *staged)
                     .map_err(Error::mls)?;
@@ -348,6 +388,9 @@ impl Conversation {
             ProcessedMessageContent::ProposalMessage(proposal)
                 if matches!(proposal.proposal(), Proposal::Update(_)) =>
             {
+                if let Proposal::Update(update) = proposal.proposal() {
+                    self.verify_continuity(update.leaf_node(), &framing_sender)?;
+                }
                 self.group
                     .store_pending_proposal(inner.provider.storage(), *proposal)
                     .map_err(Error::mls)?;
