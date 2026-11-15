@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{Person, WAIT, connect};
 use kin_identity::{DeviceKey, IdentityProvider};
 use tokio::time::timeout;
@@ -49,6 +51,8 @@ async fn a_revocation_emitted_by_a_reaches_c_through_b() {
                 e = a.next_event() => seen[0].push(e),
                 e = b.next_event() => seen[1].push(e),
                 e = c.next_event() => seen[2].push(e),
+                // Receber um tombstone não emite evento: sem o tique, o `is_revoked` abaixo nunca rodaria.
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
             }
             if c.is_revoked(&certificate).unwrap() {
                 break;
