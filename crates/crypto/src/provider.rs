@@ -112,9 +112,10 @@ impl Provider {
         )?;
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO kin_revocations
+                "INSERT INTO kin_revocations
                      (identity, signing_key, network_key, nostr_key, tombstone)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (identity, signing_key, network_key, nostr_key) DO NOTHING",
                 params![
                     key.identity,
                     key.signing.as_slice(),
@@ -128,6 +129,10 @@ impl Provider {
     }
 
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
+    ///
+    /// **Pré-condição:** o certificado já passou por `DeviceCertificate::verify` (em `credential::verify`).
+    /// Um certificado não verificado traz identidade e cadeia à escolha do atacante, e a consulta
+    /// devolveria "não revogado" para um device revogado (auditoria da 3b, I2).
     #[allow(dead_code)]
     pub(crate) fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
         let key = RevocationKey::new(
@@ -387,6 +392,36 @@ mod tests {
         let cert = cert_for(&victim, &k);
         assert!(!provider.is_revoked(&cert).unwrap());
         assert!(!provider.is_revoked_or_unknown(&cert));
+    }
+
+    /// Auditoria 3b, I3: a identidade faz parte da chave primária. Duas identidades revogando as MESMAS
+    /// três chaves públicas convivem, em qualquer ordem de gravação (nenhuma é engolida pela outra).
+    #[test]
+    fn two_identities_revoking_the_same_three_keys_both_stay() {
+        let k = keys();
+        for victim_first in [true, false] {
+            let (x, v) = (
+                StandaloneIdentity::generate(),
+                StandaloneIdentity::generate(),
+            );
+            let (ax, av) = (authority_of(&x), authority_of(&v));
+            let (cx, cv) = (cert_for(&ax, &k), cert_for(&av, &k));
+            let (rx, rv) = (
+                ax.revoke_device(&cx, NOW + 60).unwrap(),
+                av.revoke_device(&cv, NOW + 60).unwrap(),
+            );
+            let provider = Provider::open(None).unwrap();
+            if victim_first {
+                provider.store_revocation(&rv).unwrap();
+                provider.store_revocation(&rx).unwrap();
+            } else {
+                provider.store_revocation(&rx).unwrap();
+                provider.store_revocation(&rv).unwrap();
+            }
+            assert_eq!(rows(&provider), 2);
+            assert!(provider.is_revoked(&cx).unwrap());
+            assert!(provider.is_revoked(&cv).unwrap());
+        }
     }
 
     #[test]
