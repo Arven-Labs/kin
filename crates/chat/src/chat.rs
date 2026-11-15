@@ -335,6 +335,7 @@ pub struct Chat {
     /// Só em memória; zera ao desconectar.
     revocations_seen: HashMap<PeerId, (Instant, u32)>,
     /// Duração da janela do limite de tombstones (campo, para o teste não esperar 60 s).
+    #[allow(dead_code)]
     revocation_window: Duration,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
@@ -5200,7 +5201,7 @@ mod tests {
     }
 
     fn revocation_wire(raw: &mut Conversation, revocation: &DeviceRevocation) -> Vec<u8> {
-        raw.encrypt(&Payload::Revocation(revocation.clone()).encode())
+        raw.encrypt(&Payload::Revocation(Box::new(revocation.clone())).encode())
             .unwrap()
     }
 

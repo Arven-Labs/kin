@@ -72,8 +72,10 @@ pub(crate) enum Payload {
         next: u64,
         done: bool,
     },
-    /// Tombstone de um device (P30, 3c): este device deixou de valer.
-    Revocation(DeviceRevocation),
+    /// Tombstone de um device (P30, 3c): este device deixou de valer. Em `Box`: é bem maior que as
+    /// outras variantes (carrega a cadeia da autoridade).
+    #[allow(dead_code)]
+    Revocation(Box<DeviceRevocation>),
 }
 
 impl Payload {
@@ -273,9 +275,7 @@ fn take(bytes: &[u8]) -> Result<(&[u8], &[u8]), Error> {
 mod tests {
     use super::*;
     use crate::{Error, Message, MessageId};
-    use kin_identity::{
-        AuthorityIdentity, AuthorityKey, DeviceKey, IdentityProvider, StandaloneIdentity,
-    };
+    use kin_identity::{AuthorityIdentity, AuthorityKey};
 
     /// Um tombstone de um device novo, assinado pela mestra (v3) ou por uma autoridade (v4).
     fn revocation(by_authority: bool) -> DeviceRevocation {
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn a_revocation_survives_encode_and_decode_from_the_master_and_from_an_authority() {
         for by_authority in [false, true] {
-            let payload = Payload::Revocation(revocation(by_authority));
+            let payload = Payload::Revocation(Box::new(revocation(by_authority)));
 
             assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
         }
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn a_revocation_payload_that_is_empty_truncated_garbage_or_non_canonical_is_malformed() {
-        let good = Payload::Revocation(revocation(true)).encode();
+        let good = Payload::Revocation(Box::new(revocation(true))).encode();
         let mut trailing = good.clone();
         trailing.push(0);
         let mut oversized = good.clone();
