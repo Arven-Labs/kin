@@ -181,7 +181,6 @@ const REVOCATIONS_GLOBAL_PER_WINDOW: u32 = 64;
 const REVOCATION_REFUNDS_PER_WINDOW: u32 = 16;
 /// Tombstones reenviados a um peer por conexão (3c-ii-b): abaixo da cota de 16 por peer do receptor, para
 /// sobrar espaço para repasses novos e para outros remetentes. Quem tem mais recebe só os mais recentes.
-#[allow(dead_code)]
 const REVOCATIONS_RESEND_MAX: usize = 8;
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
@@ -350,7 +349,6 @@ pub struct Chat {
     /// Devoluções de cota já feitas na janela (teto `REVOCATION_REFUNDS_PER_WINDOW`): início e contagem.
     revocation_refunds: (Instant, u32),
     /// Quando reenviei tombstones a cada peer (3c-ii-b): no máximo um reenvio por janela por peer.
-    #[allow(dead_code)]
     revocations_sent: HashMap<PeerId, Instant>,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
@@ -1110,6 +1108,7 @@ impl Chat {
                 // Conversa recarregada do banco: os dois lados já a têm, então dá para anunciar já.
                 self.announce_relays(peer);
                 self.announce_devices(peer);
+                self.announce_revocations(peer);
                 self.send_hello(peer);
                 self.flush(peer);
             }
@@ -1278,6 +1277,7 @@ impl Chat {
         // por substreams diferentes e a ordem de chegada não é garantida.
         self.announce_relays(peer);
         self.announce_devices(peer);
+        self.announce_revocations(peer);
         Ok(())
     }
 
@@ -1521,6 +1521,7 @@ impl Chat {
                 // O outro lado já tem a conversa: agora é seguro anunciar os nossos relays e devices.
                 self.announce_relays(peer);
                 self.announce_devices(peer);
+                self.announce_revocations(peer);
                 match payload {
                     Payload::Message(message) => {
                         // Nova tentativa do remetente = outros bytes cifrados, o MLS não vê
@@ -1665,17 +1666,52 @@ impl Chat {
 
     /// O inverso de [`Self::accepts_identity`]: as identidades de tombstone que um device de `who` aceita.
     /// `None` = todas (irmão); senão `who` e, se eu aceito `who`, a minha.
-    #[allow(dead_code)]
-    fn revocation_identities_for(&self, _who: &IdentityId) -> Option<Vec<IdentityId>> {
-        todo!("3c-ii-b: identidades que o peer aceita")
+    fn revocation_identities_for(&self, who: &IdentityId) -> Option<Vec<IdentityId>> {
+        let own = self.device.identity();
+        if who == own {
+            return None;
+        }
+        let mut identities = vec![who.clone()];
+        if self.is_trusted(who) {
+            identities.push(own.clone());
+        }
+        Some(identities)
     }
 
     /// Reenvia ao `peer` até [`REVOCATIONS_RESEND_MAX`] tombstones gravados, os mais recentes entre os que ele
     /// aceita (3c-ii-b, ADR 0026), no máximo uma vez por janela por peer: a cota do receptor não zera ao
     /// reconectar, e reenviar a cada conexão a esgotaria. Idempotente no receptor (não repassa o repetido).
-    #[allow(dead_code)]
-    fn announce_revocations(&mut self, _peer: PeerId) {
-        todo!("3c-ii-b: reenviar tombstones ao conectar")
+    fn announce_revocations(&mut self, peer: PeerId) {
+        if !self.connected.contains(&peer) {
+            return;
+        }
+        let Some(who) = self.conversation_identity(&peer) else {
+            return;
+        };
+        let now = Instant::now();
+        let window = self.revocation_window;
+        self.revocations_sent
+            .retain(|_, last| now.duration_since(*last) < window);
+        if self.revocations_sent.contains_key(&peer) {
+            return;
+        }
+        // O filtro por identidade é no SQL: os mais recentes do banco podem ser de uma identidade que este
+        // peer não aceita, e filtrar depois do limite esconderia o que ele deveria receber.
+        let identities = self.revocation_identities_for(&who);
+        let found = match self
+            .device
+            .revocations(identities.as_deref(), REVOCATIONS_RESEND_MAX)
+        {
+            Ok(found) => found,
+            Err(e) => return self.drop_message(peer, e.into()),
+        };
+        if found.is_empty() {
+            return;
+        }
+        self.revocations_sent.insert(peer, now);
+        for revocation in &found {
+            self.send_revocation(peer, revocation);
+        }
     }
 
     /// A identidade do único device do outro lado da conversa com `peer` (conversa com vários membros: `None`;

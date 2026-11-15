@@ -133,13 +133,38 @@ impl Provider {
     /// `identities` só os dessas identidades (o filtro é no SQL: pegar os mais recentes e filtrar depois
     /// poderia devolver zero e esconder o que o peer deveria receber); com `None`, de todas. Cada linha é
     /// relida com `DeviceRevocation::from_bytes`: uma linha ilegível é **erro**, nunca pulada em silêncio.
-    #[allow(dead_code)]
     pub(crate) fn revocations(
         &self,
-        _identities: Option<&[IdentityId]>,
-        _limit: usize,
+        identities: Option<&[IdentityId]>,
+        limit: usize,
     ) -> Result<Vec<DeviceRevocation>, Error> {
-        todo!("3c-ii-b: listar os tombstones")
+        use rusqlite::types::Value;
+        let mut sql = String::from("SELECT tombstone FROM kin_revocations");
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(identities) = identities {
+            if identities.is_empty() {
+                return Ok(Vec::new());
+            }
+            sql.push_str(" WHERE identity IN (");
+            sql.push_str(&vec!["?"; identities.len()].join(","));
+            sql.push(')');
+            values.extend(identities.iter().map(|id| Value::Text(id.to_base58())));
+        }
+        sql.push_str(" ORDER BY rowid DESC LIMIT ?");
+        values.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        let mut stmt = self.conn.prepare(&sql).map_err(Error::storage)?;
+        let blobs = stmt
+            .query_map(rusqlite::params_from_iter(values), |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .map_err(Error::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Error::storage)?;
+        // Uma linha ilegível é erro (nunca pulada): quem lê não pode achar que tem menos tombstones.
+        blobs
+            .iter()
+            .map(|bytes| DeviceRevocation::from_bytes(bytes).map_err(Error::from))
+            .collect()
     }
 
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
