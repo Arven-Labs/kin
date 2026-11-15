@@ -178,7 +178,6 @@ const REVOCATIONS_PER_WINDOW: u32 = 16;
 const REVOCATIONS_GLOBAL_PER_WINDOW: u32 = 64;
 /// Teto de devoluções de cota por janela (auditoria 3c-ii, I2): com o armazenamento falhando para sempre, a
 /// devolução ilimitada deixaria o limite sem efeito justamente quando cada tentativa já pagou a assinatura.
-#[allow(dead_code)]
 const REVOCATION_REFUNDS_PER_WINDOW: u32 = 16;
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
@@ -345,7 +344,6 @@ pub struct Chat {
     /// Duração da janela do limite de tombstones (campo, para o teste não esperar 60 s).
     revocation_window: Duration,
     /// Devoluções de cota já feitas na janela (teto `REVOCATION_REFUNDS_PER_WINDOW`): início e contagem.
-    #[allow(dead_code)]
     revocation_refunds: (Instant, u32),
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
@@ -1601,10 +1599,7 @@ impl Chat {
             Err(e) => {
                 let error = Error::from(e);
                 if Self::refunds_quota(&error) {
-                    if let Some(seen) = self.revocations_seen.get_mut(&peer) {
-                        seen.1 = seen.1.saturating_sub(1);
-                    }
-                    self.revocations_global.1 = self.revocations_global.1.saturating_sub(1);
+                    self.refund_revocation_quota(peer);
                 }
                 Err(error)
             }
@@ -1615,35 +1610,55 @@ impl Chat {
     /// ocupado): o remetente não teve culpa e o tombstone seria perdido. Assinatura inválida e recusa de
     /// admissão são culpa dele e continuam gastando (ADR 0024, item 4; ADR 0025).
     /// Devolve **uma** unidade de cota do peer e da janela global, até o teto de devoluções por janela.
-    #[allow(dead_code)]
-    fn refund_revocation_quota(&mut self, _peer: PeerId) {
-        todo!("3c-ii-a: devolução com teto")
+    fn refund_revocation_quota(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        if now.duration_since(self.revocation_refunds.0) >= self.revocation_window {
+            self.revocation_refunds = (now, 0);
+        }
+        if self.revocation_refunds.1 >= REVOCATION_REFUNDS_PER_WINDOW {
+            return;
+        }
+        self.revocation_refunds.1 += 1;
+        if let Some(seen) = self.revocations_seen.get_mut(&peer) {
+            seen.1 = seen.1.saturating_sub(1);
+        }
+        self.revocations_global.1 = self.revocations_global.1.saturating_sub(1);
     }
 
     fn refunds_quota(error: &Error) -> bool {
         matches!(error, Error::Crypto(kin_crypto::Error::Storage(_)))
     }
 
-    /// Os peers a quem avisar de um tombstone: **conectados**, com conversa pronta de um único peer cuja
-    /// identidade eu aceito (`is_trusted`, irmãos sempre), menos `except` (quem me enviou). Quem não aceitei
-    /// nem recebe: o receptor o recusaria e gastaria a cota dele (ADR 0025).
-    fn revocation_targets(&self, _identity: &IdentityId, except: Option<PeerId>) -> Vec<PeerId> {
+    /// Os peers a quem avisar de um tombstone da identidade `identity`: **conectados**, com conversa pronta
+    /// de um único peer, menos `except` (quem me enviou), e só quem **aceita `identity`**, porque o receptor
+    /// admite por `is_trusted(identity)` e não pelo remetente (auditoria 3c-ii, I1; ADR 0025):
+    /// - irmão (identidade minha), sempre;
+    /// - device da própria `identity` (aceita a si mesma);
+    /// - contato que eu aceitei, **só se `identity` é a minha** (um contato não aceita uma terceira por
+    ///   mim: mandar o tombstone dela revelaria em quem eu confio e gastaria a cota de quem o recusa).
+    fn revocation_targets(&self, identity: &IdentityId, except: Option<PeerId>) -> Vec<PeerId> {
+        let own = self.device.identity();
         self.connected
             .iter()
             .copied()
-            .filter(|peer| Some(*peer) != except && self.is_trusted_peer(peer))
+            .filter(|peer| {
+                Some(*peer) != except
+                    && self.conversation_identity(peer).is_some_and(|who| {
+                        who == *own
+                            || who == *identity
+                            || (identity == own && self.is_trusted(&who))
+                    })
+            })
             .collect()
     }
 
-    /// A conversa com `peer` é de um único device cuja identidade eu aceito (a minha ou `trust`)?
-    fn is_trusted_peer(&self, peer: &PeerId) -> bool {
-        self.conversations
-            .get(peer)
-            .and_then(|conversation| conversation.peers().ok())
-            .is_some_and(|peers| match peers.as_slice() {
-                [identity] => self.is_trusted(identity),
-                _ => false,
-            })
+    /// A identidade do único device do outro lado da conversa com `peer` (conversa com vários membros: `None`;
+    /// hoje todas são 1:1, e um grupo futuro ficaria sem tombstone, em silêncio).
+    fn conversation_identity(&self, peer: &PeerId) -> Option<IdentityId> {
+        match self.conversations.get(peer)?.peers().ok()?.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// Cifra o tombstone para `peer` e o transmite (como `announce_relays`: fora da outbox, sem ack, então
@@ -1651,6 +1666,8 @@ impl Chat {
     fn send_revocation(&mut self, peer: PeerId, revocation: &DeviceRevocation) {
         let payload = Payload::Revocation(Box::new(revocation.clone())).encode();
         let Some(conversation) = self.conversations.get_mut(&peer) else {
+            // `revocation_targets` só devolve peers com conversa: se isto rodar, o filtro mudou.
+            debug_assert!(false, "destino do tombstone sem conversa");
             return;
         };
         match conversation.encrypt(&payload) {
