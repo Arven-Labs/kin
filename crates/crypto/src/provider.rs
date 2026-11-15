@@ -104,7 +104,7 @@ impl Provider {
     #[allow(dead_code)]
     pub(crate) fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<(), Error> {
         revocation.verify()?;
-        let (identity, signing, network, nostr) = revocation_key(
+        let key = RevocationKey::new(
             revocation.identity(),
             &revocation.signing_key,
             &revocation.network_key,
@@ -116,10 +116,10 @@ impl Provider {
                      (identity, signing_key, network_key, nostr_key, tombstone)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    identity,
-                    signing.as_slice(),
-                    network.as_slice(),
-                    nostr.as_slice(),
+                    key.identity,
+                    key.signing.as_slice(),
+                    key.network.as_slice(),
+                    key.nostr.as_slice(),
                     revocation.to_bytes()
                 ],
             )
@@ -130,7 +130,7 @@ impl Provider {
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
     #[allow(dead_code)]
     pub(crate) fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
-        let (identity, signing, network, nostr) = revocation_key(
+        let key = RevocationKey::new(
             certificate.identity(),
             &certificate.signing_key,
             &certificate.network_key,
@@ -141,10 +141,10 @@ impl Provider {
                 "SELECT EXISTS (SELECT 1 FROM kin_revocations
                      WHERE identity = ?1 AND signing_key = ?2 AND network_key = ?3 AND nostr_key = ?4)",
                 params![
-                    identity,
-                    signing.as_slice(),
-                    network.as_slice(),
-                    nostr.as_slice()
+                    key.identity,
+                    key.signing.as_slice(),
+                    key.network.as_slice(),
+                    key.nostr.as_slice()
                 ],
                 |r| r.get(0),
             )
@@ -217,18 +217,27 @@ impl Provider {
 /// A chave de um tombstone: `(identidade, assinatura, rede, nostr)`. A identidade entra sempre: sem ela,
 /// a autoridade de outra identidade revogaria um device alheio que tivesse as mesmas chaves públicas
 /// (P31 af).
-fn revocation_key(
-    identity: &IdentityId,
-    signing: &PublicKey,
-    network: &PublicKey,
-    nostr: &NostrPublicKey,
-) -> Result<(String, [u8; 32], [u8; 32], [u8; 32]), Error> {
-    Ok((
-        identity.to_base58(),
-        ed25519_bytes(signing)?,
-        ed25519_bytes(network)?,
-        nostr.to_bytes(),
-    ))
+struct RevocationKey {
+    identity: String,
+    signing: [u8; 32],
+    network: [u8; 32],
+    nostr: [u8; 32],
+}
+
+impl RevocationKey {
+    fn new(
+        identity: &IdentityId,
+        signing: &PublicKey,
+        network: &PublicKey,
+        nostr: &NostrPublicKey,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            identity: identity.to_base58(),
+            signing: ed25519_bytes(signing)?,
+            network: ed25519_bytes(network)?,
+            nostr: nostr.to_bytes(),
+        })
+    }
 }
 
 impl OpenMlsProvider for Provider {
