@@ -176,6 +176,10 @@ const REVOCATIONS_PER_WINDOW: u32 = 16;
 /// Teto de todos os peers somados na mesma janela (auditoria 3c-i: só o limite por peer não segura quem
 /// abre várias conexões).
 const REVOCATIONS_GLOBAL_PER_WINDOW: u32 = 64;
+/// Teto de devoluções de cota por janela (auditoria 3c-ii, I2): com o armazenamento falhando para sempre, a
+/// devolução ilimitada deixaria o limite sem efeito justamente quando cada tentativa já pagou a assinatura.
+#[allow(dead_code)]
+const REVOCATION_REFUNDS_PER_WINDOW: u32 = 16;
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Teto de linhas de histórico importadas de um irmão por sessão de sincronização (P10a). Um irmão
@@ -340,6 +344,9 @@ pub struct Chat {
     revocations_global: (Instant, u32),
     /// Duração da janela do limite de tombstones (campo, para o teste não esperar 60 s).
     revocation_window: Duration,
+    /// Devoluções de cota já feitas na janela (teto `REVOCATION_REFUNDS_PER_WINDOW`): início e contagem.
+    #[allow(dead_code)]
+    revocation_refunds: (Instant, u32),
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
     /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
@@ -480,6 +487,7 @@ impl Chat {
             revocations_seen: HashMap::new(),
             revocations_global: (Instant::now(), 0),
             revocation_window: REVOCATION_WINDOW,
+            revocation_refunds: (Instant::now(), 0),
             sibling_pending: Default::default(),
             sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
             history_cap: MAX_SYNC_ENTRIES,
@@ -1584,7 +1592,7 @@ impl Chat {
             // Novo: repasso a quem devo avisar, menos a quem me enviou. O repetido não repassa: é o que
             // corta o eco e o loop (cada device grava uma vez, então a cascata termina).
             Ok(true) => {
-                for target in self.revocation_targets(Some(peer)) {
+                for target in self.revocation_targets(revocation.identity(), Some(peer)) {
                     self.send_revocation(target, revocation);
                 }
                 Ok(())
@@ -1606,6 +1614,12 @@ impl Chat {
     /// Esta falha de gravação **devolve** a cota do peer? Só a de armazenamento (disco cheio, banco
     /// ocupado): o remetente não teve culpa e o tombstone seria perdido. Assinatura inválida e recusa de
     /// admissão são culpa dele e continuam gastando (ADR 0024, item 4; ADR 0025).
+    /// Devolve **uma** unidade de cota do peer e da janela global, até o teto de devoluções por janela.
+    #[allow(dead_code)]
+    fn refund_revocation_quota(&mut self, _peer: PeerId) {
+        todo!("3c-ii-a: devolução com teto")
+    }
+
     fn refunds_quota(error: &Error) -> bool {
         matches!(error, Error::Crypto(kin_crypto::Error::Storage(_)))
     }
@@ -1613,7 +1627,7 @@ impl Chat {
     /// Os peers a quem avisar de um tombstone: **conectados**, com conversa pronta de um único peer cuja
     /// identidade eu aceito (`is_trusted`, irmãos sempre), menos `except` (quem me enviou). Quem não aceitei
     /// nem recebe: o receptor o recusaria e gastaria a cota dele (ADR 0025).
-    fn revocation_targets(&self, except: Option<PeerId>) -> Vec<PeerId> {
+    fn revocation_targets(&self, _identity: &IdentityId, except: Option<PeerId>) -> Vec<PeerId> {
         self.connected
             .iter()
             .copied()
@@ -1655,7 +1669,7 @@ impl Chat {
             return Err(Error::UnauthorizedRevocation);
         }
         self.device.store_revocation(revocation)?;
-        for target in self.revocation_targets(None) {
+        for target in self.revocation_targets(revocation.identity(), None) {
             self.send_revocation(target, revocation);
         }
         Ok(())
@@ -5598,13 +5612,16 @@ mod tests {
 
     // ---- P30 3c-ii: emitir e repassar (ADR 0025) ----
 
-    /// A Bia com quatro devices alheios: o irmão e a Ana (aceita), conectados; um estranho (sem `trust`),
-    /// conectado; e uma Carol aceita que **não** está conectada.
+    /// A Bia com cinco devices alheios: o irmão, a Ana e o Dan (aceitos), conectados; um estranho (sem
+    /// `trust`), conectado; e uma Carol aceita que **não** está conectada.
     struct Fanout {
         bia: Chat,
         bia_key: StandaloneIdentity,
+        ana_key: StandaloneIdentity,
+        carol_key: StandaloneIdentity,
         sibling: RawDevice,
         ana: RawDevice,
+        dan: RawDevice,
         stranger: RawDevice,
         carol: RawDevice,
     }
@@ -5619,18 +5636,24 @@ mod tests {
             ..
         } = household();
         bia.trust(ana_key.id()).unwrap();
+        let dan_key = StandaloneIdentity::generate();
+        bia.trust(dan_key.id()).unwrap();
+        let dan = add_device_of(&mut bia, &dan_key);
         let stranger = add_device_of(&mut bia, &StandaloneIdentity::generate());
         let carol_key = StandaloneIdentity::generate();
         bia.trust(carol_key.id()).unwrap();
         let carol = add_device_of(&mut bia, &carol_key);
-        for peer in [sibling.0, ana.0, stranger.0] {
+        for peer in [sibling.0, ana.0, dan.0, stranger.0] {
             bia.connected.insert(peer);
         }
         Fanout {
             bia,
             bia_key,
+            ana_key,
+            carol_key,
             sibling,
             ana,
+            dan,
             stranger,
             carol,
         }
@@ -5640,26 +5663,42 @@ mod tests {
         peers.into_iter().collect()
     }
 
-    /// Destinos: conectados, com conversa, de identidade aceita (irmão sempre); sem o remetente. O estranho
-    /// (sem `trust`) e a Carol (desconectada) ficam de fora.
+    /// Destinos de um tombstone da identidade `I` (auditoria 3c-ii, I1): só quem **aceita I**, porque o
+    /// receptor admite por `is_trusted(I)`. Irmão sempre; device da própria `I` (aceita a si mesma); e,
+    /// se `I` é a minha, os contatos que aceitei. Tombstone de TERCEIRA identidade não vai a outros
+    /// contatos (revelaria em quem eu confio e gastaria a cota de quem a recusa). Sem o remetente.
     #[tokio::test]
-    async fn revocation_targets_are_connected_trusted_conversations_except_the_sender() {
+    async fn revocation_targets_are_only_those_who_accept_the_identity_except_the_sender() {
         let f = fanout();
+        let (bia, ana, carol) = (f.bia_key.id(), f.ana_key.id(), f.carol_key.id());
+        let (sibling, ana_peer, dan) = (f.sibling.0, f.ana.0, f.dan.0);
 
+        // Minha identidade: irmão e os contatos aceitos conectados (Ana e Dan); sem o estranho nem a Carol
+        // (desconectada).
         assert_eq!(
-            peer_set(f.bia.revocation_targets(None)),
-            peer_set(vec![f.sibling.0, f.ana.0])
+            peer_set(f.bia.revocation_targets(&bia, None)),
+            peer_set(vec![sibling, ana_peer, dan])
         );
         assert_eq!(
-            peer_set(f.bia.revocation_targets(Some(f.sibling.0))),
-            peer_set(vec![f.ana.0])
+            peer_set(f.bia.revocation_targets(&bia, Some(sibling))),
+            peer_set(vec![ana_peer, dan])
         );
-        assert!(!f.bia.revocation_targets(None).contains(&f.stranger.0));
-        assert!(!f.bia.revocation_targets(None).contains(&f.carol.0));
+        // Identidade da Ana (terceira para os outros contatos): o irmão e os devices da própria Ana; o Dan não.
+        assert_eq!(
+            peer_set(f.bia.revocation_targets(&ana, None)),
+            peer_set(vec![sibling, ana_peer])
+        );
+        // A Carol é aceita mas está desconectada: só o irmão.
+        assert_eq!(
+            peer_set(f.bia.revocation_targets(&carol, None)),
+            peer_set(vec![sibling])
+        );
+        assert!(!f.bia.revocation_targets(&bia, None).contains(&f.stranger.0));
+        assert!(!f.bia.revocation_targets(&bia, None).contains(&f.carol.0));
     }
 
-    /// Repasse: um tombstone NOVO vindo da Ana sai para o irmão (não volta para a Ana, nem vai ao estranho
-    /// ou à Carol); o MESMO tombstone de novo não repassa nada (sem eco, sem loop).
+    /// Repasse: um tombstone NOVO da identidade da Bia vindo da Ana sai para o irmão e o Dan (não volta
+    /// para a Ana, nem vai ao estranho ou à Carol); o MESMO tombstone de novo não repassa nada.
     #[tokio::test]
     async fn a_new_revocation_is_relayed_to_the_other_targets_and_a_repeated_one_is_not() {
         let Fanout {
@@ -5677,14 +5716,40 @@ mod tests {
 
         bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &second))
             .unwrap();
-        assert_eq!(bia.pending.len(), before + 1, "só o irmão");
+        assert_eq!(bia.pending.len(), before + 2, "o irmão e o Dan");
 
         bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &second))
             .unwrap();
-        assert_eq!(bia.pending.len(), before + 1, "repetido não repassa");
+        assert_eq!(bia.pending.len(), before + 2, "repetido não repassa");
     }
 
-    /// `broadcast_revocation`: grava e envia a todos os destinos, e de novo a cada chamada (reenvio explícito).
+    /// Auditoria 3c-ii, I1: um tombstone da CAROL (aceita pela Bia) recebido da Ana NÃO vai ao Dan nem a
+    /// outros contatos, só ao irmão e aos devices da própria Carol.
+    #[tokio::test]
+    async fn a_revocation_of_a_third_identity_goes_only_to_siblings_and_its_own_devices() {
+        let Fanout {
+            mut bia,
+            carol_key,
+            ana: (ana_peer, mut ana_raw),
+            carol: (carol_peer, _),
+            ..
+        } = fanout();
+        bia.connected.insert(carol_peer);
+        let (first, _) = revocation_by(&carol_key);
+        bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &first))
+            .unwrap();
+        let (second, _) = revocation_by(&carol_key);
+        let before = bia.pending.len();
+
+        bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &second))
+            .unwrap();
+
+        // O irmão e o device da Carol: 2. Não o Dan, não o estranho, e não a Ana (remetente).
+        assert_eq!(bia.pending.len(), before + 2);
+    }
+
+    /// `broadcast_revocation`: grava e envia a todos os destinos (irmão e contatos aceitos), e de novo a
+    /// cada chamada (reenvio explícito).
     #[tokio::test]
     async fn broadcasting_stores_the_revocation_and_sends_it_to_every_target_each_time() {
         let Fanout {
@@ -5695,10 +5760,38 @@ mod tests {
 
         bia.broadcast_revocation(&revocation).unwrap();
         assert!(bia.is_revoked(&certificate).unwrap());
-        assert_eq!(bia.pending.len(), before + 2, "irmão e Ana");
+        assert_eq!(bia.pending.len(), before + 3, "irmão, Ana e Dan");
 
         bia.broadcast_revocation(&revocation).unwrap();
-        assert_eq!(bia.pending.len(), before + 4, "reenvio explícito");
+        assert_eq!(bia.pending.len(), before + 6, "reenvio explícito");
+    }
+
+    /// Auditoria 3c-ii, I2: a devolução de cota em erro de armazenamento tem teto por janela (senão, com o
+    /// disco falhando para sempre, o limite deixaria de existir). Devolve a do peer e a global; passado o
+    /// teto não devolve mais; com a janela vencida volta a devolver.
+    #[tokio::test]
+    async fn quota_refunds_are_capped_per_window() {
+        let Fanout { mut bia, ana, .. } = fanout();
+        let peer = ana.0;
+        let now = Instant::now();
+        bia.revocations_seen.insert(peer, (now, 16));
+        bia.revocations_global = (now, 32);
+
+        for _ in 0..16 {
+            bia.refund_revocation_quota(peer);
+        }
+        assert_eq!(bia.revocations_seen[&peer].1, 0);
+        assert_eq!(bia.revocations_global.1, 16);
+
+        bia.revocations_seen.insert(peer, (now, 10));
+        bia.refund_revocation_quota(peer);
+        assert_eq!(bia.revocations_seen[&peer].1, 10, "17ª devolução: no teto");
+        assert_eq!(bia.revocations_global.1, 16);
+
+        bia.revocation_window = Duration::ZERO;
+        bia.refund_revocation_quota(peer);
+        assert_eq!(bia.revocations_seen[&peer].1, 9, "janela vencida");
+        assert_eq!(bia.revocations_global.1, 15);
     }
 
     /// `broadcast_revocation` de identidade que não aceito: recusa, não grava e não envia nada.
