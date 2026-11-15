@@ -22,16 +22,23 @@ impl Expected<'_> {
 ///
 /// A credencial carrega um `DeviceCertificate`. Aceitamos se (1) a assinatura do certificado vale,
 /// (2) o certificado cobre exatamente a chave de assinatura MLS do membro (`signature_key`) e
-/// (3) identidade e Peer ID são os esperados, nos campos que o chamador informou.
+/// (3) o device do certificado não tem tombstone em `provider` e (4) identidade e Peer ID são os
+/// esperados, nos campos que o chamador informou.
 pub(crate) fn verify(
     credential: &Credential,
     signature_key: &[u8],
     expected: &Expected,
-    _provider: &Provider,
+    provider: &Provider,
 ) -> Result<Verified, Error> {
     let cert = parse(credential)?;
     if ed25519_bytes(&cert.signing_key)? != signature_key {
         return Err(Error::InvalidCredential);
+    }
+    // Ponto único da consulta (ADR 0023 I2): só depois de `parse` ter conferido a assinatura do
+    // certificado, porque `is_revoked` assume um certificado verificado. Falha fechada: erro de
+    // leitura do store conta como revogado.
+    if provider.is_revoked_or_unknown(&cert) {
+        return Err(Error::Revoked);
     }
     let who = Verified {
         peer: cert.network_peer_id(),

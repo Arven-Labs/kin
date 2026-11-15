@@ -52,6 +52,7 @@ impl Provider {
         }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 250;
              CREATE TABLE IF NOT EXISTS kin_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_conversations (
                  label TEXT PRIMARY KEY, group_id BLOB NOT NULL);
@@ -201,7 +202,6 @@ impl Provider {
     }
 
     /// Falha fechada: na dúvida (erro de leitura), trata como revogado.
-    #[allow(dead_code)]
     pub(crate) fn is_revoked_or_unknown(&self, certificate: &DeviceCertificate) -> bool {
         self.is_revoked(certificate).unwrap_or(true)
     }
