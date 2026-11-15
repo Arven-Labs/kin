@@ -209,9 +209,10 @@ impl Conversation {
     }
 
     /// O leaf novo de um `Update` (proposta, ou `UpdatePath` de um commit) de `sender` tem de continuar
-    /// sendo o **mesmo device**: `verify` com a identidade e o Peer ID que ele tem hoje no grupo, e sem
-    /// tombstone. A chave MLS pode mudar (é para isso que o Update existe). O MLS não confere isso:
-    /// sem a checagem, um par revogado "viraria" outro certificado válido dentro do grupo (P31 q).
+    /// sendo o **mesmo device**: `verify` com a identidade e o Peer ID que ele tem hoje no grupo, sem
+    /// tombstone, e com as mesmas chaves de assinatura e Nostr (decisão do dono: as 4 chaves iguais; um
+    /// certificado renovado com as mesmas chaves passa). O MLS não confere isso: sem a checagem, um par
+    /// revogado "viraria" outro certificado válido dentro do grupo (P31 q).
     fn verify_continuity(&self, leaf: &LeafNode, sender: &Sender) -> Result<(), Error> {
         let Sender::Member(index) = sender else {
             return Err(Error::Unsupported);
@@ -228,6 +229,13 @@ impl Conversation {
             },
             &self.device.0.provider,
         )?;
+        // Identidade e Peer ID (a chave de rede) já conferem; faltam a chave de assinatura e a Nostr (as
+        // 4 chaves do tombstone, ADR 0023). Sem isso, um certificado válido da mesma identidade e do mesmo
+        // device trocaria em silêncio a chave Nostr, que é para onde o mailbox entrega (auditoria I1).
+        let next = credential::certificate_of(leaf.credential())?;
+        if next.signing_key != current.signing_key || next.nostr_key != current.nostr_key {
+            return Err(Error::DeviceKeysChanged);
+        }
         Ok(())
     }
 
@@ -644,10 +652,12 @@ mod tests {
         let forged = forged_update(&mut p.conv_bia, &rogue);
         assert!(p.conv_ana.decrypt(&forged).is_err());
 
+        // Se a proposta forjada tivesse entrado na fila de Ana, ela não conseguiria cifrar ("pending
+        // proposal exists"). O grupo de Bia é que ficou com a proposta dela, por isso é Ana quem fala.
         assert_eq!(p.conv_ana.epoch(), epoch);
-        let hello = p.conv_bia.encrypt(b"oi").unwrap();
+        let hello = p.conv_ana.encrypt(b"oi").unwrap();
         assert!(matches!(
-            p.conv_ana.decrypt(&hello),
+            p.conv_bia.decrypt(&hello),
             Ok(Decrypted::Message { .. })
         ));
     }
