@@ -1635,3 +1635,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: uso real (nada envia tombstone ainda); erro de armazenamento no caminho do `chat`; `handle(MessageReceived)` →
   `Dropped`; janela real (os testes forçam `ZERO`); o flake do `relay.rs`; revisão externa.
 - **Próximo passo**: 3c-ii (enviar e repassar, com reenvio ao conectar), em plan mode.
+
+#### Emitir e repassar o tombstone (P30, fatia 3c-ii-a, ADR 0025)
+
+- **Decisões do dono** (plan mode + 2 perguntas, mais 2 depois da auditoria): 3c-ii cortada em **a (emitir e repassar)** e **b (reenviar ao
+  conectar)**; para a 3c-ii-b, até 8 mais recentes por conexão, sem cursor. Depois da auditoria: **destinos só de quem aceita a identidade do
+  tombstone** (a minha primeira versão era "peers que eu aceito") e **reembolso de cota com teto de 16 por janela**.
+- **Feito**: `store_revocation` devolve `Result<bool>` (nova ou repetida); `Chat::broadcast_revocation`, `is_revoked` (público),
+  `revocation_targets`, `send_revocation`, `refund_revocation_quota`; repasse em `on_revocation` só do novo. ADR 0025. Nada mudou em
+  `identity` e `cli`; nada consulta o store ainda (3d).
+- **Prova de que testam algo**: stubs, **8 de 8 falharam** (run 43711885667); verde (43712874529). Depois da auditoria, **3 de 3 testes que
+  mudaram a regra falharam** (43714563176); verde (43714871348).
+- **Mutações** (branches descartáveis, 7 de 7 pegas nas duas rodadas): repassa o repetido (43713157590), repassa ao remetente (43713166425),
+  destinos sem `trust` (43713179480), `broadcast` sem admissão (43713193105), reembolso para o erro errado (43713768870), contato recebe
+  tombstone de terceira identidade (43715193040), reembolso sem teto (43715239775).
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 3 importantes: I1 (destino pela pergunta errada: vaza o grafo de
+  confiança e gasta a cota de quem recusa) e I2 (reembolso sem teto) corrigidos; I3 (propagação de tentativa única) vira a 3c-ii-b,
+  bloqueadora do P30. Tabela no ADR.
+- **Tropeços**: o teste de integração falhou duas vezes por defeito **meu** (receber tombstone não emite evento, então `next_event()`
+  não retorna: faltava um tique no `select!`); a mutação 3 deixava `is_trusted_peer` sem uso e o clippy a barrava; e a primeira versão
+  do teste de integração (A→B→C) codificava a regra de destino errada.
+- **Não verificado**: a chamada do reembolso em `on_revocation` (só o predicado e a função têm teste); o erro do `encrypt` em
+  `send_revocation`; `untrust` de destino conectado; o ciclo A→B→C→A em rede; se `conversation.peers()` verifica assinatura (S3); uso
+  real; revisão externa.
+- **Próximo passo**: 3c-ii-b (reenviar ao conectar), em plan mode, antes da 3d.

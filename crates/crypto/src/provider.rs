@@ -100,8 +100,9 @@ impl Provider {
 
     /// Grava um tombstone de device (P30, fatia 3b, ADR 0023). Confere a assinatura (`verify`) e usa a
     /// identidade da **cadeia assinada**, nunca um parâmetro do chamador. Idempotente, cumulativo e **sem
-    /// despejo**: não passa por teto nenhum.
-    pub(crate) fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<(), Error> {
+    /// despejo**: não passa por teto nenhum. Devolve `true` se o tombstone era **novo** (nenhuma linha com a
+    /// mesma chave), `false` se já estava gravado; é o que decide o repasse (P30, 3c-ii, ADR 0025).
+    pub(crate) fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<bool, Error> {
         revocation.verify()?;
         let key = RevocationKey::new(
             revocation.identity(),
@@ -109,7 +110,8 @@ impl Provider {
             &revocation.network_key,
             &revocation.nostr_key,
         )?;
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT INTO kin_revocations
                      (identity, signing_key, network_key, nostr_key, tombstone)
@@ -124,7 +126,7 @@ impl Provider {
                 ],
             )
             .map_err(Error::storage)?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
@@ -429,8 +431,9 @@ mod tests {
         let cert = cert_for(&authority, &keys());
         let revocation = authority.revoke_device(&cert, NOW + 60).unwrap();
         let provider = Provider::open(None).unwrap();
-        provider.store_revocation(&revocation).unwrap();
-        provider.store_revocation(&revocation).unwrap();
+        // 3c-ii: o retorno diz se era nova (decide o repasse): a primeira sim, a repetida não.
+        assert!(provider.store_revocation(&revocation).unwrap());
+        assert!(!provider.store_revocation(&revocation).unwrap());
         assert_eq!(rows(&provider), 1);
         assert!(provider.is_revoked(&cert).unwrap());
     }

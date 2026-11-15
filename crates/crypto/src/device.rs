@@ -170,7 +170,8 @@ impl CryptoDevice {
     }
 
     /// Grava um tombstone de device recebido (P30, 3c; ADR 0023): confere a assinatura e é idempotente.
-    pub fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<(), Error> {
+    /// Devolve `true` se era novo e `false` se já estava gravado (decide o repasse, ADR 0025).
+    pub fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<bool, Error> {
         self.0.provider.store_revocation(revocation)
     }
 
