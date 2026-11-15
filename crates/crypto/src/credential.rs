@@ -1,6 +1,7 @@
 use kin_identity::{DeviceCertificate, IdentityId, NostrPublicKey, PeerId, ed25519_bytes};
 use openmls::prelude::{BasicCredential, Credential};
 
+use crate::provider::Provider;
 use crate::{Error, Expected};
 
 /// Quem uma credencial MLS diz ser, já com a assinatura do certificado conferida.
@@ -26,6 +27,7 @@ pub(crate) fn verify(
     credential: &Credential,
     signature_key: &[u8],
     expected: &Expected,
+    _provider: &Provider,
 ) -> Result<Verified, Error> {
     let cert = parse(credential)?;
     if ed25519_bytes(&cert.signing_key)? != signature_key {
@@ -99,7 +101,7 @@ mod tests {
         let cert = issue(&id, &key.public_key(), &net.public_key());
         let raw = ed25519_bytes(&key.public_key()).unwrap();
 
-        let who = verify(&credential_for(&cert), &raw, &ANY).unwrap();
+        let who = verify(&credential_for(&cert), &raw, &ANY, &fresh()).unwrap();
         assert_eq!((who.identity, who.peer), (id.id(), net.peer_id()));
     }
 
@@ -115,7 +117,7 @@ mod tests {
             identity: Some(&own_id),
             peer: Some(&net.peer_id()),
         };
-        assert!(verify(&cred, &raw, &right).is_ok());
+        assert!(verify(&cred, &raw, &right, &fresh()).is_ok());
         // Mesmo certificado válido, apresentado por outro Peer ID (o spoof do P15), é recusado.
         let other = DeviceKey::generate().peer_id();
         let wrong = Expected {
@@ -123,7 +125,7 @@ mod tests {
             peer: Some(&other),
         };
         assert!(matches!(
-            verify(&cred, &raw, &wrong),
+            verify(&cred, &raw, &wrong, &fresh()),
             Err(Error::UnexpectedPeer)
         ));
     }
@@ -136,7 +138,7 @@ mod tests {
         let other = ed25519_bytes(&DeviceKey::generate().public_key()).unwrap();
 
         assert!(matches!(
-            verify(&credential_for(&cert), &other, &ANY),
+            verify(&credential_for(&cert), &other, &ANY, &fresh()),
             Err(Error::InvalidCredential)
         ));
     }
@@ -151,13 +153,92 @@ mod tests {
         let raw = ed25519_bytes(&key).unwrap();
 
         assert!(matches!(
-            verify(&credential_for(&cert), &raw, &ANY),
+            verify(&credential_for(&cert), &raw, &ANY, &fresh()),
             Err(Error::InvalidCredential)
         ));
         let garbage: Credential = BasicCredential::new(b"lixo".to_vec()).into();
         assert!(matches!(
-            verify(&garbage, &raw, &ANY),
+            verify(&garbage, &raw, &ANY, &fresh()),
             Err(Error::InvalidCredential)
+        ));
+    }
+
+    // ---- revogação (P30 3d-i) ----
+
+    /// Banco em memória, sem nenhum tombstone.
+    fn fresh() -> Provider {
+        Provider::open(None).unwrap()
+    }
+
+    /// Um certificado da `id`, com as chaves de signing/rede/Nostr, e o signing em bytes crus.
+    fn device_of(id: &StandaloneIdentity) -> (DeviceCertificate, Vec<u8>) {
+        let (key, net) = (DeviceKey::generate(), DeviceKey::generate());
+        let cert = issue(id, &key.public_key(), &net.public_key());
+        let raw = ed25519_bytes(&key.public_key()).unwrap();
+        (cert, raw)
+    }
+
+    #[test]
+    fn rejects_a_device_with_a_stored_tombstone() {
+        let id = StandaloneIdentity::generate();
+        let (cert, raw) = device_of(&id);
+        let provider = fresh();
+        provider
+            .store_revocation(&id.revoke_device(&cert, 2).unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            verify(&credential_for(&cert), &raw, &ANY, &provider),
+            Err(Error::Revoked)
+        ));
+    }
+
+    /// O tombstone é de UM device: outro device da mesma identidade segue aceito.
+    #[test]
+    fn a_tombstone_does_not_reject_another_device_of_the_same_identity() {
+        let id = StandaloneIdentity::generate();
+        let (revoked, _) = device_of(&id);
+        let (other, raw) = device_of(&id);
+        let provider = fresh();
+        provider
+            .store_revocation(&id.revoke_device(&revoked, 2).unwrap())
+            .unwrap();
+
+        assert!(verify(&credential_for(&other), &raw, &ANY, &provider).is_ok());
+    }
+
+    /// Ordem (auditoria I2 da 3b): a consulta vem DEPOIS da verificação do certificado. Um certificado
+    /// com as chaves de um device revogado e a assinatura adulterada tem de ser `InvalidCredential`;
+    /// consultar antes de verificar devolveria `Revoked` (e, com chaves sem tombstone, deixaria passar
+    /// a consulta sem checar a assinatura).
+    #[test]
+    fn verifies_the_certificate_before_asking_about_revocation() {
+        let id = StandaloneIdentity::generate();
+        let (cert, raw) = device_of(&id);
+        let provider = fresh();
+        provider
+            .store_revocation(&id.revoke_device(&cert, 2).unwrap())
+            .unwrap();
+        let mut forged = cert.clone();
+        forged.signature[0] ^= 0xFF;
+
+        assert!(matches!(
+            verify(&credential_for(&forged), &raw, &ANY, &provider),
+            Err(Error::InvalidCredential)
+        ));
+    }
+
+    /// Falha fechada: se o store não pode ser lido, o device conta como revogado.
+    #[test]
+    fn rejects_when_the_revocation_store_cannot_be_read() {
+        let id = StandaloneIdentity::generate();
+        let (cert, raw) = device_of(&id);
+        let provider = fresh();
+        provider.break_revocation_store_for_test();
+
+        assert!(matches!(
+            verify(&credential_for(&cert), &raw, &ANY, &provider),
+            Err(Error::Revoked)
         ));
     }
 }

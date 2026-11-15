@@ -194,6 +194,12 @@ impl Provider {
             .map_err(Error::storage)
     }
 
+    /// Só para teste: apaga a tabela de tombstones, para a leitura falhar (fail-closed, P30 3d-i).
+    #[cfg(test)]
+    pub(crate) fn break_revocation_store_for_test(&self) {
+        self.conn.execute("DROP TABLE kin_revocations", []).unwrap();
+    }
+
     /// Falha fechada: na dúvida (erro de leitura), trata como revogado.
     #[allow(dead_code)]
     pub(crate) fn is_revoked_or_unknown(&self, certificate: &DeviceCertificate) -> bool {
