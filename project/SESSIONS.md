@@ -1611,3 +1611,27 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: uso real (nenhum chamador); `busy_timeout` e `synchronous` no WAL; caminho `NotEd25519`; revisão externa.
 - **Próximo passo**: decidir a **política de admissão e o teto** (I1) antes da 3c; depois 3c (canal), em plan mode. A 3d liga o
   `is_revoked_or_unknown` na `credential::verify` e derruba o par.
+
+#### Receber o tombstone (P30, fatia 3c-i, ADR 0024)
+
+- **Decisões do dono** (plan mode + 4 perguntas, mais 2 depois da auditoria): 3c cortada em **3c-i (receber)** e **3c-ii (enviar e
+  repassar)**; contato offline só por conexão, sem outbox v8. Admissão: no plano era "própria, `trusted` ou de conversa"; **depois da
+  auditoria (C1) o dono trocou para só `is_trusted`**. Limite: por peer, e depois da auditoria (I2) **não zera ao desconectar** e ganhou
+  **teto global de 64**; os valores 16 por 60 s e 64 são palpite meu, aceitos.
+- **Feito**: `Payload::Revocation(Box<DeviceRevocation>)` (tag 7), `Chat::on_revocation` (limite, admissão, gravação), erros
+  `UnauthorizedRevocation` e `RevocationRateLimited`, `CryptoDevice::store_revocation` e `is_revoked` públicos. ADR 0024. Nada mudou em
+  `identity` e `cli`; nada consulta o store ainda (3d).
+- **Prova de que testam algo**: stubs, **9 de 9 falharam** (run 43707283754; dois runs antes pararam no clippy: imports duplicados,
+  `large_enum_variant` e `dead_code` dos stubs); verde (43707658183). Depois da auditoria, **4 de 4 testes que mudaram a regra falharam**
+  (43709041641: conversa sem `trust`, `untrust`, reconexão e teto global; 3 de caracterização já passavam); verde (43709386850).
+- **Mutações** (branches descartáveis, 6 de 6 pegas): A admissão só recusa desconfiado (43707932770), B limite de 16 000 (43707941188),
+  C janela nunca vence (43707949240), D limite compartilhado entre peers (43707958212), E restaura o `remove` na desconexão
+  (43709638917), G sem teto global (43709805739).
+- **Auditoria** (`security-auditor`, somente leitura): **1 crítico** (C1: o ramo "conversa" não filtra ninguém, pois todo estranho que
+  conecta ganha conversa; DoS de disco no `mls.sqlite`) e 4 importantes (CPU do `is_known`, reconexão zera a cota, `untrust` sem efeito,
+  tombstone perdido sem reenvio); C1, I1, I2 e I3 corrigidos, I4 vira requisito da 3c-ii. Tabela no ADR.
+- **Tropeços**: `cargo fmt` em modo escrita uma vez (reformatou o `chat.rs`; daí só `--check`); o plano aprovado tinha a regra de
+  admissão que a auditoria derrubou; falha fora do meu diff em `crates/transport/tests/relay.rs:135` num run (não investigada).
+- **Não verificado**: uso real (nada envia tombstone ainda); erro de armazenamento no caminho do `chat`; `handle(MessageReceived)` →
+  `Dropped`; janela real (os testes forçam `ZERO`); o flake do `relay.rs`; revisão externa.
+- **Próximo passo**: 3c-ii (enviar e repassar, com reenvio ao conectar), em plan mode.
