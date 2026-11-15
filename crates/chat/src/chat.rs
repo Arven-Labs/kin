@@ -5791,6 +5791,9 @@ mod tests {
         bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &first))
             .unwrap();
         let (second, _) = revocation_by(&bia_key);
+        // O reenvio ao conectar (3c-ii-b) também dispara no `on_mls`: marco-o como já feito para a Ana, para
+        // a contagem abaixo medir só o repasse.
+        bia.revocations_sent.insert(ana_peer, Instant::now());
         let before = bia.pending.len();
 
         bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &second))
