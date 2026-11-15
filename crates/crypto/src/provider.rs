@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::rc::Rc;
 
+use kin_identity::{DeviceCertificate, DeviceRevocation};
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
 use openmls_traits::OpenMlsProvider;
@@ -91,6 +92,26 @@ impl Provider {
         Ok(())
     }
 
+    /// Grava um tombstone de device (P30, fatia 3b, ADR 0023). Confere a assinatura (`verify`) e usa a
+    /// identidade da **cadeia assinada**, nunca um parâmetro do chamador. Idempotente, cumulativo e **sem
+    /// despejo**: não passa por teto nenhum.
+    #[allow(dead_code, clippy::unused_self)]
+    pub(crate) fn store_revocation(&self, _revocation: &DeviceRevocation) -> Result<(), Error> {
+        todo!("3b: gravar o tombstone")
+    }
+
+    /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
+    #[allow(dead_code, clippy::unused_self)]
+    pub(crate) fn is_revoked(&self, _certificate: &DeviceCertificate) -> Result<bool, Error> {
+        todo!("3b: consultar o tombstone")
+    }
+
+    /// Falha fechada: na dúvida (erro de leitura), trata como revogado.
+    #[allow(dead_code, clippy::unused_self)]
+    pub(crate) fn is_revoked_or_unknown(&self, _certificate: &DeviceCertificate) -> bool {
+        todo!("3b: erro vira revogado")
+    }
+
     /// Conclui um pareamento: grava o certificado e apaga o pedido pendente **na mesma transação**, para
     /// um corte no meio não deixar o banco com os dois. É um compare-and-swap: o certificado entra com
     /// `INSERT` simples (falha se já existe um) e o pedido só é apagado se ainda for **exatamente** o
@@ -163,5 +184,213 @@ impl OpenMlsProvider for Provider {
 
     fn rand(&self) -> &Self::RandProvider {
         &self.crypto
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kin_identity::{
+        AuthorityIdentity, AuthorityKey, DeviceKey, IdentityProvider, NostrPublicKey, PublicKey,
+        StandaloneIdentity,
+    };
+
+    use super::*;
+
+    const NOW: u64 = 1_700_000_000;
+
+    /// As três chaves de um device (a de assinatura MLS é uma chave Ed25519 qualquer).
+    #[derive(Clone)]
+    struct Keys {
+        signing: PublicKey,
+        network: PublicKey,
+        nostr: NostrPublicKey,
+    }
+
+    fn keys() -> Keys {
+        let net = DeviceKey::generate();
+        Keys {
+            signing: DeviceKey::generate().public_key(),
+            network: net.public_key(),
+            nostr: net.nostr_public_key(),
+        }
+    }
+
+    fn cert_for(issuer: &dyn IdentityProvider, k: &Keys) -> DeviceCertificate {
+        issuer
+            .authorize_device(&k.signing, &k.network, &k.nostr, NOW)
+            .unwrap()
+    }
+
+    fn authority_of(master: &StandaloneIdentity) -> AuthorityIdentity {
+        let key = AuthorityKey::generate();
+        let cert = master.certify_authority(&key.public_key(), 1_000).unwrap();
+        AuthorityIdentity::new(key, cert).unwrap()
+    }
+
+    /// Banco em memória com um tombstone da autoridade já gravado para `k`.
+    fn revoked(master: &StandaloneIdentity, k: &Keys) -> (Provider, DeviceCertificate) {
+        let authority = authority_of(master);
+        let cert = cert_for(&authority, k);
+        let provider = Provider::open(None).unwrap();
+        provider
+            .store_revocation(&authority.revoke_device(&cert, NOW + 60).unwrap())
+            .unwrap();
+        (provider, cert)
+    }
+
+    fn rows(p: &Provider) -> i64 {
+        p.conn
+            .query_row("SELECT COUNT(*) FROM kin_revocations", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_stored_revocation_makes_the_device_revoked() {
+        let master = StandaloneIdentity::generate();
+        let (provider, cert) = revoked(&master, &keys());
+        assert!(provider.is_revoked(&cert).unwrap());
+        assert!(provider.is_revoked_or_unknown(&cert));
+    }
+
+    #[test]
+    fn a_device_without_a_revocation_is_not_revoked() {
+        let master = StandaloneIdentity::generate();
+        let (provider, _) = revoked(&master, &keys());
+        let other = cert_for(&master, &keys());
+        assert!(!provider.is_revoked(&other).unwrap());
+        assert!(!provider.is_revoked_or_unknown(&other));
+    }
+
+    #[test]
+    fn a_revocation_from_the_master_revokes_a_v3_device() {
+        let master = StandaloneIdentity::generate();
+        let cert = cert_for(&master, &keys());
+        let provider = Provider::open(None).unwrap();
+        provider
+            .store_revocation(&master.revoke_device(&cert, NOW + 60).unwrap())
+            .unwrap();
+        assert!(provider.is_revoked(&cert).unwrap());
+    }
+
+    /// Mesma identidade, mas com UMA das três chaves diferente: é outro device, não está revogado.
+    #[test]
+    fn changing_any_one_of_the_three_keys_is_another_device() {
+        let master = StandaloneIdentity::generate();
+        let k = keys();
+        let (provider, _) = revoked(&master, &k);
+        let fresh = keys();
+        for (name, other) in [
+            (
+                "signing",
+                Keys {
+                    signing: fresh.signing.clone(),
+                    ..k.clone()
+                },
+            ),
+            (
+                "network",
+                Keys {
+                    network: fresh.network.clone(),
+                    ..k.clone()
+                },
+            ),
+            (
+                "nostr",
+                Keys {
+                    nostr: fresh.nostr.clone(),
+                    ..k.clone()
+                },
+            ),
+        ] {
+            let cert = cert_for(&master, &other);
+            assert!(!provider.is_revoked(&cert).unwrap(), "{name}");
+        }
+    }
+
+    /// P31 (af): outra identidade com as MESMAS três chaves públicas não é atingida.
+    #[test]
+    fn the_same_three_keys_under_another_identity_are_not_revoked() {
+        let victim = StandaloneIdentity::generate();
+        let k = keys();
+        let (provider, _) = revoked(&StandaloneIdentity::generate(), &k);
+        let cert = cert_for(&victim, &k);
+        assert!(!provider.is_revoked(&cert).unwrap());
+        assert!(!provider.is_revoked_or_unknown(&cert));
+    }
+
+    #[test]
+    fn storing_the_same_revocation_twice_is_idempotent() {
+        let master = StandaloneIdentity::generate();
+        let authority = authority_of(&master);
+        let cert = cert_for(&authority, &keys());
+        let revocation = authority.revoke_device(&cert, NOW + 60).unwrap();
+        let provider = Provider::open(None).unwrap();
+        provider.store_revocation(&revocation).unwrap();
+        provider.store_revocation(&revocation).unwrap();
+        assert_eq!(rows(&provider), 1);
+        assert!(provider.is_revoked(&cert).unwrap());
+    }
+
+    /// Sem despejo: nenhum tombstone antigo sai quando entram muitos.
+    #[test]
+    fn many_revocations_are_all_kept() {
+        let master = StandaloneIdentity::generate();
+        let authority = authority_of(&master);
+        let provider = Provider::open(None).unwrap();
+        let certs: Vec<_> = (0..1200)
+            .map(|_| {
+                let cert = cert_for(&authority, &keys());
+                provider
+                    .store_revocation(&authority.revoke_device(&cert, NOW + 60).unwrap())
+                    .unwrap();
+                cert
+            })
+            .collect();
+        assert_eq!(rows(&provider), 1200);
+        assert!(certs.iter().all(|c| provider.is_revoked(c).unwrap()));
+    }
+
+    #[test]
+    fn a_revocation_with_a_bad_signature_is_refused_and_not_stored() {
+        let master = StandaloneIdentity::generate();
+        let authority = authority_of(&master);
+        let cert = cert_for(&authority, &keys());
+        let mut revocation = authority.revoke_device(&cert, NOW + 60).unwrap();
+        revocation.signature[0] ^= 1;
+        let provider = Provider::open(None).unwrap();
+        assert!(provider.store_revocation(&revocation).is_err());
+        assert_eq!(rows(&provider), 0);
+        assert!(!provider.is_revoked(&cert).unwrap());
+    }
+
+    /// Fail-closed: se não dá para ler o banco, o device conta como revogado.
+    #[test]
+    fn a_read_error_counts_as_revoked() {
+        let master = StandaloneIdentity::generate();
+        let (provider, _) = revoked(&master, &keys());
+        let unrelated = cert_for(&master, &keys());
+        provider
+            .conn
+            .execute("DROP TABLE kin_revocations", [])
+            .unwrap();
+        assert!(provider.is_revoked(&unrelated).is_err());
+        assert!(provider.is_revoked_or_unknown(&unrelated));
+    }
+
+    #[test]
+    fn revocations_survive_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.sqlite");
+        let master = StandaloneIdentity::generate();
+        let authority = authority_of(&master);
+        let cert = cert_for(&authority, &keys());
+        {
+            let provider = Provider::open(Some(&path)).unwrap();
+            provider
+                .store_revocation(&authority.revoke_device(&cert, NOW + 60).unwrap())
+                .unwrap();
+        }
+        let reopened = Provider::open(Some(&path)).unwrap();
+        assert!(reopened.is_revoked(&cert).unwrap());
     }
 }
