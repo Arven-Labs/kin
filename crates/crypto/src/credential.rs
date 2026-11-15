@@ -171,7 +171,7 @@ mod tests {
     }
 
     /// Um certificado da `id`, com as chaves de signing/rede/Nostr, e o signing em bytes crus.
-    fn device_of(id: &StandaloneIdentity) -> (DeviceCertificate, Vec<u8>) {
+    fn device_of(id: &StandaloneIdentity) -> (DeviceCertificate, [u8; 32]) {
         let (key, net) = (DeviceKey::generate(), DeviceKey::generate());
         let cert = issue(id, &key.public_key(), &net.public_key());
         let raw = ed25519_bytes(&key.public_key()).unwrap();
