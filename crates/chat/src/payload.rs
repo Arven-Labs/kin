@@ -74,7 +74,6 @@ pub(crate) enum Payload {
     },
     /// Tombstone de um device (P30, 3c): este device deixou de valer. Em `Box`: é bem maior que as
     /// outras variantes (carrega a cadeia da autoridade).
-    #[allow(dead_code)]
     Revocation(Box<DeviceRevocation>),
 }
 
@@ -134,13 +133,20 @@ impl Payload {
                 }
                 out
             }
-            Self::Revocation(_) => todo!("3c-i: codificar o tombstone"),
+            Self::Revocation(revocation) => {
+                let mut out = vec![TAG_REVOCATION];
+                out.extend_from_slice(&revocation.to_bytes());
+                out
+            }
         }
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         match bytes.first() {
-            Some(&TAG_REVOCATION) => todo!("3c-i: ler o tombstone"),
+            // Forma canônica e teto de 2048 bytes já são do `from_bytes`; o erro vira `Malformed` sem detalhe.
+            Some(&TAG_REVOCATION) => DeviceRevocation::from_bytes(&bytes[1..])
+                .map(|revocation| Self::Revocation(Box::new(revocation)))
+                .map_err(|_| Error::Malformed),
             Some(&TAG_RELAY_LIST) => Self::decode_relay_list(&bytes[1..]),
             Some(&TAG_SENT) => Self::decode_sent(&bytes[1..]),
             Some(&TAG_DEVICE_LIST) => Self::decode_device_list(&bytes[1..]),

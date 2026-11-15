@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Expected};
-use kin_identity::{DeviceKey, IdentityId, IdentityProvider};
+use kin_identity::{DeviceKey, DeviceRevocation, IdentityId, IdentityProvider};
 use kin_transport::{Multiaddr, NatStatus, Node, NodeConfig, NodeEvent, PeerId, SendId};
 
 use futures::StreamExt as _;
@@ -172,7 +172,6 @@ const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
 
 /// Tombstones aceitos por peer em cada janela (P30, 3c; ADR 0024). Conta toda tentativa recebida, não só as
 /// gravadas: conferir a assinatura custa CPU, e repetir um tombstone já gravado também é inundar.
-#[allow(dead_code)]
 const REVOCATIONS_PER_WINDOW: u32 = 16;
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
@@ -335,7 +334,6 @@ pub struct Chat {
     /// Só em memória; zera ao desconectar.
     revocations_seen: HashMap<PeerId, (Instant, u32)>,
     /// Duração da janela do limite de tombstones (campo, para o teste não esperar 60 s).
-    #[allow(dead_code)]
     revocation_window: Duration,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
@@ -1554,12 +1552,33 @@ impl Chat {
     /// Um tombstone de device chegou de `peer` (P30, 3c-i; ADR 0024). Ordem: limite de taxa do peer,
     /// admissão pela identidade da **cadeia assinada** do tombstone (não pelo remetente: ele pode ter sido
     /// repassado por um terceiro) e só então a gravação, que confere a assinatura.
-    fn on_revocation(
-        &mut self,
-        _peer: PeerId,
-        _revocation: &kin_identity::DeviceRevocation,
-    ) -> Result<(), Error> {
-        todo!("3c-i: admissão, limite e gravação")
+    fn on_revocation(&mut self, peer: PeerId, revocation: &DeviceRevocation) -> Result<(), Error> {
+        let now = Instant::now();
+        let window = self.revocation_window;
+        let seen = self.revocations_seen.entry(peer).or_insert((now, 0));
+        if now.duration_since(seen.0) >= window {
+            *seen = (now, 0);
+        }
+        if seen.1 >= REVOCATIONS_PER_WINDOW {
+            return Err(Error::RevocationRateLimited);
+        }
+        seen.1 += 1;
+        if !self.is_known(revocation.identity()) {
+            return Err(Error::UnauthorizedRevocation);
+        }
+        // A gravação confere a assinatura. Falha de armazenamento sobe como erro, não vira "inválido".
+        Ok(self.device.store_revocation(revocation)?)
+    }
+
+    /// Identidade que a minha admissão de tombstones conhece: a minha, uma aceita (`trust`/`accept`) ou
+    /// uma com quem já tenho conversa (ADR 0023, I1).
+    fn is_known(&self, identity: &IdentityId) -> bool {
+        self.is_trusted(identity)
+            || self.conversations.values().any(|conversation| {
+                conversation
+                    .peers()
+                    .is_ok_and(|peers| peers.contains(identity))
+            })
     }
 
     /// Um device irmão diz que enviou `message` a `to`. Só vale se quem **assinou esta mensagem**
