@@ -1838,7 +1838,9 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use kin_identity::{DeviceCertificate, DeviceRevocation, StandaloneIdentity};
+    use kin_identity::{
+        AuthorityIdentity, AuthorityKey, DeviceCertificate, DeviceRevocation, StandaloneIdentity,
+    };
 
     use super::*;
     use crate::outbox::SEEN_LIMIT;
@@ -5245,9 +5247,11 @@ mod tests {
         assert!(events(&mut bia).is_empty());
     }
 
-    /// Identidade com quem a Bia tem conversa (mesmo sem `trust`): é conhecida.
+    /// Auditoria 3c-i, C1: ter conversa não basta. Qualquer estranho que conecte ganha uma conversa MLS (o
+    /// handshake aceita qualquer identidade com certificado válido), então "conversa" não filtra ninguém e
+    /// deixaria gravar tombstones sem limite no disco. A Ana tem conversa, mas a Bia não a aceitou.
     #[tokio::test]
-    async fn a_revocation_of_an_identity_i_have_a_conversation_with_is_stored() {
+    async fn a_revocation_of_an_identity_i_only_have_a_conversation_with_is_refused() {
         let Household {
             mut bia,
             ana_key,
@@ -5255,6 +5259,59 @@ mod tests {
             ..
         } = household();
         let (revocation, certificate) = revocation_by(&ana_key);
+
+        let err = bia
+            .on_mls(ana_peer, &revocation_wire(&mut ana_raw, &revocation))
+            .unwrap_err();
+
+        assert!(matches!(err, Error::UnauthorizedRevocation), "{err:?}");
+        assert!(!bia.device.is_revoked(&certificate).unwrap());
+    }
+
+    /// Auditoria 3c-i, I3: `untrust` corta a admissão (a conversa continua, mas o tombstone não entra).
+    #[tokio::test]
+    async fn after_untrust_a_revocation_of_that_identity_is_refused() {
+        let Household {
+            mut bia,
+            ana_key,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        bia.trust(ana_key.id()).unwrap();
+        bia.untrust(&ana_key.id()).unwrap();
+        let (revocation, certificate) = revocation_by(&ana_key);
+
+        let err = bia
+            .on_mls(ana_peer, &revocation_wire(&mut ana_raw, &revocation))
+            .unwrap_err();
+
+        assert!(matches!(err, Error::UnauthorizedRevocation), "{err:?}");
+        assert!(!bia.device.is_revoked(&certificate).unwrap());
+    }
+
+    /// O tombstone assinado por uma autoridade (v4) também é gravado pelo caminho do `chat`.
+    #[tokio::test]
+    async fn a_revocation_signed_by_an_authority_of_a_trusted_identity_is_stored() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let carol = StandaloneIdentity::generate();
+        bia.trust(carol.id()).unwrap();
+        let key = AuthorityKey::generate();
+        let authority_cert = carol.certify_authority(&key.public_key(), 1).unwrap();
+        let authority = AuthorityIdentity::new(key, authority_cert).unwrap();
+        let device = DeviceKey::generate();
+        let certificate = authority
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1,
+            )
+            .unwrap();
+        let revocation = authority.revoke_device(&certificate, 2).unwrap();
 
         bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &revocation))
             .unwrap();
@@ -5310,12 +5367,14 @@ mod tests {
             ana_device: (ana_peer, mut ana_raw),
             ..
         } = household();
+        bia.trust(ana_key.id()).unwrap();
         let (mut revocation, certificate) = revocation_by(&ana_key);
         revocation.signature[0] ^= 1;
 
         let result = bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &revocation));
 
-        assert!(result.is_err(), "{result:?}");
+        // Passa na admissão e no limite e cai na conferência da assinatura (erro do `crypto`).
+        assert!(matches!(result, Err(Error::Crypto(_))), "{result:?}");
         assert!(!bia.device.is_revoked(&certificate).unwrap());
     }
 
@@ -5328,6 +5387,7 @@ mod tests {
             ana_device: (ana_peer, mut ana_raw),
             ..
         } = household();
+        bia.trust(ana_key.id()).unwrap();
         let (revocation, certificate) = revocation_by(&ana_key);
 
         for _ in 0..2 {
@@ -5339,7 +5399,8 @@ mod tests {
     }
 
     /// Limite por peer: os 16 primeiros passam; o 17º (mesmo sendo repetição de um já gravado) é descartado
-    /// e não grava; outro peer não é afetado; e com a janela vencida o mesmo peer volta a passar.
+    /// e não grava; reconectar NÃO devolve a cota (auditoria 3c-i, I2); outro peer não é afetado; e com a
+    /// janela vencida o mesmo peer volta a passar.
     #[tokio::test]
     async fn a_peer_over_the_revocation_limit_is_dropped_and_others_are_not() {
         let Household {
@@ -5349,6 +5410,7 @@ mod tests {
             ana_device: (ana_peer, mut ana_raw),
             ..
         } = household();
+        bia.trust(ana_key.id()).unwrap();
         let all: Vec<_> = (0..REVOCATIONS_PER_WINDOW)
             .map(|_| revocation_by(&ana_key))
             .collect();
@@ -5370,6 +5432,14 @@ mod tests {
             "{again:?}"
         );
 
+        // Reconectar não zera a cota (senão 16 por conexão = inundação por reconexão).
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        let after = bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &all[0].0));
+        assert!(
+            matches!(after, Err(Error::RevocationRateLimited)),
+            "{after:?}"
+        );
+
         // Outro peer tem a sua própria cota.
         bia.on_mls(sibling_peer, &revocation_wire(&mut sibling_raw, &extra))
             .unwrap();
@@ -5379,6 +5449,65 @@ mod tests {
         bia.revocation_window = Duration::ZERO;
         bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &all[0].0))
             .unwrap();
+    }
+
+    /// Teto global (auditoria 3c-i, C1/I2): 4 peers com 16 cada esgotam os 64 da janela; o primeiro
+    /// tombstone de um 5º peer, que sozinho estaria dentro da cota dele, é descartado. Com a janela
+    /// vencida volta a passar.
+    #[tokio::test]
+    async fn the_revocation_limit_is_also_global_across_peers() {
+        let Household { mut bia, .. } = household();
+        let carol = StandaloneIdentity::generate();
+        bia.trust(carol.id()).unwrap();
+        let mut senders: Vec<_> = (0..5)
+            .map(|_| add_device_of(&mut bia, &StandaloneIdentity::generate()))
+            .collect();
+        for (peer, raw) in &mut senders[..4] {
+            for _ in 0..REVOCATIONS_PER_WINDOW {
+                let (revocation, _) = revocation_by(&carol);
+                bia.on_mls(*peer, &revocation_wire(raw, &revocation))
+                    .unwrap();
+            }
+        }
+        let (fifth, fifth_raw) = &mut senders[4];
+        let (revocation, certificate) = revocation_by(&carol);
+
+        let err = bia
+            .on_mls(*fifth, &revocation_wire(fifth_raw, &revocation))
+            .unwrap_err();
+
+        assert!(matches!(err, Error::RevocationRateLimited), "{err:?}");
+        assert!(!bia.device.is_revoked(&certificate).unwrap());
+        bia.revocation_window = Duration::ZERO;
+        bia.on_mls(*fifth, &revocation_wire(fifth_raw, &revocation))
+            .unwrap();
+        assert!(bia.device.is_revoked(&certificate).unwrap());
+    }
+
+    /// Auditoria 3c-i, gap 4: o tombstone recusado pela admissão também gasta a cota (a conta vem antes da
+    /// admissão, para o estranho não inundar de graça), e o excedente dele é `RateLimited`, não `Unauthorized`.
+    #[tokio::test]
+    async fn refused_revocations_also_spend_the_quota() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, mut ana_raw),
+            ..
+        } = household();
+        let stranger = StandaloneIdentity::generate();
+        for _ in 0..REVOCATIONS_PER_WINDOW {
+            let (revocation, _) = revocation_by(&stranger);
+            let err = bia
+                .on_mls(ana_peer, &revocation_wire(&mut ana_raw, &revocation))
+                .unwrap_err();
+            assert!(matches!(err, Error::UnauthorizedRevocation), "{err:?}");
+        }
+        let (revocation, _) = revocation_by(&stranger);
+
+        let err = bia
+            .on_mls(ana_peer, &revocation_wire(&mut ana_raw, &revocation))
+            .unwrap_err();
+
+        assert!(matches!(err, Error::RevocationRateLimited), "{err:?}");
     }
 
     /// 3.5 etapa 4 (segurança): um espelho vindo de um device de OUTRA identidade é recusado. Senão
