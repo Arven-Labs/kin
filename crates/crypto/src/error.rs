@@ -45,6 +45,9 @@ pub enum Error {
     /// O banco foi criado com outra chave de rede; as conversas antigas não valem mais (P15).
     #[error("o estado salvo pertence a outra chave de rede do device")]
     DeviceMismatch,
+    /// O certificado do membro tem tombstone gravado (ou o store não pôde ser lido: falha fechada), P30 3d-i.
+    #[error("o device deste certificado foi revogado")]
+    Revoked,
     /// O banco já tem certificado (de um pareamento ou de uma mestra): não é um device pendente (P30 2c-ii).
     #[error("este banco já tem certificado: não está pendente de pareamento")]
     AlreadyPaired,

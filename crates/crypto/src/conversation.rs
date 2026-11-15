@@ -126,6 +126,7 @@ impl Conversation {
                 &member.credential,
                 &member.signature_key,
                 &Expected::default(),
+                &inner.provider,
             )?;
             if member.index == own {
                 continue;
@@ -198,6 +199,7 @@ impl Conversation {
             key_package.leaf_node().credential(),
             key_package.leaf_node().signature_key().as_slice(),
             expected,
+            &inner.provider,
         )?;
 
         let (commit, welcome, _) = self
@@ -320,6 +322,7 @@ impl Conversation {
                         leaf.credential(),
                         leaf.signature_key().as_slice(),
                         &Expected::default(),
+                        &inner.provider,
                     )?;
                 }
                 self.group

@@ -434,3 +434,71 @@ fn a_v4_device_of_another_identity_is_refused_when_an_identity_is_expected() {
         Err(Error::UnexpectedIdentity)
     ));
 }
+
+// ---- revogação (P30 3d-i, ADR 0027) ----
+
+/// Quem tem o tombstone do device de Bia não a convida.
+#[test]
+fn a_device_with_a_tombstone_is_not_invited() {
+    let (ana, bia) = (person(), person());
+    ana.device
+        .store_revocation(
+            &bia.identity
+                .revoke_device(bia.device.certificate(), 2_000)
+                .unwrap(),
+        )
+        .unwrap();
+    let mut conv = Conversation::create(&ana.device).unwrap();
+
+    assert!(matches!(
+        conv.invite(&bia.device.key_package().unwrap(), &identity(&bia)),
+        Err(Error::Revoked)
+    ));
+}
+
+/// Quem tem o tombstone do device de quem o convidou não entra na conversa.
+#[test]
+fn a_welcome_from_a_device_with_a_tombstone_is_refused() {
+    let (ana, bia) = (person(), person());
+    let mut conv_ana = Conversation::create(&ana.device).unwrap();
+    let invite = conv_ana
+        .invite(&bia.device.key_package().unwrap(), &identity(&bia))
+        .unwrap();
+    bia.device
+        .store_revocation(
+            &ana.identity
+                .revoke_device(ana.device.certificate(), 2_000)
+                .unwrap(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        Conversation::join(&bia.device, &invite.welcome, &identity(&ana)),
+        Err(Error::Revoked)
+    ));
+}
+
+/// O tombstone de um device não atrapalha o convite a outro device da mesma pessoa.
+#[test]
+fn a_tombstone_for_another_device_does_not_block_the_invite() {
+    let (ana, bia) = (person(), person());
+    let lost = DeviceKey::generate();
+    let lost_cert = bia
+        .identity
+        .authorize_device(
+            &lost.public_key(),
+            &lost.public_key(),
+            &lost.nostr_public_key(),
+            1_500,
+        )
+        .unwrap();
+    ana.device
+        .store_revocation(&bia.identity.revoke_device(&lost_cert, 2_000).unwrap())
+        .unwrap();
+    let mut conv = Conversation::create(&ana.device).unwrap();
+
+    assert!(
+        conv.invite(&bia.device.key_package().unwrap(), &identity(&bia))
+            .is_ok()
+    );
+}
