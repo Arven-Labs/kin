@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Expected};
-use kin_identity::{DeviceKey, DeviceRevocation, IdentityId, IdentityProvider};
+use kin_identity::{DeviceCertificate, DeviceKey, DeviceRevocation, IdentityId, IdentityProvider};
 use kin_transport::{Multiaddr, NatStatus, Node, NodeConfig, NodeEvent, PeerId, SendId};
 
 use futures::StreamExt as _;
@@ -1580,7 +1580,43 @@ impl Chat {
             return Err(Error::UnauthorizedRevocation);
         }
         // A gravação confere a assinatura. Falha de armazenamento sobe como erro, não vira "inválido".
-        Ok(self.device.store_revocation(revocation)?)
+        self.device.store_revocation(revocation)?; // stub da 3c-ii: ainda não repassa nem devolve a cota
+        Ok(())
+    }
+
+    /// Esta falha de gravação **devolve** a cota do peer? Só a de armazenamento (disco cheio, banco
+    /// ocupado): o remetente não teve culpa e o tombstone seria perdido. Assinatura inválida e recusa de
+    /// admissão são culpa dele e continuam gastando (ADR 0024, item 4; ADR 0025).
+    #[allow(dead_code)]
+    fn refunds_quota(_error: &Error) -> bool {
+        todo!("3c-ii-a: só erro de armazenamento devolve a cota")
+    }
+
+    /// Os peers a quem avisar de um tombstone: **conectados**, com conversa pronta de um único peer cuja
+    /// identidade eu aceito (`is_trusted`, irmãos sempre), menos `except` (quem me enviou). Quem não aceitei
+    /// nem recebe: o receptor o recusaria e gastaria a cota dele (ADR 0025).
+    #[allow(dead_code)]
+    fn revocation_targets(&self, _except: Option<PeerId>) -> Vec<PeerId> {
+        todo!("3c-ii-a: destinos do tombstone")
+    }
+
+    /// Cifra o tombstone para `peer` e o transmite (como `announce_relays`: fora da outbox, sem ack).
+    #[allow(dead_code)]
+    fn send_revocation(&mut self, _peer: PeerId, _revocation: &DeviceRevocation) {
+        todo!("3c-ii-a: enviar o tombstone")
+    }
+
+    /// Emite um tombstone **já assinado** (a CLI da fatia 5 o monta; o `Chat` nunca tem a mestra): grava
+    /// aqui (confere a assinatura) e o envia a todos os destinos, **mesmo se já estava gravado** (um
+    /// reenvio explícito). Só de identidade aceita (a minha, ou `trust`), como na recepção.
+    pub fn broadcast_revocation(&mut self, _revocation: &DeviceRevocation) -> Result<(), Error> {
+        todo!("3c-ii-a: emitir o tombstone")
+    }
+
+    /// O device deste certificado tem tombstone gravado? **Pré-condição:** o certificado já foi verificado.
+    /// A consulta que derruba o par é a 3d; isto só lê o store (CLI e testes).
+    pub fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
+        Ok(self.device.is_revoked(certificate)?)
     }
 
     /// Um device irmão diz que enviou `message` a `to`. Só vale se quem **assinou esta mensagem**
@@ -5510,6 +5546,156 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::RevocationRateLimited), "{err:?}");
+    }
+
+    // ---- P30 3c-ii: emitir e repassar (ADR 0025) ----
+
+    /// A Bia com quatro devices alheios: o irmão e a Ana (aceita), conectados; um estranho (sem `trust`),
+    /// conectado; e uma Carol aceita que **não** está conectada.
+    struct Fanout {
+        bia: Chat,
+        bia_key: StandaloneIdentity,
+        sibling: RawDevice,
+        ana: RawDevice,
+        stranger: RawDevice,
+        carol: RawDevice,
+    }
+
+    fn fanout() -> Fanout {
+        let Household {
+            mut bia,
+            bia_key,
+            ana_key,
+            sibling,
+            ana_device: ana,
+            ..
+        } = household();
+        bia.trust(ana_key.id()).unwrap();
+        let stranger = add_device_of(&mut bia, &StandaloneIdentity::generate());
+        let carol_key = StandaloneIdentity::generate();
+        bia.trust(carol_key.id()).unwrap();
+        let carol = add_device_of(&mut bia, &carol_key);
+        for peer in [sibling.0, ana.0, stranger.0] {
+            bia.connected.insert(peer);
+        }
+        Fanout {
+            bia,
+            bia_key,
+            sibling,
+            ana,
+            stranger,
+            carol,
+        }
+    }
+
+    fn peer_set(peers: Vec<PeerId>) -> std::collections::HashSet<PeerId> {
+        peers.into_iter().collect()
+    }
+
+    /// Destinos: conectados, com conversa, de identidade aceita (irmão sempre); sem o remetente. O estranho
+    /// (sem `trust`) e a Carol (desconectada) ficam de fora.
+    #[tokio::test]
+    async fn revocation_targets_are_connected_trusted_conversations_except_the_sender() {
+        let f = fanout();
+
+        assert_eq!(
+            peer_set(f.bia.revocation_targets(None)),
+            peer_set(vec![f.sibling.0, f.ana.0])
+        );
+        assert_eq!(
+            peer_set(f.bia.revocation_targets(Some(f.sibling.0))),
+            peer_set(vec![f.ana.0])
+        );
+        assert!(!f.bia.revocation_targets(None).contains(&f.stranger.0));
+        assert!(!f.bia.revocation_targets(None).contains(&f.carol.0));
+    }
+
+    /// Repasse: um tombstone NOVO vindo da Ana sai para o irmão (não volta para a Ana, nem vai ao estranho
+    /// ou à Carol); o MESMO tombstone de novo não repassa nada (sem eco, sem loop).
+    #[tokio::test]
+    async fn a_new_revocation_is_relayed_to_the_other_targets_and_a_repeated_one_is_not() {
+        let Fanout {
+            mut bia,
+            bia_key,
+            ana: (ana_peer, mut ana_raw),
+            ..
+        } = fanout();
+        // O primeiro tombstone faz a Bia anunciar relays e devices à Ana (uma vez por conexão): fora da conta.
+        let (first, _) = revocation_by(&bia_key);
+        bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &first))
+            .unwrap();
+        let (second, _) = revocation_by(&bia_key);
+        let before = bia.pending.len();
+
+        bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &second))
+            .unwrap();
+        assert_eq!(bia.pending.len(), before + 1, "só o irmão");
+
+        bia.on_mls(ana_peer, &revocation_wire(&mut ana_raw, &second))
+            .unwrap();
+        assert_eq!(bia.pending.len(), before + 1, "repetido não repassa");
+    }
+
+    /// `broadcast_revocation`: grava e envia a todos os destinos, e de novo a cada chamada (reenvio explícito).
+    #[tokio::test]
+    async fn broadcasting_stores_the_revocation_and_sends_it_to_every_target_each_time() {
+        let Fanout {
+            mut bia, bia_key, ..
+        } = fanout();
+        let (revocation, certificate) = revocation_by(&bia_key);
+        let before = bia.pending.len();
+
+        bia.broadcast_revocation(&revocation).unwrap();
+        assert!(bia.is_revoked(&certificate).unwrap());
+        assert_eq!(bia.pending.len(), before + 2, "irmão e Ana");
+
+        bia.broadcast_revocation(&revocation).unwrap();
+        assert_eq!(bia.pending.len(), before + 4, "reenvio explícito");
+    }
+
+    /// `broadcast_revocation` de identidade que não aceito: recusa, não grava e não envia nada.
+    #[tokio::test]
+    async fn broadcasting_a_revocation_of_an_unknown_identity_is_refused_and_sends_nothing() {
+        let Fanout { mut bia, .. } = fanout();
+        let (revocation, certificate) = revocation_by(&StandaloneIdentity::generate());
+        let before = bia.pending.len();
+
+        let err = bia.broadcast_revocation(&revocation).unwrap_err();
+
+        assert!(matches!(err, Error::UnauthorizedRevocation), "{err:?}");
+        assert!(!bia.is_revoked(&certificate).unwrap());
+        assert_eq!(bia.pending.len(), before);
+    }
+
+    /// `broadcast_revocation` com assinatura adulterada (mesmo de identidade aceita): erro do `crypto`,
+    /// não grava e não envia.
+    #[tokio::test]
+    async fn broadcasting_a_revocation_with_a_bad_signature_sends_nothing() {
+        let Fanout {
+            mut bia, bia_key, ..
+        } = fanout();
+        let (mut revocation, certificate) = revocation_by(&bia_key);
+        revocation.signature[0] ^= 1;
+        let before = bia.pending.len();
+
+        let result = bia.broadcast_revocation(&revocation);
+
+        assert!(matches!(result, Err(Error::Crypto(_))), "{result:?}");
+        assert!(!bia.is_revoked(&certificate).unwrap());
+        assert_eq!(bia.pending.len(), before);
+    }
+
+    /// Só falha de armazenamento devolve a cota; assinatura inválida e recusa de admissão gastam.
+    #[test]
+    fn only_a_storage_error_refunds_the_revocation_quota() {
+        assert!(Chat::refunds_quota(&Error::Crypto(
+            kin_crypto::Error::Storage("disco cheio".into())
+        )));
+        assert!(!Chat::refunds_quota(&Error::Crypto(
+            kin_crypto::Error::Identity(kin_identity::Error::InvalidRevocation)
+        )));
+        assert!(!Chat::refunds_quota(&Error::UnauthorizedRevocation));
+        assert!(!Chat::refunds_quota(&Error::RevocationRateLimited));
     }
 
     /// 3.5 etapa 4 (segurança): um espelho vindo de um device de OUTRA identidade é recusado. Senão
