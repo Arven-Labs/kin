@@ -175,6 +175,16 @@ impl CryptoDevice {
         self.0.provider.store_revocation(revocation)
     }
 
+    /// Os tombstones gravados, do mais recente ao mais antigo, até `limit`; com `identities`, só os dessas
+    /// identidades (ver `Provider::revocations`). Uma linha ilegível é erro.
+    pub fn revocations(
+        &self,
+        identities: Option<&[IdentityId]>,
+        limit: usize,
+    ) -> Result<Vec<DeviceRevocation>, Error> {
+        self.0.provider.revocations(identities, limit)
+    }
+
     /// O device deste certificado tem tombstone gravado? (**Pré-condição:** o certificado já foi
     /// verificado; ver `Provider::is_revoked`.) Erro de leitura é erro, não "não revogado".
     pub fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {

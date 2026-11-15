@@ -129,6 +129,44 @@ impl Provider {
         Ok(inserted > 0)
     }
 
+    /// Os tombstones gravados, do mais recente ao mais antigo, até `limit` (P30, 3c-ii-b, ADR 0026). Com
+    /// `identities` só os dessas identidades (o filtro é no SQL: pegar os mais recentes e filtrar depois
+    /// poderia devolver zero e esconder o que o peer deveria receber); com `None`, de todas. Cada linha é
+    /// relida com `DeviceRevocation::from_bytes`: uma linha ilegível é **erro**, nunca pulada em silêncio.
+    pub(crate) fn revocations(
+        &self,
+        identities: Option<&[IdentityId]>,
+        limit: usize,
+    ) -> Result<Vec<DeviceRevocation>, Error> {
+        use rusqlite::types::Value;
+        let mut sql = String::from("SELECT tombstone FROM kin_revocations");
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(identities) = identities {
+            if identities.is_empty() {
+                return Ok(Vec::new());
+            }
+            sql.push_str(" WHERE identity IN (");
+            sql.push_str(&vec!["?"; identities.len()].join(","));
+            sql.push(')');
+            values.extend(identities.iter().map(|id| Value::Text(id.to_base58())));
+        }
+        sql.push_str(" ORDER BY rowid DESC LIMIT ?");
+        values.push(Value::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+        let mut stmt = self.conn.prepare(&sql).map_err(Error::storage)?;
+        let blobs = stmt
+            .query_map(rusqlite::params_from_iter(values), |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .map_err(Error::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Error::storage)?;
+        // Uma linha ilegível é erro (nunca pulada): quem lê não pode achar que tem menos tombstones.
+        blobs
+            .iter()
+            .map(|bytes| DeviceRevocation::from_bytes(bytes).map_err(Error::from))
+            .collect()
+    }
+
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
     ///
     /// **Pré-condição:** o certificado já passou por `DeviceCertificate::verify` (em `credential::verify`).
@@ -468,6 +506,78 @@ mod tests {
         assert!(provider.store_revocation(&revocation).is_err());
         assert_eq!(rows(&provider), 0);
         assert!(!provider.is_revoked(&cert).unwrap());
+    }
+
+    /// 3c-ii-b: os mais recentes primeiro (a ordem de gravação, ao contrário) e no máximo `limit`.
+    #[test]
+    fn revocations_come_most_recent_first_and_respect_the_limit() {
+        let master = StandaloneIdentity::generate();
+        let authority = authority_of(&master);
+        let provider = Provider::open(None).unwrap();
+        let stored: Vec<_> = (0..5)
+            .map(|_| {
+                let cert = cert_for(&authority, &keys());
+                let revocation = authority.revoke_device(&cert, NOW + 60).unwrap();
+                provider.store_revocation(&revocation).unwrap();
+                revocation
+            })
+            .collect();
+
+        let got = provider.revocations(None, 3).unwrap();
+
+        let expected: Vec<_> = stored.iter().rev().take(3).cloned().collect();
+        assert_eq!(got, expected);
+        assert!(provider.revocations(None, 0).unwrap().is_empty());
+    }
+
+    /// 3c-ii-b: o filtro por identidade é no SQL. Com os 3 mais recentes de outra identidade, os 2 mais
+    /// recentes da identidade pedida ainda aparecem (filtrar depois do limite devolveria zero).
+    #[test]
+    fn revocations_filter_by_identity_before_applying_the_limit() {
+        let provider = Provider::open(None).unwrap();
+        let (wanted, other) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let mut of_wanted = Vec::new();
+        // Duas da identidade pedida, depois três da outra (as 3 mais recentes do banco).
+        for (owner, is_wanted) in [
+            (&wanted, true),
+            (&wanted, true),
+            (&other, false),
+            (&other, false),
+            (&other, false),
+        ] {
+            let cert = cert_for(owner, &keys());
+            let revocation = owner.revoke_device(&cert, NOW + 60).unwrap();
+            provider.store_revocation(&revocation).unwrap();
+            if is_wanted {
+                of_wanted.push(revocation);
+            }
+        }
+
+        let got = provider.revocations(Some(&[wanted.id()]), 2).unwrap();
+
+        of_wanted.reverse(); // do mais recente ao mais antigo
+        assert_eq!(got, of_wanted);
+        assert!(provider.revocations(Some(&[]), 8).unwrap().is_empty());
+        let both = provider
+            .revocations(Some(&[wanted.id(), other.id()]), 8)
+            .unwrap();
+        assert_eq!(both.len(), 5);
+    }
+
+    /// 3c-ii-b: uma linha cujos bytes não são um tombstone é erro, não é pulada (fail-closed na leitura).
+    #[test]
+    fn an_unreadable_row_is_an_error_not_skipped() {
+        let master = StandaloneIdentity::generate();
+        let (provider, _) = revoked(&master, &keys());
+        provider
+            .conn
+            .execute("UPDATE kin_revocations SET tombstone = x'00'", [])
+            .unwrap();
+
+        assert!(provider.revocations(None, 8).is_err());
     }
 
     /// Fail-closed: se não dá para ler o banco, o device conta como revogado.

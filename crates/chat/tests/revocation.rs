@@ -77,3 +77,111 @@ async fn a_revocation_emitted_by_one_device_reaches_the_owners_other_device_thro
 
     assert!(chat_b.is_revoked(&certificate).unwrap());
 }
+
+/// P30 3c-ii-b (ADR 0026): quem conecta DEPOIS recebe o que já estava gravado, sem ninguém emitir de novo.
+/// A grava 10 tombstones de devices seus sem ninguém conectado; B (que A aceita e que aceita A) conecta e
+/// recebe os 4 mais recentes, que são os que o reenvio manda (auditoria 3c-ii-b, I2: lote de 4).
+#[tokio::test]
+async fn a_peer_that_connects_later_gets_the_four_most_recent_revocations() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let (mut a, mut b) = (pa.open(), pb.open());
+    b.trust(pa.identity.id()).unwrap();
+    a.trust(pb.identity.id()).unwrap();
+
+    let certificates: Vec<_> = (0..10)
+        .map(|_| {
+            let device = DeviceKey::generate();
+            let certificate = pa
+                .identity
+                .authorize_device(
+                    &DeviceKey::generate().public_key(),
+                    &device.public_key(),
+                    &device.nostr_public_key(),
+                    1,
+                )
+                .unwrap();
+            a.broadcast_revocation(&pa.identity.revoke_device(&certificate, 2).unwrap())
+                .unwrap();
+            certificate
+        })
+        .collect();
+
+    connect(&mut a, &mut b).await;
+
+    // O limite de 4 por lote é provado sem relógio por `at_most_four_revocations_are_resent` (unitário);
+    // aqui só a entrega: os 4 mais recentes chegam sem ninguém emitir de novo.
+    let newest = &certificates[6..];
+    let result = timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                _ = a.next_event() => {}
+                _ = b.next_event() => {}
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if newest.iter().all(|c| b.is_revoked(c).unwrap()) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "B não recebeu os 4 mais recentes ao conectar"
+    );
+}
+
+/// Auditoria 3c-ii-b, I1, em rede: A1 guarda 1 tombstone da própria identidade (o mais antigo) e 9 mais
+/// novos de um contato aceito. O irmão A2, que conecta depois, tem de saber do device revogado de A: os
+/// tombstones do contato não podem ocupar todas as vagas do reenvio.
+#[tokio::test]
+async fn a_contacts_newer_revocations_do_not_hide_mine_from_a_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a1, c) = (Person::new(dir.path(), "a1"), Person::new(dir.path(), "c"));
+    let a2 = Person {
+        identity: StandaloneIdentity::from_bytes(&a1.identity.to_bytes().unwrap()).unwrap(),
+        device: DeviceKey::generate(),
+        db: dir.path().join("a2.db"),
+    };
+    let (mut chat_a1, mut chat_a2) = (a1.open(), a2.open());
+    chat_a1.trust(c.identity.id()).unwrap();
+
+    let revoke = |owner: &StandaloneIdentity, chat: &mut kin_chat::Chat| {
+        let device = DeviceKey::generate();
+        let certificate = owner
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1,
+            )
+            .unwrap();
+        chat.broadcast_revocation(&owner.revoke_device(&certificate, 2).unwrap())
+            .unwrap();
+        certificate
+    };
+    let mine = revoke(&a1.identity, &mut chat_a1);
+    for _ in 0..9 {
+        revoke(&c.identity, &mut chat_a1);
+    }
+
+    connect(&mut chat_a1, &mut chat_a2).await;
+
+    let result = timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                _ = chat_a1.next_event() => {}
+                _ = chat_a2.next_event() => {}
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            if chat_a2.is_revoked(&mine).unwrap() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "o irmão não soube do device revogado da própria identidade"
+    );
+}
