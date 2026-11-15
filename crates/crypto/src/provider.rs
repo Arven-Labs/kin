@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use kin_identity::{DeviceCertificate, DeviceRevocation};
+use kin_identity::{
+    DeviceCertificate, DeviceRevocation, IdentityId, NostrPublicKey, PublicKey, ed25519_bytes,
+};
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
 use openmls_traits::OpenMlsProvider;
@@ -52,7 +54,11 @@ impl Provider {
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS kin_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_conversations (
-                 label TEXT PRIMARY KEY, group_id BLOB NOT NULL);",
+                 label TEXT PRIMARY KEY, group_id BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS kin_revocations (
+                 identity TEXT NOT NULL, signing_key BLOB NOT NULL,
+                 network_key BLOB NOT NULL, nostr_key BLOB NOT NULL, tombstone BLOB NOT NULL,
+                 PRIMARY KEY (identity, signing_key, network_key, nostr_key));",
         )
         .map_err(Error::storage)?;
         SqliteStorageProvider::<JsonCodec, &mut Connection>::new(&mut conn)
@@ -95,21 +101,60 @@ impl Provider {
     /// Grava um tombstone de device (P30, fatia 3b, ADR 0023). Confere a assinatura (`verify`) e usa a
     /// identidade da **cadeia assinada**, nunca um parâmetro do chamador. Idempotente, cumulativo e **sem
     /// despejo**: não passa por teto nenhum.
-    #[allow(dead_code, clippy::unused_self)]
-    pub(crate) fn store_revocation(&self, _revocation: &DeviceRevocation) -> Result<(), Error> {
-        todo!("3b: gravar o tombstone")
+    #[allow(dead_code)]
+    pub(crate) fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<(), Error> {
+        revocation.verify()?;
+        let (identity, signing, network, nostr) = revocation_key(
+            revocation.identity(),
+            &revocation.signing_key,
+            &revocation.network_key,
+            &revocation.nostr_key,
+        )?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO kin_revocations
+                     (identity, signing_key, network_key, nostr_key, tombstone)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    identity,
+                    signing.as_slice(),
+                    network.as_slice(),
+                    nostr.as_slice(),
+                    revocation.to_bytes()
+                ],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
     }
 
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.
-    #[allow(dead_code, clippy::unused_self)]
-    pub(crate) fn is_revoked(&self, _certificate: &DeviceCertificate) -> Result<bool, Error> {
-        todo!("3b: consultar o tombstone")
+    #[allow(dead_code)]
+    pub(crate) fn is_revoked(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
+        let (identity, signing, network, nostr) = revocation_key(
+            certificate.identity(),
+            &certificate.signing_key,
+            &certificate.network_key,
+            &certificate.nostr_key,
+        )?;
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM kin_revocations
+                     WHERE identity = ?1 AND signing_key = ?2 AND network_key = ?3 AND nostr_key = ?4)",
+                params![
+                    identity,
+                    signing.as_slice(),
+                    network.as_slice(),
+                    nostr.as_slice()
+                ],
+                |r| r.get(0),
+            )
+            .map_err(Error::storage)
     }
 
     /// Falha fechada: na dúvida (erro de leitura), trata como revogado.
-    #[allow(dead_code, clippy::unused_self)]
-    pub(crate) fn is_revoked_or_unknown(&self, _certificate: &DeviceCertificate) -> bool {
-        todo!("3b: erro vira revogado")
+    #[allow(dead_code)]
+    pub(crate) fn is_revoked_or_unknown(&self, certificate: &DeviceCertificate) -> bool {
+        self.is_revoked(certificate).unwrap_or(true)
     }
 
     /// Conclui um pareamento: grava o certificado e apaga o pedido pendente **na mesma transação**, para
@@ -167,6 +212,23 @@ impl Provider {
             .collect::<Result<_, _>>()
             .map_err(Error::storage)
     }
+}
+
+/// A chave de um tombstone: `(identidade, assinatura, rede, nostr)`. A identidade entra sempre: sem ela,
+/// a autoridade de outra identidade revogaria um device alheio que tivesse as mesmas chaves públicas
+/// (P31 af).
+fn revocation_key(
+    identity: &IdentityId,
+    signing: &PublicKey,
+    network: &PublicKey,
+    nostr: &NostrPublicKey,
+) -> Result<(String, [u8; 32], [u8; 32], [u8; 32]), Error> {
+    Ok((
+        identity.to_base58(),
+        ed25519_bytes(signing)?,
+        ed25519_bytes(network)?,
+        nostr.to_bytes(),
+    ))
 }
 
 impl OpenMlsProvider for Provider {
