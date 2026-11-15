@@ -110,7 +110,8 @@ impl Provider {
             &revocation.network_key,
             &revocation.nostr_key,
         )?;
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT INTO kin_revocations
                      (identity, signing_key, network_key, nostr_key, tombstone)
@@ -125,7 +126,7 @@ impl Provider {
                 ],
             )
             .map_err(Error::storage)?;
-        Ok(true) // stub da 3c-ii: ainda não distingue nova de repetida
+        Ok(inserted > 0)
     }
 
     /// O device deste certificado está revogado? Chave `(identidade, 3 chaves)`; erro de leitura é erro.

@@ -1580,37 +1580,85 @@ impl Chat {
             return Err(Error::UnauthorizedRevocation);
         }
         // A gravação confere a assinatura. Falha de armazenamento sobe como erro, não vira "inválido".
-        self.device.store_revocation(revocation)?; // stub da 3c-ii: ainda não repassa nem devolve a cota
-        Ok(())
+        match self.device.store_revocation(revocation) {
+            // Novo: repasso a quem devo avisar, menos a quem me enviou. O repetido não repassa: é o que
+            // corta o eco e o loop (cada device grava uma vez, então a cascata termina).
+            Ok(true) => {
+                for target in self.revocation_targets(Some(peer)) {
+                    self.send_revocation(target, revocation);
+                }
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => {
+                let error = Error::from(e);
+                if Self::refunds_quota(&error) {
+                    if let Some(seen) = self.revocations_seen.get_mut(&peer) {
+                        seen.1 = seen.1.saturating_sub(1);
+                    }
+                    self.revocations_global.1 = self.revocations_global.1.saturating_sub(1);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Esta falha de gravação **devolve** a cota do peer? Só a de armazenamento (disco cheio, banco
     /// ocupado): o remetente não teve culpa e o tombstone seria perdido. Assinatura inválida e recusa de
     /// admissão são culpa dele e continuam gastando (ADR 0024, item 4; ADR 0025).
-    #[allow(dead_code)]
-    fn refunds_quota(_error: &Error) -> bool {
-        todo!("3c-ii-a: só erro de armazenamento devolve a cota")
+    fn refunds_quota(error: &Error) -> bool {
+        matches!(error, Error::Crypto(kin_crypto::Error::Storage(_)))
     }
 
     /// Os peers a quem avisar de um tombstone: **conectados**, com conversa pronta de um único peer cuja
     /// identidade eu aceito (`is_trusted`, irmãos sempre), menos `except` (quem me enviou). Quem não aceitei
     /// nem recebe: o receptor o recusaria e gastaria a cota dele (ADR 0025).
-    #[allow(dead_code)]
-    fn revocation_targets(&self, _except: Option<PeerId>) -> Vec<PeerId> {
-        todo!("3c-ii-a: destinos do tombstone")
+    fn revocation_targets(&self, except: Option<PeerId>) -> Vec<PeerId> {
+        self.connected
+            .iter()
+            .copied()
+            .filter(|peer| Some(*peer) != except && self.is_trusted_peer(peer))
+            .collect()
     }
 
-    /// Cifra o tombstone para `peer` e o transmite (como `announce_relays`: fora da outbox, sem ack).
-    #[allow(dead_code)]
-    fn send_revocation(&mut self, _peer: PeerId, _revocation: &DeviceRevocation) {
-        todo!("3c-ii-a: enviar o tombstone")
+    /// A conversa com `peer` é de um único device cuja identidade eu aceito (a minha ou `trust`)?
+    fn is_trusted_peer(&self, peer: &PeerId) -> bool {
+        self.conversations
+            .get(peer)
+            .and_then(|conversation| conversation.peers().ok())
+            .is_some_and(|peers| match peers.as_slice() {
+                [identity] => self.is_trusted(identity),
+                _ => false,
+            })
+    }
+
+    /// Cifra o tombstone para `peer` e o transmite (como `announce_relays`: fora da outbox, sem ack, então
+    /// uma entrega perdida não volta ao `Chat`; o reenvio ao conectar é a 3c-ii-b).
+    fn send_revocation(&mut self, peer: PeerId, revocation: &DeviceRevocation) {
+        let payload = Payload::Revocation(Box::new(revocation.clone())).encode();
+        let Some(conversation) = self.conversations.get_mut(&peer) else {
+            return;
+        };
+        match conversation.encrypt(&payload) {
+            Ok(wire) => {
+                self.transmit(peer, &Envelope::Mls(wire));
+            }
+            Err(e) => self.drop_message(peer, e.into()),
+        }
     }
 
     /// Emite um tombstone **já assinado** (a CLI da fatia 5 o monta; o `Chat` nunca tem a mestra): grava
     /// aqui (confere a assinatura) e o envia a todos os destinos, **mesmo se já estava gravado** (um
     /// reenvio explícito). Só de identidade aceita (a minha, ou `trust`), como na recepção.
-    pub fn broadcast_revocation(&mut self, _revocation: &DeviceRevocation) -> Result<(), Error> {
-        todo!("3c-ii-a: emitir o tombstone")
+    pub fn broadcast_revocation(&mut self, revocation: &DeviceRevocation) -> Result<(), Error> {
+        if !self.is_trusted(revocation.identity()) {
+            return Err(Error::UnauthorizedRevocation);
+        }
+        self.device.store_revocation(revocation)?;
+        for target in self.revocation_targets(None) {
+            self.send_revocation(target, revocation);
+        }
+        Ok(())
     }
 
     /// O device deste certificado tem tombstone gravado? **Pré-condição:** o certificado já foi verificado.
