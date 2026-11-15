@@ -181,10 +181,9 @@ const REVOCATIONS_GLOBAL_PER_WINDOW: u32 = 64;
 const REVOCATION_REFUNDS_PER_WINDOW: u32 = 16;
 /// Tombstones reenviados a um peer por conexão (3c-ii-b): abaixo da cota de 16 por peer do receptor, para
 /// sobrar espaço para repasses novos e para outros remetentes. Quem tem mais recebe só os mais recentes.
-const REVOCATIONS_RESEND_MAX: usize = 8;
+const REVOCATIONS_RESEND_MAX: usize = 4;
 /// Intervalo mínimo entre reenvios ao mesmo peer: maior que `REVOCATION_WINDOW` (a janela de cota do
 /// receptor), para que dois lotes nunca caiam na mesma janela dele (auditoria 3c-ii-b, I2).
-#[allow(dead_code)]
 const REVOCATION_RESEND_GAP: Duration = Duration::from_secs(120);
 const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 
@@ -356,12 +355,10 @@ pub struct Chat {
     revocations_sent: HashMap<PeerId, Instant>,
     /// Intervalo mínimo entre reenvios ao mesmo peer (campo, para o teste não esperar 120 s). **Maior** que
     /// `revocation_window` do receptor, para dois lotes nunca caírem na mesma janela de cota dele.
-    #[allow(dead_code)]
     revocation_resend_gap: Duration,
     /// Peers cujo reenvio já foi avaliado **nesta conexão** (mesmo vazio ou com erro): a consulta ao store
     /// roda uma vez por conexão, não a cada mensagem. Zera ao desconectar. O que entrar no store depois sai
     /// pelo repasse de `on_revocation`.
-    #[allow(dead_code)]
     revocations_checked: std::collections::HashSet<PeerId>,
     /// Irmãos cujo re-anúncio caiu dentro do intervalo mínimo; saem no próximo evento depois do prazo.
     sibling_pending: std::collections::HashSet<PeerId>,
@@ -1134,6 +1131,7 @@ impl Chat {
                 self.devices_announced.remove(&peer);
                 self.lists_acted.remove(&peer);
                 self.last_sibling_announce.remove(&peer);
+                self.revocations_checked.remove(&peer);
                 self.sibling_pending.remove(&peer);
                 self.history_requested.remove(&peer);
                 self.history_sessions.remove(&peer);
@@ -1696,9 +1694,36 @@ impl Chat {
     /// Os tombstones a reenviar a um peer da identidade `who`: até [`REVOCATIONS_RESEND_MAX`], **os da minha
     /// identidade primeiro** e só então os das demais (auditoria 3c-ii-b, I1: um contato não pode empurrar
     /// para fora a revogação do meu device roubado), cada grupo do mais recente ao mais antigo.
-    #[allow(dead_code)]
-    fn revocations_to_resend(&self, _who: &IdentityId) -> Result<Vec<DeviceRevocation>, Error> {
-        todo!("3c-ii-b: minha identidade primeiro")
+    fn revocations_to_resend(&self, who: &IdentityId) -> Result<Vec<DeviceRevocation>, Error> {
+        let own = self.device.identity();
+        // O filtro por identidade é no SQL: os mais recentes do banco podem ser de uma identidade que este
+        // peer não aceita, e filtrar depois do limite esconderia o que ele deveria receber.
+        let identities = self.revocation_identities_for(who);
+        let own_eligible = identities.as_ref().is_none_or(|ids| ids.contains(own));
+        let mut found = if own_eligible {
+            self.device
+                .revocations(Some(std::slice::from_ref(own)), REVOCATIONS_RESEND_MAX)?
+        } else {
+            Vec::new()
+        };
+        if found.len() < REVOCATIONS_RESEND_MAX {
+            let rest: Option<Vec<IdentityId>> =
+                identities.map(|ids| ids.into_iter().filter(|id| id != own).collect());
+            let others = match rest.as_deref() {
+                Some([]) => Vec::new(),
+                other => self.device.revocations(other, REVOCATIONS_RESEND_MAX)?,
+            };
+            // Sem filtro (irmão) as da minha identidade voltam na consulta: saem aqui. Como `found` tem
+            // todas as minhas (são menos que o limite), sobram vagas suficientes entre as demais.
+            let room = REVOCATIONS_RESEND_MAX - found.len();
+            found.extend(
+                others
+                    .into_iter()
+                    .filter(|r| r.identity() != own)
+                    .take(room),
+            );
+        }
+        Ok(found)
     }
 
     /// Reenvia ao `peer` até [`REVOCATIONS_RESEND_MAX`] tombstones gravados, os mais recentes entre os que ele
@@ -1711,22 +1736,22 @@ impl Chat {
         let Some(who) = self.conversation_identity(&peer) else {
             return;
         };
+        // Uma avaliação por conexão, mesmo vazia ou com erro (auditoria 3c-ii-b, I3): sem isso cada mensagem
+        // MLS recebida faria uma consulta ao store (e, no erro, um `Dropped`). O que entrar no store depois
+        // sai pelo repasse de `on_revocation`.
+        if !self.revocations_checked.insert(peer) {
+            return;
+        }
         let now = Instant::now();
-        let window = self.revocation_window;
+        let gap = self.revocation_resend_gap;
         self.revocations_sent
-            .retain(|_, last| now.duration_since(*last) < window);
+            .retain(|_, last| now.duration_since(*last) < gap);
         if self.revocations_sent.contains_key(&peer) {
             return;
         }
-        // O filtro por identidade é no SQL: os mais recentes do banco podem ser de uma identidade que este
-        // peer não aceita, e filtrar depois do limite esconderia o que ele deveria receber.
-        let identities = self.revocation_identities_for(&who);
-        let found = match self
-            .device
-            .revocations(identities.as_deref(), REVOCATIONS_RESEND_MAX)
-        {
+        let found = match self.revocations_to_resend(&who) {
             Ok(found) => found,
-            Err(e) => return self.drop_message(peer, e.into()),
+            Err(e) => return self.drop_message(peer, e),
         };
         if found.is_empty() {
             return;
