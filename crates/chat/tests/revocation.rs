@@ -41,20 +41,29 @@ async fn a_revocation_emitted_by_a_reaches_c_through_b() {
     a.broadcast_revocation(&revocation).unwrap();
     assert!(a.is_revoked(&certificate).unwrap(), "A grava o que emite");
 
-    timeout(WAIT, async {
+    // Eventos vistos por chat (A, B, C), para o teste mostrar onde o tombstone parou se o prazo estourar.
+    let mut seen: [Vec<kin_chat::ChatEvent>; 3] = Default::default();
+    let result = timeout(WAIT, async {
         loop {
             tokio::select! {
-                _ = a.next_event() => {}
-                _ = b.next_event() => {}
-                _ = c.next_event() => {}
+                e = a.next_event() => seen[0].push(e),
+                e = b.next_event() => seen[1].push(e),
+                e = c.next_event() => seen[2].push(e),
             }
             if c.is_revoked(&certificate).unwrap() {
                 break;
             }
         }
     })
-    .await
-    .expect("o tombstone não chegou a C por repasse de B");
+    .await;
+    assert!(
+        result.is_ok(),
+        "o tombstone não chegou a C por repasse de B (B gravou: {})\neventos de A: {:#?}\neventos de B: {:#?}\neventos de C: {:#?}",
+        b.is_revoked(&certificate).unwrap(),
+        seen[0],
+        seen[1],
+        seen[2]
+    );
 
     assert!(b.is_revoked(&certificate).unwrap());
 }
