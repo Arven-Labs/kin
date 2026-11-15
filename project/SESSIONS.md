@@ -1659,3 +1659,21 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `send_revocation`; `untrust` de destino conectado; o ciclo A→B→C→A em rede; se `conversation.peers()` verifica assinatura (S3); uso
   real; revisão externa.
 - **Próximo passo**: 3c-ii-b (reenviar ao conectar), em plan mode, antes da 3d.
+
+#### Reenviar tombstones ao conectar (P30, fatia 3c-ii-b)
+
+- **Feito** (`chat`, `crypto`): `Chat::announce_revocations(peer)` reenvia ao conectar os tombstones guardados (`revocations_to_resend`,
+  filtro por identidade no SQL via `CryptoDevice::revocations`); depois da auditoria: a **minha identidade vai primeiro**, lote de
+  **`REVOCATIONS_RESEND_MAX = 4`**, intervalo de **`REVOCATION_RESEND_GAP = 120 s`** por peer e avaliação **uma vez por conexão** (mesmo
+  vazia). A regra de destino tem duas formas (`accepts_identity` e `revocation_identities_for`) com teste de que concordam. Nada mudou em
+  `identity` e `cli`; nada consulta o store ainda (3d). **Sem ADR próprio** (decidir se vale um 0026).
+- **Prova de que testam algo**: testes com stubs primeiro (commit `917203e`, vermelho esperado; contagens e runs dessa rodada não
+  foram registrados na hora). Verde no CI (run 43723036289, commit `65cbe88`); runs anteriores com falha (43722307807, 43722681631) até
+  os ajustes da auditoria.
+- **Mutações** (branches descartáveis, 4 de 4 pegas): 3cc-1 (43723447339), 3cc-2 (43723458932), 3cc-3 (43723469085) e 3cc-4, sem
+  `announce_revocations` no ramo do `Hello` (43726113125, pega por `receiving_a_message_and_connecting_both_trigger_the_resend_evaluation`).
+  Branches `mut-3cc-*` apagadas, remoto e local.
+- **Tropeços**: a sessão terminou sem PR, sem registro e com a mutação 3cc-4 aplicada e suja na árvore; fechado na sessão seguinte.
+- **Não verificado**: uso real (nada consulta o store); o que cada mutação 1 a 3 mudou (sem registro); resultado da auditoria desta
+  fatia além dos commits; revisão externa.
+- **Próximo passo**: 3d (ligar `is_revoked_or_unknown` na `credential::verify` e derrubar o par), em plan mode.
