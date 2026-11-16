@@ -433,10 +433,43 @@ impl Outbox {
     /// confiança são por identidade, não por device, e ficam.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "o chamador chega na 3d-ii-b2-ii; sai este atributo")
+        expect(
+            dead_code,
+            reason = "o chamador chega na 3d-ii-b2-ii; sai este atributo"
+        )
     )]
-    pub(crate) fn forget_peer(&self, _peer: &PeerId) -> Result<Vec<MessageId>, Error> {
-        Ok(Vec::new())
+    pub(crate) fn forget_peer(&self, peer: &PeerId) -> Result<Vec<MessageId>, Error> {
+        let peer = peer.to_string();
+        let tx = self.conn.unchecked_transaction().map_err(Error::storage)?;
+        // Os ids comuns primeiro, na ordem da fila: depois do DELETE já não há o que ler.
+        let ids = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM kin_outbox WHERE peer = ?1 AND to_identity IS NULL ORDER BY seq")
+                .map_err(Error::storage)?;
+            let rows = stmt
+                .query_map([&peer], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(Error::storage)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(message_id(&row.map_err(Error::storage)?)?);
+            }
+            ids
+        };
+        // Nomes fixos, nunca vindos de fora: entram no SQL sem risco de injeção.
+        for table in [
+            "kin_outbox",
+            "kin_deposited",
+            "kin_deposit_times",
+            "kin_peer_relays",
+            "kin_seen",
+            "kin_seen_mirror",
+            "kin_history_cursor",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE peer = ?1"), [&peer])
+                .map_err(Error::storage)?;
+        }
+        tx.commit().map_err(Error::storage)?;
+        Ok(ids)
     }
 
     /// Grava os relays de entrada anunciados por `peer` (já validados); a última lista substitui a
