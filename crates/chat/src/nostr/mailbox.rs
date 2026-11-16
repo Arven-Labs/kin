@@ -460,15 +460,14 @@ impl Mailbox for NostrMailbox {
     }
 
     /// Esquece o par nas duas direções (`peers` para endereçar, `by_nostr` para atribuir o remetente de um
-    /// evento recebido) e os relays dele, sob o mesmo lock. Só remove a entrada reversa se ela ainda aponta
-    /// para este peer: outro peer pode ter reaprendido a mesma chave Nostr.
+    /// evento recebido) e os relays dele, sob o mesmo lock. A reversa sai por **valor** (`retain`), não pela
+    /// chave atual: `learn_peer` nunca apaga a chave antiga, então um peer que mudou de chave Nostr deixou
+    /// uma entrada órfã apontando para ele (auditoria da 3d-ii-b1, I1). Uma chave que outro peer reaprendeu
+    /// aponta para o outro e fica. Custo O(contatos).
     fn forget_peer(&mut self, peer: PeerId) {
         let mut inner = self.shared.lock();
-        if let Some(key) = inner.peers.remove(&peer)
-            && inner.by_nostr.get(&key) == Some(&peer)
-        {
-            inner.by_nostr.remove(&key);
-        }
+        inner.peers.remove(&peer);
+        inner.by_nostr.retain(|_, owner| *owner != peer);
         inner.peer_relays.remove(&peer);
     }
 
