@@ -1294,6 +1294,25 @@ async fn forgetting_a_peer_also_forgets_its_relays() {
     assert!(theirs.stored().is_empty(), "usou a lista esquecida");
 }
 
+/// Se o certificado do peer trouxe outra chave Nostr, a antiga não fica órfã apontando para ele: esquecer o
+/// peer tira as duas (auditoria da 3d-ii-b1, I1).
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_peer_also_forgets_a_previous_nostr_key_of_it() {
+    let (ana_old, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let ana_new = DeviceKey::generate();
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.inject(wrap(&ana_old, &bia.nostr_public_key(), b"da chave antiga").unwrap());
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    let peer = ana_old.peer_id();
+    mb.learn_peer(peer, ana_old.nostr_public_key());
+    mb.learn_peer(peer, ana_new.nostr_public_key());
+
+    mb.forget_peer(peer);
+    let mut rx = attach(&mut mb);
+
+    quiet(&mut rx, 600).await;
+}
+
 /// Se outro peer reaprendeu a mesma chave Nostr, esquecer o primeiro não tira a atribuição do segundo.
 #[tokio::test(flavor = "multi_thread")]
 async fn forgetting_a_peer_keeps_another_peer_that_shares_the_key() {
