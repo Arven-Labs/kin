@@ -431,7 +431,10 @@ impl Outbox {
     /// espelhos (3.5) também são apagados, mas não voltam (não há mensagem do usuário a avisar).
     /// Idempotente: peer desconhecido ou repetição devolvem vazio. O histórico (`kin_history`) e a
     /// confiança são por identidade, não por device, e ficam.
-    #[expect(dead_code, reason = "o chamador chega na 3d-ii-b2-ii; sai este atributo")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "o chamador chega na 3d-ii-b2-ii; sai este atributo")
+    )]
     pub(crate) fn forget_peer(&self, _peer: &PeerId) -> Result<Vec<MessageId>, Error> {
         Ok(Vec::new())
     }
