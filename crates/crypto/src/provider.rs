@@ -197,13 +197,25 @@ impl Provider {
 
     /// Grava que esta identidade já foi aceita em regime v4 (trinco por identidade, P30 3e-ii-a, ADR 0031).
     /// Idempotente e **monotônico**: nunca se desmarca.
-    pub(crate) fn mark_authority_regime(&self, _identity: &IdentityId) -> Result<(), Error> {
+    pub(crate) fn mark_authority_regime(&self, identity: &IdentityId) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO kin_regime (identity) VALUES (?1)",
+                [identity.to_base58()],
+            )
+            .map_err(Error::storage)?;
         Ok(())
     }
 
     /// Esta identidade já foi aceita em regime v4? Erro de leitura é erro (falha fechada), não "não".
-    pub(crate) fn is_authority_regime(&self, _identity: &IdentityId) -> Result<bool, Error> {
-        Ok(false)
+    pub(crate) fn is_authority_regime(&self, identity: &IdentityId) -> Result<bool, Error> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM kin_regime WHERE identity = ?1)",
+                [identity.to_base58()],
+                |r| r.get(0),
+            )
+            .map_err(Error::storage)
     }
 
     /// Só para teste: apaga a tabela de tombstones, para a leitura falhar (fail-closed, P30 3d-i).
