@@ -6759,6 +6759,103 @@ mod tests {
         );
     }
 
+    /// Auditoria b2-ii, I1: revogar pelo meu próprio `broadcast_revocation` (o caminho de "meu device foi
+    /// roubado") também derruba a conversa com o device revogado, e só com ele.
+    #[tokio::test]
+    async fn broadcasting_a_tombstone_also_drops_the_conversation_with_the_revoked_device() {
+        let mut r = revoked_ana();
+
+        r.bia.broadcast_revocation(&r.revocation).unwrap();
+
+        assert!(!r.bia.is_ready(&r.ana_peer));
+        assert!(r.bia.is_ready(&r.other_ana) && r.bia.is_ready(&r.sibling));
+        assert!(events(&mut r.bia).contains(&ChatEvent::PeerRevoked {
+            peer: r.ana_peer,
+            identity: r.ana.clone()
+        }));
+    }
+
+    /// Auditoria b2-ii, I2: se a fila não pôde ser apagada, a conversa **fica** (é o que a varredura
+    /// reencontra), nada é esquecido na caixa postal, a fila continua inteira e o aviso é `Dropped`, não
+    /// `PeerRevoked` (que diria "apagado" sem ser verdade).
+    #[tokio::test]
+    async fn when_the_queue_cannot_be_cleared_the_conversation_stays_and_nothing_is_announced() {
+        let mut r = revoked_ana();
+        let log = SharedLog::default();
+        r.bia.set_mailbox(Forgetting(log.clone()));
+        r.bia.send(r.ana_peer, "fica", None).unwrap();
+        events(&mut r.bia);
+        r.bia.outbox.run_sql("DROP TABLE kin_history_cursor;");
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+
+        assert!(
+            r.bia.is_ready(&r.ana_peer),
+            "a conversa é o ponto de reparo"
+        );
+        assert_eq!(r.bia.queued(&r.ana_peer), 1, "a transação desfez tudo");
+        assert!(log.lock().unwrap().forgotten.is_empty());
+        let after = events(&mut r.bia);
+        assert!(
+            !after
+                .iter()
+                .any(|e| matches!(e, ChatEvent::PeerRevoked { .. }))
+        );
+        assert!(
+            after
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Dropped { peer, .. } if *peer == r.ana_peer))
+        );
+    }
+
+    /// Auditoria b2-ii, I2: consertado o banco, a varredura (a que a reabertura da 3d-ii-c também usa)
+    /// termina o que falhou: a conversa cai, a fila falha por mensagem e `PeerRevoked` chega uma vez.
+    #[tokio::test]
+    async fn a_later_sweep_finishes_a_drop_that_failed() {
+        let mut r = revoked_ana();
+        let id = r.bia.send(r.ana_peer, "fica", None).unwrap();
+        r.bia.outbox.run_sql("DROP TABLE kin_history_cursor;");
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+        events(&mut r.bia);
+        r.bia.outbox.run_sql(
+            "CREATE TABLE kin_history_cursor (peer TEXT PRIMARY KEY, cursor INTEGER NOT NULL);",
+        );
+
+        r.bia.drop_revoked_peers();
+
+        assert!(!r.bia.is_ready(&r.ana_peer));
+        let after = events(&mut r.bia);
+        assert_eq!(send_failed_ids(&after, r.ana_peer), [id]);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|e| matches!(e, ChatEvent::PeerRevoked { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// Auditoria b2-ii, I3: um `Welcome` em voo que falha depois do drop não é reenviado ao revogado
+    /// (o grupo já foi apagado). Sem conversa, só o `Hello` e o `KeyPackage` voltam a sair.
+    #[tokio::test]
+    async fn a_welcome_is_not_resent_when_there_is_no_conversation() {
+        let mut r = revoked_ana();
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+        r.bia.connected.insert(r.ana_peer);
+        let before = r.bia.pending.len();
+
+        r.bia
+            .resend_handshake(r.ana_peer, Envelope::Welcome(vec![1, 2, 3]));
+
+        assert_eq!(r.bia.pending.len(), before, "nada foi transmitido");
+        assert!(r.bia.handshake_retries.is_empty());
+        r.bia.resend_handshake(r.ana_peer, Envelope::Hello);
+        assert!(
+            !r.bia.handshake_retries.is_empty(),
+            "o Hello continua saindo"
+        );
+    }
+
     /// O device revogado não volta pelo handshake: o `KeyPackage` dele é recusado e nenhuma conversa nasce.
     #[tokio::test]
     async fn a_revoked_device_cannot_restart_a_conversation_with_a_key_package() {

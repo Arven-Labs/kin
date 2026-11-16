@@ -299,6 +299,12 @@ impl Outbox {
         })
     }
 
+    /// Só para teste: roda SQL cru, para quebrar ou consertar uma tabela de propósito.
+    #[cfg(test)]
+    pub(crate) fn run_sql(&self, sql: &str) {
+        self.conn.execute_batch(sql).unwrap();
+    }
+
     /// Só para teste: grava um destino que não decodifica na entrada (banco corrompido).
     #[cfg(test)]
     pub(crate) fn corrupt_destination(&self, peer: &PeerId, id: &MessageId) {
