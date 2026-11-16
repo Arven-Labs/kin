@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use kin_identity::{
-    DeviceCertificate, DeviceRevocation, IdentityId, IdentityProvider, NostrPublicKey, PublicKey,
-    public_key_from_ed25519,
+    DeviceCertificate, DeviceRevocation, IdentityId, IdentityProvider, Issuer, NostrPublicKey,
+    PublicKey, public_key_from_ed25519,
 };
 use openmls::prelude::tls_codec::Serialize as _;
 use openmls::prelude::{
@@ -75,7 +75,8 @@ impl CryptoDevice {
     /// (o chamador a recebeu fora de banda no pareamento): o certificado é verificado a cada abertura e
     /// tem de ser dela ([`Error::IdentityMismatch`]). Falha também se o banco não tem certificado
     /// ([`Error::NotPaired`]) ou se as chaves de rede ou Nostr não são as do certificado
-    /// ([`Error::DeviceMismatch`]).
+    /// ([`Error::DeviceMismatch`]). O certificado tem de ser v4, de uma autoridade: um banco criado pela
+    /// mestra (v3) é recusado com [`Error::NotAuthorityIssued`] (trinco v4, P30 3e-i).
     pub fn open_paired(
         expected: &IdentityId,
         network_key: &PublicKey,
@@ -94,6 +95,12 @@ impl CryptoDevice {
         // passaria em todo o resto.
         if certificate.identity() != expected {
             return Err(Error::IdentityMismatch);
+        }
+        // Trinco v4 (P30 3e-i): um pareado só vive de certificado de autoridade. Um v3 (assinado pela
+        // mestra, num banco criado por ela) deixaria a mestra neste device. Depois da identidade, para
+        // não esconder `IdentityMismatch`.
+        if matches!(certificate.issuer, Issuer::Master(_)) {
+            return Err(Error::NotAuthorityIssued);
         }
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
             return Err(Error::DeviceMismatch);
