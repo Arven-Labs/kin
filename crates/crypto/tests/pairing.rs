@@ -500,6 +500,61 @@ fn a_stored_request_of_another_device_key_is_refused() {
     ));
 }
 
+// ---- trinco v4: um pareado nunca abre com certificado da mestra (P30 3e-i) ----
+
+/// Um banco criado pela mestra (certificado v3) tem a identidade certa e as chaves certas: antes do
+/// trinco, `open_paired` o abria e o device ficava com a mestra fora do regime novo.
+#[test]
+fn open_paired_refuses_a_certificate_issued_by_the_master() {
+    let master = StandaloneIdentity::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "v3.db");
+    let key = DeviceKey::generate();
+    let (net, nostr) = (key.public_key(), key.nostr_public_key());
+    drop(CryptoDevice::open(&master, &net, &nostr, &db, 1).unwrap());
+
+    let result = CryptoDevice::open_paired(&master.id(), &net, &nostr, &db);
+
+    assert!(matches!(result, Err(Error::NotAuthorityIssued)));
+}
+
+/// Controle: o mesmo `open_paired` abre um banco pareado por autoridade (v4).
+#[test]
+fn open_paired_still_opens_a_certificate_issued_by_an_authority() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "v4.db");
+    let key = DeviceKey::generate();
+    drop(pair(&db, &key, &primary));
+
+    let result = CryptoDevice::open_paired(
+        &master.id(),
+        &key.public_key(),
+        &key.nostr_public_key(),
+        &db,
+    );
+
+    assert!(result.is_ok());
+}
+
+/// A identidade errada continua sendo o primeiro erro, mesmo num banco v3 (a ordem das checagens não
+/// esconde `IdentityMismatch` atrás do trinco).
+#[test]
+fn a_v3_database_of_another_identity_still_reports_identity_mismatch() {
+    let master = StandaloneIdentity::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "v3.db");
+    let key = DeviceKey::generate();
+    let (net, nostr) = (key.public_key(), key.nostr_public_key());
+    drop(CryptoDevice::open(&master, &net, &nostr, &db, 1).unwrap());
+    let other = StandaloneIdentity::generate().id();
+
+    let result = CryptoDevice::open_paired(&other, &net, &nostr, &db);
+
+    assert!(matches!(result, Err(Error::IdentityMismatch)));
+}
+
 // ---- um banco pendente não vira mestra ou primário por engano ----
 
 #[test]

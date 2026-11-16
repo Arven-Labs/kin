@@ -104,6 +104,24 @@ fn a_device_still_waiting_for_its_certificate_is_refused() {
     assert!(matches!(error, Error::Crypto(CryptoError::NotPaired)));
 }
 
+/// P30 3e-i: um banco aberto pela mestra (certificado v3) não abre como pareado, mesmo com a identidade
+/// certa; o trinco está na biblioteca, não só na CLI.
+#[test]
+fn a_database_created_by_the_master_is_refused_as_paired() {
+    let dir = tempfile::tempdir().unwrap();
+    let master = StandaloneIdentity::generate();
+    let key = DeviceKey::generate();
+    let db = dir.path().join("v3.db");
+    drop(Chat::open(&master, &key, config(), &db).unwrap());
+
+    let error = open_error(Chat::open_paired(&master.id(), &key, config(), &db));
+
+    assert!(matches!(
+        error,
+        Error::Crypto(CryptoError::NotAuthorityIssued)
+    ));
+}
+
 #[test]
 fn another_device_key_is_refused() {
     let dir = tempfile::tempdir().unwrap();

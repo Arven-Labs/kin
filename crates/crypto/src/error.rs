@@ -71,6 +71,12 @@ pub enum Error {
     /// MLS por cima da que o pedido já declarou.
     #[error("este banco está à espera de um certificado de pareamento")]
     PairingInProgress,
+    /// Um device pareado tem de ter certificado v4 (de uma autoridade); este foi assinado pela própria
+    /// mestra (v3), o que deixaria a mestra num device secundário (P30 3e-i, ADR 0011 item 4).
+    #[error(
+        "o certificado deste banco foi assinado pela mestra (v3), não por uma autoridade: pareie de novo"
+    )]
+    NotAuthorityIssued,
     #[error("armazenamento: {0}")]
     Storage(String),
     #[error("falha no MLS: {0}")]
