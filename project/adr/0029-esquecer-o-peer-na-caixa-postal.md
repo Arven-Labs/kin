@@ -5,7 +5,8 @@
   `kin_history_cursor` do peer e devolve os ids das mensagens comuns, não os espelhos; `kin_history` e a confiança ficam) e **b2-ii** (o `Chat`,
   **implementada** na Sessão 27, com os desvios e a auditoria na seção "b2-ii: o que foi feito" no fim). Área de segurança
   (revogação de acesso, AGENTS.md §4): a b1 foi auditada pelo `security-auditor` (0 críticos, 3 importantes; tabela no fim) e tem 5
-  mutações (5 pegas). A **3d-ii-b2** e a **3d-ii-c** são **bloqueadoras do P30**. Nada chama `forget_peer` ainda.
+  mutações (5 pegas). A **3d-ii-b2** e a **3d-ii-c** eram **bloqueadoras do P30** e estão **feitas** (Sessão 27; a 3d-ii-c na seção
+  "3d-ii-c: reabertura" no fim).
 - **Relacionados**: ADR 0004 (backend Nostr), 0025, 0027, 0028, P30, P31 (am).
 - **Nota de numeração**: o código da 3c-ii-b cita um "ADR 0026" que nunca foi escrito; este é o 0029.
 
@@ -115,3 +116,28 @@ teste; I4 (`DeviceList` repopula o revogado) e S1, S2, S4, S5 viraram P31 (ar) a
 **Mutações** (branches descartáveis, 9 de 9 pegas, apagadas): `Ok(false)` não varre (43880492754, 1 teste); sem `mailbox.forget_peer` (43880504706, 1); sem `outbox.forget_peer` (43882125607, 3; a
 primeira versão, 43880518574, foi barrada pelo clippy `dead_code` antes dos testes); derruba todo mundo (43880529491, vários); sem limpar `history_sessions` (43880543649, 1); sem tirar a
 conversa (43880557076, 5); `broadcast` sem varredura (43885432916, 1); erro do outbox não aborta (43885446899, 2); `Welcome` sempre reenviado (43886308800, 1).
+
+## 3d-ii-c: reabertura (Sessão 27, 2026-11-16)
+
+`open_with_device` (usado por `open` e `open_paired`) recarrega as conversas e então chama `scan_revoked` (só leitura: devolve os revogados e as conversas que não consegui consultar).
+- **Falha de leitura do store ou falha da derrubada falha a abertura** (falha fechada). A segunda veio da auditoria (I1): no `open` não existe "próxima varredura", então o
+  `drop_peer` passou a devolver `Result`; em tempo de execução quem chama o transforma em `Dropped`, na reabertura propaga.
+- Roda antes de qualquer `set_mailbox`: a caixa postal nunca aprende o revogado. Os eventos (`SendFailed` por mensagem, `PeerRevoked`) ficam na fila e saem no primeiro `next_event`.
+- **Desvio do requisito acima ("peers sem conversa com linhas órfãs no outbox") — descartado:** a ordem do `drop_peer` (fila antes da conversa, `forget_peer` numa transação)
+  não fabrica órfãos: um crash antes do `delete` deixa conversa e grupo (a reabertura varre e refaz, idempotente); depois do `delete` a fila já está limpa; se o `delete` falhar, o
+  label e o grupo ficam e a reabertura os recarrega. **Ressalva** (P31 az): linhas do outbox de um peer que nunca teve conversa, ou cuja conversa não carrega, e que depois seja
+  revogado, ficam inertes (nada parte delas).
+- Limite conhecido (P31 ax): se o `forget_conversation` falhar depois do `delete`, o label fica e é ignorado para sempre.
+
+| Etapa | Run | Resultado |
+|---|---|---|
+| Testes com esqueleto | 43890877302 | 2 de 4 falharam pela asserção; 2 controles (sem tombstone; tombstone de outro device) passaram |
+| Implementação | 43891831126 | verde (o run 43891626772 parou no clippy `type_complexity`: a varredura virou a struct `Scan`) |
+| Teste da auditoria (I1: fila quebrada falha a abertura) | 43894163778 | 1 de 1 falhou |
+| Correção (`drop_peer` devolve `Result`) | 43894829177 | verde |
+
+**Mutações** (branches descartáveis, 4 de 4 pegas, apagadas): abrir não derruba (43892487083, 1 teste); erro de leitura ignorado (43892499898, 1); a varredura marca todos (43892512689, vários, inclusive os da b2-ii);
+erro do `drop_peer` ignorado na abertura (43898397259, 1).
+
+**Auditoria** (`security-auditor`, somente leitura): 0 críticos, 1 importante, 3 sugestões. I1 (derrubada falhando na abertura abria com o revogado vivo) **corrigido** com teste; S1 (registrar o desvio) feito aqui; S2 (erro
+de abertura arbitrário e sem o peer) e S3 (resíduos do label e do `delete` do openmls sem transação) em P31 (ax) a (az).

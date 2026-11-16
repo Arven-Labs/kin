@@ -1786,3 +1786,18 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: `delete` do grupo falhando no meio (não simulável); o `delete` de `on_key_package`; uso real (nada na CLI revoga ainda, é a fatia 5); revisão externa.
 - **Próximo passo**: 3d-ii-c (reabrir: `drop_revoked_peers` antes do `set_mailbox`, falha de leitura falha a abertura, peers sem conversa com linhas órfãs no outbox),
   em plan mode; depois 3e (trinco v3/v4).
+
+#### Reabrir reconsulta os tombstones (P30, fatia 3d-ii-c, ADR 0029)
+
+- **Decisões do dono** (plan mode + 1 pergunta): falha de leitura do store falha a abertura (já decidido na Sessão 26); a varredura de "peers sem conversa com linhas
+  órfãs no outbox" **descartada** (a ordem do `drop_peer` não as fabrica; ADR 0029); os 4 testes aprovados.
+- **Feito** (`chat.rs`): `scan_revoked` (só leitura, devolve a struct `Scan`), usada por `drop_revoked_peers` e por `open_with_device`; na reabertura, erro de leitura **ou** falha do
+  `drop_peer` falha a abertura; `drop_peer` passou a devolver `Result` (em tempo de execução vira `Dropped`). Testes em `tests/revoked_reopen.rs` (rede real em loopback; o tombstone é
+  gravado direto no banco do B com o `Chat` fechado, que é o estado de uma derrubada interrompida).
+- **Prova de que testam algo**: esqueleto, **2 de 4** falharam pela asserção e 2 controles passaram (run 43890877302); verde (43891831126); teste da auditoria falhou (43894163778); verde (43894829177).
+- **Mutações** (4 de 4 pegas, branches apagadas): ver ADR 0029.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 1 importante, 3 sugestões. I1 (falha do `drop_peer` na abertura deixava o revogado vivo) **corrigido**; o resto em P31 (ax) a (az).
+- **Tropeços**: usei `sed -i` para tirar um import errado de um arquivo de teste, contra a regra do `CLAUDE.md` (só `Edit`/`Write`); conferi o resultado com `Read` e não repeti; o clippy barrou
+  uma vez (`type_complexity`, já ocorrido na 3b); o `gh pr merge` do #219 foi rodado com `git -C kin` de dentro de `kin` (o merge saiu, o resto falhou; conferi o estado).
+- **Não verificado**: `delete` do grupo falhando no meio (não simulável); `forget_conversation` falhando depois do `delete`; uso real (nada na CLI revoga ainda, é a fatia 5); revisão externa.
+- **Próximo passo**: 3e (trinco v3/v4), em plan mode. **O P30 3d está completa.**
