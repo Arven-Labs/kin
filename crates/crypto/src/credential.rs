@@ -237,6 +237,31 @@ mod tests {
         (cert, raw)
     }
 
+    /// A identidade própria tem dois guardas (`is_downgrade` e `mark_regime`); cada um é fixado sozinho aqui
+    /// (auditoria S1 da 3e-ii-a), porque pelo `regime.rs` o outro esconderia a ausência de um deles.
+    #[test]
+    fn the_own_identity_is_never_a_downgrade_and_never_marked() {
+        let id = StandaloneIdentity::generate();
+        let (cert, _) = device_of(&id);
+        let provider = fresh();
+        provider.mark_authority_regime(&id.id()).unwrap();
+        let someone_else = StandaloneIdentity::generate().id();
+
+        assert!(!is_downgrade(&cert, &id.id(), &provider).unwrap());
+        assert!(is_downgrade(&cert, &someone_else, &provider).unwrap());
+
+        let clean = fresh();
+        let who = Verified {
+            identity: id.id(),
+            peer: DeviceKey::generate().peer_id(),
+            authority: true,
+        };
+        mark_regime(&who, &id.id(), &clean).unwrap();
+        assert!(!clean.is_authority_regime(&id.id()).unwrap());
+        mark_regime(&who, &someone_else, &clean).unwrap();
+        assert!(clean.is_authority_regime(&id.id()).unwrap());
+    }
+
     #[test]
     fn rejects_a_device_with_a_stored_tombstone() {
         let id = StandaloneIdentity::generate();

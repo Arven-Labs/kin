@@ -195,6 +195,26 @@ fn a_device_never_latches_or_refuses_its_own_identity() {
     assert!(!m.is_downgraded(m.certificate()).unwrap());
 }
 
+/// O mesmo no `join`: um Welcome v4 recusado pela identidade esperada não vira o trinco (auditoria S1).
+#[test]
+fn a_refused_v4_welcome_does_not_turn_the_latch() {
+    let w = world();
+    let welcome = invite(&w.p, &w.c).unwrap();
+    let someone_else = StandaloneIdentity::generate().id();
+    let refused = Conversation::join(
+        &w.c,
+        &welcome,
+        &Expected {
+            identity: Some(&someone_else),
+            peer: None,
+        },
+    );
+    assert!(refused.is_err());
+
+    assert!(invite(&w.c, &w.m).is_ok());
+    assert!(!w.c.is_downgraded(w.m.certificate()).unwrap());
+}
+
 /// "Ao aceitar": um KeyPackage v4 cujo convite é **recusado** (identidade esperada diferente) não vira o
 /// trinco; senão um estranho mexeria no estado permanente só por apresentar uma credencial.
 #[test]
