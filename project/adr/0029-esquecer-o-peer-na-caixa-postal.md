@@ -3,7 +3,7 @@
 - **Status**: b1 **aceito e implementado** (Sessão 26, 2026-11-15); b2 cortada em **b2-i** (`Outbox::forget_peer`, **implementada** na Sessão 27,
   2026-11-16: uma transação apaga `kin_outbox`, `kin_deposited`, `kin_deposit_times`, `kin_peer_relays`, `kin_seen`, `kin_seen_mirror` e
   `kin_history_cursor` do peer e devolve os ids das mensagens comuns, não os espelhos; `kin_history` e a confiança ficam) e **b2-ii** (o `Chat`,
-  **desenho aceito, ainda não implementado**). Área de segurança
+  **implementada** na Sessão 27, com os desvios e a auditoria na seção "b2-ii: o que foi feito" no fim). Área de segurança
   (revogação de acesso, AGENTS.md §4): a b1 foi auditada pelo `security-auditor` (0 críticos, 3 importantes; tabela no fim) e tem 5
   mutações (5 pegas). A **3d-ii-b2** e a **3d-ii-c** são **bloqueadoras do P30**. Nada chama `forget_peer` ainda.
 - **Relacionados**: ADR 0004 (backend Nostr), 0025, 0027, 0028, P30, P31 (am).
@@ -81,3 +81,37 @@ Derrubar um peer, **nesta ordem** e em melhor esforço (cada erro vira `Dropped`
 **Auditoria** (`security-auditor`, somente leitura): sem críticos. I1 (chave rotacionada) corrigido; I2 (corrida com `on_event`) e I3 (repovoamento pelo
 `Chat`) viraram os requisitos da b2 acima. Sugestões: documentar o caso da chave compartilhada (feito) e o default vazio (coerente). O auditor executou
 `git checkout` no repo, contra o "somente leitura"; a árvore e a branch estavam íntegras, e voltei à branch de trabalho.
+
+## b2-ii: o que foi feito (Sessão 27, 2026-11-16)
+
+**Desvios do desenho acima** (decisões do dono ou consequência da auditoria):
+- **Sem guardas em `teach_mailbox` e `on_relay_list`:** só chegam com a conversa existente (`on_relay_list` vem de `on_mls`; `teach_mailbox` lê `conversations`),
+  então o guarda seria código morto.
+- **Ordem do `drop_peer` (auditoria I2):** a **fila primeiro** (`Outbox::forget_peer`; se falhar, para com a conversa intacta e avisa `Dropped`), depois a memória
+  por Peer ID e a caixa postal, e **por último** a conversa e o grupo (`delete`), com `forget_conversation` só se o `delete` deu certo. Motivo: `drop_revoked_peers`
+  só reencontra o peer por `conversations`; o `PeerRevoked` só sai com tudo apagado. O desenho original (conversa primeiro) deixava órfãos sem reparo. A `fila`
+  e o banco do `crypto` são arquivos SQLite diferentes, então não há atomicidade entre eles: a ordem faz o papel da transação.
+- **`broadcast_revocation` também varre (I1):** é o caminho de "revogar o meu device roubado".
+- **`Welcome` só é reenviado com conversa (I3):** como o desenho dizia, mas `resend_handshake` não o fazia. Três testes antigos mandavam o `Welcome` a um peer sem conversa e
+  foram ajustados para usar um peer com conversa.
+- **Conexão de rede fica aberta** (decisão do dono): sem conversa, tudo dele vira `Dropped` e o re-handshake falha no `verify`.
+- **`on_key_package` apaga o grupo se o `invite` falhar** (P31 am), **sem teste** no `chat` (decisão do dono): não há API para ver grupos órfãos; só o `delete` do `crypto`
+  (ADR 0028) é testado.
+
+**Requisitos da 3d-ii-c** (reabertura): rodar `drop_revoked_peers` logo depois de carregar as conversas e **antes** do `set_mailbox`; falha de leitura falha a abertura;
+achar peers **sem conversa** com linhas órfãs no outbox (um `drop_peer` que parou no `delete` deixa o label e o grupo); cobrir o `delete` que falhou.
+
+**Auditoria da b2-ii** (`security-auditor`, somente leitura): 0 críticos, 4 importantes, 5 sugestões. I1 (`broadcast_revocation`), I2 (ordem) e I3 (`Welcome`) **corrigidos** com
+teste; I4 (`DeviceList` repopula o revogado) e S1, S2, S4, S5 viraram P31 (ar) a (av); S3 (`PeerRevoked` com falha parcial) fecha com a I2. O auditor confirmou que o `delete` de
+`on_key_package` não atinge outro grupo nem mascara o erro, e que a varredura não derruba outro device da mesma identidade.
+
+| Etapa | Run | Resultado |
+|---|---|---|
+| Testes com esqueleto | 43878401911 | 7 de 9 falharam pela asserção; 2 (controles) passaram. Antes, 43877838600: 2 testes meus estavam errados (remetente; raw do device) |
+| Implementação | 43879842499 | verde |
+| Testes da auditoria (I1, I2, I3) | 43883491261 | 4 de 4 falharam |
+| Correções | 43884168101 / 43884840677 | 3 testes antigos de reenvio falharam (peer sem conversa); verde depois do ajuste |
+
+**Mutações** (branches descartáveis, 9 de 9 pegas, apagadas): `Ok(false)` não varre (43880492754, 1 teste); sem `mailbox.forget_peer` (43880504706, 1); sem `outbox.forget_peer` (43882125607, 3; a
+primeira versão, 43880518574, foi barrada pelo clippy `dead_code` antes dos testes); derruba todo mundo (43880529491, vários); sem limpar `history_sessions` (43880543649, 1); sem tirar a
+conversa (43880557076, 5); `broadcast` sem varredura (43885432916, 1); erro do outbox não aborta (43885446899, 2); `Welcome` sempre reenviado (43886308800, 1).
