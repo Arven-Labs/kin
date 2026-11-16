@@ -6400,6 +6400,7 @@ mod tests {
         ana: IdentityId,
         ana_key: StandaloneIdentity,
         ana_peer: PeerId,
+        ana_raw: Conversation,
         other_ana: PeerId,
         other_raw: Conversation,
         sibling: PeerId,
@@ -6414,7 +6415,7 @@ mod tests {
             ana_key,
             bia_key,
             sibling: (sibling, mut sibling_raw),
-            ana_device: (ana_peer, _),
+            ana_device: (ana_peer, ana_raw),
             ..
         } = household();
         let (other_ana, other_raw) = add_device_of(&mut bia, &ana_key);
@@ -6432,6 +6433,7 @@ mod tests {
             ana,
             ana_key,
             ana_peer,
+            ana_raw,
             other_ana,
             other_raw,
             sibling,
@@ -6574,8 +6576,7 @@ mod tests {
         let mut r = revoked_ana();
         r.bia.on_mls(r.sibling, &r.wire).unwrap();
         events(&mut r.bia);
-        let mut raw = r.other_raw;
-        let late = Envelope::Mls(wire(&mut raw, "tarde")).encode();
+        let late = Envelope::Mls(wire(&mut r.ana_raw, "tarde")).encode();
 
         r.bia.handle_mailbox(MailboxEvent::Retrieved {
             from: r.ana_peer,
@@ -6647,7 +6648,7 @@ mod tests {
         let (revocation, _) = revocation_by(&r.ana_key);
 
         r.bia
-            .on_mls(r.sibling, &revocation_wire(&mut r.other_raw, &revocation))
+            .on_mls(r.other_ana, &revocation_wire(&mut r.other_raw, &revocation))
             .unwrap();
 
         assert!(r.bia.is_ready(&r.ana_peer) && r.bia.is_ready(&r.other_ana));
