@@ -1268,13 +1268,23 @@ impl Chat {
             return Ok(());
         }
         let mut conversation = Conversation::create(&self.device)?;
-        let invite = conversation.invite(
+        let invite = match conversation.invite(
             key_package,
             &Expected {
                 identity: self.expected.get(&peer),
                 peer: Some(&peer),
             },
-        )?;
+        ) {
+            Ok(invite) => invite,
+            Err(e) => {
+                // O grupo já está no banco: sem isto, um `KeyPackage` recusado (revogado, identidade errada)
+                // deixaria um grupo órfão por tentativa (P31 am). Sem teste no `chat`: não há como ver grupos.
+                if let Err(delete) = conversation.delete() {
+                    self.drop_message(peer, delete.into());
+                }
+                return Err(e.into());
+            }
+        };
         self.transmit(peer, &Envelope::Welcome(invite.welcome));
         self.ready(peer, conversation)
     }
@@ -1619,12 +1629,18 @@ impl Chat {
             // Novo: repasso a quem devo avisar, menos a quem me enviou. O repetido não repassa: é o que
             // corta o eco e o loop (cada device grava uma vez, então a cascata termina).
             Ok(true) => {
+                // Derrubo antes de repassar: o revogado deixa de ter conversa e sai dos destinos.
+                self.drop_revoked_peers();
                 for target in self.revocation_targets(revocation.identity(), Some(peer)) {
                     self.send_revocation(target, revocation);
                 }
                 Ok(())
             }
-            Ok(false) => Ok(()),
+            // Já estava no store, mas a conversa pode ter sobrado de uma derrubada que falhou no meio.
+            Ok(false) => {
+                self.drop_revoked_peers();
+                Ok(())
+            }
             Err(e) => {
                 let error = Error::from(e);
                 if Self::refunds_quota(&error) {
@@ -1633,6 +1649,90 @@ impl Chat {
                 Err(error)
             }
         }
+    }
+
+    /// Derruba toda conversa com um device que o store marca como revogado (P30, 3d-ii-b2; ADR 0029). Um
+    /// erro de leitura **não** derruba (não sei se está revogado) e vira `Dropped`; a reabertura (3d-ii-c)
+    /// reconsulta.
+    fn drop_revoked_peers(&mut self) {
+        let mut revoked = Vec::new();
+        let mut failures = Vec::new();
+        for (peer, conversation) in &self.conversations {
+            let certificates = match conversation.peer_certificates() {
+                Ok(certificates) => certificates,
+                Err(e) => {
+                    failures.push((*peer, Error::from(e)));
+                    continue;
+                }
+            };
+            for certificate in certificates {
+                match self.device.is_revoked(&certificate) {
+                    Ok(true) => {
+                        revoked.push((*peer, certificate.identity().clone()));
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(e) => failures.push((*peer, Error::from(e))),
+                }
+            }
+        }
+        for (peer, error) in failures {
+            self.drop_message(peer, error);
+        }
+        for (peer, identity) in revoked {
+            self.drop_peer(peer, identity);
+        }
+    }
+
+    /// Esquece o device `peer`, nesta ordem e em melhor esforço (cada erro vira `Dropped`; tudo idempotente):
+    /// a conversa e o grupo no banco, a memória por Peer ID, a fila (`outbox`) e só **então** a caixa postal
+    /// (senão um `set_mailbox` reensinaria o que o `outbox` ainda guarda). A conexão de rede não é fechada.
+    fn drop_peer(&mut self, peer: PeerId, identity: IdentityId) {
+        if let Some(conversation) = self.conversations.remove(&peer)
+            && let Err(e) = conversation.delete()
+        {
+            self.drop_message(peer, e.into());
+        }
+        if let Err(e) = self.device.forget_conversation(&peer.to_string()) {
+            self.drop_message(peer, e.into());
+        }
+        self.expected.remove(&peer);
+        self.future.remove(&peer);
+        self.handshake_retries.retain(|(p, _), _| *p != peer);
+        self.announced.remove(&peer);
+        self.devices_announced.remove(&peer);
+        self.lists_acted.remove(&peer);
+        self.last_sibling_announce.remove(&peer);
+        self.revocations_checked.remove(&peer);
+        self.sibling_pending.remove(&peer);
+        self.history_requested.remove(&peer);
+        self.history_sessions.remove(&peer);
+        self.history_requests.retain(|_, p| *p != peer);
+        self.in_flight.remove(&peer);
+        self.depositing.retain(|_, (p, _)| *p != peer);
+        self.household.remove(&peer);
+        self.contact_devices.remove(&peer);
+        let failed = match self.outbox.forget_peer(&peer) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.drop_message(peer, e.into());
+                Vec::new()
+            }
+        };
+        self.pending
+            .retain(|_, id| id.is_none_or(|id| !failed.contains(&id)));
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            mailbox.forget_peer(peer);
+        }
+        for message in failed {
+            self.queue.push_back(ChatEvent::SendFailed {
+                peer,
+                message: Some(message),
+                reason: "o device foi revogado".into(),
+            });
+        }
+        self.queue
+            .push_back(ChatEvent::PeerRevoked { peer, identity });
     }
 
     /// Esta falha de gravação **devolve** a cota do peer? Só a de armazenamento (disco cheio, banco
