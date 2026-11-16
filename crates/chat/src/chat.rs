@@ -1688,14 +1688,16 @@ impl Chat {
     /// a conversa e o grupo no banco, a memória por Peer ID, a fila (`outbox`) e só **então** a caixa postal
     /// (senão um `set_mailbox` reensinaria o que o `outbox` ainda guarda). A conexão de rede não é fechada.
     fn drop_peer(&mut self, peer: PeerId, identity: IdentityId) {
-        if let Some(conversation) = self.conversations.remove(&peer)
-            && let Err(e) = conversation.delete()
-        {
-            self.drop_message(peer, e.into());
-        }
-        if let Err(e) = self.device.forget_conversation(&peer.to_string()) {
-            self.drop_message(peer, e.into());
-        }
+        // A fila primeiro, e se falhar paro com a conversa intacta: ela é o ponto de reparo (a próxima varredura
+        // tenta de novo) e nada foi esquecido ainda. É outro arquivo SQLite, então não há atomicidade com o
+        // banco do `crypto`: por isso a ordem, e não uma transação.
+        let failed = match self.outbox.forget_peer(&peer) {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.drop_message(peer, e);
+                return;
+            }
+        };
         self.expected.remove(&peer);
         self.future.remove(&peer);
         self.handshake_retries.retain(|(p, _), _| *p != peer);
@@ -1712,13 +1714,6 @@ impl Chat {
         self.depositing.retain(|_, (p, _)| *p != peer);
         self.household.remove(&peer);
         self.contact_devices.remove(&peer);
-        let failed = match self.outbox.forget_peer(&peer) {
-            Ok(ids) => ids,
-            Err(e) => {
-                self.drop_message(peer, e);
-                Vec::new()
-            }
-        };
         self.pending
             .retain(|_, id| id.is_none_or(|id| !failed.contains(&id)));
         if let Some(mailbox) = self.mailbox.as_mut() {
@@ -1730,6 +1725,19 @@ impl Chat {
                 message: Some(message),
                 reason: "o device foi revogado".into(),
             });
+        }
+        // A conversa e o grupo por último: `drop_revoked_peers` só reencontra o peer por `conversations`, então
+        // enquanto algo acima pudesse falhar ela tinha de continuar lá. Se o `delete` falhar, o label fica e a
+        // reabertura recarrega o grupo (3d-ii-c); `PeerRevoked` só sai com tudo apagado.
+        if let Some(conversation) = self.conversations.remove(&peer)
+            && let Err(e) = conversation.delete()
+        {
+            self.drop_message(peer, e.into());
+            return;
+        }
+        if let Err(e) = self.device.forget_conversation(&peer.to_string()) {
+            self.drop_message(peer, e.into());
+            return;
         }
         self.queue
             .push_back(ChatEvent::PeerRevoked { peer, identity });
@@ -1903,6 +1911,8 @@ impl Chat {
             return Err(Error::UnauthorizedRevocation);
         }
         self.device.store_revocation(revocation)?;
+        // Revogar o meu próprio device roubado passa por aqui: derruba antes de escolher os destinos.
+        self.drop_revoked_peers();
         for target in self.revocation_targets(revocation.identity(), None) {
             self.send_revocation(target, revocation);
         }
@@ -2127,10 +2137,10 @@ impl Chat {
     /// outro lado ignora a duplicata (`on_welcome`). Reenviar os mesmos bytes não gasta outro
     /// `KeyPackage` nem muda a época.
     fn resend_handshake(&mut self, peer: PeerId, envelope: Envelope) {
-        let needs_no_conversation = !matches!(envelope, Envelope::Welcome(_));
-        if !self.connected.contains(&peer)
-            || (needs_no_conversation && self.conversations.contains_key(&peer))
-        {
+        // `Hello` e `KeyPackage` só voltam enquanto não há conversa; o `Welcome` só se ela existe (derrubado o
+        // par, o grupo some e o convite não vale mais).
+        let is_welcome = matches!(envelope, Envelope::Welcome(_));
+        if !self.connected.contains(&peer) || is_welcome != self.conversations.contains_key(&peer) {
             return;
         }
         let retries = self
