@@ -245,6 +245,14 @@ impl Provider {
         Ok(())
     }
 
+    /// Esquece o `label` (não falha se não existe). Não toca o grupo MLS.
+    pub(crate) fn forget(&self, label: &str) -> Result<(), Error> {
+        self.conn
+            .execute("DELETE FROM kin_conversations WHERE label = ?1", [label])
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
     pub(crate) fn remembered(&self) -> Result<Vec<(String, Vec<u8>)>, Error> {
         let mut stmt = self
             .conn

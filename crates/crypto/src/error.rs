@@ -45,6 +45,10 @@ pub enum Error {
     /// O banco foi criado com outra chave de rede; as conversas antigas não valem mais (P15).
     #[error("o estado salvo pertence a outra chave de rede do device")]
     DeviceMismatch,
+    /// Um `Update` trocou a chave de assinatura ou a chave Nostr do membro: o leaf novo tem de ser o mesmo
+    /// device, com as mesmas 4 chaves (P30 3d-ii-a, ADR 0028).
+    #[error("o Update trocou as chaves do device")]
+    DeviceKeysChanged,
     /// O certificado do membro tem tombstone gravado (ou o store não pôde ser lido: falha fechada), P30 3d-i.
     #[error("o device deste certificado foi revogado")]
     Revoked,

@@ -1,8 +1,9 @@
-use kin_identity::{IdentityId, NostrPublicKey, PeerId};
+use kin_identity::{DeviceCertificate, IdentityId, NostrPublicKey, PeerId};
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::{
-    GroupId, KeyPackageIn, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn, MlsMessageIn,
-    ProcessedMessageContent, Proposal, ProtocolVersion, SenderRatchetConfiguration, StagedWelcome,
+    GroupId, KeyPackageIn, LeafNode, MlsGroup, MlsGroupCreateConfig, MlsMessageBodyIn,
+    MlsMessageIn, ProcessedMessageContent, Proposal, ProtocolVersion, Sender,
+    SenderRatchetConfiguration, StagedWelcome,
 };
 
 use openmls_traits::OpenMlsProvider as _;
@@ -187,6 +188,57 @@ impl Conversation {
             .collect()
     }
 
+    /// Certificados (já verificados) dos outros membros: dão as 3 chaves do par, para o `chat` consultar a
+    /// revogação com [`CryptoDevice::is_revoked`] (P30 3d-ii-a, ADR 0028).
+    pub fn peer_certificates(&self) -> Result<Vec<DeviceCertificate>, Error> {
+        let own = self.group.own_leaf_index();
+        self.group
+            .members()
+            .filter(|m| m.index != own)
+            .map(|m| credential::certificate_of(&m.credential))
+            .collect()
+    }
+
+    /// Apaga este grupo do banco (estado, segredos de época e propostas; a chave de assinatura fica).
+    /// Irreversível: é o que derruba um par revogado (P30 3d-ii-a, ADR 0028). Quem chama apaga o label
+    /// depois, com [`CryptoDevice::forget_conversation`].
+    pub fn delete(mut self) -> Result<(), Error> {
+        self.group
+            .delete(self.device.0.provider.storage())
+            .map_err(Error::mls)
+    }
+
+    /// O leaf novo de um `Update` (proposta, ou `UpdatePath` de um commit) de `sender` tem de continuar
+    /// sendo o **mesmo device**: `verify` com a identidade e o Peer ID que ele tem hoje no grupo, sem
+    /// tombstone, e com as mesmas chaves de assinatura e Nostr (decisão do dono: as 4 chaves iguais; um
+    /// certificado renovado com as mesmas chaves passa). O MLS não confere isso: sem a checagem, um par
+    /// revogado "viraria" outro certificado válido dentro do grupo (P31 q).
+    fn verify_continuity(&self, leaf: &LeafNode, sender: &Sender) -> Result<(), Error> {
+        let Sender::Member(index) = sender else {
+            return Err(Error::Unsupported);
+        };
+        let member = self.group.member_at(*index).ok_or(Error::Malformed)?;
+        let current = credential::certificate_of(&member.credential)?;
+        let (identity, peer) = (current.identity().clone(), current.network_peer_id());
+        credential::verify(
+            leaf.credential(),
+            leaf.signature_key().as_slice(),
+            &Expected {
+                identity: Some(&identity),
+                peer: Some(&peer),
+            },
+            &self.device.0.provider,
+        )?;
+        // Identidade e Peer ID (a chave de rede) já conferem; faltam a chave de assinatura e a Nostr (as
+        // 4 chaves do tombstone, ADR 0023). Sem isso, um certificado válido da mesma identidade e do mesmo
+        // device trocaria em silêncio a chave Nostr, que é para onde o mailbox entrega (auditoria I1).
+        let next = credential::certificate_of(leaf.credential())?;
+        if next.signing_key != current.signing_key || next.nostr_key != current.nostr_key {
+            return Err(Error::DeviceKeysChanged);
+        }
+        Ok(())
+    }
+
     /// Convida o dono do KeyPackage. Valida o KeyPackage e a credencial dele antes de aceitar;
     /// `expected` exige identidade e/ou Peer ID de rede específicos.
     pub fn invite(&mut self, key_package: &[u8], expected: &Expected) -> Result<Invite, Error> {
@@ -306,6 +358,7 @@ impl Conversation {
             .map_err(map_process_error)?;
 
         let sender = credential::identity_of(processed.credential())?;
+        let framing_sender = processed.sender().clone();
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(m) => Ok(Decrypted::Message {
                 sender,
@@ -325,6 +378,14 @@ impl Conversation {
                         &inner.provider,
                     )?;
                 }
+                // Os leaves novos de Update (o `UpdatePath` do commit e as propostas Update que ele
+                // efetiva) continuam sendo o mesmo device de quem os enviou (P31 q).
+                if let Some(leaf) = staged.update_path_leaf_node() {
+                    self.verify_continuity(leaf, &framing_sender)?;
+                }
+                for update in staged.update_proposals() {
+                    self.verify_continuity(update.update_proposal().leaf_node(), update.sender())?;
+                }
                 self.group
                     .merge_staged_commit(&inner.provider, *staged)
                     .map_err(Error::mls)?;
@@ -335,6 +396,9 @@ impl Conversation {
             ProcessedMessageContent::ProposalMessage(proposal)
                 if matches!(proposal.proposal(), Proposal::Update(_)) =>
             {
+                if let Proposal::Update(update) = proposal.proposal() {
+                    self.verify_continuity(update.leaf_node(), &framing_sender)?;
+                }
                 self.group
                     .store_pending_proposal(inner.provider.storage(), *proposal)
                     .map_err(Error::mls)?;
@@ -363,5 +427,256 @@ fn map_process_error<S: std::error::Error>(e: openmls::prelude::ProcessMessageEr
         P::ValidationError(V::WrongGroupId) => Error::WrongConversation,
         P::ValidationError(V::WrongEpoch) => Error::UnknownEpoch,
         _ => Error::mls(e),
+    }
+}
+
+/// Testes que precisam do grupo MLS (campo privado) para forjar um `Update`: o MLS assina o leaf novo
+/// com a chave nova e o enquadramento com a antiga, então só dá para forjar por baixo da API pública
+/// (P30 3d-ii-a, ADR 0028; P31 q).
+#[cfg(test)]
+mod tests {
+    use kin_identity::{DeviceKey, StandaloneIdentity};
+    use openmls::credentials::NewSignerBundle;
+    use openmls::prelude::LeafNodeParameters;
+
+    use super::*;
+
+    fn device_of(identity: &StandaloneIdentity) -> CryptoDevice {
+        let net = DeviceKey::generate();
+        CryptoDevice::new(identity, &net.public_key(), &net.nostr_public_key(), 1).unwrap()
+    }
+
+    /// Ana (committer) e Bia na mesma conversa; devolve também a identidade de Bia.
+    fn pair() -> (StandaloneIdentity, Conversation, Conversation) {
+        let p = pair_full();
+        (p.bia_id, p.conv_ana, p.conv_bia)
+    }
+
+    /// A conversa de Ana e Bia com tudo o que os testes de continuidade precisam.
+    struct Pair {
+        ana: CryptoDevice,
+        bia_id: StandaloneIdentity,
+        bia_net: DeviceKey,
+        conv_ana: Conversation,
+        conv_bia: Conversation,
+    }
+
+    fn pair_full() -> Pair {
+        let (ana_id, bia_id) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let bia_net = DeviceKey::generate();
+        let ana = device_of(&ana_id);
+        let bia = CryptoDevice::new(
+            &bia_id,
+            &bia_net.public_key(),
+            &bia_net.nostr_public_key(),
+            1,
+        )
+        .unwrap();
+        let mut conv_ana = Conversation::create(&ana).unwrap();
+        let invite = conv_ana
+            .invite(&bia.key_package().unwrap(), &Expected::default())
+            .unwrap();
+        let conv_bia = Conversation::join(&bia, &invite.welcome, &Expected::default()).unwrap();
+        Pair {
+            ana,
+            bia_id,
+            bia_net,
+            conv_ana,
+            conv_bia,
+        }
+    }
+
+    /// Um Update de `conv` cujo leaf novo traz a credencial de `rogue` (assinado pela chave de `rogue`),
+    /// com o enquadramento ainda assinado pela chave atual de `conv`.
+    fn forged_update(conv: &mut Conversation, rogue: &CryptoDevice) -> Vec<u8> {
+        let inner = &conv.device.0;
+        let (message, _) = conv
+            .group
+            .propose_self_update_with_new_signer(
+                &inner.provider,
+                &inner.signer,
+                NewSignerBundle {
+                    signer: &rogue.0.signer,
+                    credential_with_key: rogue.0.credential.clone(),
+                },
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        message.to_bytes().unwrap()
+    }
+
+    /// Um commit de `conv` com `UpdatePath` cujo leaf novo traz a credencial de `rogue`.
+    fn forged_commit(conv: &mut Conversation, rogue: &CryptoDevice) -> Vec<u8> {
+        let inner = &conv.device.0;
+        let bundle = conv
+            .group
+            .self_update_with_new_signer(
+                &inner.provider,
+                &inner.signer,
+                NewSignerBundle {
+                    signer: &rogue.0.signer,
+                    credential_with_key: rogue.0.credential.clone(),
+                },
+                LeafNodeParameters::default(),
+            )
+            .unwrap();
+        bundle.into_commit().to_bytes().unwrap()
+    }
+
+    #[test]
+    fn an_update_proposal_with_another_identity_is_refused() {
+        let (_, mut conv_ana, mut conv_bia) = pair();
+        let rogue = device_of(&StandaloneIdentity::generate());
+
+        let forged = forged_update(&mut conv_bia, &rogue);
+
+        assert!(matches!(
+            conv_ana.decrypt(&forged),
+            Err(Error::UnexpectedIdentity)
+        ));
+    }
+
+    /// Mesma identidade, mas outro device (outro Peer ID): também não é a continuação de Bia.
+    #[test]
+    fn an_update_proposal_with_another_peer_id_is_refused() {
+        let (bia_id, mut conv_ana, mut conv_bia) = pair();
+        let other_device = device_of(&bia_id);
+
+        let forged = forged_update(&mut conv_bia, &other_device);
+
+        assert!(matches!(
+            conv_ana.decrypt(&forged),
+            Err(Error::UnexpectedPeer)
+        ));
+    }
+
+    #[test]
+    fn a_commit_with_an_update_path_with_another_identity_is_refused() {
+        let (_, mut conv_ana, mut conv_bia) = pair();
+        let rogue = device_of(&StandaloneIdentity::generate());
+
+        let forged = forged_commit(&mut conv_bia, &rogue);
+
+        assert!(matches!(
+            conv_ana.decrypt(&forged),
+            Err(Error::UnexpectedIdentity)
+        ));
+    }
+
+    /// Mesma identidade e mesmo Peer ID, mas **outra chave Nostr** (certificado novo e válido): o `Update`
+    /// não pode trocar para onde os relays entregam o que é do membro (auditoria da 3d-ii-a, I1).
+    #[test]
+    fn an_update_proposal_with_another_nostr_key_is_refused() {
+        let mut p = pair_full();
+        let rogue = CryptoDevice::new(
+            &p.bia_id,
+            &p.bia_net.public_key(),
+            &DeviceKey::generate().nostr_public_key(),
+            2,
+        )
+        .unwrap();
+
+        let forged = forged_update(&mut p.conv_bia, &rogue);
+
+        assert!(matches!(
+            p.conv_ana.decrypt(&forged),
+            Err(Error::DeviceKeysChanged)
+        ));
+    }
+
+    /// Mesma identidade, Peer ID e chave Nostr, mas **outra chave de assinatura** (certificado novo): a
+    /// rotação de chave MLS com certificado novo ainda não existe (decisão do dono: as 4 chaves iguais).
+    #[test]
+    fn an_update_proposal_with_another_signing_key_is_refused() {
+        let mut p = pair_full();
+        let rogue = CryptoDevice::new(
+            &p.bia_id,
+            &p.bia_net.public_key(),
+            &p.bia_net.nostr_public_key(),
+            2,
+        )
+        .unwrap();
+
+        let forged = forged_update(&mut p.conv_bia, &rogue);
+
+        assert!(matches!(
+            p.conv_ana.decrypt(&forged),
+            Err(Error::DeviceKeysChanged)
+        ));
+    }
+
+    /// O mesmo para o `UpdatePath` de um commit.
+    #[test]
+    fn a_commit_with_an_update_path_with_another_nostr_key_is_refused() {
+        let mut p = pair_full();
+        let rogue = CryptoDevice::new(
+            &p.bia_id,
+            &p.bia_net.public_key(),
+            &DeviceKey::generate().nostr_public_key(),
+            2,
+        )
+        .unwrap();
+
+        let forged = forged_commit(&mut p.conv_bia, &rogue);
+
+        assert!(matches!(
+            p.conv_ana.decrypt(&forged),
+            Err(Error::DeviceKeysChanged)
+        ));
+    }
+
+    /// Um Update do mesmo device cujo certificado tem tombstone é `Revoked` (ADR 0027 dentro da continuidade).
+    #[test]
+    fn a_legitimate_rotation_from_a_revoked_device_is_refused() {
+        let mut p = pair_full();
+        let cert = p.conv_ana.peer_certificates().unwrap().remove(0);
+        p.ana
+            .store_revocation(&p.bia_id.revoke_device(&cert, 2_000).unwrap())
+            .unwrap();
+
+        let proposal = p.conv_bia.propose_rotation().unwrap();
+
+        assert!(matches!(p.conv_ana.decrypt(&proposal), Err(Error::Revoked)));
+    }
+
+    /// A rejeição não mexe no estado: a época e a conversa seguem como estavam e a seguinte mensagem boa passa.
+    #[test]
+    fn a_refused_update_leaves_the_conversation_usable() {
+        let mut p = pair_full();
+        let rogue = device_of(&StandaloneIdentity::generate());
+        let epoch = p.conv_ana.epoch();
+
+        let forged = forged_update(&mut p.conv_bia, &rogue);
+        assert!(p.conv_ana.decrypt(&forged).is_err());
+
+        // Se a proposta forjada tivesse entrado na fila de Ana, ela não conseguiria cifrar ("pending
+        // proposal exists"). O grupo de Bia é que ficou com a proposta dela, por isso é Ana quem fala.
+        assert_eq!(p.conv_ana.epoch(), epoch);
+        let hello = p.conv_ana.encrypt(b"oi").unwrap();
+        assert!(matches!(
+            p.conv_bia.decrypt(&hello),
+            Ok(Decrypted::Message { .. })
+        ));
+    }
+
+    /// A rotação legítima (mesma credencial) segue aceita, como proposta e como commit.
+    #[test]
+    fn a_legitimate_rotation_is_still_accepted() {
+        let (_, mut conv_ana, mut conv_bia) = pair();
+
+        let proposal = conv_bia.propose_rotation().unwrap();
+        assert!(matches!(
+            conv_ana.decrypt(&proposal),
+            Ok(Decrypted::ProposalQueued)
+        ));
+
+        let commit = conv_ana.rotate_keys().unwrap();
+        assert!(matches!(
+            conv_bia.decrypt(&commit),
+            Ok(Decrypted::EpochChanged)
+        ));
     }
 }

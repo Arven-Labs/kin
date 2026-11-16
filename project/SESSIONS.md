@@ -1702,3 +1702,29 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   a alcança, teto de 2 membros); `cert.identity()` e `revocation.identity()` convergirem em todas as cadeias; uso real; revisão externa.
 - **Próximo passo**: 3d-ii (derrubar o par: conversa, outbox, mailbox, evento; reconsultar ao reabrir; `verify` do leaf de `Update`),
   em plan mode.
+
+#### O `crypto` para derrubar o par e a continuidade do `Update` (P30, fatia 3d-ii-a, ADR 0028)
+
+- **Decisões do dono** (plan mode + 4 perguntas, mais 2 depois da auditoria): 3d-ii cortada em **a (crypto), b (chat), c (reabertura)**;
+  na b, `PeerRevoked` + `SendFailed` por mensagem apagada e consulta **antes** do `Conversation::create` em `on_key_package` (fecha o P31 am);
+  na c, falha de leitura do store **falha a abertura**. Depois da auditoria: o `Update` exige as **4 chaves iguais** (o plano aceitava chave
+  MLS diferente) e o `delete` não transacional vira pendência.
+- **Feito** (só `crypto`): `Conversation::peer_certificates`, `Conversation::delete`, `CryptoDevice::forget_conversation`
+  (`Provider::forget`), `credential::certificate_of` (ex-`parse`) e `Conversation::verify_continuity` em `decrypt` (proposta solta,
+  `UpdatePath` e propostas `Update` efetivadas por um commit); `Error::DeviceKeysChanged`. **Fecha o P31 (q)**. ADR **0028**.
+- **Prova de que testam algo**: stubs, **7 de 7** falharam (run 43772348947); nos 3 testes de `Update` o código aceitava o forjado, então o
+  P31 (q) estava provado como real. Verde (43772955286). Depois da auditoria, **3 de 3** testes das 4 chaves falharam (43776826447) e o 4º
+  falhou por erro **meu** no teste (a Bia, dona da proposta forjada, era quem não podia cifrar); verde (43777160424).
+- **Mutações** (branches descartáveis, 6 de 6 pegas, apagadas): `peer_certificates` devolve o próprio membro (43773323829, 2 testes);
+  `delete` sem apagar (43773338458, 1); `forget` sem apagar (43773349106, 1); `Update` proposto sem a checagem (43773360125, 2);
+  `UpdatePath` sem a checagem (43773372043, 1); sem conferir assinatura e Nostr (43777489583, 3).
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 2 importantes. I1: o `Update` ainda deixava trocar a chave Nostr dentro
+  da mesma identidade e do mesmo device: corrigido (4 chaves). I2: `delete` não transacional e os segredos que sobram (chaves HPKE do leaf,
+  sem `secure_delete`): pendência P31 (an), por decisão sua. Sugestões viraram P31 (ao) a (aq).
+- **Tropeços**: o plano dizia que o `Update` podia trocar a chave MLS; a auditoria mostrou o que isso deixava passar; uma mutação do
+  `delete` precisou tirar o `mut self` e outra usou `&& false` para o clippy não barrar antes dos testes; o meu teste de "conversa
+  utilizável" falhou por erro meu e foi corrigido antes da implementação.
+- **Não verificado**: a checagem das propostas `Update` dentro de um commit (inalcançável por teste com 2 membros); atomicidade do
+  `delete` e do `openmls_sqlite_storage`; `secure_delete`; uso real (nada no `chat` chama o que a fatia adiciona); revisão externa.
+- **Próximo passo**: 3d-ii-b (o `chat` derruba o par: varredura em `on_revocation`, outbox, `Mailbox::forget_peer`, `PeerRevoked`, CLI,
+  consulta antes do `create` em `on_key_package`), em plan mode.

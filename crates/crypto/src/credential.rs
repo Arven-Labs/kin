@@ -30,11 +30,11 @@ pub(crate) fn verify(
     expected: &Expected,
     provider: &Provider,
 ) -> Result<Verified, Error> {
-    let cert = parse(credential)?;
+    let cert = certificate_of(credential)?;
     if ed25519_bytes(&cert.signing_key)? != signature_key {
         return Err(Error::InvalidCredential);
     }
-    // Ponto único da consulta (ADR 0023 I2): só depois de `parse` ter conferido a assinatura do
+    // Ponto único da consulta (ADR 0023 I2): só depois de `certificate_of` ter conferido a assinatura do
     // certificado, porque `is_revoked` assume um certificado verificado. Falha fechada: erro de
     // leitura do store recusa com `Error::Storage` (diagnosticável, sem fingir que foi revogado).
     if provider.is_revoked(&cert)? {
@@ -56,20 +56,22 @@ pub(crate) fn verify(
 /// Lê a identidade de uma credencial de um membro que já entrou. **Não é uma verificação**: o MLS não
 /// confere revogação nem continuidade de identidade; quem decide aceitar um membro é [`verify`].
 pub(crate) fn identity_of(credential: &Credential) -> Result<IdentityId, Error> {
-    Ok(parse(credential)?.identity().clone())
+    Ok(certificate_of(credential)?.identity().clone())
 }
 
 /// Lê o Peer ID de rede certificado numa credencial já validada pelo MLS.
 pub(crate) fn peer_of(credential: &Credential) -> Result<PeerId, Error> {
-    Ok(parse(credential)?.network_peer_id())
+    Ok(certificate_of(credential)?.network_peer_id())
 }
 
 /// Lê a chave Nostr certificada numa credencial já validada pelo MLS.
 pub(crate) fn nostr_of(credential: &Credential) -> Result<NostrPublicKey, Error> {
-    Ok(parse(credential)?.nostr_key)
+    Ok(certificate_of(credential)?.nostr_key)
 }
 
-fn parse(credential: &Credential) -> Result<DeviceCertificate, Error> {
+/// O certificado de uma credencial, com a assinatura da cadeia conferida (não consulta revogação nem
+/// confere a chave MLS: quem aceita um membro é [`verify`]).
+pub(crate) fn certificate_of(credential: &Credential) -> Result<DeviceCertificate, Error> {
     let basic =
         BasicCredential::try_from(credential.clone()).map_err(|_| Error::InvalidCredential)?;
     let cert =
