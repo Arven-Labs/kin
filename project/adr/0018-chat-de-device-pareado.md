@@ -30,7 +30,8 @@ sobre esse banco.
 - Um device recém-pareado começa com `trusted` **vazio** (vem da outbox dele); os contatos do primário só chegam por sincronização
   entre irmãos. **Decisão de produto para a 2d-ii**.
 - `open_paired` aceita também um banco criado pela mestra (cert v3, `Issuer::Master`) se a identidade esperada bater: o nome diz
-  "pareado" sem garantir o emissor. O trinco v4 vs v3 é da fatia 3 (P31(o)); por ora só está documentado no doc da função.
+  "pareado" sem garantir o emissor. O trinco v4 vs v3 é da fatia 3 (P31(o)); por ora só está documentado no doc da função. **Atualização (Sessão 27): fechado
+  na 3e-i (ADR 0030); `open_paired` recusa v3.**
 - Uma recusa pode deixar um `.db` vazio se o caminho não existia (`Provider::open` cria; `open` faz o mesmo).
 
 ## O que não foi validado

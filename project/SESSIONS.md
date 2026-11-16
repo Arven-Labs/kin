@@ -1801,3 +1801,22 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   uma vez (`type_complexity`, já ocorrido na 3b); o `gh pr merge` do #219 foi rodado com `git -C kin` de dentro de `kin` (o merge saiu, o resto falhou; conferi o estado).
 - **Não verificado**: `delete` do grupo falhando no meio (não simulável); `forget_conversation` falhando depois do `delete`; uso real (nada na CLI revoga ainda, é a fatia 5); revisão externa.
 - **Próximo passo**: 3e (trinco v3/v4), em plan mode. **O P30 3d está completa.**
+
+#### Trinco v4 no device pareado (P30, fatia 3e-i, ADR 0030)
+
+- **Decisões do dono** (plan mode + 3 perguntas): a 3e cortada em **3e-i (lado A, esta)** e **3e-ii (lado B: contatos)**, em PRs separados; no lado B, ao virar v4 as
+  conversas v3 da identidade serão derrubadas (3e-ii); depois da auditoria, a **instalação** também recusa v3 (era fora do escopo no plano) e o ADR 0030 foi criado.
+- **Feito**: `Error::NotAuthorityIssued`; `CryptoDevice::open_paired` (e `Chat::open_paired`) e `PendingDevice::install_certificate_at` recusam emissor que não é
+  `Issuer::Authority` (forma que falha fechado), depois do `verify` e de `IdentityMismatch`; na instalação, antes do `finish_pairing` (o banco segue pendente). Mensagem
+  "pareie de novo, em um --data-dir novo"; comentário de `ensure_current_issuer` corrigido (roda depois do `open_paired`).
+- **Prova de que testam algo**: esqueleto, **2 de 4** falharam pela asserção e 2 controles passaram (run 43958160518); verde (43958950571). Teste da instalação (auditoria I1):
+  falhou sozinho, 22 de 23 (43963691200); verde (43966071427).
+- **Mutações** (2 de 2 pegas, branches apagadas): `Master` por `Authority` (43959538712, 10 testes); trinco antes da identidade (43959577683, 2 testes). Na instalação, o run vermelho
+  sem a checagem faz o papel da mutação.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 2 importantes, 5 sugestões. I1 (instalação aceitava v3 e deixava o banco preso), I2 (docs defasadas), S1, S2, S3
+  **corrigidos**; S4 em P31 (ba); S5 é a 3e-ii.
+- **Tropeços**: o CI só roda em PR ou `workflow_dispatch`, então o push sozinho não gerou run (usei `gh workflow run ci.yml --ref <branch>`); um `gh run watch` passou do timeout de 10 min
+  do Bash e foi para segundo plano.
+- **Não verificado**: consumidores de `kin-crypto`/`kin-chat` fora deste repo (p. ex. `warden/mobile`); revisão externa. O lado B segue aberto: um device v3 antigo da mesma identidade
+  ainda é aceito pelos contatos.
+- **Próximo passo**: 3e-ii (trinco por identidade nos contatos), em plan mode; depois a fatia 4 (validade/frescor).

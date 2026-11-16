@@ -189,6 +189,39 @@ fn a_wrong_certificate_is_refused_and_the_database_stays_pending() {
     assert_eq!(device.identity(), &master.id());
 }
 
+/// P30 3e-i (auditoria I1): a própria mestra, a identidade esperada, emite um v3 com as chaves do pedido.
+/// Instalar o v3 consumiria o pedido e deixaria o banco preso (`open_paired` o recusa e `request` dá
+/// `AlreadyPaired`): a instalação o recusa, com o banco ainda pendente e o v4 ainda valendo.
+#[test]
+fn a_certificate_issued_by_the_master_is_refused_on_install_and_the_database_stays_pending() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+    let request = PendingDevice::open(&db).unwrap().request(&key).unwrap();
+    let v3 = master
+        .authorize_device(
+            &request.signing_key,
+            &request.network_key,
+            &request.nostr_key,
+            2_000,
+        )
+        .unwrap();
+
+    let result = PendingDevice::open(&db)
+        .unwrap()
+        .install_certificate(&key, &v3, &master.id());
+
+    assert!(matches!(result, Err(Error::NotAuthorityIssued)));
+    let pending = PendingDevice::open(&db).unwrap();
+    assert_eq!(pending.request(&key).unwrap(), request);
+    let device = pending
+        .install_certificate(&key, &answer(&primary, &request), &master.id())
+        .unwrap();
+    assert_eq!(device.identity(), &master.id());
+}
+
 #[test]
 fn a_certificate_of_another_expected_identity_is_refused() {
     let master = StandaloneIdentity::generate();
@@ -498,6 +531,61 @@ fn a_stored_request_of_another_device_key_is_refused() {
         pending.request(&other),
         Err(Error::DeviceMismatch)
     ));
+}
+
+// ---- trinco v4: um pareado nunca abre com certificado da mestra (P30 3e-i) ----
+
+/// Um banco criado pela mestra (certificado v3) tem a identidade certa e as chaves certas: antes do
+/// trinco, `open_paired` o abria e o device ficava com a mestra fora do regime novo.
+#[test]
+fn open_paired_refuses_a_certificate_issued_by_the_master() {
+    let master = StandaloneIdentity::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "v3.db");
+    let key = DeviceKey::generate();
+    let (net, nostr) = (key.public_key(), key.nostr_public_key());
+    drop(CryptoDevice::open(&master, &net, &nostr, &db, 1).unwrap());
+
+    let result = CryptoDevice::open_paired(&master.id(), &net, &nostr, &db);
+
+    assert!(matches!(result, Err(Error::NotAuthorityIssued)));
+}
+
+/// Controle: o mesmo `open_paired` abre um banco pareado por autoridade (v4).
+#[test]
+fn open_paired_still_opens_a_certificate_issued_by_an_authority() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "v4.db");
+    let key = DeviceKey::generate();
+    drop(pair(&db, &key, &primary));
+
+    let result = CryptoDevice::open_paired(
+        &master.id(),
+        &key.public_key(),
+        &key.nostr_public_key(),
+        &db,
+    );
+
+    assert!(result.is_ok());
+}
+
+/// A identidade errada continua sendo o primeiro erro, mesmo num banco v3 (a ordem das checagens não
+/// esconde `IdentityMismatch` atrás do trinco).
+#[test]
+fn a_v3_database_of_another_identity_still_reports_identity_mismatch() {
+    let master = StandaloneIdentity::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "v3.db");
+    let key = DeviceKey::generate();
+    let (net, nostr) = (key.public_key(), key.nostr_public_key());
+    drop(CryptoDevice::open(&master, &net, &nostr, &db, 1).unwrap());
+    let other = StandaloneIdentity::generate().id();
+
+    let result = CryptoDevice::open_paired(&other, &net, &nostr, &db);
+
+    assert!(matches!(result, Err(Error::IdentityMismatch)));
 }
 
 // ---- um banco pendente não vira mestra ou primário por engano ----

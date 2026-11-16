@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use kin_identity::{
-    DeviceCertificate, DeviceKey, IdentityId, PairRequest, public_key_from_ed25519,
+    DeviceCertificate, DeviceKey, IdentityId, Issuer, PairRequest, public_key_from_ed25519,
 };
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
@@ -168,6 +168,11 @@ impl PendingDevice {
         let signing_key = public_key_from_ed25519(self.signer.public())?;
         let request = Self::check_stored(&bytes, &signing_key, device_key)?;
         request.accept_certificate(certificate, expected)?;
+        // Trinco v4 (P30 3e-i, auditoria I1): um v3 (da mestra) instalado consumiria o pedido e deixaria o
+        // banco preso, já que `open_paired` o recusa. Antes do `finish_pairing`, o banco segue pendente.
+        if !matches!(certificate.issuer, Issuer::Authority(_)) {
+            return Err(Error::NotAuthorityIssued);
+        }
         self.provider.finish_pairing(
             &certificate.to_bytes(),
             META_CERT,
