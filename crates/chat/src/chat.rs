@@ -129,6 +129,13 @@ pub enum ChatEvent {
         peer: PeerId,
         relays: Vec<String>,
     },
+    /// O device `peer` (da `identity`) foi revogado por um tombstone e a conversa com ele foi apagada, com
+    /// a fila e o que a caixa postal sabia dele (P30, 3d-ii-b2). Chega uma vez por device derrubado; cada
+    /// mensagem que estava na fila para ele chega antes como [`ChatEvent::SendFailed`].
+    PeerRevoked {
+        peer: PeerId,
+        identity: IdentityId,
+    },
     /// Algo do peer foi descartado (malformado, de outra conversa, etc.).
     Dropped {
         peer: PeerId,
@@ -6348,5 +6355,329 @@ mod tests {
         let mut expected = vec![a1, a2];
         expected.sort();
         assert_eq!(queued, expected);
+    }
+
+    // ---- P30 3d-ii-b2-ii: o `Chat` derruba o par revogado ----
+
+    /// Caixa postal que anota o que o `Chat` lhe ensina e o que manda esquecer.
+    #[derive(Default)]
+    struct MailboxLog {
+        learned_peers: Vec<PeerId>,
+        learned_relays: Vec<PeerId>,
+        forgotten: Vec<PeerId>,
+    }
+
+    type SharedLog = std::sync::Arc<std::sync::Mutex<MailboxLog>>;
+
+    struct Forgetting(SharedLog);
+
+    impl Mailbox for Forgetting {
+        fn attach(&mut self, _events: futures::channel::mpsc::UnboundedSender<MailboxEvent>) {}
+
+        fn deposit(&mut self, _to: PeerId, _blob: Vec<u8>) -> DepositId {
+            DepositId(0)
+        }
+
+        fn learn_peer(&mut self, peer: PeerId, _nostr: kin_identity::NostrPublicKey) {
+            self.0.lock().unwrap().learned_peers.push(peer);
+        }
+
+        fn learn_relays(&mut self, peer: PeerId, _relays: Vec<String>) {
+            self.0.lock().unwrap().learned_relays.push(peer);
+        }
+
+        fn forget_peer(&mut self, peer: PeerId) {
+            self.0.lock().unwrap().forgotten.push(peer);
+        }
+    }
+
+    /// A Bia aceita a Ana e tem conversa com: um device irmão, o device `ana_peer` da Ana (o que vai ser
+    /// revogado) e um segundo device da Ana. `wire` é o tombstone do `ana_peer`, assinado pela Ana e
+    /// entregue pelo irmão (a identidade é aceita, então vale).
+    struct Revoked {
+        bia: Chat,
+        bia_key: StandaloneIdentity,
+        ana: IdentityId,
+        ana_key: StandaloneIdentity,
+        ana_peer: PeerId,
+        other_ana: PeerId,
+        other_raw: Conversation,
+        sibling: PeerId,
+        revocation: DeviceRevocation,
+        wire: Vec<u8>,
+    }
+
+    fn revoked_ana() -> Revoked {
+        let Household {
+            mut bia,
+            ana,
+            ana_key,
+            bia_key,
+            sibling: (sibling, mut sibling_raw),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let (other_ana, other_raw) = add_device_of(&mut bia, &ana_key);
+        bia.trust(ana.clone()).unwrap();
+        let certificate = bia.conversations[&ana_peer]
+            .peer_certificates()
+            .unwrap()
+            .remove(0);
+        let revocation = ana_key.revoke_device(&certificate, 2).unwrap();
+        let wire = revocation_wire(&mut sibling_raw, &revocation);
+        events(&mut bia);
+        Revoked {
+            bia,
+            bia_key,
+            ana,
+            ana_key,
+            ana_peer,
+            other_ana,
+            other_raw,
+            sibling,
+            revocation,
+            wire,
+        }
+    }
+
+    fn send_failed_ids(events: &[ChatEvent], peer: PeerId) -> Vec<MessageId> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::SendFailed {
+                    peer: p,
+                    message: Some(id),
+                    ..
+                } if *p == peer => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Chegou o tombstone de um device da Ana com quem a Bia conversa: a conversa some, o evento avisa uma
+    /// vez, e nem o irmão nem o outro device da Ana são tocados.
+    #[tokio::test]
+    async fn a_tombstone_for_a_contact_device_drops_only_that_conversation() {
+        let mut r = revoked_ana();
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+
+        assert!(!r.bia.is_ready(&r.ana_peer));
+        assert!(r.bia.is_ready(&r.other_ana) && r.bia.is_ready(&r.sibling));
+        let revoked: Vec<_> = events(&mut r.bia)
+            .into_iter()
+            .filter(|e| matches!(e, ChatEvent::PeerRevoked { .. }))
+            .collect();
+        assert_eq!(
+            revoked,
+            [ChatEvent::PeerRevoked {
+                peer: r.ana_peer,
+                identity: r.ana.clone()
+            }]
+        );
+        // `send_to` a quem a Bia ainda alcança segue valendo; o device derrubado já não conta.
+        let to_ana = r.bia.send_to(&r.ana, "oi", None).unwrap();
+        assert_eq!(r.bia.queued(&r.other_ana), 1);
+        assert_eq!(r.bia.queued(&r.ana_peer), 0, "{to_ana:?}");
+    }
+
+    /// O mesmo tombstone repetido (já no store): a conversa que ainda existe também cai. É o que repara uma
+    /// derrubada que falhou no meio (disco) na primeira vez.
+    #[tokio::test]
+    async fn a_tombstone_already_in_the_store_still_drops_a_conversation_that_survived() {
+        let mut r = revoked_ana();
+        assert!(r.bia.device.store_revocation(&r.revocation).unwrap());
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+
+        assert!(!r.bia.is_ready(&r.ana_peer));
+    }
+
+    /// Cada mensagem que esperava na fila do device derrubado vira um `SendFailed` com o id dela, a fila
+    /// esvazia, e a do outro device da Ana fica.
+    #[tokio::test]
+    async fn queued_messages_for_the_dropped_device_fail_one_by_one_and_the_queue_empties() {
+        let mut r = revoked_ana();
+        let first = r.bia.send(r.ana_peer, "um", None).unwrap();
+        let second = r.bia.send(r.ana_peer, "dois", None).unwrap();
+        let kept = r.bia.send(r.other_ana, "fica", None).unwrap();
+        events(&mut r.bia);
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+
+        let after = events(&mut r.bia);
+        assert_eq!(send_failed_ids(&after, r.ana_peer), [first, second]);
+        assert!(send_failed_ids(&after, r.other_ana).is_empty());
+        assert_eq!(r.bia.queued(&r.ana_peer), 0);
+        assert_eq!(r.bia.queued(&r.other_ana), 1, "{kept:?}");
+    }
+
+    /// Um device irmão revogado: a conversa cai e a identidade do evento é a da própria Bia. A entrada de
+    /// espelho ("enviei isto à Ana") que esperava por ele some sem `SendFailed`: não é mensagem do usuário.
+    #[tokio::test]
+    async fn a_revoked_sibling_is_dropped_and_its_mirror_entries_fail_silently() {
+        let mut r = revoked_ana();
+        let certificate = r.bia.conversations[&r.sibling]
+            .peer_certificates()
+            .unwrap()
+            .remove(0);
+        let own = r.bia_key.revoke_device(&certificate, 2).unwrap();
+        let mirror = Message::new("eco".into(), None);
+        r.bia
+            .outbox
+            .enqueue_mirror(&r.sibling, &mirror, &r.ana)
+            .unwrap();
+        events(&mut r.bia);
+
+        // A própria identidade é aceita sempre; quem entrega é o outro device da Ana.
+        let wire = revocation_wire(&mut r.other_raw, &own);
+        r.bia.on_mls(r.other_ana, &wire).unwrap();
+
+        assert!(!r.bia.is_ready(&r.sibling));
+        let after = events(&mut r.bia);
+        assert!(after.contains(&ChatEvent::PeerRevoked {
+            peer: r.sibling,
+            identity: r.bia_key.id()
+        }));
+        assert!(send_failed_ids(&after, r.sibling).is_empty());
+        assert_eq!(r.bia.queued(&r.sibling), 0);
+    }
+
+    /// A caixa postal é mandada esquecer o device derrubado (e só ele), e o que a Bia tinha guardado dos
+    /// relays dele sai do banco. Ligar uma caixa postal nova depois não o ensina de novo.
+    #[tokio::test]
+    async fn the_mailbox_forgets_the_dropped_device_and_a_new_one_is_not_taught_it_again() {
+        let mut r = revoked_ana();
+        let log = SharedLog::default();
+        r.bia.set_mailbox(Forgetting(log.clone()));
+        r.bia
+            .outbox
+            .set_peer_relays(&r.ana_peer, &["wss://a.example".to_string()])
+            .unwrap();
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+
+        assert_eq!(log.lock().unwrap().forgotten, [r.ana_peer]);
+        assert_eq!(r.bia.outbox.peer_relays(&r.ana_peer).unwrap(), None);
+        let fresh = SharedLog::default();
+        r.bia.set_mailbox(Forgetting(fresh.clone()));
+        let fresh = fresh.lock().unwrap();
+        assert!(!fresh.learned_peers.contains(&r.ana_peer));
+        assert!(!fresh.learned_relays.contains(&r.ana_peer));
+        assert!(fresh.learned_peers.contains(&r.other_ana), "o outro fica");
+    }
+
+    /// Um depósito da caixa postal que já estava a caminho quando o device caiu chega depois: sem conversa,
+    /// vira `Dropped` e nunca uma mensagem.
+    #[tokio::test]
+    async fn a_late_delivery_from_the_dropped_device_is_dropped_not_shown() {
+        let mut r = revoked_ana();
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+        events(&mut r.bia);
+        let mut raw = r.other_raw;
+        let late = Envelope::Mls(wire(&mut raw, "tarde")).encode();
+
+        r.bia.handle_mailbox(MailboxEvent::Retrieved {
+            from: r.ana_peer,
+            blob: late,
+        });
+
+        let after = events(&mut r.bia);
+        assert!(received_texts(&after).is_empty());
+        assert!(
+            after
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Dropped { peer, .. } if *peer == r.ana_peer))
+        );
+    }
+
+    /// A memória por Peer ID do device derrubado some (inclusive o que esperava o handshake), a do outro
+    /// device fica, e a conexão de rede continua marcada: o `Node` não desconecta.
+    #[tokio::test]
+    async fn the_per_peer_memory_of_the_dropped_device_is_cleared_and_the_other_kept() {
+        let mut r = revoked_ana();
+        let (gone, kept) = (r.ana_peer, r.other_ana);
+        for (n, peer) in [gone, kept].into_iter().enumerate() {
+            r.bia.connected.insert(peer);
+            r.bia.expected.insert(peer, r.ana.clone());
+            r.bia.future.insert(peer, vec![vec![1]]);
+            r.bia.announced.insert(peer);
+            r.bia.devices_announced.insert(peer);
+            r.bia.lists_acted.insert(peer);
+            r.bia
+                .in_flight
+                .entry(peer)
+                .or_default()
+                .insert(MessageId::from_bytes([9; 16]));
+            r.bia.contact_devices.insert(peer, invite_for(&r.ana_key));
+            r.bia.household.insert(peer, invite_for(&r.bia_key));
+            r.bia.history_requested.insert(peer);
+            r.bia.history_sessions.insert(peer, 1);
+            r.bia
+                .depositing
+                .insert(DepositId(n as u64), (peer, MessageId::from_bytes([9; 16])));
+        }
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+
+        let bia = &r.bia;
+        assert!(!bia.expected.contains_key(&gone) && bia.expected.contains_key(&kept));
+        assert!(!bia.future.contains_key(&gone) && bia.future.contains_key(&kept));
+        assert!(!bia.announced.contains(&gone) && bia.announced.contains(&kept));
+        assert!(!bia.devices_announced.contains(&gone) && bia.devices_announced.contains(&kept));
+        assert!(!bia.lists_acted.contains(&gone) && bia.lists_acted.contains(&kept));
+        assert!(!bia.in_flight.contains_key(&gone) && bia.in_flight.contains_key(&kept));
+        assert!(
+            !bia.contact_devices.contains_key(&gone) && bia.contact_devices.contains_key(&kept)
+        );
+        assert!(!bia.household.contains_key(&gone) && bia.household.contains_key(&kept));
+        assert!(!bia.history_requested.contains(&gone) && bia.history_requested.contains(&kept));
+        assert!(
+            !bia.history_sessions.contains_key(&gone) && bia.history_sessions.contains_key(&kept)
+        );
+        assert!(bia.depositing.values().all(|(peer, _)| *peer != gone));
+        assert!(bia.depositing.values().any(|(peer, _)| *peer == kept));
+        assert!(bia.connected.contains(&gone), "a rede não é fechada");
+    }
+
+    /// Um tombstone de um device que a Bia não tem em nenhuma conversa não derruba ninguém e não avisa.
+    #[tokio::test]
+    async fn a_tombstone_for_a_device_in_no_conversation_drops_nobody() {
+        let mut r = revoked_ana();
+        let (revocation, _) = revocation_by(&r.ana_key);
+
+        r.bia
+            .on_mls(r.sibling, &revocation_wire(&mut r.other_raw, &revocation))
+            .unwrap();
+
+        assert!(r.bia.is_ready(&r.ana_peer) && r.bia.is_ready(&r.other_ana));
+        assert!(
+            !events(&mut r.bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::PeerRevoked { .. }))
+        );
+    }
+
+    /// O device revogado não volta pelo handshake: o `KeyPackage` dele é recusado e nenhuma conversa nasce.
+    #[tokio::test]
+    async fn a_revoked_device_cannot_restart_a_conversation_with_a_key_package() {
+        let mut r = revoked_ana();
+        let key = loop {
+            let key = DeviceKey::generate();
+            if key.peer_id() >= r.bia.peer_id() {
+                break key;
+            }
+        };
+        let device =
+            CryptoDevice::new(&r.ana_key, &key.public_key(), &key.nostr_public_key(), 1).unwrap();
+        let revocation = r.ana_key.revoke_device(device.certificate(), 2).unwrap();
+        r.bia.device.store_revocation(&revocation).unwrap();
+
+        let result = r
+            .bia
+            .on_key_package(key.peer_id(), &device.key_package().unwrap());
+
+        assert!(result.is_err());
+        assert!(!r.bia.is_ready(&key.peer_id()));
     }
 }
