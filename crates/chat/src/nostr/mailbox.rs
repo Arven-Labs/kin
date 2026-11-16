@@ -459,6 +459,8 @@ impl Mailbox for NostrMailbox {
         inner.by_nostr.insert(key, peer);
     }
 
+    fn forget_peer(&mut self, _peer: PeerId) {}
+
     fn relays(&self) -> Vec<String> {
         self.announced.clone()
     }

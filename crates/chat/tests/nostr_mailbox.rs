@@ -1232,6 +1232,89 @@ fn expired_wrap(from: &DeviceKey, to: &DeviceKey, blob: &[u8]) -> Event {
     .unwrap()
 }
 
+// ---- esquecer o peer (P30 3d-ii-b1, ADR 0029) ----
+
+/// Depois de esquecer, a chave Nostr do peer não é mais conhecida: o depósito falha como para um estranho.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forgotten_peer_can_no_longer_be_addressed() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+
+    mb.forget_peer(bia.peer_id());
+    let id = mb.deposit(bia.peer_id(), b"para quem foi revogado".to_vec());
+
+    assert!(matches!(
+        next(&mut rx).await,
+        MailboxEvent::DepositFailed { id: failed, .. } if failed == id
+    ));
+    sleep(Duration::from_millis(200)).await;
+    assert!(relay.stored().is_empty());
+}
+
+/// A direção inversa (chave Nostr para Peer ID) também some: um evento guardado de uma chave esquecida
+/// não é mais atribuído a ninguém.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_from_a_forgotten_key_is_not_attributed_to_anyone() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"guardada").unwrap());
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    mb.forget_peer(ana.peer_id());
+    let mut rx = attach(&mut mb);
+
+    quiet(&mut rx, 600).await;
+}
+
+/// Os relays do contato também somem: reaprendida a chave, o depósito volta aos relays próprios.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_peer_also_forgets_its_relays() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let (own, theirs) = (
+        FakeRelay::start(Policy::Accept).await,
+        FakeRelay::start(Policy::Accept).await,
+    );
+    let mut mb = mailbox(&ana, &[&own.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_relays(bia.peer_id(), vec![theirs.url.clone()]);
+
+    mb.forget_peer(bia.peer_id());
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    let id = mb.deposit(bia.peer_id(), b"sem a lista antiga".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+    eventually("o relay próprio guarda o evento", || {
+        own.stored().len() == 1
+    })
+    .await;
+    assert!(theirs.stored().is_empty(), "usou a lista esquecida");
+}
+
+/// Esquecer um peer não mexe nos outros, e esquecer um desconhecido não é erro.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_one_peer_leaves_the_others_and_an_unknown_one_is_harmless() {
+    let (ana, bia, caio) = (
+        DeviceKey::generate(),
+        DeviceKey::generate(),
+        DeviceKey::generate(),
+    );
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let mut mb = mailbox(&ana, &[&relay.url]);
+    let mut rx = attach(&mut mb);
+    mb.learn_peer(bia.peer_id(), bia.nostr_public_key());
+    mb.learn_peer(caio.peer_id(), caio.nostr_public_key());
+
+    mb.forget_peer(bia.peer_id());
+    mb.forget_peer(DeviceKey::generate().peer_id());
+    let id = mb.deposit(caio.peer_id(), b"para o caio".to_vec());
+
+    assert_eq!(next(&mut rx).await, MailboxEvent::Deposited { id });
+}
+
 /// Próximo evento bruto, se vier logo (o `Deposited` pode sair depois dos resultados por relay).
 async fn next_or_none(rx: &mut UnboundedReceiver<MailboxEvent>) -> Option<MailboxEvent> {
     timeout(Duration::from_millis(300), rx.next())
