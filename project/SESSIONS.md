@@ -1747,3 +1747,24 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   da branch na origin) e voltei à branch; a guarda que eu pus além do plano (`get == Some(&peer)`) era justamente o que deixava a chave antiga órfã.
 - **Não verificado**: depósito em voo seguido de `forget_peer`; a corrida com `on_event`; uso real (nada chama `forget_peer`); revisão externa.
 - **Próximo passo**: 3d-ii-b2 (o `Chat` derruba o par), em plan mode.
+
+### 2026-11-16 — Sessão 27
+
+#### `Outbox::forget_peer` (P30, fatia 3d-ii-b2-i, ADR 0029)
+
+- **Decisões do dono** (plan mode + 2 perguntas): a b2 cortada em **b2-i (`outbox`)** e **b2-ii (`chat`)**, em PRs separados; a conexão de rede do
+  revogado **fica aberta** (sem mudança no `transport`: sem conversa tudo vira `Dropped` e o re-handshake falha no `verify`).
+- **Feito** (só `outbox.rs`): `Outbox::forget_peer(&peer) -> Result<Vec<MessageId>>`, uma transação nas 7 tabelas por device; devolve os ids das
+  mensagens comuns na ordem da fila (o espelho sai da fila mas não volta). `kin_history`, `kin_trusted` e `kin_distrusted` ficam. Nenhum chamador:
+  `#[cfg_attr(not(test), expect(dead_code))]` até a b2-ii.
+- **Prova de que testam algo**: esqueleto, **5 de 6** falharam pela asserção e o 6º (histórico e confiança ficam, caracterização) passou (run
+  43868288237; os dois runs antes pararam no `expect(dead_code)`: primeiro `unfulfilled` em `cfg(test)`); verde (43868907592, 250 testes).
+- **Mutações** (branches descartáveis, 4 de 4 pegas, apagadas): sem `kin_history_cursor` (43869387762, 2 testes); `DELETE` sem filtro de peer
+  (43869411052, 3); devolve também os espelhos (43869459608, 2); sem transação nenhuma (43870460208, 1). A primeira versão da "sem transação"
+  (43869433469) **sobreviveu**: `unchecked_transaction` abre o `BEGIN` na conexão, então `self.conn.execute` continuava dentro dela (mutação equivalente).
+- **Tropeços**: `dead_code` do clippy barrou antes dos testes (já tinha ocorrido na 3b); `cargo fmt` reformatou o arquivo local; tentei apendar esta
+  entrada por heredoc no Bash e o hook barrou (regra do `CLAUDE.md`: só `Edit`/`Write`).
+- **Não verificado**: uso real (nada chama); crash no meio do `COMMIT` (SQLite WAL, não exercitado); revisão externa. Sem auditoria separada: a
+  fatia é só SQL com nomes fixos; a auditoria fica para a b2-ii, que decide o que apagar.
+- **Próximo passo**: 3d-ii-b2-ii (o `Chat` derruba o par), em plan mode (plano aprovado nesta sessão: `drop_revoked_peers`, `drop_peer`, guardas em
+  `teach_mailbox` e `on_relay_list`, `on_key_package`, `PeerRevoked`, CLI).

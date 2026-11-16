@@ -1,6 +1,9 @@
 # ADR 0029 — A caixa postal esquece o peer revogado e o desenho do `chat` que o derruba (P30 fatia 3d-ii-b)
 
-- **Status**: b1 **aceito e implementado** (Sessão 26, 2026-11-15); b2 **desenho aceito, ainda não implementado**. Área de segurança
+- **Status**: b1 **aceito e implementado** (Sessão 26, 2026-11-15); b2 cortada em **b2-i** (`Outbox::forget_peer`, **implementada** na Sessão 27,
+  2026-11-16: uma transação apaga `kin_outbox`, `kin_deposited`, `kin_deposit_times`, `kin_peer_relays`, `kin_seen`, `kin_seen_mirror` e
+  `kin_history_cursor` do peer e devolve os ids das mensagens comuns, não os espelhos; `kin_history` e a confiança ficam) e **b2-ii** (o `Chat`,
+  **desenho aceito, ainda não implementado**). Área de segurança
   (revogação de acesso, AGENTS.md §4): a b1 foi auditada pelo `security-auditor` (0 críticos, 3 importantes; tabela no fim) e tem 5
   mutações (5 pegas). A **3d-ii-b2** e a **3d-ii-c** são **bloqueadoras do P30**. Nada chama `forget_peer` ainda.
 - **Relacionados**: ADR 0004 (backend Nostr), 0025, 0027, 0028, P30, P31 (am).
