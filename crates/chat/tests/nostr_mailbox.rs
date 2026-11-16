@@ -1294,6 +1294,29 @@ async fn forgetting_a_peer_also_forgets_its_relays() {
     assert!(theirs.stored().is_empty(), "usou a lista esquecida");
 }
 
+/// Se outro peer reaprendeu a mesma chave Nostr, esquecer o primeiro não tira a atribuição do segundo.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_peer_keeps_another_peer_that_shares_the_key() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let other = DeviceKey::generate();
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"guardada").unwrap());
+    let mut mb = mailbox(&bia, &[&relay.url]);
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    mb.learn_peer(other.peer_id(), ana.nostr_public_key());
+
+    mb.forget_peer(ana.peer_id());
+    let mut rx = attach(&mut mb);
+
+    assert_eq!(
+        next(&mut rx).await,
+        MailboxEvent::Retrieved {
+            from: other.peer_id(),
+            blob: b"guardada".to_vec()
+        }
+    );
+}
+
 /// Esquecer um peer não mexe nos outros, e esquecer um desconhecido não é erro.
 #[tokio::test(flavor = "multi_thread")]
 async fn forgetting_one_peer_leaves_the_others_and_an_unknown_one_is_harmless() {
