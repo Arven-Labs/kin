@@ -82,6 +82,11 @@ pub trait Mailbox {
     /// O `Chat` informa onde `peer` recebe: lista já validada (`nostr::validate_peer_relays`), vinda
     /// de uma mensagem dele dentro do MLS ou recarregada do banco. A última lista substitui a anterior.
     fn learn_relays(&mut self, _peer: PeerId, _relays: Vec<String>) {}
+
+    /// O `Chat` derrubou `peer` (device revogado, P30 3d-ii-b): esquece tudo o que aprendeu dele com
+    /// [`Self::learn_peer`] e [`Self::learn_relays`], nas duas direções (endereçar e atribuir o remetente de
+    /// um evento recebido). Idempotente; um peer desconhecido não é erro. Sem estado por peer, ignora.
+    fn forget_peer(&mut self, _peer: PeerId) {}
 }
 
 /// Um depósito registrado pelo [`MemoryRelay`].
