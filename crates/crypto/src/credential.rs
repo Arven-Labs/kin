@@ -1,4 +1,4 @@
-use kin_identity::{DeviceCertificate, IdentityId, NostrPublicKey, PeerId, ed25519_bytes};
+use kin_identity::{DeviceCertificate, IdentityId, Issuer, NostrPublicKey, PeerId, ed25519_bytes};
 use openmls::prelude::{BasicCredential, Credential};
 
 use crate::provider::Provider;
@@ -8,6 +8,37 @@ use crate::{Error, Expected};
 pub(crate) struct Verified {
     pub(crate) identity: IdentityId,
     pub(crate) peer: PeerId,
+    /// O certificado é v4 (emissor `Authority`)? Só o que decide o trinco por identidade (P30 3e-ii-a).
+    pub(crate) authority: bool,
+}
+
+/// Trinco por identidade (P30 3e-ii-a, ADR 0031): este certificado é um **v3** (da mestra) de uma
+/// identidade que já foi aceita em regime v4? A identidade **própria** fica de fora: um device em modo
+/// mestra emite v3 de propósito e convive com irmãos v4 até a migração. Erro de leitura é erro.
+///
+/// **Pré-condição:** o certificado já passou por `DeviceCertificate::verify`.
+pub(crate) fn is_downgrade(
+    cert: &DeviceCertificate,
+    own: &IdentityId,
+    provider: &Provider,
+) -> Result<bool, Error> {
+    if cert.identity() == own || matches!(cert.issuer, Issuer::Authority(_)) {
+        return Ok(false);
+    }
+    provider.is_authority_regime(cert.identity())
+}
+
+/// Marca a identidade como em regime v4, **só** depois de o par ter sido aceito (ADR 0031): marcar em
+/// todo `verify` deixaria um estranho, ou um KeyPackage ainda não aceito, gravar estado permanente.
+pub(crate) fn mark_regime(
+    who: &Verified,
+    own: &IdentityId,
+    provider: &Provider,
+) -> Result<(), Error> {
+    if who.authority && &who.identity != own {
+        provider.mark_authority_regime(&who.identity)?;
+    }
+    Ok(())
 }
 
 impl Expected<'_> {
@@ -22,12 +53,14 @@ impl Expected<'_> {
 ///
 /// A credencial carrega um `DeviceCertificate`. Aceitamos se (1) a assinatura do certificado vale,
 /// (2) o certificado cobre exatamente a chave de assinatura MLS do membro (`signature_key`) e
-/// (3) o device do certificado não tem tombstone em `provider` e (4) identidade e Peer ID são os
+/// (3) o device do certificado não tem tombstone em `provider`, (4) não é um v3 de identidade já em
+/// regime v4 ([`is_downgrade`], `own` é a identidade deste device) e (5) identidade e Peer ID são os
 /// esperados, nos campos que o chamador informou.
 pub(crate) fn verify(
     credential: &Credential,
     signature_key: &[u8],
     expected: &Expected,
+    own: &IdentityId,
     provider: &Provider,
 ) -> Result<Verified, Error> {
     let cert = certificate_of(credential)?;
@@ -40,9 +73,13 @@ pub(crate) fn verify(
     if provider.is_revoked(&cert)? {
         return Err(Error::Revoked);
     }
+    if is_downgrade(&cert, own, provider)? {
+        return Err(Error::Downgrade);
+    }
     let who = Verified {
         peer: cert.network_peer_id(),
         identity: cert.identity().clone(),
+        authority: matches!(cert.issuer, Issuer::Authority(_)),
     };
     if expected.identity.is_some_and(|id| id != &who.identity) {
         return Err(Error::UnexpectedIdentity);
@@ -85,6 +122,18 @@ mod tests {
     use kin_identity::{DeviceKey, IdentityProvider, PublicKey, StandaloneIdentity};
 
     use super::*;
+
+    /// Os testes antigos não tratam o trinco: uma identidade própria qualquer (nunca a do certificado).
+    /// O trinco tem testes próprios em `crates/crypto/tests/regime.rs`.
+    fn verify(
+        credential: &Credential,
+        signature_key: &[u8],
+        expected: &Expected,
+        provider: &Provider,
+    ) -> Result<Verified, Error> {
+        let nobody = StandaloneIdentity::generate().id();
+        super::verify(credential, signature_key, expected, &nobody, provider)
+    }
 
     fn credential_for(cert: &DeviceCertificate) -> Credential {
         BasicCredential::new(cert.to_bytes()).into()
@@ -186,6 +235,31 @@ mod tests {
         let cert = issue(id, &key.public_key(), &net.public_key());
         let raw = ed25519_bytes(&key.public_key()).unwrap();
         (cert, raw)
+    }
+
+    /// A identidade própria tem dois guardas (`is_downgrade` e `mark_regime`); cada um é fixado sozinho aqui
+    /// (auditoria S1 da 3e-ii-a), porque pelo `regime.rs` o outro esconderia a ausência de um deles.
+    #[test]
+    fn the_own_identity_is_never_a_downgrade_and_never_marked() {
+        let id = StandaloneIdentity::generate();
+        let (cert, _) = device_of(&id);
+        let provider = fresh();
+        provider.mark_authority_regime(&id.id()).unwrap();
+        let someone_else = StandaloneIdentity::generate().id();
+
+        assert!(!is_downgrade(&cert, &id.id(), &provider).unwrap());
+        assert!(is_downgrade(&cert, &someone_else, &provider).unwrap());
+
+        let clean = fresh();
+        let who = Verified {
+            identity: id.id(),
+            peer: DeviceKey::generate().peer_id(),
+            authority: true,
+        };
+        mark_regime(&who, &id.id(), &clean).unwrap();
+        assert!(!clean.is_authority_regime(&id.id()).unwrap());
+        mark_regime(&who, &someone_else, &clean).unwrap();
+        assert!(clean.is_authority_regime(&id.id()).unwrap());
     }
 
     #[test]

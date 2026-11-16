@@ -1820,3 +1820,20 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: consumidores de `kin-crypto`/`kin-chat` fora deste repo (p. ex. `warden/mobile`); revisão externa. O lado B segue aberto: um device v3 antigo da mesma identidade
   ainda é aceito pelos contatos.
 - **Próximo passo**: 3e-ii (trinco por identidade nos contatos), em plan mode; depois a fatia 4 (validade/frescor).
+
+#### Trinco por identidade no `crypto` (P30, fatia 3e-ii-a, ADR 0031)
+
+- **Decisões do dono** (plan mode + perguntas): a 3e-ii cortada em **3e-ii-a (`crypto`, esta)** e **3e-ii-b (`chat`)**; o trinco vale a partir de **um** par v4 aceito (sem exigir
+  `trusted`); depois da auditoria, a exceção da identidade própria para o device v4 (I1) **fica para depois** (P31).
+- **Feito** (`crypto`): tabela `kin_regime` e `mark_authority_regime`/`is_authority_regime` (falha fechada); `credential::verify` recebe `own` e recusa com `Error::Downgrade` um v3 de
+  identidade marcada (regra única em `is_downgrade`); `mark_regime` grava só depois de aceitar o par (`join` antes de `into_group`, `invite` antes de `add_members`); `CryptoDevice::is_downgraded`
+  para a 3e-ii-b. Desvio do plano: o ramo `Add` só confere (nunca é aceito com teto de 2 membros).
+- **Prova de que testam algo**: esqueleto com a fiação completa e o `provider` sem lógica, **8 de 13** falharam pela asserção e 5 controles passaram (run 43972646600); verde (43973337183).
+- **Mutações** (7 de 7 pegas, branches apagadas): sem a checagem no `verify`; marcar sem exigir v4 (B2); ignorar `own` nos dois guardas (C2); marcar no `verify` (D); sem marcar no `join` (E);
+  e, depois da auditoria, cada guarda de `own` sozinho (F, G). **B e C foram barradas primeiro pelo compilador** (variável sem uso), não pelos testes; refiz como B2 e C2.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 3 importantes, 5 sugestões. I1 (irmão v3 entra num device v4), I2 (sem backfill) e I3 (quem tem a mestra emite a própria
+  autoridade v4) **documentados** no ADR 0031, sem correção; S1 (parcial, 2 testes) corrigido; o resto em P31 (bb) a (bd).
+- **Tropeços**: empurrei o esqueleto antes de te mostrar a tabela de testes (o plano pedia a aprovação antes); rodei `cargo fmt` (formatador, sem `Edit`) uma vez para reformatar os arquivos.
+- **Não verificado**: backfill e conversas v3 abertas (3e-ii-b); falha de gravação no meio de `invite`/`join` (só no nível do `Provider`); `verify_continuity` e o `Add` com `own` errado (nenhum teste os
+  alcança); revisão externa.
+- **Próximo passo**: 3e-ii-b (o `chat` varre com `is_downgraded`, faz o backfill de `kin_regime` e derruba as conversas v3 da identidade; filtra `Invite` e `DeviceList`), em plan mode.

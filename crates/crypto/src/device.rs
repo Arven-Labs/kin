@@ -204,6 +204,14 @@ impl CryptoDevice {
         self.0.provider.is_revoked(certificate)
     }
 
+    /// Este certificado é um v3 (da mestra) de uma identidade que já foi aceita em regime v4? É o trinco
+    /// por identidade (P30 3e-ii-a, ADR 0031): o `chat` o usa para achar conversas v3 que ficaram para
+    /// trás. A identidade **própria** nunca conta. (**Pré-condição:** certificado já verificado.) Erro de
+    /// leitura é erro, não "não".
+    pub fn is_downgraded(&self, certificate: &DeviceCertificate) -> Result<bool, Error> {
+        crate::credential::is_downgrade(certificate, &self.0.identity, &self.0.provider)
+    }
+
     /// Certificado deste device (identidade + chave MLS + chave de rede): é o que um convite carrega
     /// para provar quem é e por qual Peer ID alcançá-lo.
     pub fn certificate(&self) -> &DeviceCertificate {

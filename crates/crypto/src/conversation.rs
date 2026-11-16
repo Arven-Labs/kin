@@ -118,6 +118,7 @@ impl Conversation {
             return Err(Error::TooManyMembers);
         }
         let own = staged.own_leaf_index();
+        let mut verified = Vec::new();
         let (mut found_identity, mut found_both) = (
             inviter.identity.is_none(),
             inviter.peer.is_none() && inviter.identity.is_none(),
@@ -127,6 +128,7 @@ impl Conversation {
                 &member.credential,
                 &member.signature_key,
                 &Expected::default(),
+                &inner.identity,
                 &inner.provider,
             )?;
             if member.index == own {
@@ -134,12 +136,18 @@ impl Conversation {
             }
             found_identity |= inviter.identity.is_some_and(|id| id == &who.identity);
             found_both |= inviter.accepts(&who);
+            verified.push(who);
         }
         if !found_identity {
             return Err(Error::UnexpectedIdentity);
         }
         if !found_both {
             return Err(Error::UnexpectedPeer);
+        }
+        // Só agora o par foi aceito (ADR 0031): marca o regime v4 antes de gravar o grupo, para uma falha de
+        // leitura/escrita abortar a entrada em vez de deixar a conversa sem o trinco.
+        for who in &verified {
+            credential::mark_regime(who, &inner.identity, &inner.provider)?;
         }
         let group = staged.into_group(&inner.provider).map_err(Error::mls)?;
         Ok(Self {
@@ -227,6 +235,7 @@ impl Conversation {
                 identity: Some(&identity),
                 peer: Some(&peer),
             },
+            &self.device.0.identity,
             &self.device.0.provider,
         )?;
         // Identidade e Peer ID (a chave de rede) já conferem; faltam a chave de assinatura e a Nostr (as
@@ -247,12 +256,16 @@ impl Conversation {
             .map_err(|_| Error::Malformed)?
             .validate(inner.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|_| Error::Malformed)?;
-        credential::verify(
+        let who = credential::verify(
             key_package.leaf_node().credential(),
             key_package.leaf_node().signature_key().as_slice(),
             expected,
+            &inner.identity,
             &inner.provider,
         )?;
+        // O par é aceito a partir daqui (o `expected` já conferiu): marca o regime v4 antes de gravar o
+        // commit (ADR 0031). Se o `add_members` falhar depois, a marca fica, na direção segura.
+        credential::mark_regime(&who, &inner.identity, &inner.provider)?;
 
         let (commit, welcome, _) = self
             .group
@@ -375,6 +388,7 @@ impl Conversation {
                         leaf.credential(),
                         leaf.signature_key().as_slice(),
                         &Expected::default(),
+                        &inner.identity,
                         &inner.provider,
                     )?;
                 }
