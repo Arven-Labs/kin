@@ -136,6 +136,14 @@ pub enum ChatEvent {
         peer: PeerId,
         identity: IdentityId,
     },
+    /// O device `peer` usa certificado v3 (da mestra), mas a `identity` dele já foi aceita em regime v4: a
+    /// conversa foi apagada, com a fila e o que a caixa postal sabia dele (P30, 3e-ii-b, ADR 0032). Não há
+    /// tombstone: é a regra local do trinco por identidade. Cada mensagem que estava na fila para ele chega
+    /// antes como [`ChatEvent::SendFailed`].
+    PeerDowngraded {
+        peer: PeerId,
+        identity: IdentityId,
+    },
     /// Algo do peer foi descartado (malformado, de outra conversa, etc.).
     Dropped {
         peer: PeerId,

@@ -115,6 +115,20 @@ fn is_downgraded_tells_the_v3_certificate_of_a_latched_identity() {
     assert!(!w.c.is_downgraded(w.p.certificate()).unwrap());
 }
 
+/// P30 3e-ii-b: `learn_regime` é o backfill do `chat`; só um certificado v4 de outra identidade vira o trinco.
+#[test]
+fn learning_a_v4_certificate_turns_the_latch_but_a_v3_one_does_not() {
+    let w = world();
+
+    w.c.learn_regime(w.m.certificate()).unwrap();
+    assert!(!w.c.is_downgraded(w.m.certificate()).unwrap());
+
+    w.c.learn_regime(w.p.certificate()).unwrap();
+    w.c.learn_regime(w.p.certificate()).unwrap();
+    assert!(w.c.is_downgraded(w.m.certificate()).unwrap());
+    assert!(!w.c.is_downgraded(w.p.certificate()).unwrap());
+}
+
 /// O estado é gravado no banco: reabrir o device de `C` mantém o trinco.
 #[test]
 fn the_latch_survives_reopening_the_database() {
