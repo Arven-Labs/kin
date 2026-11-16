@@ -425,6 +425,53 @@ impl Outbox {
         Ok(out)
     }
 
+    /// Esquece tudo o que o banco guarda por device de `peer` (P30, 3d-ii-b2): a fila, os depósitos e as
+    /// horas deles, os relays, os ids vistos (os dois tipos) e o cursor do histórico. Numa transação:
+    /// ou sai tudo ou nada. Devolve os ids das mensagens **comuns** apagadas, na ordem da fila; os
+    /// espelhos (3.5) também são apagados, mas não voltam (não há mensagem do usuário a avisar).
+    /// Idempotente: peer desconhecido ou repetição devolvem vazio. O histórico (`kin_history`) e a
+    /// confiança são por identidade, não por device, e ficam.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "o chamador chega na 3d-ii-b2-ii; sai este atributo"
+        )
+    )]
+    pub(crate) fn forget_peer(&self, peer: &PeerId) -> Result<Vec<MessageId>, Error> {
+        let peer = peer.to_string();
+        let tx = self.conn.unchecked_transaction().map_err(Error::storage)?;
+        // Os ids comuns primeiro, na ordem da fila: depois do DELETE já não há o que ler.
+        let ids = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM kin_outbox WHERE peer = ?1 AND to_identity IS NULL ORDER BY seq")
+                .map_err(Error::storage)?;
+            let rows = stmt
+                .query_map([&peer], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(Error::storage)?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(message_id(&row.map_err(Error::storage)?)?);
+            }
+            ids
+        };
+        // Nomes fixos, nunca vindos de fora: entram no SQL sem risco de injeção.
+        for table in [
+            "kin_outbox",
+            "kin_deposited",
+            "kin_deposit_times",
+            "kin_peer_relays",
+            "kin_seen",
+            "kin_seen_mirror",
+            "kin_history_cursor",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE peer = ?1"), [&peer])
+                .map_err(Error::storage)?;
+        }
+        tx.commit().map_err(Error::storage)?;
+        Ok(ids)
+    }
+
     /// Grava os relays de entrada anunciados por `peer` (já validados); a última lista substitui a
     /// anterior. Um relay por linha: URL validada não tem quebra de linha.
     pub(crate) fn set_peer_relays(&self, peer: &PeerId, relays: &[String]) -> Result<(), Error> {
@@ -1842,5 +1889,160 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 7);
+    }
+
+    /// Enche todas as tabelas por device de `peer`: uma mensagem comum depositada, um espelho, relays,
+    /// um id visto de cada tipo e o cursor do histórico. Devolve (comum, espelho).
+    fn populate(outbox: &Outbox, peer: &PeerId, tag: &str) -> (Message, Message) {
+        let plain = Message::new(format!("comum {tag}"), None);
+        let mirror = Message::new(format!("espelho {tag}"), None);
+        outbox.enqueue(peer, &plain).unwrap();
+        outbox.mark_deposited(peer, &plain.id, 100).unwrap();
+        outbox.enqueue_mirror(peer, &mirror, &identity()).unwrap();
+        outbox
+            .set_peer_relays(peer, &["wss://relay.example".to_string()])
+            .unwrap();
+        outbox
+            .mark_seen(peer, &MessageId::from_bytes([1; 16]), SeenKind::Message)
+            .unwrap();
+        outbox
+            .mark_seen(peer, &MessageId::from_bytes([2; 16]), SeenKind::Mirror)
+            .unwrap();
+        outbox.set_history_cursor(peer, 5).unwrap();
+        (plain, mirror)
+    }
+
+    /// As 6 primeiras tabelas por device; a sétima, `kin_history_cursor`, é a que o teste 18 apaga.
+    const FIRST_SIX: [&str; 6] = [
+        "kin_outbox",
+        "kin_deposited",
+        "kin_deposit_times",
+        "kin_peer_relays",
+        "kin_seen",
+        "kin_seen_mirror",
+    ];
+
+    /// Quantas linhas as 7 tabelas por device guardam de `peer`.
+    fn rows_of(outbox: &Outbox, peer: &PeerId) -> i64 {
+        rows_in(outbox, peer, &FIRST_SIX) + rows_in(outbox, peer, &["kin_history_cursor"])
+    }
+
+    fn rows_in(outbox: &Outbox, peer: &PeerId, tables: &[&str]) -> i64 {
+        tables
+            .iter()
+            .map(|table| {
+                outbox
+                    .conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE peer = ?1"),
+                        [peer.to_string()],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+            })
+            .sum()
+    }
+
+    // 13
+    #[test]
+    fn forgetting_a_peer_empties_all_seven_per_device_tables_and_only_for_that_peer() {
+        let (outbox, gone, kept) = (Outbox::memory().unwrap(), peer(), peer());
+        populate(&outbox, &gone, "gone");
+        let (kept_plain, _) = populate(&outbox, &kept, "kept");
+        let before = rows_of(&outbox, &kept);
+        assert_eq!(rows_of(&outbox, &gone), before, "mesma quantidade antes");
+
+        outbox.forget_peer(&gone).unwrap();
+
+        assert_eq!(rows_of(&outbox, &gone), 0);
+        assert_eq!(rows_of(&outbox, &kept), before, "o outro peer fica intacto");
+        assert_eq!(outbox.entries(&kept).unwrap().len(), 2);
+        assert_eq!(outbox.entries(&kept).unwrap()[0], kept_plain);
+        assert_eq!(outbox.peer_relays(&gone).unwrap(), None);
+        assert_eq!(outbox.history_cursor(&gone).unwrap(), 0);
+    }
+
+    // 14
+    #[test]
+    fn forgetting_returns_the_plain_message_ids_in_queue_order_and_not_the_mirrors() {
+        let (outbox, gone) = (Outbox::memory().unwrap(), peer());
+        let (first, second) = (
+            Message::new("um".into(), None),
+            Message::new("dois".into(), None),
+        );
+        outbox.enqueue(&gone, &first).unwrap();
+        outbox
+            .enqueue_mirror(&gone, &Message::new("eco".into(), None), &identity())
+            .unwrap();
+        outbox.enqueue(&gone, &second).unwrap();
+
+        let ids = outbox.forget_peer(&gone).unwrap();
+
+        assert_eq!(ids, [first.id, second.id]);
+        assert!(
+            outbox.entries(&gone).unwrap().is_empty(),
+            "o espelho também saiu"
+        );
+    }
+
+    // 15
+    #[test]
+    fn the_same_message_waiting_for_two_devices_is_only_dropped_for_the_forgotten_one() {
+        let (outbox, gone, kept) = (Outbox::memory().unwrap(), peer(), peer());
+        let message = same_message_for(&outbox, [&gone, &kept]);
+        outbox.mark_deposited(&gone, &message.id, 100).unwrap();
+        outbox.mark_deposited(&kept, &message.id, 100).unwrap();
+
+        assert_eq!(outbox.forget_peer(&gone).unwrap(), [message.id]);
+
+        assert_eq!(outbox.entries(&kept).unwrap(), [message]);
+        assert_eq!(outbox.deposited_count(&kept).unwrap(), 1);
+        assert_eq!(time_rows(&outbox), 1);
+    }
+
+    // 16
+    #[test]
+    fn forgetting_an_unknown_peer_or_forgetting_twice_is_not_an_error() {
+        let (outbox, gone, unknown) = (Outbox::memory().unwrap(), peer(), peer());
+        populate(&outbox, &gone, "gone");
+
+        assert!(outbox.forget_peer(&unknown).unwrap().is_empty());
+        assert_eq!(outbox.forget_peer(&gone).unwrap().len(), 1);
+        assert!(outbox.forget_peer(&gone).unwrap().is_empty());
+    }
+
+    // 17
+    #[test]
+    fn forgetting_a_peer_keeps_the_history_and_the_trust_of_the_identity() {
+        let (outbox, gone, ana) = (Outbox::memory().unwrap(), peer(), identity());
+        let line = Message::new("história".into(), None);
+        outbox.record_history(&ana, true, &line).unwrap();
+        outbox.add_trusted(&ana).unwrap();
+        outbox.add_distrusted(&identity()).unwrap();
+        populate(&outbox, &gone, "gone");
+
+        outbox.forget_peer(&gone).unwrap();
+
+        assert_eq!(outbox.history(&ana, None, 10).unwrap()[0].message, line);
+        assert_eq!(outbox.trusted_identities().unwrap(), [ana]);
+        assert_eq!(outbox.distrusted_identities().unwrap().len(), 1);
+    }
+
+    // 18
+    #[test]
+    fn a_failure_in_the_middle_leaves_everything_in_place() {
+        let (outbox, gone) = (Outbox::memory().unwrap(), peer());
+        populate(&outbox, &gone, "gone");
+        let before = rows_in(&outbox, &gone, &FIRST_SIX);
+        assert!(before > 0);
+        // A última tabela some: se a limpeza não fosse atômica, as anteriores já teriam sido apagadas.
+        outbox
+            .conn
+            .execute_batch("DROP TABLE kin_history_cursor;")
+            .unwrap();
+
+        assert!(outbox.forget_peer(&gone).is_err());
+
+        assert_eq!(rows_in(&outbox, &gone, &FIRST_SIX), before);
     }
 }
