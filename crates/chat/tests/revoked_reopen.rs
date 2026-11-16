@@ -96,6 +96,35 @@ async fn reopening_keeps_a_device_whose_sibling_was_revoked() {
     assert!(reopened.is_ready(&a.peer_id()));
 }
 
+/// Auditoria 3d-ii-c, I1: se a derrubada falha na reabertura (aqui a fila não pôde ser apagada), a abertura
+/// também falha: não existe "próxima varredura" no `open`, e abrir com o revogado vivo contradiz a falha fechada.
+#[tokio::test(flavor = "multi_thread")]
+async fn reopening_fails_when_the_revoked_device_cannot_be_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let certificate = talked_once(&a, &b).await;
+    store_tombstone_while_closed(&a, &b, &certificate);
+    // A fila (outro arquivo SQLite) abre, mas a limpeza por peer falha: a tabela existe sem a coluna `peer`.
+    let conn = rusqlite::Connection::open(b.db.with_extension("outbox.db")).unwrap();
+    conn.execute_batch(
+        "DROP TABLE kin_history_cursor; CREATE TABLE kin_history_cursor (broken INTEGER);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let result = Chat::open(
+        &b.identity,
+        &b.device,
+        kin_transport::NodeConfig {
+            mdns: false,
+            ..Default::default()
+        },
+        &b.db,
+    );
+
+    assert!(result.is_err(), "abriu com o revogado ainda vivo");
+}
+
 /// Se o store de tombstones não pode ser lido, não dá para saber quem está revogado: a abertura falha
 /// (falha fechada), em vez de abrir com um par possivelmente revogado.
 #[tokio::test(flavor = "multi_thread")]
