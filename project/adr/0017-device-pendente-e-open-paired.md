@@ -52,7 +52,7 @@ onde guardar a chave e o pedido entre pedir e receber o certificado, e como reab
   nem em `open_paired` (S2). `build` não chama `certificate.verify()` nem confere a chave MLS do certificado (S3, já era assim).
 - Dois `request()` concorrentes podem divergir do código mostrado (S1): falha fechado.
 - O signer MLS e o estado MLS seguem **em claro** no SQLite (0600): P13. Restaurar backup antigo reverte contadores (T6 do ADR 0011).
-- Aceita certificado v3 (da mestra) na instalação e na reabertura: o trinco v4 vs v3 é da fatia 3 (S5).
+- Aceita certificado v3 (da mestra) na instalação e na reabertura: o trinco v4 vs v3 é da fatia 3 (S5). **Atualização (Sessão 27): a 3e-i (ADR 0030) passou a recusar v3 nos dois pontos.**
 - Não foi conferido se o peer exige `credential.signature_key == cert.signing_key` além do `verify()` do certificado.
 - Não foi verificado o `busy_timeout` do `rusqlite` e o comportamento da corrida entre processos.
 

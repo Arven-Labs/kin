@@ -20,7 +20,8 @@ pareamento autenticado existe para evitar.
 3. **`provider()` virou `Option`**: o pareado não certifica nada (o certificado já está no banco), então não há um provider falso. Em
    `main`, `Some` → `Chat::open`, `None` → `Chat::open_paired(&id, ...)`, que confere a identidade a cada abertura (ADR 0017).
 4. **Trinco v4 só na CLI**: `ensure_current_issuer` recusa certificado de emissor `Master` (v3) num pareado. Cobre o único ponto de
-   abertura do `Chat` na CLI; o trinco geral (e no `Chat::open_paired`) é da fatia 3 (P31(o)).
+   abertura do `Chat` na CLI; o trinco geral (e no `Chat::open_paired`) é da fatia 3 (P31(o)). **Atualização (Sessão 27): o trinco passou para
+   `Chat::open_paired` e a instalação (3e-i, ADR 0030); a CLI fica como defesa em profundidade.**
 5. **Contatos confiáveis (P30 (s)): `trusted` começa vazio** e segue o fluxo existente (`/trust` na primeira conversa; irmãos são
    confiados por construção). É o comportamento do `--pair` antigo: não há regressão. Descartadas: mandar a lista junto do pareamento
    (formato de fio novo, exige revisão externa) e confirmação extra por contato.
