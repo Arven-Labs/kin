@@ -189,6 +189,39 @@ fn a_wrong_certificate_is_refused_and_the_database_stays_pending() {
     assert_eq!(device.identity(), &master.id());
 }
 
+/// P30 3e-i (auditoria I1): a própria mestra, a identidade esperada, emite um v3 com as chaves do pedido.
+/// Instalar o v3 consumiria o pedido e deixaria o banco preso (`open_paired` o recusa e `request` dá
+/// `AlreadyPaired`): a instalação o recusa, com o banco ainda pendente e o v4 ainda valendo.
+#[test]
+fn a_certificate_issued_by_the_master_is_refused_on_install_and_the_database_stays_pending() {
+    let master = StandaloneIdentity::generate();
+    let primary = primary_of(&master);
+    let dir = tempfile::tempdir().unwrap();
+    let db = db_in(&dir, "new.db");
+    let key = DeviceKey::generate();
+    let request = PendingDevice::open(&db).unwrap().request(&key).unwrap();
+    let v3 = master
+        .authorize_device(
+            &request.signing_key,
+            &request.network_key,
+            &request.nostr_key,
+            2_000,
+        )
+        .unwrap();
+
+    let result = PendingDevice::open(&db)
+        .unwrap()
+        .install_certificate(&key, &v3, &master.id());
+
+    assert!(matches!(result, Err(Error::NotAuthorityIssued)));
+    let pending = PendingDevice::open(&db).unwrap();
+    assert_eq!(pending.request(&key).unwrap(), request);
+    let device = pending
+        .install_certificate(&key, &answer(&primary, &request), &master.id())
+        .unwrap();
+    assert_eq!(device.identity(), &master.id());
+}
+
 #[test]
 fn a_certificate_of_another_expected_identity_is_refused() {
     let master = StandaloneIdentity::generate();
