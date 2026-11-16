@@ -144,6 +144,8 @@ fn a_v3_device_is_accepted_while_no_v4_of_the_identity_was_seen() {
     let w = world();
 
     assert!(invite(&w.c, &w.m).is_ok());
+    // aceitar um v3 não vira o trinco: ele só anda com um v4 aceito
+    assert!(!w.c.is_downgraded(w.m.certificate()).unwrap());
 }
 
 /// Outro device v4 de X continua aceito depois do trinco.
