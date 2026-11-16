@@ -4004,8 +4004,17 @@ mod tests {
     #[tokio::test]
     async fn key_package_and_welcome_resends_stop_at_three_per_connection() {
         for envelope in [Envelope::KeyPackage(vec![1]), Envelope::Welcome(vec![1])] {
-            let Household { mut bia, .. } = household();
-            let peer = PeerId::random();
+            let Household {
+                mut bia,
+                ana_device: (with_conversation, _),
+                ..
+            } = household();
+            // O `Welcome` só é reenviado com conversa (quem o manda já a tem); o `KeyPackage`, sem.
+            let peer = if matches!(envelope, Envelope::Welcome(_)) {
+                with_conversation
+            } else {
+                PeerId::random()
+            };
             bia.connected.insert(peer);
             bia.transmit(peer, &envelope);
 
@@ -4033,9 +4042,14 @@ mod tests {
     /// nem as do `Welcome`.
     #[tokio::test]
     async fn the_resend_cap_is_per_kind_of_handshake_message() {
-        let Household { mut bia, .. } = household();
+        let Household {
+            mut bia,
+            ana_device: (with_conversation, _),
+            ..
+        } = household();
         let peer = PeerId::random();
         bia.handle(NodeEvent::PeerConnected(peer));
+        bia.connected.insert(with_conversation);
         for _ in 0..4 {
             let id = only_pending(&bia);
             fail_send(&mut bia, peer, id);
@@ -4043,6 +4057,12 @@ mod tests {
         assert!(bia.pending.is_empty(), "o Hello esgotou as 3 tentativas");
 
         for envelope in [Envelope::KeyPackage(vec![1]), Envelope::Welcome(vec![1])] {
+            // O `Welcome` só é reenviado com conversa: vai para o peer que a tem.
+            let peer = if matches!(envelope, Envelope::Welcome(_)) {
+                with_conversation
+            } else {
+                peer
+            };
             bia.transmit(peer, &envelope);
             let id = only_pending(&bia);
             fail_send(&mut bia, peer, id);
@@ -4055,10 +4075,20 @@ mod tests {
     /// P25 (d): o reenvio leva os MESMOS bytes (um `Welcome` só abre para o `KeyPackage` que o gerou).
     #[tokio::test]
     async fn a_resent_handshake_message_carries_the_same_bytes() {
-        let Household { mut bia, .. } = household();
-        let peer = PeerId::random();
-        bia.connected.insert(peer);
+        let Household {
+            mut bia,
+            ana_device: (with_conversation, _),
+            ..
+        } = household();
+        bia.connected.insert(with_conversation);
         for envelope in [Envelope::KeyPackage(vec![7, 8]), Envelope::Welcome(vec![9])] {
+            // O `Welcome` só é reenviado com conversa; o `KeyPackage`, sem.
+            let peer = if matches!(envelope, Envelope::Welcome(_)) {
+                with_conversation
+            } else {
+                PeerId::random()
+            };
+            bia.connected.insert(peer);
             bia.transmit(peer, &envelope);
             let first = only_pending(&bia);
             fail_send(&mut bia, peer, first);
