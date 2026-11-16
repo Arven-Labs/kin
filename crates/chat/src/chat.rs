@@ -476,6 +476,16 @@ impl Chat {
                 }
             }
         }
+        // Um device revogado com o processo fechado (ou cuja derrubada parou no meio) não volta vivo (P30,
+        // 3d-ii-c). Antes de qualquer `set_mailbox`: a caixa postal nunca aprende o revogado. Se não consigo
+        // consultar o store, não sei quem está revogado: a abertura falha (falha fechada), sem abrir "vivo".
+        let (revoked, mut failures) = chat.scan_revoked();
+        if !failures.is_empty() {
+            return Err(failures.swap_remove(0).1);
+        }
+        for (peer, identity) in revoked {
+            chat.drop_peer(peer, identity);
+        }
         Ok(chat)
     }
 
@@ -1653,8 +1663,20 @@ impl Chat {
 
     /// Derruba toda conversa com um device que o store marca como revogado (P30, 3d-ii-b2; ADR 0029). Um
     /// erro de leitura **não** derruba (não sei se está revogado) e vira `Dropped`; a reabertura (3d-ii-c)
-    /// reconsulta.
+    /// reconsulta, e lá o erro de leitura falha a abertura.
     fn drop_revoked_peers(&mut self) {
+        let (revoked, failures) = self.scan_revoked();
+        for (peer, error) in failures {
+            self.drop_message(peer, error);
+        }
+        for (peer, identity) in revoked {
+            self.drop_peer(peer, identity);
+        }
+    }
+
+    /// Consulta o store para cada conversa: os peers com certificado revogado (e a identidade deles) e os
+    /// que não consegui consultar. Só lê; quem chama decide o que fazer com cada lista.
+    fn scan_revoked(&self) -> (Vec<(PeerId, IdentityId)>, Vec<(PeerId, Error)>) {
         let mut revoked = Vec::new();
         let mut failures = Vec::new();
         for (peer, conversation) in &self.conversations {
@@ -1676,12 +1698,7 @@ impl Chat {
                 }
             }
         }
-        for (peer, error) in failures {
-            self.drop_message(peer, error);
-        }
-        for (peer, identity) in revoked {
-            self.drop_peer(peer, identity);
-        }
+        (revoked, failures)
     }
 
     /// Esquece o device `peer`, nesta ordem e em melhor esforço (cada erro vira `Dropped`; tudo idempotente):
