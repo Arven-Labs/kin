@@ -61,8 +61,8 @@ pub fn ensure_current_issuer(
     let primary = match identity {
         LocalIdentity::Master(_) => return Ok(()),
         // Pareado (ADR 0021): o certificado tem de ser v4, de uma autoridade. Um v3 (de um banco criado
-        // pela mestra) deixaria o device fora do regime novo. `open_paired` também recusa (P30 3e-i);
-        // esta checagem fica antes dele para dar a mensagem com o caminho a seguir.
+        // pela mestra) deixaria o device fora do regime novo. `Chat::open_paired` já recusa (P30 3e-i) e
+        // roda antes desta função em `main`; esta checagem é defesa em profundidade.
         LocalIdentity::Paired(_) => {
             return match &in_use.issuer {
                 Issuer::Authority(_) => Ok(()),

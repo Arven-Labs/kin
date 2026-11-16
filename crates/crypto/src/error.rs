@@ -74,7 +74,7 @@ pub enum Error {
     /// Um device pareado tem de ter certificado v4 (de uma autoridade); este foi assinado pela própria
     /// mestra (v3), o que deixaria a mestra num device secundário (P30 3e-i, ADR 0011 item 4).
     #[error(
-        "o certificado deste banco foi assinado pela mestra (v3), não por uma autoridade: pareie de novo"
+        "o certificado deste banco foi assinado pela mestra (v3), não por uma autoridade: pareie de novo, em um --data-dir novo"
     )]
     NotAuthorityIssued,
     #[error("armazenamento: {0}")]

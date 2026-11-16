@@ -99,7 +99,7 @@ impl CryptoDevice {
         // Trinco v4 (P30 3e-i): um pareado só vive de certificado de autoridade. Um v3 (assinado pela
         // mestra, num banco criado por ela) deixaria a mestra neste device. Depois da identidade, para
         // não esconder `IdentityMismatch`.
-        if matches!(certificate.issuer, Issuer::Master(_)) {
+        if !matches!(certificate.issuer, Issuer::Authority(_)) {
             return Err(Error::NotAuthorityIssued);
         }
         if &certificate.network_key != network_key || &certificate.nostr_key != nostr_key {
