@@ -495,7 +495,7 @@ impl Chat {
             return Err(failures.swap_remove(0).1);
         }
         for (peer, identity) in revoked {
-            chat.drop_peer(peer, identity);
+            chat.drop_peer(peer, identity)?;
         }
         Ok(chat)
     }
@@ -1681,7 +1681,9 @@ impl Chat {
             self.drop_message(peer, error);
         }
         for (peer, identity) in revoked {
-            self.drop_peer(peer, identity);
+            if let Err(e) = self.drop_peer(peer, identity) {
+                self.drop_message(peer, e);
+            }
         }
     }
 
@@ -1712,20 +1714,16 @@ impl Chat {
         Scan { revoked, failures }
     }
 
-    /// Esquece o device `peer`, nesta ordem e em melhor esforço (cada erro vira `Dropped`; tudo idempotente):
-    /// a conversa e o grupo no banco, a memória por Peer ID, a fila (`outbox`) e só **então** a caixa postal
-    /// (senão um `set_mailbox` reensinaria o que o `outbox` ainda guarda). A conexão de rede não é fechada.
-    fn drop_peer(&mut self, peer: PeerId, identity: IdentityId) {
+    /// Esquece o device `peer`, nesta ordem (tudo idempotente): a fila (`outbox`), a memória por Peer ID, a
+    /// caixa postal (senão um `set_mailbox` reensinaria o que o `outbox` ainda guarda) e só **por último** a
+    /// conversa e o grupo no banco. A conexão de rede não é fechada. Devolve o primeiro erro e **para**: em
+    /// tempo de execução quem chama o transforma em `Dropped` (a próxima varredura repete); na reabertura ele
+    /// falha a abertura (não há "próxima varredura", e abrir com o revogado vivo contradiz a falha fechada).
+    fn drop_peer(&mut self, peer: PeerId, identity: IdentityId) -> Result<(), Error> {
         // A fila primeiro, e se falhar paro com a conversa intacta: ela é o ponto de reparo (a próxima varredura
         // tenta de novo) e nada foi esquecido ainda. É outro arquivo SQLite, então não há atomicidade com o
         // banco do `crypto`: por isso a ordem, e não uma transação.
-        let failed = match self.outbox.forget_peer(&peer) {
-            Ok(ids) => ids,
-            Err(e) => {
-                self.drop_message(peer, e);
-                return;
-            }
-        };
+        let failed = self.outbox.forget_peer(&peer)?;
         self.expected.remove(&peer);
         self.future.remove(&peer);
         self.handshake_retries.retain(|(p, _), _| *p != peer);
@@ -1757,18 +1755,13 @@ impl Chat {
         // A conversa e o grupo por último: `drop_revoked_peers` só reencontra o peer por `conversations`, então
         // enquanto algo acima pudesse falhar ela tinha de continuar lá. Se o `delete` falhar, o label fica e a
         // reabertura recarrega o grupo (3d-ii-c); `PeerRevoked` só sai com tudo apagado.
-        if let Some(conversation) = self.conversations.remove(&peer)
-            && let Err(e) = conversation.delete()
-        {
-            self.drop_message(peer, e.into());
-            return;
+        if let Some(conversation) = self.conversations.remove(&peer) {
+            conversation.delete()?;
         }
-        if let Err(e) = self.device.forget_conversation(&peer.to_string()) {
-            self.drop_message(peer, e.into());
-            return;
-        }
+        self.device.forget_conversation(&peer.to_string())?;
         self.queue
             .push_back(ChatEvent::PeerRevoked { peer, identity });
+        Ok(())
     }
 
     /// Esta falha de gravação **devolve** a cota do peer? Só a de armazenamento (disco cheio, banco
