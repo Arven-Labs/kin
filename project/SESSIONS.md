@@ -1768,3 +1768,21 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   fatia é só SQL com nomes fixos; a auditoria fica para a b2-ii, que decide o que apagar.
 - **Próximo passo**: 3d-ii-b2-ii (o `Chat` derruba o par), em plan mode (plano aprovado nesta sessão: `drop_revoked_peers`, `drop_peer`, guardas em
   `teach_mailbox` e `on_relay_list`, `on_key_package`, `PeerRevoked`, CLI).
+
+#### O `Chat` derruba o par revogado (P30, fatia 3d-ii-b2-ii, ADR 0029)
+
+- **Decisões do dono** (3 perguntas): o P31 (am) entra **sem teste** no `chat` (não há como ver grupos órfãos); depois da auditoria, entram **I1 + I2 + I3** e o I4 e as
+  sugestões viram P31 (ar) a (av).
+- **Feito** (`chat.rs`, `outbox.rs` só um helper de teste, `cli`): `drop_revoked_peers` e `drop_peer`; chamados em `on_revocation` (`Ok(true)` e `Ok(false)`) e em
+  `broadcast_revocation`; `ChatEvent::PeerRevoked` + braço na CLI; `on_key_package` apaga o grupo se o `invite` falhar; `Welcome` só reenviado com conversa. Ordem do
+  `drop_peer`: fila, memória, caixa postal, conversa e grupo (a conversa é o ponto de reparo). Tirei do plano os guardas de `teach_mailbox` e `on_relay_list` (código morto).
+- **Prova de que testam algo**: esqueleto, **7 de 9** falharam pela asserção, 2 controles passaram (run 43878401911; antes, 43877838600, 2 testes meus estavam errados:
+  remetente e raw do device); verde (43879842499). Testes da auditoria: **4 de 4** falharam (43883491261); verde (43884840677).
+- **Mutações** (9 de 9 pegas, branches apagadas): ver ADR 0029. Uma (sem `outbox.forget_peer`) foi barrada pelo clippy `dead_code` antes dos testes e refeita.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 4 importantes, 5 sugestões. I1 (`broadcast_revocation` não derrubava), I2 (a conversa saía primeiro e uma
+  falha deixava órfãos sem reparo) e I3 (`Welcome` em voo reenviado ao revogado) **corrigidos**; I4 e S1, S2, S4, S5 em P31 (ar) a (av).
+- **Tropeços**: tentei apendar o `SESSIONS.md` por heredoc (barrado, regra do `CLAUDE.md`); a regra do `Welcome` quebrou 3 testes antigos que o mandavam a um peer sem
+  conversa (ajustei o setup); o `gh pr merge` do PR da b2-i, rodado na raiz do workspace, procurou o PR no repo errado (o comando que eu dei estava sem o `cd`).
+- **Não verificado**: `delete` do grupo falhando no meio (não simulável); o `delete` de `on_key_package`; uso real (nada na CLI revoga ainda, é a fatia 5); revisão externa.
+- **Próximo passo**: 3d-ii-c (reabrir: `drop_revoked_peers` antes do `set_mailbox`, falha de leitura falha a abertura, peers sem conversa com linhas órfãs no outbox),
+  em plan mode; depois 3e (trinco v3/v4).

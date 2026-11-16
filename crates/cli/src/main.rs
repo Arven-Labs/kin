@@ -813,6 +813,12 @@ fn on_event(
         ChatEvent::PeerRelays { peer, relays } => {
             println!("(relays de {peer}: {})", relays.join(", "));
         }
+        ChatEvent::PeerRevoked { peer, identity } => {
+            println!(
+                "(device {peer} da identidade {} foi revogado: conversa e fila apagadas)",
+                identity.to_base58()
+            );
+        }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
         ChatEvent::HistorySynced {
             peer,

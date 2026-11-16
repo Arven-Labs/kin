@@ -299,6 +299,12 @@ impl Outbox {
         })
     }
 
+    /// Só para teste: roda SQL cru, para quebrar ou consertar uma tabela de propósito.
+    #[cfg(test)]
+    pub(crate) fn run_sql(&self, sql: &str) {
+        self.conn.execute_batch(sql).unwrap();
+    }
+
     /// Só para teste: grava um destino que não decodifica na entrada (banco corrompido).
     #[cfg(test)]
     pub(crate) fn corrupt_destination(&self, peer: &PeerId, id: &MessageId) {
@@ -431,13 +437,6 @@ impl Outbox {
     /// espelhos (3.5) também são apagados, mas não voltam (não há mensagem do usuário a avisar).
     /// Idempotente: peer desconhecido ou repetição devolvem vazio. O histórico (`kin_history`) e a
     /// confiança são por identidade, não por device, e ficam.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "o chamador chega na 3d-ii-b2-ii; sai este atributo"
-        )
-    )]
     pub(crate) fn forget_peer(&self, peer: &PeerId) -> Result<Vec<MessageId>, Error> {
         let peer = peer.to_string();
         let tx = self.conn.unchecked_transaction().map_err(Error::storage)?;
