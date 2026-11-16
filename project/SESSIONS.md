@@ -1728,3 +1728,22 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `delete` e do `openmls_sqlite_storage`; `secure_delete`; uso real (nada no `chat` chama o que a fatia adiciona); revisão externa.
 - **Próximo passo**: 3d-ii-b (o `chat` derruba o par: varredura em `on_revocation`, outbox, `Mailbox::forget_peer`, `PeerRevoked`, CLI,
   consulta antes do `create` em `on_key_package`), em plan mode.
+
+#### A caixa postal esquece o peer revogado (P30, fatia 3d-ii-b1, ADR 0029)
+
+- **Decisões do dono** (plan mode + 2 perguntas): 3d-ii-b cortada em **b1 (mailbox)** e **b2 (chat)**, em PRs separados; para o grupo órfão do P31 (am), **apagar o
+  grupo se o `invite` falhar** em vez de consultar antes do `create` (troquei a sua escolha anterior depois de ler que a `Conversation::delete` da 3d-ii-a já
+  existia e cobre todos os erros do `invite`, não só `Revoked`; você aceitou).
+- **Feito** (só `chat`): `Mailbox::forget_peer` (default vazio) e `NostrMailbox::forget_peer`. ADR **0029** (b1 feita, desenho fechado da b2). **Nada chama
+  `forget_peer` ainda.**
+- **Prova de que testam algo**: stubs, **3 de 4** falharam pela asserção e o 4º (caracterização) passou (run 43784070943); verde (43784953079). Depois da
+  auditoria, o teste da chave rotacionada **falhou** com o código antigo (43786379958) e passou com o `retain` por valor (43786692119).
+- **Mutações** (branches descartáveis, 5 de 5 pegas, apagadas): sem `by_nostr` (43785348315), sem `peers` (43785354949), sem `peer_relays` (43785361916),
+  remove `by_nostr` sem conferir o dono (43785368645), `retain` apagando tudo sobre o código novo (43787028107).
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 3 importantes. I1: `learn_peer` nunca apaga a chave Nostr antiga, e a minha guarda só
+  removia a atual (chave órfã apontando para o peer esquecido): corrigido com `retain` por valor. I2 (corrida com `on_event`) e I3 (o `Chat` repovoa o estado
+  pelo `set_mailbox`, `teach_mailbox` e `on_relay_list`) viraram requisitos da b2 no ADR.
+- **Tropeços**: o auditor rodou `git checkout` no repo, contra o "somente leitura", e deixou a árvore em `main`; nada se perdeu (conferi `git status` e o HEAD
+  da branch na origin) e voltei à branch; a guarda que eu pus além do plano (`get == Some(&peer)`) era justamente o que deixava a chave antiga órfã.
+- **Não verificado**: depósito em voo seguido de `forget_peer`; a corrida com `on_event`; uso real (nada chama `forget_peer`); revisão externa.
+- **Próximo passo**: 3d-ii-b2 (o `Chat` derruba o par), em plan mode.
