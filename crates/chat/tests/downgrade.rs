@@ -227,7 +227,9 @@ async fn reopening_with_an_unreadable_regime_store_fails() {
     }
     rusqlite::Connection::open(&c.db)
         .unwrap()
-        .execute("DROP TABLE kin_regime", [])
+        // Só apagar a tabela não basta: `Provider::open` a recria (`CREATE TABLE IF NOT EXISTS`). Uma tabela
+        // com outro formato sobrevive à abertura e quebra a consulta.
+        .execute_batch("DROP TABLE kin_regime; CREATE TABLE kin_regime (other TEXT);")
         .unwrap();
 
     let result = Chat::open(&c.identity, &c.device, config(), &c.db);
