@@ -459,7 +459,18 @@ impl Mailbox for NostrMailbox {
         inner.by_nostr.insert(key, peer);
     }
 
-    fn forget_peer(&mut self, _peer: PeerId) {}
+    /// Esquece o par nas duas direções (`peers` para endereçar, `by_nostr` para atribuir o remetente de um
+    /// evento recebido) e os relays dele, sob o mesmo lock. Só remove a entrada reversa se ela ainda aponta
+    /// para este peer: outro peer pode ter reaprendido a mesma chave Nostr.
+    fn forget_peer(&mut self, peer: PeerId) {
+        let mut inner = self.shared.lock();
+        if let Some(key) = inner.peers.remove(&peer)
+            && inner.by_nostr.get(&key) == Some(&peer)
+        {
+            inner.by_nostr.remove(&key);
+        }
+        inner.peer_relays.remove(&peer);
+    }
 
     fn relays(&self) -> Vec<String> {
         self.announced.clone()
