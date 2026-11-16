@@ -1715,7 +1715,7 @@ impl Chat {
         let failed = match self.outbox.forget_peer(&peer) {
             Ok(ids) => ids,
             Err(e) => {
-                self.drop_message(peer, e.into());
+                self.drop_message(peer, e);
                 Vec::new()
             }
         };
