@@ -77,6 +77,12 @@ pub enum Error {
         "o certificado deste banco foi assinado pela mestra (v3), não por uma autoridade: pareie de novo, em um --data-dir novo"
     )]
     NotAuthorityIssued,
+    /// O certificado é v3 (da mestra), mas esta identidade já foi aceita em regime v4: um device v3 dela
+    /// só pode ser de quem tem a mestra, e o regime novo não volta atrás (P30 3e-ii-a, ADR 0031).
+    #[error(
+        "esta identidade já usa certificados de autoridade (v4): um certificado da mestra (v3) é recusado"
+    )]
+    Downgrade,
     #[error("armazenamento: {0}")]
     Storage(String),
     #[error("falha no MLS: {0}")]

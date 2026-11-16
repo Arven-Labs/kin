@@ -58,7 +58,8 @@ impl Provider {
              CREATE TABLE IF NOT EXISTS kin_revocations (
                  identity TEXT NOT NULL, signing_key BLOB NOT NULL,
                  network_key BLOB NOT NULL, nostr_key BLOB NOT NULL, tombstone BLOB NOT NULL,
-                 PRIMARY KEY (identity, signing_key, network_key, nostr_key));",
+                 PRIMARY KEY (identity, signing_key, network_key, nostr_key));
+             CREATE TABLE IF NOT EXISTS kin_regime (identity TEXT PRIMARY KEY);",
         )
         .map_err(Error::storage)?;
         SqliteStorageProvider::<JsonCodec, &mut Connection>::new(&mut conn)
@@ -192,6 +193,17 @@ impl Provider {
                 |r| r.get(0),
             )
             .map_err(Error::storage)
+    }
+
+    /// Grava que esta identidade já foi aceita em regime v4 (trinco por identidade, P30 3e-ii-a, ADR 0031).
+    /// Idempotente e **monotônico**: nunca se desmarca.
+    pub(crate) fn mark_authority_regime(&self, _identity: &IdentityId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Esta identidade já foi aceita em regime v4? Erro de leitura é erro (falha fechada), não "não".
+    pub(crate) fn is_authority_regime(&self, _identity: &IdentityId) -> Result<bool, Error> {
+        Ok(false)
     }
 
     /// Só para teste: apaga a tabela de tombstones, para a leitura falhar (fail-closed, P30 3d-i).
@@ -613,5 +625,56 @@ mod tests {
         }
         let reopened = Provider::open(Some(&path)).unwrap();
         assert!(reopened.is_revoked(&cert).unwrap());
+    }
+
+    // ---- regime v4 por identidade (P30 3e-ii-a, ADR 0031) ----
+
+    #[test]
+    fn marking_an_identity_is_per_identity_and_idempotent() {
+        let provider = Provider::open(None).unwrap();
+        let (a, b) = (
+            StandaloneIdentity::generate().id(),
+            StandaloneIdentity::generate().id(),
+        );
+        assert!(!provider.is_authority_regime(&a).unwrap());
+
+        provider.mark_authority_regime(&a).unwrap();
+        provider.mark_authority_regime(&a).unwrap();
+
+        assert!(provider.is_authority_regime(&a).unwrap());
+        assert!(!provider.is_authority_regime(&b).unwrap());
+        let rows: i64 = provider
+            .conn
+            .query_row("SELECT COUNT(*) FROM kin_regime", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_broken_regime_store_fails_closed() {
+        let provider = Provider::open(None).unwrap();
+        let id = StandaloneIdentity::generate().id();
+        provider.conn.execute("DROP TABLE kin_regime", []).unwrap();
+
+        assert!(provider.is_authority_regime(&id).is_err());
+        assert!(provider.mark_authority_regime(&id).is_err());
+    }
+
+    #[test]
+    fn the_regime_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls.sqlite");
+        let id = StandaloneIdentity::generate().id();
+        Provider::open(Some(&path))
+            .unwrap()
+            .mark_authority_regime(&id)
+            .unwrap();
+
+        assert!(
+            Provider::open(Some(&path))
+                .unwrap()
+                .is_authority_regime(&id)
+                .unwrap()
+        );
     }
 }
