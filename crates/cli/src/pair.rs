@@ -948,6 +948,29 @@ mod tests {
         assert!(crate::devices::list(&dir.path().join("primary"), &identity).is_empty());
     }
 
+    #[test]
+    fn answer_and_record_does_not_deliver_the_link_when_the_registry_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let (primary, identity) = primary_in(dir.path());
+        let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
+        // `issued` é um arquivo: não dá para registrar.
+        std::fs::write(
+            dir.path().join("primary").join(crate::devices::ISSUED_DIR),
+            b"x",
+        )
+        .unwrap();
+
+        let result = answer_and_record(
+            &dir.path().join("primary"),
+            &primary,
+            &shown.link,
+            &shown.sas,
+            NOW,
+        );
+
+        assert!(result.is_err(), "entregou o link sem registrar");
+    }
+
     // ---- accept (device novo) ----
 
     #[test]

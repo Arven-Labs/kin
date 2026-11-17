@@ -645,25 +645,27 @@ fn revoke_device(chat: &mut Chat, identity: &keys::LocalIdentity, data_dir: &Pat
     match devices::decide_revoke(args, &issued, &chat.peer_id()) {
         Err(e) => println!("({e})"),
         Ok(devices::RevokeAction::Ask(certificate)) => println!(
-            "revogar o device {} (emitido em {})? Não dá para desfazer. Para confirmar: /revoke {} confirmo",
-            certificate.network_peer_id(),
+            "revogar o device {peer} (emitido em {})? Não dá para desfazer. Para confirmar: /revoke {peer} confirmo",
             certificate.created_at,
-            args.trim()
+            peer = certificate.network_peer_id(),
         ),
         Ok(devices::RevokeAction::Revoke(certificate)) => {
-            let now = std::time::SystemTime::now()
+            let result = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let result = primary
-                .revoke_device(certificate, now)
-                .map_err(|e| e.to_string())
+                .map(|d| d.as_secs())
+                .map_err(|e| format!("relógio do sistema inválido: {e}"))
+                .and_then(|now| {
+                    primary
+                        .revoke_device(certificate, now)
+                        .map_err(|e| e.to_string())
+                })
                 .and_then(|revocation| {
                     chat.broadcast_revocation(&revocation)
                         .map_err(|e| e.to_string())
                 });
             match result {
                 Ok(()) => println!(
-                    "(device {} revogado e tombstone enviado; quem estiver offline só saberá depois)",
+                    "(device {} revogado: tombstone gravado e enviado a quem está conectado; quem estiver offline só saberá quando reconectar)",
                     certificate.network_peer_id()
                 ),
                 Err(e) => println!("(não revoguei: {e})"),

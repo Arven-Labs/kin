@@ -29,17 +29,57 @@ pub enum RevokeAction<'a> {
     Revoke(&'a DeviceCertificate),
 }
 
-/// Grava `certificate` em `<data_dir>/issued/<peer-id>.cert` (0600). Idempotente: se o arquivo do
-/// mesmo device já existe, não o reescreve e devolve `Ok`.
+/// Grava `certificate` em `<data_dir>/issued/<peer-id>.cert` (0600). Idempotente **só** para o mesmo
+/// device: se o arquivo já existe, ele precisa ser um certificado válido da mesma identidade e com as
+/// **mesmas três chaves** (as que o tombstone cita). Qualquer outra coisa é erro, e o `answer` não
+/// entrega o link: emitir um certificado que o `/revoke` não alcança seria revogação falsa (auditoria I1).
 pub fn record(data_dir: &Path, certificate: &DeviceCertificate) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt as _;
     let dir = data_dir.join(ISSUED_DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("não deu para criar {ISSUED_DIR}/: {e}"))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("não deu para criar {ISSUED_DIR}/: {e}"))?;
     let path = dir.join(file_name(certificate));
     match crate::pair::write_new_atomic(&path, &certificate.to_bytes()) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_certificate(&path) {
+            Some(existing) if existing.verify().is_ok() && same_device(&existing, certificate) => {
+                Ok(())
+            }
+            _ => Err(format!(
+                "já existe um registro diferente (ou ilegível) para o device {} em {ISSUED_DIR}/: \
+                     não emiti. Pareie com um device.key novo ou apague o registro antigo à mão",
+                certificate.network_peer_id()
+            )),
+        },
         Err(e) => Err(format!("não deu para registrar o device emitido: {e}")),
     }
+}
+
+/// Mesma identidade e as mesmas três chaves (as que um tombstone cita).
+fn same_device(a: &DeviceCertificate, b: &DeviceCertificate) -> bool {
+    a.identity() == b.identity()
+        && a.signing_key == b.signing_key
+        && a.network_key == b.network_key
+        && a.nostr_key == b.nostr_key
+}
+
+/// Lê e decodifica um certificado de `path`, com teto de tamanho aplicado no próprio arquivo aberto
+/// (nada de `metadata` e depois `read`, que dá margem a troca por FIFO ou symlink).
+fn read_certificate(path: &Path) -> Option<DeviceCertificate> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_LEN + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_FILE_LEN {
+        return None;
+    }
+    DeviceCertificate::from_bytes(&bytes).ok()
 }
 
 fn file_name(certificate: &DeviceCertificate) -> String {
@@ -55,16 +95,14 @@ pub fn list(data_dir: &Path, identity: &IdentityId) -> Vec<DeviceCertificate> {
     let mut issued: Vec<DeviceCertificate> = entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
-            let meta = entry.metadata().ok()?;
-            if !meta.is_file() || meta.len() > MAX_FILE_LEN {
-                return None;
-            }
-            let certificate =
-                DeviceCertificate::from_bytes(&std::fs::read(entry.path()).ok()?).ok()?;
+            // O barato primeiro: o nome tem de ser `<peer-id>.cert` antes de qualquer leitura.
+            let name = entry.file_name().into_string().ok()?;
+            name.strip_suffix(".cert")?.parse::<PeerId>().ok()?;
+            let certificate = read_certificate(&entry.path())?;
             certificate.verify().ok()?;
-            // Só da minha identidade, e só se o nome do arquivo é o do device (sem duplicata).
-            let named_right = entry.file_name().to_str() == Some(file_name(&certificate).as_str());
-            (certificate.identity() == identity && named_right).then_some(certificate)
+            // Só da minha identidade, e só se o nome é o do device (sem duplicata sob outro nome).
+            (certificate.identity() == identity && file_name(&certificate) == name)
+                .then_some(certificate)
         })
         .collect();
     issued.sort_by_key(|certificate| certificate.network_peer_id());
@@ -206,13 +244,65 @@ mod tests {
         assert_eq!(DeviceCertificate::from_bytes(&kept).unwrap(), cert);
     }
 
+    #[test]
+    fn recording_a_different_certificate_for_the_same_peer_id_is_an_error() {
+        // Mesmo Peer ID (chave de rede), outra chave MLS: o tombstone do primeiro não alcançaria este.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = primary();
+        let (first, device) = issue(&primary, NOW);
+        let second = primary
+            .authorize_device(
+                &DeviceKey::generate().public_key(), // outra chave MLS
+                &device.public_key(),
+                &device.nostr_public_key(),
+                NOW + 1,
+            )
+            .unwrap();
+        record(dir.path(), &first).unwrap();
+
+        let err = record(dir.path(), &second).unwrap_err();
+
+        assert!(err.contains("registro diferente"), "{err}");
+        let kept = list(dir.path(), &primary.id());
+        assert_eq!(kept, vec![first]);
+    }
+
+    #[test]
+    fn recording_over_garbage_or_a_foreign_file_with_that_name_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mine, other) = (primary(), primary());
+        let (cert, device) = issue(&mine, NOW);
+        let folder = dir.path().join(ISSUED_DIR);
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join(format!("{}.cert", cert.network_peer_id()));
+
+        std::fs::write(&path, b"lixo").unwrap();
+        assert!(record(dir.path(), &cert).is_err(), "aceitou lixo");
+
+        // um certificado VÁLIDO das mesmas chaves, mas de outra identidade, com o mesmo nome
+        let foreign = other
+            .authorize_device(
+                &cert.signing_key,
+                &device.public_key(),
+                &device.nostr_public_key(),
+                NOW,
+            )
+            .unwrap();
+        foreign.verify().unwrap();
+        std::fs::write(&path, foreign.to_bytes()).unwrap();
+        assert!(
+            record(dir.path(), &cert).is_err(),
+            "aceitou outra identidade"
+        );
+    }
+
     // ---- list ----
 
     #[test]
     fn list_returns_the_issued_certificates_in_peer_id_order() {
         let dir = tempfile::tempdir().unwrap();
         let primary = primary();
-        let issued = certs(&primary, 3);
+        let issued = certs(&primary, 12);
         for cert in &issued {
             record(dir.path(), cert).unwrap();
         }
@@ -250,7 +340,54 @@ mod tests {
         assert_eq!(list(dir.path(), &mine.id()), vec![good]);
     }
 
+    #[test]
+    fn list_ignores_a_valid_certificate_under_the_wrong_name_and_non_regular_files() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let primary = primary();
+        let (good, _) = issue(&primary, NOW);
+        let (renamed, _) = issue(&primary, NOW + 1);
+        record(dir.path(), &good).unwrap();
+        let folder = dir.path().join(ISSUED_DIR);
+        // válido, da minha identidade, mas com o nome de outro Peer ID (e a duplicata do `good`)
+        std::fs::write(
+            folder.join(format!("{}.cert", PeerId::random())),
+            renamed.to_bytes(),
+        )
+        .unwrap();
+        std::fs::copy(
+            folder.join(file_name(&good)),
+            folder.join(format!("{}.cert", PeerId::random())),
+        )
+        .unwrap();
+        // diretório, link simbólico e arquivo grande com nome de certificado
+        let dir_name = format!("{}.cert", PeerId::random());
+        std::fs::create_dir(folder.join(&dir_name)).unwrap();
+        let link_name = format!("{}.cert", PeerId::random());
+        symlink(folder.join(file_name(&good)), folder.join(&link_name)).unwrap();
+        let big = format!("{}.cert", PeerId::random());
+        std::fs::write(folder.join(&big), vec![0u8; (MAX_FILE_LEN + 1) as usize]).unwrap();
+
+        assert_eq!(list(dir.path(), &primary.id()), vec![good]);
+    }
+
     // ---- decide_revoke ----
+
+    #[test]
+    fn the_prefix_minimum_is_four_characters_after_the_common_start() {
+        let issued = certs(&primary(), 2);
+        let own = PeerId::random();
+        let tail = &peer_str(&issued[0])["12D3KooW".len()..];
+
+        // exatamente 4: aceito
+        assert_eq!(
+            decide_revoke(&tail[..4], &issued, &own).unwrap(),
+            RevokeAction::Ask(&issued[0])
+        );
+        // 3: recusado pelo tamanho
+        let err = decide_revoke(&tail[..3], &issued, &own).unwrap_err();
+        assert!(err.contains("curto"), "{err}");
+    }
 
     fn peer_str(cert: &DeviceCertificate) -> String {
         cert.network_peer_id().to_string()
@@ -288,8 +425,8 @@ mod tests {
         for bad in [
             "",
             "confirmo",
-            "12D3",                  // curto demais
-            &full[..11],             // um a menos que o mínimo
+            "12D3",                  // 4 caracteres, mas nenhum device começa assim
+            &full[..11],             // 3 depois do 12D3KooW: curto
             "12D3KooWnaoexisteaqui", // não existe
             "12D3KooW",              // comum a todos: ambíguo (e curto)
         ] {
