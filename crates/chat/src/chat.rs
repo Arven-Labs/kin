@@ -213,12 +213,14 @@ const RETRY_BASE: Duration = Duration::from_secs(2);
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
 /// Reenvio direto agendado para um peer depois de um `SendFailed` de mensagem de chat (P19).
-#[allow(dead_code)] // esqueleto P19: sai com a implementação
 struct Retry {
     /// Falhas seguidas sem ack; decide a espera ([`Chat::retry_delay`]).
     attempts: u32,
     /// Quando o reenvio pode sair.
     due: Instant,
+    /// Há um reenvio esperando o prazo. Depois que ele dispara, o registro fica (para contar a próxima
+    /// falha seguida), mas sem acordar o relógio: senão o prazo vencido manteria o laço girando à toa.
+    armed: bool,
 }
 
 /// Folga abaixo do teto de validade ao emitir um link, para o leitor com relógio um pouco atrasado.
@@ -422,12 +424,9 @@ pub struct Chat {
     sibling_announce_gap: Duration,
     /// Reenvio direto agendado por peer depois de um `SendFailed` de mensagem de chat (P19). Só existe para
     /// peer conectado; sai no ack, ao desconectar ou quando o reenvio é tentado de novo.
-    #[allow(dead_code)] // esqueleto P19: sai com a implementação
     retry: HashMap<PeerId, Retry>,
     /// Espera inicial e teto do reenvio (campos, para o teste não esperar 2 s a 60 s).
-    #[allow(dead_code)] // esqueleto P19: sai com a implementação
     retry_base: Duration,
-    #[allow(dead_code)] // esqueleto P19: sai com a implementação
     retry_cap: Duration,
     /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
     /// alimentar 100 000 linhas).
@@ -1131,9 +1130,10 @@ impl Chat {
                 self.handle_mailbox(event);
                 continue;
             }
-            // Com re-anúncio pendente (P24), acorda no prazo mesmo sem tráfego: sem isto a lista ficaria
-            // parada numa rede quieta e os irmãos nunca convergiriam.
-            let wake = self.sibling_wake_in();
+            // Com re-anúncio pendente (P24) ou reenvio agendado (P19), acorda no prazo mesmo sem tráfego:
+            // sem isto a lista ficaria parada numa rede quieta e a mensagem que falhou esperaria a próxima
+            // conexão.
+            let wake = self.wake_in();
             let node = &mut self.node;
             let mailbox_events = self.mailbox_events.as_mut();
             let waiting = async {
@@ -1158,7 +1158,10 @@ impl Chat {
                 None => waiting.await,
             };
             match next {
-                Next::Tick => self.flush_sibling_pending(),
+                Next::Tick => {
+                    self.flush_sibling_pending();
+                    self.flush_due_retries();
+                }
                 Next::Node(event) => self.handle(event),
                 Next::Mailbox(Some(event)) => self.handle_mailbox(event),
                 // O backend largou o canal: sem ele não há mais o que escutar.
@@ -1210,8 +1213,10 @@ impl Chat {
     }
 
     fn handle(&mut self, event: NodeEvent) {
-        // Sem timer: o re-anúncio que caiu no intervalo mínimo sai no primeiro evento depois do prazo.
+        // O que venceu o prazo sai no primeiro evento depois dele (o `next_event` também acorda no prazo, sem
+        // tráfego): o re-anúncio a irmão que caiu no intervalo mínimo e o reenvio da outbox.
         self.flush_sibling_pending();
+        self.flush_due_retries();
         match event {
             NodeEvent::Listening(addr) => self.queue.push_back(ChatEvent::Listening(addr)),
             NodeEvent::PeerConnected(peer) => {
@@ -1227,6 +1232,7 @@ impl Chat {
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.retry.remove(&peer);
                 self.handshake_retries.retain(|(p, _), _| *p != peer);
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
@@ -1258,6 +1264,8 @@ impl Chat {
                         Ok(EntryKind::Mirror(_))
                     );
                     self.leave_flight(peer, &message);
+                    // O ack prova que o caminho voltou: o próximo reenvio recomeça da espera base (P19).
+                    self.retry.remove(&peer);
                     if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
@@ -1277,10 +1285,15 @@ impl Chat {
                     self.history_sessions.remove(&requested);
                 }
                 match self.pending.remove(&id).flatten() {
-                    // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
+                    // Mensagem de chat: continua na outbox. Com o peer conectado, o reenvio é agendado com
+                    // espera crescente (P19) e só a primeira falha seguida avisa; sem conexão, sai ao
+                    // reconectar.
                     Some(message) => {
                         self.leave_flight(peer, &message);
-                        self.queue.push_back(ChatEvent::Queued { peer, message });
+                        let first = !self.connected.contains(&peer) || self.schedule_retry(peer);
+                        if first {
+                            self.queue.push_back(ChatEvent::Queued { peer, message });
+                        }
                     }
                     // Handshake ou anúncio (controle): sem outbox, quem decide é a aplicação. Os
                     // anúncios podem ter se perdido, então liberam o próximo gatilho (`on_mls`, algo
@@ -1597,20 +1610,63 @@ impl Chat {
             .min()
     }
 
-    /// ESQUELETO (P19, etapa D): ainda sem comportamento.
-    #[allow(dead_code)]
-    fn retry_delay(&self, _attempts: u32) -> Duration {
-        Duration::ZERO
+    /// Espera antes do reenvio depois de `attempts` falhas seguidas: a base, dobrando a cada falha, até o
+    /// teto. O deslocamento é limitado, então muitas falhas não estouram a conta.
+    fn retry_delay(&self, attempts: u32) -> Duration {
+        let doublings = attempts.saturating_sub(1).min(16);
+        self.retry_base
+            .saturating_mul(1 << doublings)
+            .min(self.retry_cap)
     }
 
-    /// ESQUELETO (P19, etapa D): ainda sem comportamento.
-    #[allow(dead_code)]
-    fn flush_due_retries(&mut self) {}
+    /// Registra uma falha de envio direto a `peer` e agenda o reenvio. Devolve `true` se é a primeira
+    /// falha seguida (a única que avisa a aplicação com `Queued`).
+    fn schedule_retry(&mut self, peer: PeerId) -> bool {
+        let attempts = self.retry.get(&peer).map_or(0, |retry| retry.attempts) + 1;
+        let due = Instant::now() + self.retry_delay(attempts);
+        self.retry.insert(
+            peer,
+            Retry {
+                attempts,
+                due,
+                armed: true,
+            },
+        );
+        attempts == 1
+    }
 
-    /// ESQUELETO (P19, etapa D): ainda só o re-anúncio dos irmãos.
-    #[allow(dead_code)]
+    /// Reenvia aos peers cujo prazo venceu (P19). Peer que desconectou no meio do caminho perde o
+    /// agendamento: a fila sai sozinha ao reconectar. O registro de quem disparou fica, desarmado.
+    fn flush_due_retries(&mut self) {
+        let now = Instant::now();
+        let due: Vec<PeerId> = self
+            .retry
+            .iter()
+            .filter(|(_, retry)| retry.armed && retry.due <= now)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            if !self.connected.contains(&peer) {
+                self.retry.remove(&peer);
+                continue;
+            }
+            if let Some(retry) = self.retry.get_mut(&peer) {
+                retry.armed = false;
+            }
+            self.send_direct(peer);
+        }
+    }
+
+    /// Quanto falta para o próximo prazo que pede o relógio: o do re-anúncio dos irmãos (P24) ou o de um
+    /// reenvio armado (P19). `None` = só a rede acorda o `next_event`.
     fn wake_in(&self) -> Option<Duration> {
-        self.sibling_wake_in()
+        let now = Instant::now();
+        let retries = self
+            .retry
+            .values()
+            .filter(|retry| retry.armed)
+            .map(|retry| retry.due.saturating_duration_since(now));
+        self.sibling_wake_in().into_iter().chain(retries).min()
     }
 
     /// Anuncia aos irmãos pendentes cujo prazo já passou; os que ainda esperam voltam à pendência.
