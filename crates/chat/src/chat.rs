@@ -2672,6 +2672,7 @@ mod tests {
     async fn a_second_failure_doubles_the_wait() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
+        bia.retry_cap = Duration::from_secs(86_400); // acima do dobro da base, senão o teto corta
         bia.handle(NodeEvent::PeerConnected(ana_peer));
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
@@ -2839,6 +2840,7 @@ mod tests {
     async fn the_clock_wakes_for_the_retry_deadline() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
+        bia.retry_cap = Duration::from_secs(86_400);
         bia.handle(NodeEvent::PeerConnected(ana_peer));
         assert_eq!(bia.wake_in(), None, "sem nada agendado, espera só a rede");
 
