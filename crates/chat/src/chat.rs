@@ -339,6 +339,8 @@ enum Next {
 pub struct Chat {
     node: Node,
     device: CryptoDevice,
+    /// Cópia da chave do device só para assinar links de convite (`invite_link`).
+    signer: DeviceKey,
     conversations: HashMap<PeerId, Conversation>,
     pending: HashMap<SendId, Option<MessageId>>,
     /// Envios em voo que são handshake (`Hello`, `KeyPackage`, `Welcome`), com o envelope: só estes são
@@ -530,9 +532,13 @@ impl Chat {
         config: NodeConfig,
         outbox: Outbox,
     ) -> Result<Self, Error> {
+        let signer =
+            DeviceKey::from_bytes(&device_key.to_bytes().map_err(kin_crypto::Error::from)?)
+                .map_err(kin_crypto::Error::from)?;
         Ok(Self {
             node: Node::new(device_key.keypair().clone(), config)?,
             device,
+            signer,
             conversations: HashMap::new(),
             pending: HashMap::new(),
             handshake: HashMap::new(),
@@ -612,8 +618,9 @@ impl Chat {
 
     /// Link de convite deste device com os endereços `addrs`, válido por `ttl` a partir de agora e
     /// assinado pela chave de rede do device (P18).
-    pub fn invite_link(&self, _addrs: Vec<Multiaddr>, _ttl: Duration) -> String {
-        String::new()
+    pub fn invite_link(&self, addrs: Vec<Multiaddr>, ttl: Duration) -> String {
+        self.invite(addrs)
+            .to_link(&self.signer, now_secs().saturating_add(ttl.as_secs()))
     }
 
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e
