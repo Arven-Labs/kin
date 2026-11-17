@@ -2,7 +2,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kin_identity::{DeviceCertificate, DeviceKey, IdentityId};
+use kin_identity::{DeviceCertificate, IdentityId, InviteSigner};
 use kin_transport::{Multiaddr, PeerId};
 
 use crate::Error;
@@ -22,7 +22,6 @@ fn now_secs() -> u64 {
 const VERSION: u8 = 1;
 /// Versão do link, com validade e assinatura (P18).
 const LINK_VERSION: u8 = 2;
-const SIGN_DOMAIN: &[u8] = b"kin/invite/v2";
 const PREFIX: &str = "kin://invite/";
 const MAX_ADDRS: usize = 32;
 
@@ -67,17 +66,15 @@ impl Invite {
     }
 
     /// O convite como link (`kin://invite/...`), próprio para texto ou QR, válido até `expires_at`
-    /// (segundos Unix) e assinado por `key`, a chave de rede do device do convite (P18).
+    /// (segundos Unix) e assinado por `signer`, o da chave de rede do device do convite (P18).
     ///
     /// Formato v2: `versão 2 | len16 certificado | n u8 | n × (len16 endereço) | expires_at u64 (BE) |
-    /// len16 assinatura`. A assinatura (Ed25519, chave de rede) cobre `DOMAIN | tudo antes dela`.
-    pub fn to_link(&self, key: &DeviceKey, expires_at: u64) -> String {
+    /// len16 assinatura`. A assinatura (Ed25519, chave de rede, domínio `kin/invite/v2` imposto pelo
+    /// `InviteSigner`) cobre tudo antes dela.
+    pub fn to_link(&self, signer: &InviteSigner, expires_at: u64) -> String {
         let mut out = self.encode_as(LINK_VERSION);
         out.extend_from_slice(&expires_at.to_be_bytes());
-        let signature = key
-            .keypair()
-            .sign(&signed_message(&out))
-            .expect("assinar com Ed25519 não falha");
+        let signature = signer.sign(&out);
         put(&mut out, &signature);
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(out))
     }
@@ -113,8 +110,10 @@ impl Invite {
             return Err(Error::InvalidInvite);
         }
         // Só quem tem a chave de rede do certificado escolhe a validade (e os endereços).
-        let network_key = &invite.certificate.network_key;
-        if !network_key.verify(&signed_message(&bytes[..signed_len]), signature) {
+        if !invite
+            .certificate
+            .verify_invite(&bytes[..signed_len], signature)
+        {
             return Err(Error::InvalidInvite);
         }
         if expires_at > now.saturating_add(MAX_INVITE_TTL.as_secs()) {
@@ -171,11 +170,6 @@ impl Invite {
         }
         Ok((Self { certificate, addrs }, cur))
     }
-}
-
-/// O que a assinatura do link cobre: o domínio e os bytes do link até a validade.
-fn signed_message(body: &[u8]) -> Vec<u8> {
-    [SIGN_DOMAIN, body].concat()
 }
 
 fn put(out: &mut Vec<u8>, field: &[u8]) {

@@ -627,7 +627,8 @@ mod tests {
         let identity = StandaloneIdentity::generate();
         let (invite, device) = invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]);
 
-        let restored = Invite::from_link_at(&invite.to_link(&device, 4600), 1000).unwrap();
+        let restored =
+            Invite::from_link_at(&invite.to_link(&device.invite_signer(), 4600), 1000).unwrap();
 
         assert_eq!(restored, invite);
         assert_eq!(restored.identity(), &identity.id());

@@ -3,7 +3,9 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Expected};
-use kin_identity::{DeviceCertificate, DeviceKey, DeviceRevocation, IdentityId, IdentityProvider};
+use kin_identity::{
+    DeviceCertificate, DeviceKey, DeviceRevocation, IdentityId, IdentityProvider, InviteSigner,
+};
 use kin_transport::{Multiaddr, NatStatus, Node, NodeConfig, NodeEvent, PeerId, SendId};
 
 use futures::StreamExt as _;
@@ -342,8 +344,8 @@ enum Next {
 pub struct Chat {
     node: Node,
     device: CryptoDevice,
-    /// Cópia da chave do device só para assinar links de convite (`invite_link`).
-    signer: DeviceKey,
+    /// Só a chave de rede do device, para assinar links de convite (`invite_link`); sem a chave Nostr.
+    signer: InviteSigner,
     conversations: HashMap<PeerId, Conversation>,
     pending: HashMap<SendId, Option<MessageId>>,
     /// Envios em voo que são handshake (`Hello`, `KeyPackage`, `Welcome`), com o envelope: só estes são
@@ -535,13 +537,10 @@ impl Chat {
         config: NodeConfig,
         outbox: Outbox,
     ) -> Result<Self, Error> {
-        let signer =
-            DeviceKey::from_bytes(&device_key.to_bytes().map_err(kin_crypto::Error::from)?)
-                .map_err(kin_crypto::Error::from)?;
         Ok(Self {
             node: Node::new(device_key.keypair().clone(), config)?,
             device,
-            signer,
+            signer: device_key.invite_signer(),
             conversations: HashMap::new(),
             pending: HashMap::new(),
             handshake: HashMap::new(),
