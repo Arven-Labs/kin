@@ -1873,4 +1873,23 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   `DeviceKey::sign_invite` no `identity`. Verde final: run 44087622135.
 - **Tropeços**: nenhum de processo; o plano previa `accept` conferir a validade e mudei para só `from_link` (avisei na tabela de testes).
 - **Não verificado**: consumidores de `Invite::to_link` fora deste repo (p. ex. `warden/mobile`); tamanho do QR com certificado v4; relógio com falha (`now_secs` = 0); revisão externa.
-- **Próximo passo**: decidir o `signer`; depois fatia 5 (CLI `/devices` e `/revoke`), em plan mode.
+- **Próximo passo**: decidir o `signer`; depois fatia 5 (CLI `/devices` e `/revoke`), em plan mode. *(A fatia 5 foi feita na mesma sessão, abaixo; o `signer` segue aberto.)*
+
+#### `/devices` e `/revoke` no primário (P30, fatia 5, ADR 0034)
+
+- **Achado do levantamento**: o primário não guardava os certificados que emitia (`pair answer` devolvia o link e esquecia), então não havia o que listar nem de onde tirar o
+  `DeviceCertificate` que `revoke_device` exige. **Decisões do dono** (plan mode + pergunta): registro em arquivos `issued/<peer-id>.cert`; depois, "segue as recomendações": prefixo mínimo
+  de 4 caracteres depois do `12D3KooW`, `/devices` com o Peer ID inteiro.
+- **Feito** (`cli`): `devices.rs` (`record`, `list`, `decide_revoke`, `describe`), `pair::answer_and_record` (não entrega o link se o registro falha), comandos `/devices` e `/revoke` no `main.rs`
+  (só no primário; `confirmo` obrigatório; recusa o device do próprio primário). Nenhuma mudança em `identity`, `crypto` ou `chat`.
+- **Prova de que testam algo**: esqueleto, **10 de 13** falharam (run 44093611424). Previ 3 passes por acidente (4, 8, 10): passaram 4, 8 e 14, e o 10 **falhou** (confere a mensagem). Verde: 44094708826.
+- **Mutações** (4 de 4 pegas, branches apagadas): `list` sem conferir a identidade (44095384179, 1 teste); `confirmo` ignorado (44095404650, 1); ambíguo aceito (44095431230, 1); depois da
+  auditoria, `AlreadyExists` aceito sem conferir (D2, 44097329172, 2 testes). **A primeira tentativa da D (44097097945) não valeu**: o clippy barrou o `return` desnecessário (`needless_return`)
+  antes dos testes; refiz sem o `return`.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 1 importante, 5 sugestões. **I1** (`record` aceitava `AlreadyExists` sem conferir o conteúdo: um certificado novo com outra chave MLS
+  ficava fora do alcance do `/revoke`, com falsa confirmação) **corrigido** (fail-closed: confere identidade e as 3 chaves). TOCTOU na leitura, ordem do teste de nome, pasta 0700, mensagens e
+  lacunas de teste corrigidos. S4 e S5 não feitos. Verde final: 44096486103.
+- **Tropeços**: errei 2 previsões da tabela de testes (acima); a mutação D inicial não valeu (acima), e quase a registrei como pega: conferi que o run falhou no clippy e não em teste.
+- **Não verificado**: a fiação `show_devices`/`revoke_device` no `main.rs` (sem teste, o `main.rs` não tem infraestrutura com `Chat`); revogar com tombstone entre dois `Chat` reais a partir da CLI
+  (o `broadcast_revocation` já tem testes no `chat`); devices pareados antes da fatia; revisão externa.
+- **Próximo passo**: decidir o `signer`; fatia 6 (migração das identidades v3 e remoção do `kin://pair/` com a mestra), em plan mode.
