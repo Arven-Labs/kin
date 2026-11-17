@@ -39,6 +39,9 @@ pub enum Error {
     /// convite para si mesmo.
     #[error("convite inválido")]
     InvalidInvite,
+    /// Link de convite íntegro, mas com a validade vencida (P18, ADR 0033).
+    #[error("convite vencido")]
+    ExpiredInvite,
     /// `Chat::untrust` da minha própria identidade: os meus devices são família, não contatos.
     #[error("não dá para desconfiar da própria identidade")]
     OwnIdentity,

@@ -37,7 +37,9 @@ mod keys;
 mod pair;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
-use kin_chat::{Chat, ChatEvent, Error, HistoryEntry, Invite, Message, MessageId};
+use kin_chat::{
+    Chat, ChatEvent, DEFAULT_INVITE_TTL, Error, HistoryEntry, Invite, Message, MessageId,
+};
 use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -446,7 +448,7 @@ fn print_invite(chat: &Chat) {
         );
         return;
     }
-    let link = invite.to_link();
+    let link = chat.invite_link(invite.addrs().to_vec(), DEFAULT_INVITE_TTL);
     match qrcode::QrCode::new(link.as_bytes()) {
         Ok(code) => println!(
             "{}",
@@ -456,7 +458,10 @@ fn print_invite(chat: &Chat) {
         ),
         Err(e) => println!("(não deu para gerar o QR: {e})"),
     }
-    println!("convite: {link}");
+    println!(
+        "convite (válido por {} h): {link}",
+        DEFAULT_INVITE_TTL.as_secs() / 3600
+    );
 }
 
 /// `/pair`: mostra o link de pareamento (a chave mestra!) e o QR, só depois de `/pair confirmo`. O

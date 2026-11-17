@@ -11,6 +11,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::future::{self, Either};
 use futures::pin_mut;
 
+use crate::invite::MAX_INVITE_TTL;
 use crate::nostr::validate_peer_relays;
 use crate::outbox::{EntryKind, Outbox, SeenKind};
 use crate::payload::{HISTORY_CHUNK_BUDGET, HistoryItem, MAX_DECODED_HISTORY, Payload};
@@ -201,6 +202,8 @@ const MAX_HANDSHAKE_RETRIES: u8 = 3;
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
 const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
+/// Folga abaixo do teto de validade ao emitir um link, para o leitor com relógio um pouco atrasado.
+const INVITE_CLOCK_SLACK: Duration = Duration::from_secs(300);
 
 /// Tombstones aceitos por peer em cada janela (P30, 3c; ADR 0024). Conta toda tentativa recebida, não só as
 /// gravadas: conferir a assinatura custa CPU, e repetir um tombstone já gravado também é inundar.
@@ -339,6 +342,8 @@ enum Next {
 pub struct Chat {
     node: Node,
     device: CryptoDevice,
+    /// Cópia da chave do device só para assinar links de convite (`invite_link`).
+    signer: DeviceKey,
     conversations: HashMap<PeerId, Conversation>,
     pending: HashMap<SendId, Option<MessageId>>,
     /// Envios em voo que são handshake (`Hello`, `KeyPackage`, `Welcome`), com o envelope: só estes são
@@ -530,9 +535,13 @@ impl Chat {
         config: NodeConfig,
         outbox: Outbox,
     ) -> Result<Self, Error> {
+        let signer =
+            DeviceKey::from_bytes(&device_key.to_bytes().map_err(kin_crypto::Error::from)?)
+                .map_err(kin_crypto::Error::from)?;
         Ok(Self {
             node: Node::new(device_key.keypair().clone(), config)?,
             device,
+            signer,
             conversations: HashMap::new(),
             pending: HashMap::new(),
             handshake: HashMap::new(),
@@ -608,6 +617,15 @@ impl Chat {
     /// estiver exatamente esta identidade, neste Peer ID.
     pub fn invite(&self, addrs: Vec<Multiaddr>) -> Invite {
         Invite::new(self.device.certificate().clone(), addrs)
+    }
+
+    /// Link de convite deste device com os endereços `addrs`, válido por `ttl` a partir de agora e
+    /// assinado pela chave de rede do device (P18). `ttl` passa de [`MAX_INVITE_TTL`] menos 5 minutos
+    /// vira esse teto (folga para relógios desencontrados): quem lê recusa validade além de 7 dias.
+    pub fn invite_link(&self, addrs: Vec<Multiaddr>, ttl: Duration) -> String {
+        let ttl = ttl.min(MAX_INVITE_TTL - INVITE_CLOCK_SLACK);
+        self.invite(addrs)
+            .to_link(&self.signer, now_secs().saturating_add(ttl.as_secs()))
     }
 
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e
@@ -739,6 +757,9 @@ impl Chat {
 
     /// Aceita um convite: disca o dono dele e, no handshake, **exige** a identidade do convite.
     /// Identidade errada vira `ChatEvent::Dropped` e nunca uma conversa.
+    ///
+    /// **Não confere validade**: ela vive só no link, e quem confere é `Invite::from_link`. Quem
+    /// guardar um `Invite` e chamar `accept` depois aceita um convite que já pode ter vencido (ADR 0033).
     pub fn accept(&mut self, invite: &Invite) -> Result<(), Error> {
         let peer = invite.peer_id();
         if peer == self.peer_id() {

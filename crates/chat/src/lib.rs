@@ -15,6 +15,6 @@ mod wire;
 
 pub use chat::{Chat, ChatEvent};
 pub use error::Error;
-pub use invite::Invite;
+pub use invite::{DEFAULT_INVITE_TTL, Invite, MAX_INVITE_TTL};
 pub use mailbox::{Deposit, DepositId, Mailbox, MailboxEvent, MemoryMailbox, MemoryRelay};
 pub use message::{HistoryEntry, Message, MessageId};
