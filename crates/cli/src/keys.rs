@@ -26,9 +26,19 @@ pub enum LocalIdentity {
 /// Aviso de migração para quem roda no modo `Master` (mestra no próprio device, v3): essa identidade
 /// pode ter sido copiada por `/pair` e não ganha mais devices nem revoga (P30 fatia 6, ADR 0035).
 /// `None` para o primário e para o device pareado.
-pub fn notice_for(_identity: &LocalIdentity) -> Option<&'static str> {
-    None
+pub fn notice_for(identity: &LocalIdentity) -> Option<&'static str> {
+    match identity {
+        LocalIdentity::Master(_) => Some(MASTER_NOTICE),
+        LocalIdentity::Primary(_) | LocalIdentity::Paired(_) => None,
+    }
 }
+
+const MASTER_NOTICE: &str = "aviso: a chave mestra desta identidade (v3) está neste device. Se você já a copiou para outro \
+device com o `/pair` antigo, trate-a como exposta: ela não ganha mais devices e não consegue revogar nenhum. \
+Para migrar: 1) `kin cold init` (mestra fria offline e chave de autoridade do primário); 2) abra o primário e \
+pareie os outros devices com `kin pair request`, `kin pair answer` e `kin pair accept`; 3) troque convites com \
+cada contato e confira o ID da identidade nova fora de banda (`/accept`, depois `/trust`); 4) em cada contato, \
+`/untrust` da identidade antiga. Quem não reconfirmar continua confiando na chave antiga.";
 
 impl LocalIdentity {
     pub fn id(&self) -> IdentityId {
@@ -46,14 +56,6 @@ impl LocalIdentity {
             Self::Master(master) => Some(master.as_ref()),
             Self::Primary(primary) => Some(primary.as_ref()),
             Self::Paired(_) => None,
-        }
-    }
-
-    /// A mestra, se este diretório a tem (só o modo antigo; o primário nunca).
-    pub fn master(&self) -> Option<&StandaloneIdentity> {
-        match self {
-            Self::Master(master) => Some(master.as_ref()),
-            Self::Primary(_) | Self::Paired(_) => None,
         }
     }
 }
@@ -266,13 +268,10 @@ pub fn read_passphrase_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
 
 /// Carrega (ou cria) `identity.key` e `device.key` em `dir`.
 ///
-/// - `pair_text`: link `kin://pair/...` já lido (ADR 0006); só vale com `identity.key` e `mls.sqlite`
-///   ausentes.
 /// - `passphrase`: `Some` cifra e abre com senha; `None` trabalha em claro (legado ou `--no-passphrase`).
 /// - `protect`: antes de abrir, cifra no lugar os arquivos que ainda estão em claro.
 pub fn load(
     dir: &Path,
-    pair_text: Option<&str>,
     passphrase: Option<&[u8]>,
     protect: bool,
     params: KdfParams,
@@ -280,10 +279,10 @@ pub fn load(
     std::fs::create_dir_all(dir)?;
     // `primary.id` só existe num device pareado (`kin pair request`): decide o modo antes de qualquer outra coisa.
     if present(&dir.join(crate::pair::PRIMARY_ID_FILE))? {
-        return load_paired(dir, pair_text.is_some(), passphrase, protect, params);
+        return load_paired(dir, passphrase, protect, params);
     }
     if present(&dir.join(AUTHORITY_KEY_FILE))? || present(&dir.join(AUTHORITY_CERT_FILE))? {
-        return load_primary(dir, pair_text.is_some(), passphrase, protect, params);
+        return load_primary(dir, passphrase, protect, params);
     }
     let identity_path = dir.join("identity.key");
     let device_path = dir.join("device.key");
@@ -295,27 +294,6 @@ pub fn load(
             "este --data-dir tem estado (mls.sqlite) mas nenhuma identidade: restaure identity.key ou primary.id (device pareado), ou use um diretório novo"
                 .into(),
         );
-    }
-    if let Some(text) = pair_text {
-        if identity_path.exists() {
-            return Err(
-                "já existe identity.key neste --data-dir: --pair não sobrescreve uma identidade"
-                    .into(),
-            );
-        }
-        // Estado MLS e outbox pertencem à identidade que os criou; com outra identidade, o `Chat`
-        // abriria conversas que não são dela.
-        if dir.join("mls.sqlite").exists() {
-            return Err(
-                "este --data-dir já tem estado (mls.sqlite) de outra identidade: use um diretório novo"
-                    .into(),
-            );
-        }
-        let imported = StandaloneIdentity::from_pair_link(text)?;
-        match passphrase {
-            Some(pass) => imported.save_sealed(&identity_path, pass, params)?,
-            None => imported.save(&identity_path)?,
-        }
     }
     if protect {
         let pass = passphrase.ok_or("--protect exige uma senha")?;
@@ -367,7 +345,6 @@ fn read_authority_cert(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error
 /// já criado, como no modo mestra.
 fn load_primary(
     dir: &Path,
-    pairing: bool,
     passphrase: Option<&[u8]>,
     protect: bool,
     params: KdfParams,
@@ -375,12 +352,6 @@ fn load_primary(
     let key_path = dir.join(AUTHORITY_KEY_FILE);
     let cert_path = dir.join(AUTHORITY_CERT_FILE);
     let device_path = dir.join("device.key");
-    if pairing {
-        return Err(
-            "este --data-dir é de um primário (authority.key): --pair não importa a mestra aqui"
-                .into(),
-        );
-    }
     if present(&dir.join("identity.key"))? {
         return Err(
             "este --data-dir tem a mestra (identity.key) e a autoridade (authority.key): a mestra não pode ficar no primário; leve o identity.key para fora (mídia offline)"
@@ -414,17 +385,10 @@ fn load_primary(
 /// sem mestra nem autoridade. Nunca cria chave.
 fn load_paired(
     dir: &Path,
-    pairing: bool,
     passphrase: Option<&[u8]>,
     protect: bool,
     params: KdfParams,
 ) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
-    if pairing {
-        return Err(
-            "este --data-dir é de um device pareado (primary.id): --pair não importa a mestra aqui"
-                .into(),
-        );
-    }
     for name in ["identity.key", AUTHORITY_KEY_FILE, AUTHORITY_CERT_FILE] {
         if present(&dir.join(name))? {
             return Err(format!(
@@ -780,10 +744,10 @@ mod tests {
     #[test]
     fn load_creates_sealed_keys_that_reopen_with_the_same_passphrase() {
         let dir = tempfile::tempdir().unwrap();
-        let (id, dev) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+        let (id, dev) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
         assert!(is_sealed(&std::fs::read(id_path(dir.path())).unwrap()));
         assert!(is_sealed(&std::fs::read(dev_path(dir.path())).unwrap()));
-        let (id2, dev2) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+        let (id2, dev2) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
         assert_eq!(id.id(), id2.id());
         assert_eq!(dev.peer_id(), dev2.peer_id());
     }
@@ -791,13 +755,13 @@ mod tests {
     #[test]
     fn load_with_the_wrong_or_no_passphrase_fails_and_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+        load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
         let before = (
             std::fs::read(id_path(dir.path())).unwrap(),
             std::fs::read(dev_path(dir.path())).unwrap(),
         );
-        assert!(load(dir.path(), None, Some(b"errada"), false, KdfParams::MIN).is_err());
-        assert!(load(dir.path(), None, None, false, KdfParams::MIN).is_err());
+        assert!(load(dir.path(), Some(b"errada"), false, KdfParams::MIN).is_err());
+        assert!(load(dir.path(), None, false, KdfParams::MIN).is_err());
         let after = (
             std::fs::read(id_path(dir.path())).unwrap(),
             std::fs::read(dev_path(dir.path())).unwrap(),
@@ -808,10 +772,10 @@ mod tests {
     #[test]
     fn load_without_a_passphrase_keeps_the_plain_format() {
         let dir = tempfile::tempdir().unwrap();
-        let (id, _) = load(dir.path(), None, None, false, KdfParams::MIN).unwrap();
+        let (id, _) = load(dir.path(), None, false, KdfParams::MIN).unwrap();
         assert!(!is_sealed(&std::fs::read(id_path(dir.path())).unwrap()));
         assert!(!is_sealed(&std::fs::read(dev_path(dir.path())).unwrap()));
-        let (id2, _) = load(dir.path(), None, None, false, KdfParams::MIN).unwrap();
+        let (id2, _) = load(dir.path(), None, false, KdfParams::MIN).unwrap();
         assert_eq!(id.id(), id2.id());
     }
 
@@ -820,7 +784,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         make_plain(dir.path());
         let before = std::fs::read(id_path(dir.path())).unwrap();
-        let err = load(dir.path(), None, Some(PASS), false, KdfParams::MIN)
+        let err = load(dir.path(), Some(PASS), false, KdfParams::MIN)
             .err()
             .unwrap();
         assert!(matches!(
@@ -834,7 +798,7 @@ mod tests {
     fn protect_seals_both_files_and_keeps_the_identity_and_device() {
         let dir = tempfile::tempdir().unwrap();
         let (id, peer) = make_plain(dir.path());
-        let (loaded, device) = load(dir.path(), None, Some(PASS), true, KdfParams::MIN).unwrap();
+        let (loaded, device) = load(dir.path(), Some(PASS), true, KdfParams::MIN).unwrap();
         assert_eq!(loaded.id(), id);
         assert_eq!(device.peer_id(), peer);
         assert!(is_sealed(&std::fs::read(id_path(dir.path())).unwrap()));
@@ -853,56 +817,9 @@ mod tests {
         )
         .unwrap();
         let identity_before = std::fs::read(id_path(dir.path())).unwrap();
-        load(dir.path(), None, Some(PASS), true, KdfParams::MIN).unwrap();
+        load(dir.path(), Some(PASS), true, KdfParams::MIN).unwrap();
         assert_eq!(std::fs::read(id_path(dir.path())).unwrap(), identity_before);
         assert!(is_sealed(&std::fs::read(dev_path(dir.path())).unwrap()));
-    }
-
-    #[test]
-    fn pair_import_with_a_passphrase_writes_a_sealed_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let origin = StandaloneIdentity::generate();
-        let link = origin.to_pair_link().unwrap();
-        let (loaded, _) = load(dir.path(), Some(&link), Some(PASS), false, KdfParams::MIN).unwrap();
-        assert_eq!(loaded.id(), origin.id());
-        assert!(is_sealed(&std::fs::read(id_path(dir.path())).unwrap()));
-    }
-
-    #[test]
-    fn pair_import_refuses_an_existing_identity_or_mls_state() {
-        let link = StandaloneIdentity::generate().to_pair_link().unwrap();
-        let with_identity = tempfile::tempdir().unwrap();
-        make_plain(with_identity.path());
-        assert!(
-            load(
-                with_identity.path(),
-                Some(&link),
-                None,
-                false,
-                KdfParams::MIN
-            )
-            .is_err()
-        );
-        let with_mls = tempfile::tempdir().unwrap();
-        std::fs::write(with_mls.path().join("mls.sqlite"), b"x").unwrap();
-        assert!(load(with_mls.path(), Some(&link), None, false, KdfParams::MIN).is_err());
-        assert!(!id_path(with_mls.path()).exists());
-    }
-
-    #[test]
-    fn pair_import_with_a_bad_link_creates_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            load(
-                dir.path(),
-                Some("kin://pair/lixo"),
-                None,
-                false,
-                KdfParams::MIN
-            )
-            .is_err()
-        );
-        assert!(!id_path(dir.path()).exists());
     }
 
     // ---- primário (P30 2b, ADR 0015): authority.key + authority.cert, sem a mestra ----
@@ -926,7 +843,7 @@ mod tests {
     }
 
     fn primary_load(dir: &Path) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
-        load(dir, None, Some(PASS), false, KdfParams::MIN)
+        load(dir, Some(PASS), false, KdfParams::MIN)
     }
 
     #[test]
@@ -938,7 +855,10 @@ mod tests {
 
         assert!(matches!(loaded, LocalIdentity::Primary(_)));
         assert_eq!(loaded.id(), identity);
-        assert!(loaded.master().is_none(), "primário com a mestra");
+        assert!(
+            !matches!(loaded, LocalIdentity::Master(_)),
+            "primário com a mestra"
+        );
         assert!(!id_path(&primary).exists(), "não pode criar identity.key");
         assert!(is_sealed(&std::fs::read(dev_path(&primary)).unwrap()));
         // Reabrir dá o mesmo device e a mesma identidade.
@@ -1005,16 +925,6 @@ mod tests {
     }
 
     #[test]
-    fn pairing_into_a_primary_directory_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let (primary, _) = cold_init(root.path());
-        let link = StandaloneIdentity::generate().to_pair_link().unwrap();
-
-        assert!(load(&primary, Some(&link), Some(PASS), false, KdfParams::MIN).is_err());
-        assert!(!id_path(&primary).exists(), "--pair gravou a mestra");
-    }
-
-    #[test]
     fn an_authority_certificate_for_another_key_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let (primary, _) = cold_init(root.path());
@@ -1041,8 +951,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (primary, _) = cold_init(root.path());
 
-        assert!(load(&primary, None, Some(b"errada"), false, KdfParams::MIN).is_err());
-        assert!(load(&primary, None, None, false, KdfParams::MIN).is_err());
+        assert!(load(&primary, Some(b"errada"), false, KdfParams::MIN).is_err());
+        assert!(load(&primary, None, false, KdfParams::MIN).is_err());
         assert!(!dev_path(&primary).exists());
         assert!(!id_path(&primary).exists());
     }
@@ -1050,10 +960,10 @@ mod tests {
     #[test]
     fn a_directory_without_authority_files_still_opens_with_the_master() {
         let dir = tempfile::tempdir().unwrap();
-        let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+        let (loaded, _) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
 
         assert!(matches!(loaded, LocalIdentity::Master(_)));
-        assert!(loaded.master().is_some());
+        assert!(matches!(loaded, LocalIdentity::Master(_)));
     }
 
     // ---- auditoria da 2b ----
@@ -1119,7 +1029,7 @@ mod tests {
     #[test]
     fn the_master_mode_does_not_check_the_issuer() {
         let dir = tempfile::tempdir().unwrap();
-        let (loaded, _) = load(dir.path(), None, Some(PASS), false, KdfParams::MIN).unwrap();
+        let (loaded, _) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
 
         let own = device_cert(loaded.provider().unwrap());
 
@@ -1203,7 +1113,7 @@ mod tests {
     }
 
     fn paired_load(dir: &Path) -> Result<(LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
-        load(dir, None, Some(PASS), false, KdfParams::MIN)
+        load(dir, Some(PASS), false, KdfParams::MIN)
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -1227,7 +1137,10 @@ mod tests {
 
         assert!(matches!(loaded, LocalIdentity::Paired(_)));
         assert_eq!(loaded.id(), identity);
-        assert!(loaded.master().is_none(), "pareado com a mestra");
+        assert!(
+            !matches!(loaded, LocalIdentity::Master(_)),
+            "pareado com a mestra"
+        );
         assert_eq!(names(&dir), files_before, "criou ou apagou arquivo");
         assert!(!id_path(&dir).exists() && !dir.join(AUTHORITY_KEY_FILE).exists());
         assert_eq!(std::fs::read(dev_path(&dir)).unwrap(), device_bytes);
@@ -1279,12 +1192,8 @@ mod tests {
             assert!(paired_load(&dir).is_err(), "aceitou com {name}");
             std::fs::remove_file(dir.join(name)).unwrap();
         }
-        // `--pair` não importa a mestra num pareado
-        let link = StandaloneIdentity::generate().to_pair_link().unwrap();
-        assert!(load(&dir, Some(&link), Some(PASS), false, KdfParams::MIN).is_err());
-        assert!(!id_path(&dir).exists(), "--pair gravou a mestra");
         // senha errada
-        assert!(load(&dir, None, Some(b"senha errada"), false, KdfParams::MIN).is_err());
+        assert!(load(&dir, Some(b"senha errada"), false, KdfParams::MIN).is_err());
         // ainda abre depois de tudo isso
         assert!(paired_load(&dir).is_ok());
     }
