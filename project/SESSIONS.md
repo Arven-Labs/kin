@@ -1919,4 +1919,16 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   mais do que entregava), S2 (comentários do lab), S3. **Não feitos**: I3 (o fio da trava e do aviso no laço da CLI não tem teste) e I4 (a trava não pega o corpo base64 sem prefixo nem em pedaços), documentados no ADR.
 - **Tropeços**: o auditor, que devia ser só leitura, fez `git checkout` e deixou o repositório em `main` (voltei ao branch e nada se perdeu); editei `Cargo.lock` à mão (conferido pelo auditor com `cargo metadata --locked`).
 - **Não verificado**: o lab `multi-device` e `history-sync` (rodam fora do CI) depois da mudança, embora só copiem `identity.key`; consumidores de `kin-identity` fora do repo; revisão externa.
-- **Próximo passo**: fatia 7 (cenário de lab: revogar um irmão atrás de NAT; contato offline, contato só conectado ao device roubado, rollback, backup), em plan mode. **Depois dela o P30 fecha.**
+- **Próximo passo**: fatia 7 (cenário de lab: revogar um irmão atrás de NAT; contato offline, contato só conectado ao device roubado, rollback, backup), em plan mode. **Depois dela o P30 fecha.** *(Feita abaixo.)*
+
+#### Cenário de lab `revoke-device` (P30, fatia 7; fecha o P30)
+
+- **Decisões do dono** (plan mode + perguntas): um cenário com várias fases (não um por situação); backup observado no lab, rollback só nos testes de unidade; "vamos de a" = a fase do backup só observa e não reprova.
+  Assumi (sem resposta explícita) e avisei: o serviço `a3` entra no `docker-compose.yml`. O build local do `kin-cli` foi rodado pelo dono (`!`), porque o `guard-heavy` barrou o meu.
+- **Feito** (só `lab/`, nenhuma mudança em `crates/`): `scenario_revoke_device` (a primário, a2 e a3 pareados no host, c contato), `pair_on_host`, `wait_log_after` (só linhas novas depois de um `stop`/`start`), serviço `a3`, README.
+- **Achados**: (1) o texto do convite mudou na fatia 4 (`convite (válido por 24 h): ...`) e **quebrava `invite`, `multi-device`, `paired-device` e `history-sync` no lab**, sem ninguém ver porque o lab não roda no CI; padrão corrigido nas 4 linhas;
+  (2) o backup restaurado em `/tmp` deixava o SQLite readonly (`fs.protected_regular`, o mesmo do `a2`); o `a` deste cenário usa `/root`; (3) S4 do ADR 0023 confirmado na prática; (4) o log do container persiste entre `stop` e `start`: a primeira versão deu um falso positivo (casava linhas antigas), por isso `wait_log_after`.
+- **Prova de que testam algo**: com `SKEL=1` (sem os `/revoke`), 7 checks de revogação falharam e os controles passaram; um check passou por acidente (`a3 recebe a revogação`, padrão frouxo) e foi apertado. Completo: 1 rodada verde e `REPEAT=5` **5/5**. Vizinhos com o binário atual: `invite`, `multi-device`, `paired-device`, `history-sync` e `multi-device-plain` verdes.
+- **Tropeços**: afirmei que a branch tinha sido criada, mas o hook barrou o comando inteiro (o trabalho ficou na `main` até eu perceber); tentei `sed -i` (barrado pelo auto mode, refeito com `Edit`); um heredoc vazio contra o `CLAUDE.md` (sem efeito).
+- **Não coberto no lab**: contato só conectado ao device revogado (nenhum nó religa sozinho, P19/P21; a CLI não tem comando de discar); rollback de declaração. **Não verificado**: relay real, 3+ contatos, revisão externa, auditoria (só tocou script de lab).
+- **Próximo passo**: P30 fechado. Candidatos: P19 (reenvio periódico da outbox, que também destravaria cobrir a fase 3 do lab), P26/P27, teste em redes reais.

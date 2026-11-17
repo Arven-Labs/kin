@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -122,7 +122,7 @@ scenario_invite() {
   compose up -d a >/dev/null
   wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; return; }
   say a "/invite"
-  wait_log a "convite: kin://invite/" 15 || { fail "a não gerou o convite"; logs a; return; }
+  wait_log a "convite[^:]*: kin://invite/" 15 || { fail "a não gerou o convite"; logs a; return; }
   LINK=$(logs a | grep -oE 'kin://invite/[A-Za-z0-9_-]+' | tail -1)
 
   # Um caractere trocado no meio do certificado: a assinatura não confere.
@@ -162,7 +162,7 @@ scenario_relay_failover() {
   check "a reserva no relay 2" wait_log a "reserva aceita no relay $r2" 30 || { logs a | tail -20; return; }
 
   say a "/invite"
-  wait_log a "convite: kin://invite/" 15 || { fail "a não gerou o convite"; return; }
+  wait_log a "convite[^:]*: kin://invite/" 15 || { fail "a não gerou o convite"; return; }
   LINK=$(logs a | grep -oE 'kin://invite/[A-Za-z0-9_-]+' | tail -1)
   export B_ARGS="--data-dir /data --no-mdns --relay $RELAY2_ADDR --accept $LINK"
   compose up -d b >/dev/null
@@ -227,7 +227,7 @@ contact_and_fanout() {
   wait_log b "reserva aceita no relay" 30 || { fail "c sem reserva no relay"; logs b; return; }
   C_ID=$(peer_id b)
   say b "/invite"
-  wait_log b "convite: kin://invite/" 15 || { fail "c não gerou o convite"; logs b; return; }
+  wait_log b "convite[^:]*: kin://invite/" 15 || { fail "c não gerou o convite"; logs b; return; }
   LINK=$(logs b | grep -oE 'kin://invite/[A-Za-z0-9_-]+' | tail -1)
   say a "/accept $LINK"
   if wait_log a "conversa cifrada pronta com $C_ID" 45 && wait_log b "conversa cifrada pronta com $A1_ID" 45; then
@@ -373,6 +373,157 @@ scenario_paired_device() {
   contact_and_fanout
 }
 
+# Pareia um device novo no host (como o `paired-device`): `pair request` em $2, `answer` no primário $1 com o
+# código digitado por pipe, `accept` em $2. Uso: pair_on_host PRIMARIO PAREADO IDENTIDADE SENHA.
+pair_on_host() {
+  local out link sas cert
+  out=$("$BIN" pair request --data-dir "$2" --identity "$3" --passphrase-file "$4" 2>&1) || { echo "$out"; return 1; }
+  link=$(echo "$out" | grep -oE 'kin://pair-request/[A-Za-z0-9_-]+' | head -1)
+  sas=$(echo "$out" | grep -oE '[0-9]{6}-[0-9]{6}-[0-9]{6}-[0-9]{6}' | head -1)
+  [ -n "$link" ] && [ -n "$sas" ] || { echo "$out"; return 1; }
+  echo "$link" > "$2.req"
+  out=$(printf '%s\n' "$sas" | "$BIN" pair answer --data-dir "$1" --request "$2.req" --passphrase-file "$4" 2>&1) \
+    || { echo "$out"; return 1; }
+  cert=$(echo "$out" | grep -oE 'kin://pair-cert/[A-Za-z0-9_-]+' | head -1)
+  [ -n "$cert" ] || { echo "$out"; return 1; }
+  echo "$cert" > "$2.cert"
+  "$BIN" pair accept --data-dir "$2" --certificate "$2.cert" --passphrase-file "$4" 2>&1
+}
+
+# Última linha de `/devices` do primário `a` sobre o device $1 ("<peer>  emitido em ...  ativo|revogado[, conectado]").
+device_line() { logs a | grep -E "^$1  emitido em" | tail -1; }
+# Como `wait_log`, mas só nas linhas depois da `desde`-ésima (o log do container persiste entre stop e start).
+wait_log_after() { # container, desde, padrão, segundos
+  local c=$1 from=$2 pat=$3 t=${4:-30}
+  for _ in $(seq $((t * 2))); do
+    logs "$c" | tail -n +$((from + 1)) | grep -qE "$pat" && return 0
+    sleep 0.5
+  done
+  return 1
+}
+note() { echo "  NOTE  $1"; }   # observação que não reprova o cenário (decisão do dono: a fase 4 só observa)
+
+# P30 fatia 7 (ADR 0011, decisão 6.7): revogação de irmãos pareados atrás de NAT. a = primário, a2 e a3 =
+# irmãos pareados, c (`b`) = contato atrás de outro NAT. SKEL=1 pula os `/revoke` (prova do esqueleto: os
+# checks que dependem da revogação têm de falhar).
+scenario_revoke_device() {
+  echo "== Revogar irmãos pareados (a = primário, a2 e a3 = irmãos, c = contato)"
+  local t out ID_X f pfx
+  t=$(mktemp -d)
+  install -m 600 passphrase "$t/lab.pass"
+  (umask 077; echo "senha da mestra fria do lab" > "$t/master.pass")
+
+  out=$("$BIN" cold init --master-out "$t/cold/master.key" --authority-dir "$t/primary" \
+    --master-passphrase-file "$t/master.pass" --passphrase-file "$t/lab.pass" 2>&1) \
+    || { fail "kin cold init"; echo "$out"; rm -rf "$t"; return; }
+  ID_X=$(echo "$out" | sed -n 's/^identidade: //p')
+  [ -n "$ID_X" ] || { fail "cold init sem identidade"; rm -rf "$t"; return; }
+  pair_on_host "$t/primary" "$t/p2" "$ID_X" "$t/lab.pass" >/dev/null \
+    && pair_on_host "$t/primary" "$t/p3" "$ID_X" "$t/lab.pass" >/dev/null \
+    || { fail "parear a2 e a3 no host"; rm -rf "$t"; return; }
+
+  infra cone || { fail "montar o laboratório"; rm -rf "$t"; return; }
+  # `/root` e não `/tmp`: o backup restaurado por `compose cp` fica com o uid do host e o sticky bit de `/tmp`
+  # (fs.protected_regular) deixa o SQLite readonly (mesmo motivo do `a2` no `paired-device`).
+  export A_ARGS="--data-dir /root --no-mdns --relay $RELAY_ADDR --listen /ip4/0.0.0.0/tcp/4002"
+  compose create a >/dev/null 2>&1
+  for f in authority.key authority.cert issued; do   # `issued/` tem os certificados emitidos (o /revoke precisa deles)
+    compose cp "$t/primary/$f" "a:/root/$f" >/dev/null 2>&1 || { fail "copiar $f para a"; rm -rf "$t"; return; }
+  done
+  compose start a >/dev/null
+  wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; rm -rf "$t"; return; }
+  A1_ID=$(peer_id a)
+
+  local n d
+  for n in 2 3; do
+    export "A${n}_ARGS=--data-dir /root --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
+    compose create "a$n" >/dev/null 2>&1
+    d="$t/p$n"
+    for f in primary.id device.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
+      [ -e "$d/$f" ] || continue
+      compose cp "$d/$f" "a$n:/root/$f" >/dev/null 2>&1 || { fail "copiar $f para a$n"; rm -rf "$t"; return; }
+    done
+  done
+  compose start a2 >/dev/null
+  wait_log a2 "peer id: [A-Za-z0-9]+" 15 || { fail "a2 não subiu"; logs a2; rm -rf "$t"; return; }
+  A2_ID=$(peer_id a2)
+  compose start a3 >/dev/null
+  wait_log a3 "peer id: [A-Za-z0-9]+" 15 || { fail "a3 não subiu"; logs a3; rm -rf "$t"; return; }
+  A3_ID=$(peer_id a3)
+  wait_log a "conversa cifrada pronta com $A2_ID" 40 && wait_log a "conversa cifrada pronta com $A3_ID" 40 \
+    || { fail "a não ficou com conversa pronta com a2 e a3"; logs a | tail -15; rm -rf "$t"; return; }
+  pass "a2 e a3 pareados ao primário a (conversa pronta)"
+  BACKUP="$t/backup"; mkdir -p "$BACKUP"
+
+  # Fase 0: c entra, confia em X, e fala com os irmãos (controle: sem isso a revogação não prova nada).
+  # c leva `--dial` do primário (pelo relay) para reconectar quando for reiniciado na fase 2.
+  KEY_ARGS="--dial $RELAY_ADDR/p2p-circuit/p2p/$A1_ID"
+  contact_and_fanout
+  [ $FAILED -eq 0 ] || { echo "(fase 0 falhou: o resto não vale)"; rm -rf "$t"; return; }
+  wait_log a3 "conversa cifrada pronta com $C_ID" 60 && pass "a3 também acha c" || fail "a3 não achou c"
+
+  # Fase 1: revogar o a2 com c online.
+  say a "/devices"; sleep 2
+  check "/devices: a2 ativo e conectado" bash -c 'grep -qE "ativo, conectado" <<<"$1"' _ "$(device_line "$A2_ID")"
+  pfx=${A2_ID:8:8}
+  if [ -z "${SKEL:-}" ]; then
+    say a "/revoke $pfx"
+    check "/revoke sem confirmo só pergunta (c e a2 seguem normais)" wait_log a "Para confirmar: /revoke $A2_ID confirmo" 10
+    say a "/revoke $A2_ID confirmo"
+  fi
+  check "c é avisado: device a2 revogado" wait_log b "device $A2_ID da identidade $ID_X foi revogado" 30
+  say a2 "msg do a2 revogado"
+  sleep 8
+  check "a2 -> c depois da revogação: não chega" bash -c '! grep -q "peer: msg do a2 revogado" <<<"$1"' _ "$(logs b)"
+  say b "c depois da revogação do a2"
+  check "c -> X: chega em a" wait_log a "peer: c depois da revogação do a2" 20
+  sleep 5
+  check "c -> X: não chega no a2" bash -c '! grep -q "peer: c depois da revogação do a2" <<<"$1"' _ "$(logs a2)"
+  say a "/devices"; sleep 2
+  check "/devices: a2 revogado" bash -c 'grep -q "revogado" <<<"$1"' _ "$(device_line "$A2_ID")"
+
+  # Fase 2: com c parado, revogar o a3 (e guardar o banco do primário antes, para a fase 4).
+  compose stop b >/dev/null 2>&1
+  compose stop a >/dev/null 2>&1                       # backup do primário ANTES da revogação do a3 (fase 4)
+  for f in mls.sqlite mls.sqlite-wal mls.sqlite-shm; do compose cp "a:/root/$f" "$BACKUP/$f" >/dev/null 2>&1 || true; done
+  compose start a >/dev/null
+  wait_log a "primário da identidade $ID_X" 20 || { fail "a não reabriu como primário"; logs a | tail; rm -rf "$t"; return; }
+  if [ -z "${SKEL:-}" ]; then
+    say a "/revoke $A3_ID confirmo"
+    check "a revogou o a3 (c offline)" wait_log a "device $A3_ID revogado" 15
+  fi
+  check "a3 recebe a revogação (está conectado ao primário)" wait_log a3 "da identidade $ID_X foi revogado" 40
+  # Fase 2: c volta (o `--dial` do primário está nos argumentos dele) e deve aprender a revogação que perdeu.
+  # Não coberto no lab: "contato só conectado ao device revogado" (ADR 0011). Nenhum nó religa sozinho (P19/P21) e
+  # a CLI não tem comando de discar, então não dá para impor "c só alcança o a3" sem código novo.
+  local nb
+  nb=$(logs b | wc -l)
+  compose start b >/dev/null
+  check "c (estava offline) aprende a revogação do a3 ao voltar" \
+    wait_log_after b "$nb" "device $A3_ID da identidade $ID_X foi revogado" 60
+
+  # Fase 4: restaurar o banco do primário anterior à revogação do a3 (ADR 0023, S4: perda de banco "desrevoga").
+  compose stop a >/dev/null 2>&1
+  for f in mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
+    [ -e "$BACKUP/$f" ] && compose cp "$BACKUP/$f" "a:/root/$f" >/dev/null 2>&1
+  done
+  compose start a >/dev/null
+  if wait_log a "primário da identidade $ID_X" 30; then
+    say a "/devices"; sleep 2
+    case "$(device_line "$A3_ID")" in
+      *revogado*) note "fase 4: o banco restaurado AINDA marca o a3 como revogado (S4 do ADR 0023 não se reproduziu)" ;;
+      *ativo*) note "fase 4: o banco restaurado devolveu o a3 a ativo (S4 do ADR 0023 confirmado)" ;;
+      *) note "fase 4: /devices não listou o a3 depois do restauro" ;;
+    esac
+    [ -z "${SKEL:-}" ] && say a "/revoke $A3_ID confirmo" && sleep 3
+    say a "/devices"; sleep 2
+    check "repetir o /revoke deixa o a3 revogado" bash -c 'grep -q "revogado" <<<"$1"' _ "$(device_line "$A3_ID")"
+  else
+    note "fase 4: o primário não subiu com o banco restaurado (P16)"; logs a | tail -5
+  fi
+  rm -rf "$t"
+}
+
 # A1 (`a`) e C (`b`) conversam; SÓ DEPOIS entra A2 (`a2`), irmão de A1 com banco vazio, e deve receber o
 # histórico pelo pull da sincronização (ADR 0009). Confere por MessageId e direção, não só por texto.
 # Como em `multi-device`, A2 recebe o `identity.key` de A1 por `compose cp`. Para o `/history` de A2
@@ -390,7 +541,7 @@ scenario_history_sync() {
   wait_log b "reserva aceita no relay" 30 || { fail "c sem reserva no relay"; logs b; return; }
   C_ID=$(peer_id b)
   say b "/invite"
-  wait_log b "convite: kin://invite/" 15 || { fail "c não gerou o convite"; logs b; return; }
+  wait_log b "convite[^:]*: kin://invite/" 15 || { fail "c não gerou o convite"; logs b; return; }
   LINK=$(logs b | grep -oE 'kin://invite/[A-Za-z0-9_-]+' | tail -1)
   say a "/accept $LINK"
   if wait_log a "conversa cifrada pronta com $C_ID" 45 && wait_log b "conversa cifrada pronta com $A1_ID" 45; then
@@ -455,12 +606,13 @@ run_scenario() {
     multi-device-plain) scenario_multi_device_plain ;;
     history-sync) scenario_history_sync ;;
     paired-device) scenario_paired_device ;;
+    revoke-device) scenario_revoke_device ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}
