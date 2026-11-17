@@ -163,7 +163,7 @@ enum Reason {
 /// O resultado de consultar o store (tombstones e trinco) para cada conversa (`Chat::scan_revoked`).
 struct Scan {
     /// Peers a derrubar (certificado revogado, ou v3 de identidade já em v4), com a identidade e o motivo.
-    drop: Vec<(PeerId, IdentityId, Reason)>,
+    to_drop: Vec<(PeerId, IdentityId, Reason)>,
     /// Peers que não consegui consultar, com o erro.
     failures: Vec<(PeerId, Error)>,
 }
@@ -511,11 +511,14 @@ impl Chat {
         // Um device revogado com o processo fechado (ou cuja derrubada parou no meio) não volta vivo (P30,
         // 3d-ii-c). Antes de qualquer `set_mailbox`: a caixa postal nunca aprende o revogado. Se não consigo
         // consultar o store, não sei quem está revogado: a abertura falha (falha fechada), sem abrir "vivo".
-        let Scan { drop, mut failures } = chat.scan_revoked();
+        let Scan {
+            to_drop,
+            mut failures,
+        } = chat.scan_revoked();
         if !failures.is_empty() {
             return Err(failures.swap_remove(0).1);
         }
-        for (peer, identity, reason) in drop {
+        for (peer, identity, reason) in to_drop {
             chat.drop_peer(peer, identity, reason)?;
         }
         Ok(chat)
@@ -1558,6 +1561,15 @@ impl Chat {
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
+        // Só um par v4 de outra identidade vira o trinco (no `crypto`); varrer todas as conversas a cada par
+        // novo custaria O(N) por conexão de estranho (auditoria I1 da 3e-ii-b). Erro ao ler: varre.
+        let may_turn_latch = match conversation.peer_certificates() {
+            Ok(certificates) => certificates.iter().any(|c| {
+                matches!(c.issuer, kin_identity::Issuer::Authority(_))
+                    && c.identity() != self.device.identity()
+            }),
+            Err(_) => true,
+        };
         self.device
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
@@ -1568,7 +1580,9 @@ impl Chat {
         self.flush(peer);
         // Aceitar um par v4 vira o trinco da identidade dele (no `crypto`); as conversas v3 que já existiam
         // com ela não são revalidadas por nenhum caminho de mensagem (P30 3e-ii-b, ADR 0032).
-        self.drop_revoked_peers();
+        if may_turn_latch {
+            self.drop_revoked_peers();
+        }
         Ok(())
     }
 
@@ -1700,11 +1714,11 @@ impl Chat {
     /// v3 de uma identidade já aceita em v4 (3e-ii-b, ADR 0032). Um erro de leitura **não** derruba (não sei)
     /// e vira `Dropped`; a reabertura (3d-ii-c) reconsulta, e lá o erro de leitura falha a abertura.
     fn drop_revoked_peers(&mut self) {
-        let Scan { drop, failures } = self.scan_revoked();
+        let Scan { to_drop, failures } = self.scan_revoked();
         for (peer, error) in failures {
             self.drop_message(peer, error);
         }
-        for (peer, identity, reason) in drop {
+        for (peer, identity, reason) in to_drop {
             if let Err(e) = self.drop_peer(peer, identity, reason) {
                 self.drop_message(peer, e);
             }
@@ -1714,7 +1728,7 @@ impl Chat {
     /// Consulta o store para cada conversa: os peers com certificado revogado ou v3 de identidade em v4 (com a
     /// identidade e o motivo) e os que não consegui consultar. Revogado vence. Só lê; quem chama decide.
     fn scan_revoked(&self) -> Scan {
-        let mut drop = Vec::new();
+        let mut to_drop = Vec::new();
         let mut failures = Vec::new();
         for (peer, conversation) in &self.conversations {
             let certificates = match conversation.peer_certificates() {
@@ -1743,10 +1757,10 @@ impl Chat {
                 }
             }
             if let Some((identity, reason)) = found {
-                drop.push((*peer, identity, reason));
+                to_drop.push((*peer, identity, reason));
             }
         }
-        Scan { drop, failures }
+        Scan { to_drop, failures }
     }
 
     /// Esquece o device `peer`, nesta ordem (tudo idempotente): a fila (`outbox`), a memória por Peer ID, a
