@@ -207,6 +207,11 @@ const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
 /// Espera antes do primeiro reenvio direto de uma mensagem de chat que falhou com o peer conectado (P19). Cada
 /// falha seguida dobra a espera, até [`RETRY_CAP`]; um ack ou a desconexão zera.
 const RETRY_BASE: Duration = Duration::from_secs(2);
+/// Falhas seguidas de envio direto a um peer depois das quais o timer de reenvio para de armar (P19, auditoria
+/// I1). Cada falha equivale a uma geração de chave MLS gasta, por qualquer gatilho (timer, `send`, ack), e o
+/// receptor tolera um salto de 2000 (`MAX_FORWARD_DISTANCE`): 500 deixa folga para o `Hello` e os anúncios. A
+/// mensagem segue na outbox e sai quando o peer reconectar (que zera a conta) ou com um ack.
+const RETRY_BUDGET: u32 = 500;
 /// Teto da espera entre reenvios diretos (P19). Cada tentativa re-cifra e gasta uma geração de chave MLS (ADR
 /// 0002): a 1 por minuto, o salto máximo que o receptor tolera (`MAX_FORWARD_DISTANCE`, 2000) leva ~33 h de
 /// falha contínua.
@@ -428,6 +433,9 @@ pub struct Chat {
     /// Espera inicial e teto do reenvio (campos, para o teste não esperar 2 s a 60 s).
     retry_base: Duration,
     retry_cap: Duration,
+    /// Falhas seguidas depois das quais o timer para de armar (campo, para o teste não falhar 500 vezes).
+    #[allow(dead_code)] // esqueleto da correção da auditoria I1: sai com a implementação
+    retry_budget: u32,
     /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
     /// alimentar 100 000 linhas).
     history_cap: usize,
@@ -594,6 +602,7 @@ impl Chat {
             retry: HashMap::new(),
             retry_base: RETRY_BASE,
             retry_cap: RETRY_CAP,
+            retry_budget: RETRY_BUDGET,
             history_cap: MAX_SYNC_ENTRIES,
             history_requested: Default::default(),
             history_requests: HashMap::new(),
@@ -2802,6 +2811,99 @@ mod tests {
         make_due(&mut bia, ana_peer);
         bia.flush_due_retries();
         assert_eq!(fail(&mut bia), [], "a segunda falha não avisa de novo");
+    }
+
+    /// P19, auditoria I1: depois de `retry_budget` falhas seguidas o timer para de armar (a conta de gerações
+    /// de chave é finita), a mensagem segue na outbox e o relógio dorme; reconectar zera e volta a enviar.
+    #[tokio::test]
+    async fn retries_stop_after_the_budget_and_resume_on_reconnect() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.retry_budget = 3;
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        for _ in 0..2 {
+            make_due(&mut bia, ana_peer);
+            bia.flush_due_retries();
+            let id = first_in_flight(&bia);
+            bia.handle(NodeEvent::SendFailed {
+                peer: ana_peer,
+                id,
+                reason: "timeout".into(),
+            });
+        }
+
+        assert_eq!(bia.retry[&ana_peer].attempts, 3);
+        assert!(!bia.retry[&ana_peer].armed, "orçamento esgotado: não arma");
+        assert_eq!(bia.wake_in(), None, "o relógio dorme");
+        assert_eq!(bia.queued(&ana_peer), 1, "a mensagem segue na outbox");
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        assert!(bia.retry.is_empty(), "reconectar zera a conta");
+        assert_eq!(in_flight(&bia), 1, "e a fila sai de novo");
+    }
+
+    /// P19, auditoria I2: depois que o reenvio dispara o relógio volta a dormir. Sem isso o prazo vencido
+    /// faria `next_event` girar a 100% de CPU.
+    #[tokio::test]
+    async fn the_clock_sleeps_again_after_the_retry_fires() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        make_due(&mut bia, ana_peer);
+
+        bia.flush_due_retries();
+        assert_eq!(in_flight(&bia), 1, "reenviou");
+        assert_eq!(bia.wake_in(), None);
+    }
+
+    /// P19, auditoria S1: derrubar o peer (revogado) apaga o reenvio dele, como os demais mapas por peer.
+    #[tokio::test]
+    async fn dropping_a_peer_clears_its_retry() {
+        let mut r = revoked_ana();
+        r.bia.retry.insert(
+            r.ana_peer,
+            Retry {
+                attempts: 1,
+                due: Instant::now(),
+                armed: true,
+            },
+        );
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+        assert!(!r.bia.is_ready(&r.ana_peer), "a conversa caiu");
+        assert!(!r.bia.retry.contains_key(&r.ana_peer));
+    }
+
+    /// P19, auditoria S2: se o prazo vence e não há o que enviar (a entrada sumiu da outbox), o registro some;
+    /// senão a próxima mensagem herdaria a contagem velha, esperaria mais e não avisaria com `Queued`.
+    #[tokio::test]
+    async fn a_retry_that_finds_nothing_to_send_is_forgotten() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let first = send_and_fail(&mut bia, ana_peer, "some");
+        bia.outbox.remove(&ana_peer, &first).unwrap();
+        make_due(&mut bia, ana_peer);
+
+        bia.flush_due_retries();
+        assert!(bia.retry.is_empty());
+
+        let next = bia.send(ana_peer, "outra", None).unwrap();
+        events(&mut bia);
+        let id = first_in_flight(&bia);
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id,
+            reason: "timeout".into(),
+        });
+        assert_eq!(bia.retry[&ana_peer].attempts, 1, "recomeça da base");
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::Queued {
+                peer: ana_peer,
+                message: next
+            }]
+        );
     }
 
     /// P19: falha de mensagem de controle (o `Hello`) não agenda reenvio da outbox: ela tem o tratamento
