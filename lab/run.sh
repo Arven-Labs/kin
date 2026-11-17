@@ -177,8 +177,8 @@ scenario_relay_failover() {
 # A1 (`a`) e A2 (`a2`) são devices da mesma identidade X, na mesma LAN atrás do `routera`; C (`b`) é um
 # contato atrás do `routerb`. A ordem importa: a linha digitada na CLI vai à identidade da conversa
 # ATUAL (a última `conversa cifrada pronta`), então A2 é ligado a A1 antes de A1 aceitar C.
-# O `/pair` da CLI recusa saída que não é terminal (o log do Docker é um pipe), então o segundo device
-# recebe o `identity.key` de A1 por `compose cp` (é o que o `--pair` grava).
+# O segundo device recebe o `identity.key` de A1 por `compose cp` (modo `Master`, v3: a mestra mora nos
+# dois devices). O `/pair` e o `--pair` antigos foram removidos (ADR 0035).
 scenario_multi_device() {
   echo "== Multi-device atrás de NAT: descoberta, espelho e fan-out (A1 e A2 irmãos, C contato)"
   infra cone || { fail "montar o laboratório"; return; }

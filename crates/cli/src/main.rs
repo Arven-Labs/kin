@@ -367,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
-                    println!("{PAIR_REMOVED}");
+                    println!("{}", pair_reply(&identity));
                     continue;
                 }
                 if let Some(link) = line.strip_prefix("/accept ") {
@@ -547,9 +547,24 @@ fn untrust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerI
 }
 
 /// Resposta a `/pair` depois que a cópia da mestra foi removida (P30 fatia 6, ADR 0035).
-const PAIR_REMOVED: &str = "(o /pair foi removido: ele copiava a chave mestra para outro device. Para ter outro device, rode \
-`kin cold init` (mestra fria e primário); no device novo, `kin pair request`; no primário, `kin pair answer`; e de volta \
-no device novo, `kin pair accept`. Se você já tinha copiado a mestra, veja o aviso de migração da abertura.)";
+const PAIR_REMOVED_MASTER: &str = "(o /pair foi removido: ele copiava a chave mestra para outro device, e copiar o identity.key à mão é a mesma \
+coisa: essa mestra nunca revoga nada. Para ter vários devices é preciso uma identidade NOVA (outro ID): `kin cold init`, \
+depois `kin pair request`, `kin pair answer` e `kin pair accept`, e reconfirmar com cada contato. Veja o aviso de migração \
+da abertura.)";
+const PAIR_REMOVED_PRIMARY: &str = "(o /pair foi removido. Para adicionar um device a este primário: no device novo, `kin pair request`; \
+aqui, `kin pair answer`; e de volta no device novo, `kin pair accept`. Veja também /devices e /revoke.)";
+const PAIR_REMOVED_PAIRED: &str = "(o /pair foi removido. Este é um device pareado: quem adiciona e revoga devices é o primário, \
+com `kin pair answer`.)";
+
+/// A resposta a `/pair` para o modo em que a CLI está: cada um tem um caminho diferente, e mandar o
+/// primário rodar `kin cold init` criaria uma segunda identidade por engano (auditoria da fatia 6, I1).
+fn pair_reply(identity: &keys::LocalIdentity) -> &'static str {
+    match identity {
+        keys::LocalIdentity::Master(_) => PAIR_REMOVED_MASTER,
+        keys::LocalIdentity::Primary(_) => PAIR_REMOVED_PRIMARY,
+        keys::LocalIdentity::Paired(_) => PAIR_REMOVED_PAIRED,
+    }
+}
 
 /// A linha parece um link de pareamento antigo (`kin://pair/`, que carregava a chave mestra)? A trava de
 /// envio a barra mesmo sem o `/pair`: links velhos ainda podem circular (ADR 0035).
@@ -906,15 +921,37 @@ mod tests {
     }
 
     #[test]
-    fn the_slash_pair_reply_points_to_the_new_flow_and_carries_no_link() {
-        for needle in ["kin cold init", "kin pair request", "kin pair answer"] {
-            assert!(
-                PAIR_REMOVED.contains(needle),
-                "a resposta não cita {needle}"
-            );
+    fn the_slash_pair_reply_depends_on_the_mode_and_carries_no_link() {
+        let master = StandaloneIdentity::generate();
+        let key = kin_identity::AuthorityKey::generate();
+        let chain = master.certify_authority(&key.public_key(), 1).unwrap();
+        let primary = kin_identity::AuthorityIdentity::new(key, chain).unwrap();
+        let paired = keys::LocalIdentity::Paired(master.id());
+        let master = keys::LocalIdentity::Master(Box::new(master));
+        let primary = keys::LocalIdentity::Primary(Box::new(primary));
+
+        // Master: o caminho é uma identidade NOVA, e o texto tem de dizer isso.
+        let text = pair_reply(&master);
+        for needle in [
+            "kin cold init",
+            "kin pair request",
+            "identidade NOVA",
+            "identity.key",
+        ] {
+            assert!(text.contains(needle), "o Master não ouve {needle}: {text}");
         }
-        // a resposta não pode disparar a própria trava nem sugerir o link antigo
-        assert!(!is_pair_link(PAIR_REMOVED));
+        // Primário: só `kin pair answer`; mandá-lo rodar `kin cold init` criaria uma segunda identidade.
+        let text = pair_reply(&primary);
+        assert!(text.contains("kin pair answer"), "{text}");
+        assert!(!text.contains("kin cold init"), "{text}");
+        // Pareado: quem adiciona devices é o primário.
+        let text = pair_reply(&paired);
+        assert!(text.contains("primário"), "{text}");
+        assert!(!text.contains("kin cold init"), "{text}");
+        // Nenhuma resposta pode disparar a própria trava nem sugerir o link antigo.
+        for mode in [&master, &primary, &paired] {
+            assert!(!is_pair_link(pair_reply(mode)));
+        }
     }
 
     #[test]

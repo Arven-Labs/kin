@@ -33,12 +33,14 @@ pub fn notice_for(identity: &LocalIdentity) -> Option<&'static str> {
     }
 }
 
-const MASTER_NOTICE: &str = "aviso: a chave mestra desta identidade (v3) está neste device. Se você já a copiou para outro \
-device com o `/pair` antigo, trate-a como exposta: ela não ganha mais devices e não consegue revogar nenhum. \
-Para migrar: 1) `kin cold init` (mestra fria offline e chave de autoridade do primário); 2) abra o primário e \
-pareie os outros devices com `kin pair request`, `kin pair answer` e `kin pair accept`; 3) troque convites com \
-cada contato e confira o ID da identidade nova fora de banda (`/accept`, depois `/trust`); 4) em cada contato, \
-`/untrust` da identidade antiga. Quem não reconfirmar continua confiando na chave antiga.";
+const MASTER_NOTICE: &str = "aviso: a chave mestra desta identidade (v3) está neste device, e copiá-la para outro device (o `/pair` \
+antigo, ou copiar o identity.key à mão) a expõe do mesmo jeito: essa mestra nunca revoga um device. Se você já copiou, \
+trate-a como exposta. Para ter vários devices com revogação é preciso uma identidade NOVA (outro ID): \
+1) `kin cold init --master-out ARQUIVO --authority-dir DIR` (mestra fria offline e chave de autoridade; o primário usa \
+um --data-dir novo); 2) pareie os outros devices com `kin pair request`, `kin pair answer` e `kin pair accept`; \
+3) troque convites com cada contato e confira o ID novo fora de banda (`/accept`, depois `/trust`); 4) em cada contato, \
+`/untrust` da identidade antiga; 5) apague o identity.key antigo e os backups dele. Quem não reconfirmar continua \
+confiando na chave antiga.";
 
 impl LocalIdentity {
     pub fn id(&self) -> IdentityId {
@@ -480,7 +482,14 @@ mod tests {
         let notice = notice_for(&LocalIdentity::Master(Box::new(master_identity())))
             .expect("o modo Master tem de avisar");
 
-        for needle in ["kin cold init", "kin pair request", "/untrust", "/accept"] {
+        for needle in [
+            "kin cold init",
+            "kin pair request",
+            "/untrust",
+            "/accept",
+            "identidade NOVA",
+            "identity.key",
+        ] {
             assert!(
                 notice.contains(needle),
                 "o aviso não cita {needle}: {notice}"
@@ -962,7 +971,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (loaded, _) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
 
-        assert!(matches!(loaded, LocalIdentity::Master(_)));
         assert!(matches!(loaded, LocalIdentity::Master(_)));
     }
 
