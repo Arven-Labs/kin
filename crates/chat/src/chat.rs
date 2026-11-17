@@ -204,6 +204,29 @@ const MAX_HANDSHAKE_RETRIES: u8 = 3;
 /// Intervalo mínimo entre dois re-anúncios da lista de devices ao mesmo irmão. Um irmão que alterna o
 /// endereço de um Peer ID sem parar não vira uma torrente de mensagens cifradas.
 const SIBLING_ANNOUNCE_MIN: Duration = Duration::from_secs(5);
+/// Espera antes do primeiro reenvio direto de uma mensagem de chat que falhou com o peer conectado (P19). Cada
+/// falha seguida dobra a espera, até [`RETRY_CAP`]; um ack ou a desconexão zera.
+const RETRY_BASE: Duration = Duration::from_secs(2);
+/// Falhas seguidas de envio direto a um peer depois das quais o timer de reenvio para de armar (P19, auditoria
+/// I1). Cada falha equivale a uma geração de chave MLS gasta, por qualquer gatilho (timer, `send`, ack), e o
+/// receptor tolera um salto de 2000 (`MAX_FORWARD_DISTANCE`): 500 deixa folga para o `Hello` e os anúncios. A
+/// mensagem segue na outbox e sai quando o peer reconectar (que zera a conta) ou com um ack.
+const RETRY_BUDGET: u32 = 500;
+/// Teto da espera entre reenvios diretos (P19). Cada tentativa re-cifra e gasta uma geração de chave MLS (ADR
+/// 0002); quem limita o total é [`RETRY_BUDGET`], não este teto (outros gatilhos também reenviam na hora).
+const RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// Reenvio direto agendado para um peer depois de um `SendFailed` de mensagem de chat (P19).
+struct Retry {
+    /// Falhas seguidas sem ack; decide a espera ([`Chat::retry_delay`]).
+    attempts: u32,
+    /// Quando o reenvio pode sair.
+    due: Instant,
+    /// Há um reenvio esperando o prazo. Depois que ele dispara, o registro fica (para contar a próxima
+    /// falha seguida), mas sem acordar o relógio: senão o prazo vencido manteria o laço girando à toa.
+    armed: bool,
+}
+
 /// Folga abaixo do teto de validade ao emitir um link, para o leitor com relógio um pouco atrasado.
 const INVITE_CLOCK_SLACK: Duration = Duration::from_secs(300);
 
@@ -403,6 +426,14 @@ pub struct Chat {
     sibling_pending: std::collections::HashSet<PeerId>,
     /// Intervalo mínimo entre re-anúncios ao mesmo irmão (campo, para o teste não esperar 5 s).
     sibling_announce_gap: Duration,
+    /// Reenvio direto agendado por peer depois de um `SendFailed` de mensagem de chat (P19). Só existe para
+    /// peer conectado; sai no ack, ao desconectar ou quando o reenvio é tentado de novo.
+    retry: HashMap<PeerId, Retry>,
+    /// Espera inicial e teto do reenvio (campos, para o teste não esperar 2 s a 60 s).
+    retry_base: Duration,
+    retry_cap: Duration,
+    /// Falhas seguidas depois das quais o timer para de armar (campo, para o teste não falhar 500 vezes).
+    retry_budget: u32,
     /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
     /// alimentar 100 000 linhas).
     history_cap: usize,
@@ -566,6 +597,10 @@ impl Chat {
             revocations_checked: Default::default(),
             sibling_pending: Default::default(),
             sibling_announce_gap: SIBLING_ANNOUNCE_MIN,
+            retry: HashMap::new(),
+            retry_base: RETRY_BASE,
+            retry_cap: RETRY_CAP,
+            retry_budget: RETRY_BUDGET,
             history_cap: MAX_SYNC_ENTRIES,
             history_requested: Default::default(),
             history_requests: HashMap::new(),
@@ -1102,9 +1137,10 @@ impl Chat {
                 self.handle_mailbox(event);
                 continue;
             }
-            // Com re-anúncio pendente (P24), acorda no prazo mesmo sem tráfego: sem isto a lista ficaria
-            // parada numa rede quieta e os irmãos nunca convergiriam.
-            let wake = self.sibling_wake_in();
+            // Com re-anúncio pendente (P24) ou reenvio agendado (P19), acorda no prazo mesmo sem tráfego:
+            // sem isto a lista ficaria parada numa rede quieta e a mensagem que falhou esperaria a próxima
+            // conexão.
+            let wake = self.wake_in();
             let node = &mut self.node;
             let mailbox_events = self.mailbox_events.as_mut();
             let waiting = async {
@@ -1129,7 +1165,10 @@ impl Chat {
                 None => waiting.await,
             };
             match next {
-                Next::Tick => self.flush_sibling_pending(),
+                Next::Tick => {
+                    self.flush_sibling_pending();
+                    self.flush_due_retries();
+                }
                 Next::Node(event) => self.handle(event),
                 Next::Mailbox(Some(event)) => self.handle_mailbox(event),
                 // O backend largou o canal: sem ele não há mais o que escutar.
@@ -1181,8 +1220,10 @@ impl Chat {
     }
 
     fn handle(&mut self, event: NodeEvent) {
-        // Sem timer: o re-anúncio que caiu no intervalo mínimo sai no primeiro evento depois do prazo.
+        // O que venceu o prazo sai no primeiro evento depois dele (o `next_event` também acorda no prazo, sem
+        // tráfego): o re-anúncio a irmão que caiu no intervalo mínimo e o reenvio da outbox.
         self.flush_sibling_pending();
+        self.flush_due_retries();
         match event {
             NodeEvent::Listening(addr) => self.queue.push_back(ChatEvent::Listening(addr)),
             NodeEvent::PeerConnected(peer) => {
@@ -1198,6 +1239,7 @@ impl Chat {
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.retry.remove(&peer);
                 self.handshake_retries.retain(|(p, _), _| *p != peer);
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
@@ -1229,6 +1271,8 @@ impl Chat {
                         Ok(EntryKind::Mirror(_))
                     );
                     self.leave_flight(peer, &message);
+                    // O ack prova que o caminho voltou: o próximo reenvio recomeça da espera base (P19).
+                    self.retry.remove(&peer);
                     if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
@@ -1248,10 +1292,15 @@ impl Chat {
                     self.history_sessions.remove(&requested);
                 }
                 match self.pending.remove(&id).flatten() {
-                    // Mensagem de chat: continua na outbox e volta a esperar a próxima conexão.
+                    // Mensagem de chat: continua na outbox. Com o peer conectado, o reenvio é agendado com
+                    // espera crescente (P19) e só a primeira falha seguida avisa; sem conexão, sai ao
+                    // reconectar.
                     Some(message) => {
                         self.leave_flight(peer, &message);
-                        self.queue.push_back(ChatEvent::Queued { peer, message });
+                        let first = !self.connected.contains(&peer) || self.schedule_retry(peer);
+                        if first {
+                            self.queue.push_back(ChatEvent::Queued { peer, message });
+                        }
                     }
                     // Handshake ou anúncio (controle): sem outbox, quem decide é a aplicação. Os
                     // anúncios podem ter se perdido, então liberam o próximo gatilho (`on_mls`, algo
@@ -1568,6 +1617,79 @@ impl Chat {
             .min()
     }
 
+    /// Espera antes do reenvio depois de `attempts` falhas seguidas: a base, dobrando a cada falha, até o
+    /// teto. O deslocamento é limitado, então muitas falhas não estouram a conta.
+    fn retry_delay(&self, attempts: u32) -> Duration {
+        let doublings = attempts.saturating_sub(1).min(16);
+        self.retry_base
+            .saturating_mul(1 << doublings)
+            .min(self.retry_cap)
+    }
+
+    /// Registra uma falha de envio direto a `peer` e agenda o reenvio, a não ser que o orçamento de falhas
+    /// tenha acabado (`retry_budget`): aí o registro fica, sem armar o timer, e a mensagem espera a próxima
+    /// conexão ou um ack. Devolve `true` se é a primeira falha seguida (a única que avisa com `Queued`).
+    fn schedule_retry(&mut self, peer: PeerId) -> bool {
+        let attempts = self
+            .retry
+            .get(&peer)
+            .map_or(0, |retry| retry.attempts)
+            .saturating_add(1);
+        let due = Instant::now() + self.retry_delay(attempts);
+        self.retry.insert(
+            peer,
+            Retry {
+                attempts,
+                due,
+                armed: attempts < self.retry_budget,
+            },
+        );
+        attempts == 1
+    }
+
+    /// Reenvia aos peers cujo prazo venceu (P19). Peer que desconectou no meio do caminho perde o
+    /// agendamento: a fila sai sozinha ao reconectar. O registro de quem disparou fica, desarmado.
+    fn flush_due_retries(&mut self) {
+        let now = Instant::now();
+        let due: Vec<PeerId> = self
+            .retry
+            .iter()
+            .filter(|(_, retry)| retry.armed && retry.due <= now)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            if !self.connected.contains(&peer) {
+                self.retry.remove(&peer);
+                continue;
+            }
+            if let Some(retry) = self.retry.get_mut(&peer) {
+                retry.armed = false;
+            }
+            self.send_direct(peer);
+            // Nada saiu (a entrada sumiu da outbox, ou a conversa caiu): o registro velho faria a próxima
+            // mensagem herdar a contagem, esperar mais e não avisar com `Queued`.
+            if self
+                .in_flight
+                .get(&peer)
+                .is_none_or(|flying| flying.is_empty())
+            {
+                self.retry.remove(&peer);
+            }
+        }
+    }
+
+    /// Quanto falta para o próximo prazo que pede o relógio: o do re-anúncio dos irmãos (P24) ou o de um
+    /// reenvio armado (P19). `None` = só a rede acorda o `next_event`.
+    fn wake_in(&self) -> Option<Duration> {
+        let now = Instant::now();
+        let retries = self
+            .retry
+            .values()
+            .filter(|retry| retry.armed)
+            .map(|retry| retry.due.saturating_duration_since(now));
+        self.sibling_wake_in().into_iter().chain(retries).min()
+    }
+
     /// Anuncia aos irmãos pendentes cujo prazo já passou; os que ainda esperam voltam à pendência.
     fn flush_sibling_pending(&mut self) {
         if self.sibling_pending.is_empty() {
@@ -1811,6 +1933,7 @@ impl Chat {
         self.history_sessions.remove(&peer);
         self.history_requests.retain(|_, p| *p != peer);
         self.in_flight.remove(&peer);
+        self.retry.remove(&peer);
         self.depositing.retain(|_, (p, _)| *p != peer);
         self.household.remove(&peer);
         self.contact_devices.remove(&peer);
@@ -2526,6 +2649,319 @@ mod tests {
         );
         assert_eq!(bia.queued(&ana_peer), 1);
         assert_eq!(in_flight(&bia), 0);
+    }
+
+    /// P19: faz o primeiro envio a `peer` falhar com a conexão de pé e devolve o id da mensagem.
+    fn send_and_fail(bia: &mut Chat, peer: PeerId, text: &str) -> MessageId {
+        let message = bia.send(peer, text, None).unwrap();
+        events(bia);
+        let id = first_in_flight(bia);
+        bia.handle(NodeEvent::SendFailed {
+            peer,
+            id,
+            reason: "timeout".into(),
+        });
+        events(bia);
+        message
+    }
+
+    /// P19: vence o prazo do reenvio de `peer` sem esperar.
+    fn make_due(bia: &mut Chat, peer: PeerId) {
+        bia.retry.get_mut(&peer).expect("sem reenvio agendado").due = Instant::now();
+    }
+
+    /// P19: falha de mensagem de chat com o peer conectado agenda o reenvio; antes do prazo nada sai, no
+    /// prazo sai (a mensagem continua na fila até o ack).
+    #[tokio::test]
+    async fn a_failed_chat_send_is_retried_only_after_the_wait() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.retry_base = Duration::from_secs(3600);
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+
+        assert_eq!(bia.retry[&ana_peer].attempts, 1);
+        bia.flush_due_retries();
+        assert_eq!(in_flight(&bia), 0, "o prazo não venceu: nada sai");
+
+        make_due(&mut bia, ana_peer);
+        bia.flush_due_retries();
+        assert_eq!(in_flight(&bia), 1, "venceu: reenvia");
+        assert_eq!(bia.queued(&ana_peer), 1, "segue na fila até o ack");
+    }
+
+    /// P19: falha de novo depois do reenvio dobra a espera (2 falhas seguidas = o dobro da base).
+    #[tokio::test]
+    async fn a_second_failure_doubles_the_wait() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.retry_base = Duration::from_secs(3600);
+        bia.retry_cap = Duration::from_secs(86_400); // acima do dobro da base, senão o teto corta
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        make_due(&mut bia, ana_peer);
+        bia.flush_due_retries();
+
+        let id = first_in_flight(&bia);
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id,
+            reason: "timeout".into(),
+        });
+
+        assert_eq!(bia.retry[&ana_peer].attempts, 2);
+        assert!(
+            bia.retry[&ana_peer].due > Instant::now() + Duration::from_secs(7000),
+            "2 falhas: ~2 x 3600 s"
+        );
+    }
+
+    /// P19: a espera é base, 2x, 4x... e para no teto; muitas falhas não estouram a conta.
+    #[tokio::test]
+    async fn the_wait_doubles_up_to_the_cap() {
+        let (bia, _ana, _peer) = bia_and_raw_ana();
+        let secs = |attempts| bia.retry_delay(attempts).as_secs();
+        let waits: Vec<u64> = (1..=7).map(secs).collect();
+        assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(secs(1000), 60, "sem estouro de aritmética");
+    }
+
+    /// P19: o ack de uma mensagem zera o reenvio: a próxima falha volta à espera da base.
+    #[tokio::test]
+    async fn an_ack_resets_the_backoff() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        make_due(&mut bia, ana_peer);
+        bia.flush_due_retries();
+
+        let id = first_in_flight(&bia);
+        bia.handle(NodeEvent::MessageDelivered { peer: ana_peer, id });
+        assert!(bia.retry.is_empty(), "o ack zera");
+
+        send_and_fail(&mut bia, ana_peer, "de novo");
+        assert_eq!(bia.retry[&ana_peer].attempts, 1, "recomeça da base");
+    }
+
+    /// P19: desconectar apaga o reenvio (ao reconectar, o `PeerConnected` já envia a fila).
+    #[tokio::test]
+    async fn disconnecting_clears_the_retry() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        assert!(bia.retry.contains_key(&ana_peer));
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        assert!(bia.retry.is_empty());
+    }
+
+    /// P19: prazo vencido com o peer já desconectado não envia direto e não deixa o agendamento para trás.
+    #[tokio::test]
+    async fn a_due_retry_does_not_send_to_a_disconnected_peer() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        make_due(&mut bia, ana_peer);
+        bia.connected.remove(&ana_peer);
+
+        bia.flush_due_retries();
+        assert_eq!(in_flight(&bia), 0);
+        assert!(bia.retry.is_empty());
+    }
+
+    /// P19: a falha de um peer agenda só o reenvio dele.
+    #[tokio::test]
+    async fn a_failure_to_one_peer_schedules_only_that_peer() {
+        let Household {
+            mut bia,
+            sibling: (sibling, _),
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        bia.handle(NodeEvent::PeerConnected(sibling));
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        events(&mut bia);
+        bia.send(ana_peer, "para a ana", None).unwrap();
+        let to_sibling = bia.send(sibling, "para o irmão", None).unwrap();
+        let failing = *bia
+            .pending
+            .iter()
+            .find_map(|(id, message)| (*message == Some(to_sibling)).then_some(id))
+            .unwrap();
+        bia.handle(NodeEvent::SendFailed {
+            peer: sibling,
+            id: failing,
+            reason: "timeout".into(),
+        });
+
+        assert_eq!(bia.retry.len(), 1);
+        assert!(bia.retry.contains_key(&sibling));
+    }
+
+    /// P19: o aviso `Queued` sai na primeira falha da mensagem e não se repete a cada reenvio que falha (a CLI
+    /// imprimiria uma linha por minuto).
+    #[tokio::test]
+    async fn queued_is_announced_on_the_first_failure_only() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let message = bia.send(ana_peer, "tentando", None).unwrap();
+        events(&mut bia);
+        let fail = |bia: &mut Chat| {
+            let id = first_in_flight(bia);
+            bia.handle(NodeEvent::SendFailed {
+                peer: ana_peer,
+                id,
+                reason: "timeout".into(),
+            });
+            events(bia)
+        };
+
+        assert_eq!(
+            fail(&mut bia),
+            [ChatEvent::Queued {
+                peer: ana_peer,
+                message
+            }]
+        );
+        make_due(&mut bia, ana_peer);
+        bia.flush_due_retries();
+        assert_eq!(fail(&mut bia), [], "a segunda falha não avisa de novo");
+    }
+
+    /// P19, auditoria I1: depois de `retry_budget` falhas seguidas o timer para de armar (a conta de gerações
+    /// de chave é finita), a mensagem segue na outbox e o relógio dorme; reconectar zera e volta a enviar.
+    #[tokio::test]
+    async fn retries_stop_after_the_budget_and_resume_on_reconnect() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.retry_budget = 3;
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        for _ in 0..2 {
+            make_due(&mut bia, ana_peer);
+            bia.flush_due_retries();
+            let id = first_in_flight(&bia);
+            bia.handle(NodeEvent::SendFailed {
+                peer: ana_peer,
+                id,
+                reason: "timeout".into(),
+            });
+        }
+
+        assert_eq!(bia.retry[&ana_peer].attempts, 3);
+        assert!(!bia.retry[&ana_peer].armed, "orçamento esgotado: não arma");
+        assert_eq!(bia.wake_in(), None, "o relógio dorme");
+        assert_eq!(bia.queued(&ana_peer), 1, "a mensagem segue na outbox");
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        assert!(bia.retry.is_empty(), "reconectar zera a conta");
+        assert_eq!(in_flight(&bia), 1, "e a fila sai de novo");
+    }
+
+    /// P19, auditoria I2: depois que o reenvio dispara o relógio volta a dormir. Sem isso o prazo vencido
+    /// faria `next_event` girar a 100% de CPU.
+    #[tokio::test]
+    async fn the_clock_sleeps_again_after_the_retry_fires() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        make_due(&mut bia, ana_peer);
+
+        bia.flush_due_retries();
+        assert_eq!(in_flight(&bia), 1, "reenviou");
+        assert_eq!(bia.wake_in(), None);
+    }
+
+    /// P19, auditoria S1: derrubar o peer (revogado) apaga o reenvio dele, como os demais mapas por peer.
+    #[tokio::test]
+    async fn dropping_a_peer_clears_its_retry() {
+        let mut r = revoked_ana();
+        r.bia.retry.insert(
+            r.ana_peer,
+            Retry {
+                attempts: 1,
+                due: Instant::now(),
+                armed: true,
+            },
+        );
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+        assert!(!r.bia.is_ready(&r.ana_peer), "a conversa caiu");
+        assert!(!r.bia.retry.contains_key(&r.ana_peer));
+    }
+
+    /// P19, auditoria S2: se o prazo vence e não há o que enviar (a entrada sumiu da outbox), o registro some;
+    /// senão a próxima mensagem herdaria a contagem velha, esperaria mais e não avisaria com `Queued`.
+    #[tokio::test]
+    async fn a_retry_that_finds_nothing_to_send_is_forgotten() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        let first = send_and_fail(&mut bia, ana_peer, "some");
+        bia.outbox.remove(&ana_peer, &first).unwrap();
+        make_due(&mut bia, ana_peer);
+
+        bia.flush_due_retries();
+        assert!(bia.retry.is_empty());
+
+        let next = bia.send(ana_peer, "outra", None).unwrap();
+        events(&mut bia);
+        let id = first_in_flight(&bia);
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id,
+            reason: "timeout".into(),
+        });
+        assert_eq!(bia.retry[&ana_peer].attempts, 1, "recomeça da base");
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::Queued {
+                peer: ana_peer,
+                message: next
+            }]
+        );
+    }
+
+    /// P19: falha de mensagem de controle (o `Hello`) não agenda reenvio da outbox: ela tem o tratamento
+    /// próprio do P25.
+    #[tokio::test]
+    async fn a_failed_control_message_does_not_schedule_a_retry() {
+        let Household { mut bia, .. } = household();
+        let peer = PeerId::random();
+        bia.handle(NodeEvent::PeerConnected(peer));
+        let hello = only_pending(&bia);
+
+        fail_send(&mut bia, peer, hello);
+        assert!(bia.retry.is_empty());
+    }
+
+    /// P19: falha que chega depois de o peer desconectar não agenda nada (a fila sai ao reconectar).
+    #[tokio::test]
+    async fn a_failure_after_the_peer_disconnected_schedules_nothing() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        bia.send(ana_peer, "tentando", None).unwrap();
+        events(&mut bia);
+        let id = first_in_flight(&bia);
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+
+        bia.handle(NodeEvent::SendFailed {
+            peer: ana_peer,
+            id,
+            reason: "timeout".into(),
+        });
+        assert!(bia.retry.is_empty());
+    }
+
+    /// P19: o relógio do `next_event` acorda no prazo do reenvio, não só no do re-anúncio dos irmãos.
+    #[tokio::test]
+    async fn the_clock_wakes_for_the_retry_deadline() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.retry_base = Duration::from_secs(3600);
+        bia.retry_cap = Duration::from_secs(86_400);
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        assert_eq!(bia.wake_in(), None, "sem nada agendado, espera só a rede");
+
+        send_and_fail(&mut bia, ana_peer, "tentando");
+        let wake = bia.wake_in().expect("com reenvio agendado, acorda");
+        assert!(wake <= Duration::from_secs(3600) && wake > Duration::from_secs(3000));
     }
 
     /// 3.2: a mesma mensagem re-cifrada (nova tentativa) chega com bytes diferentes e aparece uma vez.

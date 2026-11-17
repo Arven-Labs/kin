@@ -43,7 +43,8 @@ Três problemas apareceram ao desenhá-la:
 - Uma mensagem escrita com o peer offline não se perde nem aparece duplicada, inclusive se o remetente reinicia.
 - Reentrega atrasada de uma mensagem cujo id já foi esquecido (depois de 1024) apareceria de novo.
 - Esvaziar uma fila grande é lento (uma ida e volta por mensagem).
-- Se o envio falha com a conexão ainda aberta, a mensagem só tenta de novo na próxima conexão (P19).
+- Se o envio falha com a conexão ainda aberta, a mensagem tenta de novo sozinha com espera crescente: 2 s dobrando até 60 s, até 500 falhas seguidas por peer (P19, Sessão 29); depois o timer para e a mensagem espera a próxima conexão ou um ack. Cada tentativa re-cifra e gasta uma geração de chave (o receptor tolera salto de 2000); o receptor deduplica pelo `MessageId`.
+- Com o peer conectado só o envio direto é tentado (o depósito na caixa postal ocorre na desconexão) e a janela é 1: uma conexão viva mas inútil prende a fila inteira atrás da mensagem que falha (head-of-line blocking).
 - Perda de estado do receptor (P16) continua silenciosa: o ack é de transporte, não de leitura.
 
 ## Em aberto
