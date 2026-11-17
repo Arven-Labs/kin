@@ -610,6 +610,12 @@ impl Chat {
         Invite::new(self.device.certificate().clone(), addrs)
     }
 
+    /// Link de convite deste device com os endereços `addrs`, válido por `ttl` a partir de agora e
+    /// assinado pela chave de rede do device (P18).
+    pub fn invite_link(&self, _addrs: Vec<Multiaddr>, _ttl: Duration) -> String {
+        String::new()
+    }
+
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e
     /// escuta de IP global; ver `Node::shareable_addresses`). Vazio se ainda não há nenhum.
     pub fn shareable_invite(&self) -> Invite {

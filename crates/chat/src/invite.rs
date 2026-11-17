@@ -1,9 +1,22 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use kin_identity::{DeviceCertificate, IdentityId};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use kin_identity::{DeviceCertificate, DeviceKey, IdentityId};
 use kin_transport::{Multiaddr, PeerId};
 
 use crate::Error;
+
+/// Prazo padrão de um convite (P18, ADR 0033).
+pub const DEFAULT_INVITE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Maior validade aceita ao ler um link: além disso o link é recusado (relógio errado ou forjado).
+pub const MAX_INVITE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 const VERSION: u8 = 1;
 const PREFIX: &str = "kin://invite/";
@@ -47,13 +60,21 @@ impl Invite {
         &self.addrs
     }
 
-    /// O convite como link (`kin://invite/...`), próprio para texto ou QR.
-    pub fn to_link(&self) -> String {
+    /// O convite como link (`kin://invite/...`), próprio para texto ou QR, válido até `expires_at`
+    /// (segundos Unix) e assinado por `key`, a chave de rede do device do convite (P18).
+    pub fn to_link(&self, _key: &DeviceKey, _expires_at: u64) -> String {
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(self.encode()))
     }
 
-    /// Lê um link de convite. Confere a assinatura do certificado.
+    /// Lê um link de convite com o relógio do sistema. Ver [`Self::from_link_at`].
     pub fn from_link(link: &str) -> Result<Self, Error> {
+        Self::from_link_at(link, now_secs())
+    }
+
+    /// Lê um link de convite no instante `now` (segundos Unix). Confere a assinatura do certificado, a
+    /// assinatura do link pela chave de rede do certificado e a validade: vencido é
+    /// `Error::ExpiredInvite`; validade além de `MAX_INVITE_TTL` no futuro é `Error::InvalidInvite`.
+    pub fn from_link_at(link: &str, _now: u64) -> Result<Self, Error> {
         let body = link
             .trim()
             .strip_prefix(PREFIX)

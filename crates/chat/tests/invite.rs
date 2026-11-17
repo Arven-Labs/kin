@@ -7,7 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{
     WAIT, connect_until_ready, listen, receive_while_driving, settle, start_relay, wait_for,
 };
-use kin_chat::{Chat, ChatEvent, Error, Invite};
+use kin_chat::{Chat, ChatEvent, DEFAULT_INVITE_TTL, Error, Invite, MAX_INVITE_TTL};
 use kin_identity::{DeviceKey, IdentityProvider, StandaloneIdentity};
 use kin_transport::NodeConfig;
 use std::time::Duration;
@@ -37,6 +37,22 @@ fn person() -> Person {
     })
 }
 
+/// Instante fixo dos testes de validade (segundos Unix).
+const NOW: u64 = 1_800_000_000;
+const DAY: u64 = 24 * 60 * 60;
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Link da Ana, assinado pelo device dela, válido até `expires_at`.
+fn signed_link(ana: &Person, expires_at: u64) -> String {
+    ana.chat.invite(vec![]).to_link(&ana.device, expires_at)
+}
+
 fn bytes_of(link: &str) -> Vec<u8> {
     URL_SAFE_NO_PAD
         .decode(link.strip_prefix("kin://invite/").unwrap())
@@ -53,22 +69,22 @@ async fn link_roundtrips_and_carries_identity_peer_and_addresses() {
     let addr = listen(&mut ana.chat).await;
     let invite = ana.chat.invite(vec![addr.clone()]);
 
-    let link = invite.to_link();
+    let link = invite.to_link(&ana.device, NOW + DAY);
     assert!(link.starts_with("kin://invite/"));
     assert!(link.len() < 1000, "cabe num QR: {} caracteres", link.len());
-    let read = Invite::from_link(&link).unwrap();
+    let read = Invite::from_link_at(&link, NOW).unwrap();
     assert_eq!(read, invite);
     assert_eq!(read.identity(), &ana.identity.id());
     assert_eq!(read.peer_id(), ana.device.peer_id());
     assert_eq!(read.addrs(), [addr]);
     // Espaços em volta (colado de uma mensagem) não atrapalham.
-    assert!(Invite::from_link(&format!("  {link}\n")).is_ok());
+    assert!(Invite::from_link_at(&format!("  {link}\n"), NOW).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn damaged_links_are_rejected() {
     let ana = person();
-    let link = ana.chat.invite(vec![]).to_link();
+    let link = signed_link(&ana, NOW + DAY);
     let bytes = bytes_of(&link);
 
     for bad in [
@@ -78,30 +94,128 @@ async fn damaged_links_are_rejected() {
         "kin://invite/@@@@".into(),
         link_of(&bytes[..bytes.len() - 1]),           // truncado
         link_of(&[bytes.clone(), vec![0]].concat()),  // sobra
-        link_of(&[&[2u8][..], &bytes[1..]].concat()), // versão desconhecida
+        link_of(&[&[3u8][..], &bytes[1..]].concat()), // versão desconhecida
     ] {
         assert!(
-            matches!(Invite::from_link(&bad), Err(Error::InvalidInvite)),
+            matches!(Invite::from_link_at(&bad, NOW), Err(Error::InvalidInvite)),
             "deveria recusar {bad:?}"
         );
     }
 
-    // Qualquer byte alterado dentro do certificado quebra a assinatura (ou o formato).
-    for i in 4..bytes.len().min(150) {
+    // Qualquer byte alterado, em qualquer ponto (certificado, endereços, validade ou assinatura),
+    // e qualquer truncamento quebram o link.
+    for i in 1..bytes.len() {
         let mut tampered = bytes.clone();
         tampered[i] ^= 0x01;
         assert!(
-            Invite::from_link(&link_of(&tampered)).is_err(),
+            Invite::from_link_at(&link_of(&tampered), NOW).is_err(),
             "byte {i} alterado passou"
         );
+        assert!(
+            Invite::from_link_at(&link_of(&bytes[..i]), NOW).is_err(),
+            "truncado em {i} passou"
+        );
     }
+}
+
+/// A validade vale ao segundo: no instante `expires_at` o convite já venceu (P18).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_link_is_refused_and_one_second_before_is_accepted() {
+    let ana = person();
+    let link = signed_link(&ana, NOW + DAY);
+
+    assert!(Invite::from_link_at(&link, NOW + DAY - 1).is_ok());
+    for late in [NOW + DAY, NOW + DAY + 1, NOW + 30 * DAY] {
+        assert!(
+            matches!(Invite::from_link_at(&link, late), Err(Error::ExpiredInvite)),
+            "deveria estar vencido em {late}"
+        );
+    }
+}
+
+/// Quem tem o link só estende a validade se refizer a assinatura, e não tem a chave do device.
+#[tokio::test(flavor = "multi_thread")]
+async fn extending_the_expiry_without_the_device_key_breaks_the_link() {
+    let ana = person();
+    let mut bytes = bytes_of(&signed_link(&ana, NOW + DAY));
+    // A validade é o u64 logo antes da assinatura: len16 (2) + 64 bytes de Ed25519.
+    let at = bytes.len() - 2 - 64 - 8;
+    let old = u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+    assert_eq!(old, NOW + DAY, "layout: validade antes da assinatura");
+    bytes[at..at + 8].copy_from_slice(&(NOW + 3 * DAY).to_be_bytes());
+
+    assert!(matches!(
+        Invite::from_link_at(&link_of(&bytes), NOW),
+        Err(Error::InvalidInvite)
+    ));
+}
+
+/// A Mallory assina o convite da Ana com a chave dela: o certificado é da Ana, a assinatura não.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_signed_by_another_device_is_refused() {
+    let (ana, mallory) = (person(), person());
+    let link = ana.chat.invite(vec![]).to_link(&mallory.device, NOW + DAY);
+
+    assert!(matches!(
+        Invite::from_link_at(&link, NOW),
+        Err(Error::InvalidInvite)
+    ));
+}
+
+/// Validade além de 7 dias no futuro (relógio errado ou forjado) é recusada; 7 dias exatos passam.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validity_beyond_the_maximum_horizon_is_refused() {
+    let ana = person();
+    let max = MAX_INVITE_TTL.as_secs();
+
+    assert!(Invite::from_link_at(&signed_link(&ana, NOW + max), NOW).is_ok());
+    assert!(matches!(
+        Invite::from_link_at(&signed_link(&ana, NOW + max + 1), NOW),
+        Err(Error::InvalidInvite)
+    ));
+    assert!(matches!(
+        Invite::from_link_at(&signed_link(&ana, u64::MAX), NOW),
+        Err(Error::InvalidInvite)
+    ));
+}
+
+/// O formato v1 (sem validade) não é mais aceito: era o problema do P18.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_old_v1_link_without_expiry_is_refused() {
+    let ana = person();
+    let mut bytes = bytes_of(&signed_link(&ana, NOW + DAY));
+    bytes[0] = 1;
+
+    assert!(matches!(
+        Invite::from_link_at(&link_of(&bytes), NOW),
+        Err(Error::InvalidInvite)
+    ));
+}
+
+/// `Chat::invite_link` assina com o próprio device e usa o prazo pedido a partir de agora.
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_invite_link_is_signed_by_the_own_device_and_lasts_the_requested_ttl() {
+    let ana = person();
+    let before = now();
+    let link = ana.chat.invite_link(vec![], DEFAULT_INVITE_TTL);
+    let after = now();
+
+    let invite = Invite::from_link(&link).unwrap();
+    assert_eq!(invite.peer_id(), ana.device.peer_id());
+    let ttl = DEFAULT_INVITE_TTL.as_secs();
+    assert!(Invite::from_link_at(&link, before + ttl - 1).is_ok());
+    assert!(matches!(
+        Invite::from_link_at(&link, after + ttl),
+        Err(Error::ExpiredInvite)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn accepting_an_invite_connects_and_pins_the_identity() {
     let (mut ana, mut bia) = (person(), person());
     let addr = listen(&mut ana.chat).await;
-    let invite = Invite::from_link(&ana.chat.invite(vec![addr]).to_link()).unwrap();
+    let link = ana.chat.invite_link(vec![addr], DEFAULT_INVITE_TTL);
+    let invite = Invite::from_link(&link).unwrap();
 
     bia.chat.accept(&invite).unwrap();
     connect_until_ready(&mut ana.chat, &mut bia.chat).await;
@@ -126,6 +240,7 @@ async fn accepting_an_invite_connects_and_pins_the_identity() {
 async fn invite_claiming_another_identity_for_the_same_peer_is_refused() {
     let (mut ana, mut bia) = (person(), person());
     let mallory = StandaloneIdentity::generate();
+    let mallory_device = DeviceKey::generate();
     let addr = listen(&mut ana.chat).await;
 
     let forged_cert = mallory
@@ -136,7 +251,13 @@ async fn invite_claiming_another_identity_for_the_same_peer_is_refused() {
             1,
         )
         .unwrap();
-    let forged = Invite::from_link(&Invite::new(forged_cert, vec![addr]).to_link()).unwrap();
+    let forged = Invite::new(forged_cert, vec![addr]);
+    // Como link, a falsificação já morre na assinatura: a Mallory não tem a chave de rede da Ana.
+    assert!(matches!(
+        Invite::from_link_at(&forged.to_link(&mallory_device, NOW + DAY), NOW),
+        Err(Error::InvalidInvite)
+    ));
+    // Já com o objeto `Invite` na mão (sem link), `accept` ainda exige a identidade no handshake.
     assert_eq!(forged.peer_id(), ana.device.peer_id());
     assert_ne!(forged.identity(), &ana.identity.id());
 

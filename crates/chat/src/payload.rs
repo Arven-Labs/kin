@@ -595,7 +595,7 @@ mod tests {
     }
 
     /// Convite de um device certificado pela autoridade (v4, P30 fatia 2a).
-    fn invite_v4(master: &StandaloneIdentity, addrs: Vec<Multiaddr>) -> Invite {
+    fn invite_v4(master: &StandaloneIdentity, addrs: Vec<Multiaddr>) -> (Invite, DeviceKey) {
         let key = kin_identity::AuthorityKey::generate();
         let chain = master.certify_authority(&key.public_key(), 1).unwrap();
         let primary = kin_identity::AuthorityIdentity::new(key, chain).unwrap();
@@ -608,7 +608,7 @@ mod tests {
                 2,
             )
             .unwrap();
-        Invite::new(cert, addrs)
+        (Invite::new(cert, addrs), device)
     }
 
     #[test]
@@ -616,7 +616,7 @@ mod tests {
         let identity = StandaloneIdentity::generate();
         let payload = Payload::DeviceList(vec![
             invite(&identity, vec![]),
-            invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]),
+            invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]).0,
         ]);
 
         assert_eq!(Payload::decode(&payload.encode()).unwrap(), payload);
@@ -625,9 +625,9 @@ mod tests {
     #[test]
     fn an_invite_link_with_a_v4_certificate_roundtrips_with_the_master_identity() {
         let identity = StandaloneIdentity::generate();
-        let invite = invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]);
+        let (invite, device) = invite_v4(&identity, vec![addr("/ip4/127.0.0.1/tcp/4001")]);
 
-        let restored = Invite::from_link(&invite.to_link()).unwrap();
+        let restored = Invite::from_link_at(&invite.to_link(&device, 4600), 1000).unwrap();
 
         assert_eq!(restored, invite);
         assert_eq!(restored.identity(), &identity.id());
