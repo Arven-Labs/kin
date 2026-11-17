@@ -312,6 +312,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
     keys::ensure_current_issuer(&identity, chat.certificate())?;
+    if let Some(notice) = keys::notice_for(&identity) {
+        eprintln!("{notice}");
+    }
     if matches!(identity, keys::LocalIdentity::Paired(_)) {
         println!(
             "device pareado da identidade {} (certificado v4 do primário; sem mestra nem autoridade aqui)",
@@ -419,7 +422,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 // A chave mestra nunca vai a um contato por engano (ex.: Ctrl+V do link de pareamento).
-                if line.contains("kin://pair/") {
+                if is_pair_link(line) {
                     println!("(não enviado: isto é um link de pareamento, a sua chave mestra)");
                     continue;
                 }
@@ -601,6 +604,16 @@ fn untrust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerI
         }
         Resolved::Ambiguous => println!("(prefixo ambíguo: digite mais caracteres)"),
     }
+}
+
+/// Resposta a `/pair` depois que a cópia da mestra foi removida (P30 fatia 6, ADR 0035).
+#[allow(dead_code)] // esqueleto: usado quando o `/pair` for trocado pela mensagem
+const PAIR_REMOVED: &str = "";
+
+/// A linha parece um link de pareamento antigo (`kin://pair/`, que carregava a chave mestra)? A trava de
+/// envio a barra mesmo sem o `/pair`: links velhos ainda podem circular (ADR 0035).
+fn is_pair_link(line: &str) -> bool {
+    line.contains("kin://pair/")
 }
 
 const NOT_PRIMARY: &str = "(só o primário lista e revoga devices: rode a CLI no diretório com authority.key; no modo antigo da mestra, revogar não adianta, pois cada device tem a mestra)";
@@ -938,6 +951,40 @@ mod tests {
 
     fn parse(argv: &[&str], env: Option<&str>) -> Result<Args, String> {
         parse_from(argv.iter().map(|s| s.to_string()), env.map(str::to_string))
+    }
+
+    // ---- remoção da cópia da mestra (P30 fatia 6, ADR 0035) ----
+
+    #[test]
+    fn the_pair_flag_no_longer_exists() {
+        // `--pair ARQUIVO` importava a mestra de outro device: agora é uma flag desconhecida.
+        assert!(parse(&["--pair", "arquivo"], None).is_err());
+        assert!(parse(&["--pair", "-"], None).is_err());
+        // controle: uma flag válida segue sendo aceita
+        assert!(parse(&["--no-nostr"], None).is_ok());
+    }
+
+    #[test]
+    fn the_slash_pair_reply_points_to_the_new_flow_and_carries_no_link() {
+        for needle in ["kin cold init", "kin pair request", "kin pair answer"] {
+            assert!(
+                PAIR_REMOVED.contains(needle),
+                "a resposta não cita {needle}"
+            );
+        }
+        // a resposta não pode disparar a própria trava nem sugerir o link antigo
+        assert!(!is_pair_link(PAIR_REMOVED));
+    }
+
+    #[test]
+    fn the_send_guard_still_blocks_an_old_pair_link_but_not_other_links() {
+        assert!(is_pair_link("kin://pair/AAAA"));
+        assert!(is_pair_link("olha isso kin://pair/AAAA ok?"));
+        // pedido e certificado do pareamento novo não carregam a mestra
+        assert!(!is_pair_link("kin://pair-request/AAAA"));
+        assert!(!is_pair_link("kin://pair-cert/AAAA"));
+        assert!(!is_pair_link("kin://invite/AAAA"));
+        assert!(!is_pair_link("oi, tudo bem?"));
     }
 
     #[test]

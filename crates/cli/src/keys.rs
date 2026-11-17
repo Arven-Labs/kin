@@ -23,6 +23,13 @@ pub enum LocalIdentity {
     Paired(IdentityId),
 }
 
+/// Aviso de migração para quem roda no modo `Master` (mestra no próprio device, v3): essa identidade
+/// pode ter sido copiada por `/pair` e não ganha mais devices nem revoga (P30 fatia 6, ADR 0035).
+/// `None` para o primário e para o device pareado.
+pub fn notice_for(_identity: &LocalIdentity) -> Option<&'static str> {
+    None
+}
+
 impl LocalIdentity {
     pub fn id(&self) -> IdentityId {
         match self {
@@ -491,6 +498,43 @@ mod tests {
     use kin_identity::{Error, IdentityProvider, is_sealed};
 
     const PASS: &[u8] = b"senha de teste";
+
+    // ---- aviso de migração do modo Master (P30 fatia 6) ----
+
+    fn master_identity() -> StandaloneIdentity {
+        StandaloneIdentity::generate()
+    }
+
+    fn primary_identity(master: &StandaloneIdentity) -> kin_identity::AuthorityIdentity {
+        let key = kin_identity::AuthorityKey::generate();
+        let chain = master.certify_authority(&key.public_key(), 1).unwrap();
+        kin_identity::AuthorityIdentity::new(key, chain).unwrap()
+    }
+
+    #[test]
+    fn the_master_mode_notice_gives_the_migration_roadmap() {
+        let notice = notice_for(&LocalIdentity::Master(Box::new(master_identity())))
+            .expect("o modo Master tem de avisar");
+
+        for needle in ["kin cold init", "kin pair request", "/untrust", "/accept"] {
+            assert!(
+                notice.contains(needle),
+                "o aviso não cita {needle}: {notice}"
+            );
+        }
+        // o aviso nunca carrega segredo nem o prefixo do link antigo
+        assert!(!notice.contains("kin://pair/"), "{notice}");
+    }
+
+    #[test]
+    fn the_primary_and_the_paired_device_get_no_migration_notice() {
+        let master = master_identity();
+        let primary = LocalIdentity::Primary(Box::new(primary_identity(&master)));
+        let paired = LocalIdentity::Paired(master.id());
+
+        assert_eq!(notice_for(&primary), None);
+        assert_eq!(notice_for(&paired), None);
+    }
 
     fn opts(file: Option<&str>, no_passphrase: bool, protect: bool) -> KeyOptions {
         KeyOptions {
