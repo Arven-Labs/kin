@@ -2,7 +2,7 @@
 
 > **Nota**: Este log foi criado junto com o projeto. As sessões serão registradas aqui conforme o trabalho avança.
 >
-> Última atualização: 2026-11-13 (Sessão 22)
+> Última atualização: 2026-11-17 (Sessão 28)
 
 ---
 
@@ -1856,3 +1856,21 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
   na raiz do workspace e o comando de merge que te passei falhou duas vezes por isso (agora uso `cd` com caminho absoluto).
 - **Não verificado**: comportamento real em rede (só loopback); papéis aleatórios do handshake (quem convida); `Invite`/`DeviceList` com v3 de identidade travada; revisão externa.
 - **Próximo passo**: fatia 4 (validade/frescor), em plan mode. **A 3e está completa.**
+
+### 2026-11-17 — Sessão 28
+
+#### Convite com expiração assinada (P30, fatia 4, ADR 0033; fecha a expiração do P18)
+
+- **Decisões do dono** (plan mode + 2 perguntas): expiração **assinada** pela chave de rede do device (não só um campo solto), prazo padrão **24 h**; depois, "siga a recomendação": link v1
+  recusado e teto de 7 dias. Para guardar a chave de assinatura no `Chat`, o dono escolheu a cópia via `to_bytes`/`from_bytes`.
+- **Feito** (`chat`, `cli`): link v2 (`expires_at` + assinatura Ed25519, domínio `kin/invite/v2`), `Invite::from_link_at`, `Chat::invite_link` (prazo limitado a 7 dias menos 5 min),
+  `Error::ExpiredInvite`, CLI mostra "válido por 24 h". `DeviceList` não mudou; `accept(&Invite)` não confere validade (documentado).
+- **Prova de que testam algo**: esqueleto, **8 de 12** falharam em `tests/invite.rs` (run 44084875872). **Errei duas previsões da tabela**: `damaged_links_are_rejected` passou no esqueleto (só vira
+  teste da assinatura depois do formato novo) e os testes 11 e 12 falharam por causa do esqueleto, não eram controles. Verde com a implementação (44085830592).
+- **Mutações** (3 de 3 pegas, branches apagadas): `>=` por `>` no vencimento (44086379529, 2 testes); sem checar a assinatura (44086400125, 4 testes); sem o teto de 7 dias (44086422172, 1 teste).
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 3 importantes, 7 sugestões. Corrigidos: lacuna de teste do domínio e dos endereços (3 testes novos), `ttl` sem limite, docs, CLI.
+  **Aberto**: o `signer` copia o `DeviceKey` inteiro (inclui a chave Nostr) por um `Vec` sem zeroizar; alternativas: só o `Keypair` de rede (dependência direta do `libp2p-identity`) ou
+  `DeviceKey::sign_invite` no `identity`. Verde final: run 44087622135.
+- **Tropeços**: nenhum de processo; o plano previa `accept` conferir a validade e mudei para só `from_link` (avisei na tabela de testes).
+- **Não verificado**: consumidores de `Invite::to_link` fora deste repo (p. ex. `warden/mobile`); tamanho do QR com certificado v4; relógio com falha (`now_secs` = 0); revisão externa.
+- **Próximo passo**: decidir o `signer`; depois fatia 5 (CLI `/devices` e `/revoke`), em plan mode.
