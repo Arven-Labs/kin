@@ -213,8 +213,7 @@ const RETRY_BASE: Duration = Duration::from_secs(2);
 /// mensagem segue na outbox e sai quando o peer reconectar (que zera a conta) ou com um ack.
 const RETRY_BUDGET: u32 = 500;
 /// Teto da espera entre reenvios diretos (P19). Cada tentativa re-cifra e gasta uma geração de chave MLS (ADR
-/// 0002): a 1 por minuto, o salto máximo que o receptor tolera (`MAX_FORWARD_DISTANCE`, 2000) leva ~33 h de
-/// falha contínua.
+/// 0002); quem limita o total é [`RETRY_BUDGET`], não este teto (outros gatilhos também reenviam na hora).
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
 /// Reenvio direto agendado para um peer depois de um `SendFailed` de mensagem de chat (P19).
