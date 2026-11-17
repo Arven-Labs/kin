@@ -434,7 +434,6 @@ pub struct Chat {
     retry_base: Duration,
     retry_cap: Duration,
     /// Falhas seguidas depois das quais o timer para de armar (campo, para o teste não falhar 500 vezes).
-    #[allow(dead_code)] // esqueleto da correção da auditoria I1: sai com a implementação
     retry_budget: u32,
     /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
     /// alimentar 100 000 linhas).
@@ -1628,17 +1627,22 @@ impl Chat {
             .min(self.retry_cap)
     }
 
-    /// Registra uma falha de envio direto a `peer` e agenda o reenvio. Devolve `true` se é a primeira
-    /// falha seguida (a única que avisa a aplicação com `Queued`).
+    /// Registra uma falha de envio direto a `peer` e agenda o reenvio, a não ser que o orçamento de falhas
+    /// tenha acabado (`retry_budget`): aí o registro fica, sem armar o timer, e a mensagem espera a próxima
+    /// conexão ou um ack. Devolve `true` se é a primeira falha seguida (a única que avisa com `Queued`).
     fn schedule_retry(&mut self, peer: PeerId) -> bool {
-        let attempts = self.retry.get(&peer).map_or(0, |retry| retry.attempts) + 1;
+        let attempts = self
+            .retry
+            .get(&peer)
+            .map_or(0, |retry| retry.attempts)
+            .saturating_add(1);
         let due = Instant::now() + self.retry_delay(attempts);
         self.retry.insert(
             peer,
             Retry {
                 attempts,
                 due,
-                armed: true,
+                armed: attempts < self.retry_budget,
             },
         );
         attempts == 1
@@ -1663,6 +1667,15 @@ impl Chat {
                 retry.armed = false;
             }
             self.send_direct(peer);
+            // Nada saiu (a entrada sumiu da outbox, ou a conversa caiu): o registro velho faria a próxima
+            // mensagem herdar a contagem, esperar mais e não avisar com `Queued`.
+            if self
+                .in_flight
+                .get(&peer)
+                .is_none_or(|flying| flying.is_empty())
+            {
+                self.retry.remove(&peer);
+            }
         }
     }
 
@@ -1921,6 +1934,7 @@ impl Chat {
         self.history_sessions.remove(&peer);
         self.history_requests.retain(|_, p| *p != peer);
         self.in_flight.remove(&peer);
+        self.retry.remove(&peer);
         self.depositing.retain(|_, (p, _)| *p != peer);
         self.household.remove(&peer);
         self.contact_devices.remove(&peer);
