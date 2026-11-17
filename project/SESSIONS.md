@@ -1837,3 +1837,22 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: backfill e conversas v3 abertas (3e-ii-b); falha de gravação no meio de `invite`/`join` (só no nível do `Provider`); `verify_continuity` e o `Add` com `own` errado (nenhum teste os
   alcança); revisão externa.
 - **Próximo passo**: 3e-ii-b (o `chat` varre com `is_downgraded`, faz o backfill de `kin_regime` e derruba as conversas v3 da identidade; filtra `Invite` e `DeviceList`), em plan mode.
+
+#### O `Chat` derruba as conversas v3 de identidade em v4 (P30, fatia 3e-ii-b, ADR 0032)
+
+- **Decisões do dono** (plan mode): a derrubada das conversas v3 já abertas ao virar v4, com backfill na reabertura; a tabela de testes aprovada **antes** de empurrar o esqueleto
+  (corrigindo o erro da 3e-ii-a).
+- **Feito** (`chat`, `crypto`, `cli`): `Scan.to_drop` com `Reason::{Revoked, Downgraded}` (revogado vence); `drop_peer` com o motivo; `ChatEvent::PeerDowngraded` e braço na CLI;
+  `CryptoDevice::learn_regime`; backfill em `open_with_device` antes da varredura (erro falha a abertura); varredura em `ready()` só se o par novo é v4 de outra identidade.
+  Nomes `scan_revoked`/`drop_revoked_peers` mantidos (sem renome oportunista).
+- **Prova de que testam algo**: esqueleto (evento, CLI e `learn_regime` vazios), **5 de 7** falharam e os controles 4 e 6 passaram (run 43981782288); verde (43982997350). **O teste 2 não era
+  controle puro** (assere que o v3 cai), ao contrário do que eu disse na tabela. O teste do store quebrado falhou na primeira rodada verde: `Provider::open` recria a tabela apagada;
+  passou a usar uma tabela de outro formato.
+- **Mutações** (7 de 7 pegas, branches apagadas): sem a varredura em `ready()`; sem o backfill; `is_downgraded` ignorado; evento trocado; `learn_regime` marcando v3; backfill depois da
+  varredura; e, depois da auditoria, `may_turn_latch` invertida.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 2 importantes, 6 sugestões. I1 (varredura O(N) a cada `ready()`) **corrigido**; I2 (falha parcial depois de marcar) e as
+  lacunas de teste em P31 (be) e (bf); S5 e S6 corrigidos.
+- **Tropeços**: rodei um `sed -i` com alvo `/dev/null` por descuido (sem efeito em nenhum arquivo, mas contra a regra do `CLAUDE.md`); `cargo fmt` reescreveu arquivos duas vezes; o shell estava
+  na raiz do workspace e o comando de merge que te passei falhou duas vezes por isso (agora uso `cd` com caminho absoluto).
+- **Não verificado**: comportamento real em rede (só loopback); papéis aleatórios do handshake (quem convida); `Invite`/`DeviceList` com v3 de identidade travada; revisão externa.
+- **Próximo passo**: fatia 4 (validade/frescor), em plan mode. **A 3e está completa.**

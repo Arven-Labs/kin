@@ -136,6 +136,14 @@ pub enum ChatEvent {
         peer: PeerId,
         identity: IdentityId,
     },
+    /// O device `peer` usa certificado v3 (da mestra), mas a `identity` dele já foi aceita em regime v4: a
+    /// conversa foi apagada, com a fila e o que a caixa postal sabia dele (P30, 3e-ii-b, ADR 0032). Não há
+    /// tombstone: é a regra local do trinco por identidade. Cada mensagem que estava na fila para ele chega
+    /// antes como [`ChatEvent::SendFailed`].
+    PeerDowngraded {
+        peer: PeerId,
+        identity: IdentityId,
+    },
     /// Algo do peer foi descartado (malformado, de outra conversa, etc.).
     Dropped {
         peer: PeerId,
@@ -143,10 +151,19 @@ pub enum ChatEvent {
     },
 }
 
-/// O resultado de consultar o store de tombstones para cada conversa (`Chat::scan_revoked`).
+/// Por que uma conversa é derrubada (P30 3e-ii-b, ADR 0032): decide o texto do `SendFailed` e o evento.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reason {
+    /// O device tem tombstone gravado (3d).
+    Revoked,
+    /// O device é v3 e a identidade dele já foi aceita em v4 (trinco por identidade, 3e).
+    Downgraded,
+}
+
+/// O resultado de consultar o store (tombstones e trinco) para cada conversa (`Chat::scan_revoked`).
 struct Scan {
-    /// Peers com certificado revogado, com a identidade deles.
-    revoked: Vec<(PeerId, IdentityId)>,
+    /// Peers a derrubar (certificado revogado, ou v3 de identidade já em v4), com a identidade e o motivo.
+    to_drop: Vec<(PeerId, IdentityId, Reason)>,
     /// Peers que não consegui consultar, com o erro.
     failures: Vec<(PeerId, Error)>,
 }
@@ -483,18 +500,26 @@ impl Chat {
                 }
             }
         }
+        // Backfill do trinco por identidade (P30 3e-ii-b, ADR 0032): quem aceitou um v4 antes de o trinco
+        // existir não tem a marca; as conversas v4 já gravadas a refazem. **Antes** da varredura: sem marcar
+        // primeiro, um banco antigo responderia "não" e a conversa v3 sobreviveria. Erro falha a abertura.
+        for conversation in chat.conversations.values() {
+            for certificate in conversation.peer_certificates()? {
+                chat.device.learn_regime(&certificate)?;
+            }
+        }
         // Um device revogado com o processo fechado (ou cuja derrubada parou no meio) não volta vivo (P30,
         // 3d-ii-c). Antes de qualquer `set_mailbox`: a caixa postal nunca aprende o revogado. Se não consigo
         // consultar o store, não sei quem está revogado: a abertura falha (falha fechada), sem abrir "vivo".
         let Scan {
-            revoked,
+            to_drop,
             mut failures,
         } = chat.scan_revoked();
         if !failures.is_empty() {
             return Err(failures.swap_remove(0).1);
         }
-        for (peer, identity) in revoked {
-            chat.drop_peer(peer, identity)?;
+        for (peer, identity, reason) in to_drop {
+            chat.drop_peer(peer, identity, reason)?;
         }
         Ok(chat)
     }
@@ -1536,6 +1561,15 @@ impl Chat {
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
+        // Só um par v4 de outra identidade vira o trinco (no `crypto`); varrer todas as conversas a cada par
+        // novo custaria O(N) por conexão de estranho (auditoria I1 da 3e-ii-b). Erro ao ler: varre.
+        let may_turn_latch = match conversation.peer_certificates() {
+            Ok(certificates) => certificates.iter().any(|c| {
+                matches!(c.issuer, kin_identity::Issuer::Authority(_))
+                    && c.identity() != self.device.identity()
+            }),
+            Err(_) => true,
+        };
         self.device
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
@@ -1544,6 +1578,11 @@ impl Chat {
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.
         self.flush(peer);
+        // Aceitar um par v4 vira o trinco da identidade dele (no `crypto`); as conversas v3 que já existiam
+        // com ela não são revalidadas por nenhum caminho de mensagem (P30 3e-ii-b, ADR 0032).
+        if may_turn_latch {
+            self.drop_revoked_peers();
+        }
         Ok(())
     }
 
@@ -1671,25 +1710,25 @@ impl Chat {
         }
     }
 
-    /// Derruba toda conversa com um device que o store marca como revogado (P30, 3d-ii-b2; ADR 0029). Um
-    /// erro de leitura **não** derruba (não sei se está revogado) e vira `Dropped`; a reabertura (3d-ii-c)
-    /// reconsulta, e lá o erro de leitura falha a abertura.
+    /// Derruba toda conversa com um device que o store marca como revogado (P30, 3d-ii-b2; ADR 0029) ou que é
+    /// v3 de uma identidade já aceita em v4 (3e-ii-b, ADR 0032). Um erro de leitura **não** derruba (não sei)
+    /// e vira `Dropped`; a reabertura (3d-ii-c) reconsulta, e lá o erro de leitura falha a abertura.
     fn drop_revoked_peers(&mut self) {
-        let Scan { revoked, failures } = self.scan_revoked();
+        let Scan { to_drop, failures } = self.scan_revoked();
         for (peer, error) in failures {
             self.drop_message(peer, error);
         }
-        for (peer, identity) in revoked {
-            if let Err(e) = self.drop_peer(peer, identity) {
+        for (peer, identity, reason) in to_drop {
+            if let Err(e) = self.drop_peer(peer, identity, reason) {
                 self.drop_message(peer, e);
             }
         }
     }
 
-    /// Consulta o store para cada conversa: os peers com certificado revogado (e a identidade deles) e os
-    /// que não consegui consultar. Só lê; quem chama decide o que fazer com cada lista.
+    /// Consulta o store para cada conversa: os peers com certificado revogado ou v3 de identidade em v4 (com a
+    /// identidade e o motivo) e os que não consegui consultar. Revogado vence. Só lê; quem chama decide.
     fn scan_revoked(&self) -> Scan {
-        let mut revoked = Vec::new();
+        let mut to_drop = Vec::new();
         let mut failures = Vec::new();
         for (peer, conversation) in &self.conversations {
             let certificates = match conversation.peer_certificates() {
@@ -1699,18 +1738,29 @@ impl Chat {
                     continue;
                 }
             };
+            let mut found = None;
             for certificate in certificates {
+                let identity = certificate.identity().clone();
                 match self.device.is_revoked(&certificate) {
                     Ok(true) => {
-                        revoked.push((*peer, certificate.identity().clone()));
+                        found = Some((identity, Reason::Revoked));
                         break;
                     }
-                    Ok(false) => {}
+                    Ok(false) => match self.device.is_downgraded(&certificate) {
+                        Ok(true) => {
+                            found.get_or_insert((identity, Reason::Downgraded));
+                        }
+                        Ok(false) => {}
+                        Err(e) => failures.push((*peer, Error::from(e))),
+                    },
                     Err(e) => failures.push((*peer, Error::from(e))),
                 }
             }
+            if let Some((identity, reason)) = found {
+                to_drop.push((*peer, identity, reason));
+            }
         }
-        Scan { revoked, failures }
+        Scan { to_drop, failures }
     }
 
     /// Esquece o device `peer`, nesta ordem (tudo idempotente): a fila (`outbox`), a memória por Peer ID, a
@@ -1718,7 +1768,12 @@ impl Chat {
     /// conversa e o grupo no banco. A conexão de rede não é fechada. Devolve o primeiro erro e **para**: em
     /// tempo de execução quem chama o transforma em `Dropped` (a próxima varredura repete); na reabertura ele
     /// falha a abertura (não há "próxima varredura", e abrir com o revogado vivo contradiz a falha fechada).
-    fn drop_peer(&mut self, peer: PeerId, identity: IdentityId) -> Result<(), Error> {
+    fn drop_peer(
+        &mut self,
+        peer: PeerId,
+        identity: IdentityId,
+        reason: Reason,
+    ) -> Result<(), Error> {
         // A fila primeiro, e se falhar paro com a conversa intacta: ela é o ponto de reparo (a próxima varredura
         // tenta de novo) e nada foi esquecido ainda. É outro arquivo SQLite, então não há atomicidade com o
         // banco do `crypto`: por isso a ordem, e não uma transação.
@@ -1748,18 +1803,26 @@ impl Chat {
             self.queue.push_back(ChatEvent::SendFailed {
                 peer,
                 message: Some(message),
-                reason: "o device foi revogado".into(),
+                reason: match reason {
+                    Reason::Revoked => "o device foi revogado",
+                    Reason::Downgraded => {
+                        "a identidade do device já usa certificados v4 e o dele é v3"
+                    }
+                }
+                .into(),
             });
         }
         // A conversa e o grupo por último: `drop_revoked_peers` só reencontra o peer por `conversations`, então
         // enquanto algo acima pudesse falhar ela tinha de continuar lá. Se o `delete` falhar, o label fica e a
-        // reabertura recarrega o grupo (3d-ii-c); `PeerRevoked` só sai com tudo apagado.
+        // reabertura recarrega o grupo (3d-ii-c); o evento final só sai com tudo apagado.
         if let Some(conversation) = self.conversations.remove(&peer) {
             conversation.delete()?;
         }
         self.device.forget_conversation(&peer.to_string())?;
-        self.queue
-            .push_back(ChatEvent::PeerRevoked { peer, identity });
+        self.queue.push_back(match reason {
+            Reason::Revoked => ChatEvent::PeerRevoked { peer, identity },
+            Reason::Downgraded => ChatEvent::PeerDowngraded { peer, identity },
+        });
         Ok(())
     }
 

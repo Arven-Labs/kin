@@ -212,6 +212,18 @@ impl CryptoDevice {
         crate::credential::is_downgrade(certificate, &self.0.identity, &self.0.provider)
     }
 
+    /// Marca a identidade do certificado de um peer como em regime v4 se ele é v4 e não é a identidade própria
+    /// (P30 3e-ii-b, ADR 0032): é o backfill do `chat` ao reabrir, para quem aceitou um v4 antes de o trinco
+    /// existir. Idempotente. (**Pré-condição:** certificado já verificado, como o de `peer_certificates`.)
+    pub fn learn_regime(&self, certificate: &DeviceCertificate) -> Result<(), Error> {
+        let who = crate::credential::Verified {
+            identity: certificate.identity().clone(),
+            peer: certificate.network_peer_id(),
+            authority: matches!(certificate.issuer, Issuer::Authority(_)),
+        };
+        crate::credential::mark_regime(&who, &self.0.identity, &self.0.provider)
+    }
+
     /// Certificado deste device (identidade + chave MLS + chave de rede): é o que um convite carrega
     /// para provar quem é e por qual Peer ID alcançá-lo.
     pub fn certificate(&self) -> &DeviceCertificate {

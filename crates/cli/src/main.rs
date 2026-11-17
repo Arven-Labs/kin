@@ -819,6 +819,12 @@ fn on_event(
                 identity.to_base58()
             );
         }
+        ChatEvent::PeerDowngraded { peer, identity } => {
+            println!(
+                "(device {peer} da identidade {} usa certificado antigo (v3) e a identidade já está no regime novo: conversa e fila apagadas)",
+                identity.to_base58()
+            );
+        }
         ChatEvent::Dropped { peer, reason } => println!("(descartado de {peer}: {reason})"),
         ChatEvent::HistorySynced {
             peer,
