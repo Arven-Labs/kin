@@ -213,6 +213,7 @@ const RETRY_BASE: Duration = Duration::from_secs(2);
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
 /// Reenvio direto agendado para um peer depois de um `SendFailed` de mensagem de chat (P19).
+#[allow(dead_code)] // esqueleto P19: sai com a implementação
 struct Retry {
     /// Falhas seguidas sem ack; decide a espera ([`Chat::retry_delay`]).
     attempts: u32,
@@ -421,9 +422,12 @@ pub struct Chat {
     sibling_announce_gap: Duration,
     /// Reenvio direto agendado por peer depois de um `SendFailed` de mensagem de chat (P19). Só existe para
     /// peer conectado; sai no ack, ao desconectar ou quando o reenvio é tentado de novo.
+    #[allow(dead_code)] // esqueleto P19: sai com a implementação
     retry: HashMap<PeerId, Retry>,
     /// Espera inicial e teto do reenvio (campos, para o teste não esperar 2 s a 60 s).
+    #[allow(dead_code)] // esqueleto P19: sai com a implementação
     retry_base: Duration,
+    #[allow(dead_code)] // esqueleto P19: sai com a implementação
     retry_cap: Duration,
     /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
     /// alimentar 100 000 linhas).
@@ -1594,14 +1598,17 @@ impl Chat {
     }
 
     /// ESQUELETO (P19, etapa D): ainda sem comportamento.
+    #[allow(dead_code)]
     fn retry_delay(&self, _attempts: u32) -> Duration {
         Duration::ZERO
     }
 
     /// ESQUELETO (P19, etapa D): ainda sem comportamento.
+    #[allow(dead_code)]
     fn flush_due_retries(&mut self) {}
 
     /// ESQUELETO (P19, etapa D): ainda só o re-anúncio dos irmãos.
+    #[allow(dead_code)]
     fn wake_in(&self) -> Option<Duration> {
         self.sibling_wake_in()
     }
