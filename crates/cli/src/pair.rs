@@ -156,7 +156,7 @@ pub fn certificate_from_link(link: &str) -> Result<DeviceCertificate, String> {
 /// Grava `bytes` em `path` (0600) **sem nunca substituir** e sem expor arquivo pela metade: escreve num
 /// temporário do mesmo diretório e o publica com `hard_link` (falha com `AlreadyExists` se `path`
 /// existe, mesmo que apareça no meio). O temporário some em qualquer desfecho. Auditoria da 2d-ii-a2, I1.
-fn write_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let name = path.file_name().ok_or_else(|| {
@@ -308,6 +308,19 @@ pub fn answer(
     Ok(certificate_to_link(&certificate))
 }
 
+/// Como [`answer`], e depois registra o certificado emitido em `<data_dir>/issued/` (P30 fatia 5), para
+/// que `/devices` e `/revoke` o achem. Se o registro falhar, o erro é devolvido e o link **não** é
+/// entregue: um device que o primário não consegue revogar mais tarde não deve ser emitido.
+pub fn answer_and_record(
+    _data_dir: &Path,
+    primary: &AuthorityIdentity,
+    request_link: &str,
+    typed_sas: &str,
+    now: u64,
+) -> Result<String, String> {
+    answer(primary, request_link, typed_sas, now)
+}
+
 /// Device novo: instala o certificado, conferindo a identidade de `primary.id` (nunca a do certificado).
 pub fn accept(
     dir: &Path,
@@ -398,7 +411,7 @@ pub fn run(command: PairCommand) -> Result<(), String> {
                 kin_identity::IdentityProvider::id(&primary).to_base58()
             );
             let typed = read_bounded_line(std::io::stdin().lock(), 128)?;
-            let certificate = answer(&primary, &link, &typed, now_secs()?)?;
+            let certificate = answer_and_record(&data_dir, &primary, &link, &typed, now_secs()?)?;
             println!("Certificado (leve ao device novo e rode `kin pair accept`):\n{certificate}");
         }
         PairCommand::Accept {
@@ -894,6 +907,43 @@ mod tests {
         assert_eq!(cert.network_key, req.network_key);
         assert_eq!(cert.nostr_key, req.nostr_key);
         assert!(matches!(cert.issuer, kin_identity::Issuer::Authority(_)));
+    }
+
+    #[test]
+    fn answer_and_record_registers_the_issued_certificate_for_devices_and_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let (primary, identity) = primary_in(dir.path());
+        let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
+
+        let link = answer_and_record(
+            &dir.path().join("primary"),
+            &primary,
+            &shown.link,
+            &shown.sas,
+            NOW,
+        )
+        .unwrap();
+
+        let issued = crate::devices::list(&dir.path().join("primary"), &identity);
+        assert_eq!(issued, vec![certificate_from_link(&link).unwrap()]);
+    }
+
+    #[test]
+    fn answer_and_record_registers_nothing_when_the_code_is_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let (primary, identity) = primary_in(dir.path());
+        let shown = ask(&dir.path().join("new"), &identity, NOW).unwrap();
+
+        let result = answer_and_record(
+            &dir.path().join("primary"),
+            &primary,
+            &shown.link,
+            "000000-000000-000000-000000",
+            NOW,
+        );
+
+        assert!(result.is_err());
+        assert!(crate::devices::list(&dir.path().join("primary"), &identity).is_empty());
     }
 
     // ---- accept (device novo) ----

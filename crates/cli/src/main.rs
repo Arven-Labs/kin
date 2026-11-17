@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 
 mod cold;
+mod devices;
 mod keys;
 mod pair;
 
