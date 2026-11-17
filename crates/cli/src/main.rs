@@ -19,6 +19,10 @@
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
 //! deixa de valer (um irmão que o repasse não o faz voltar); a conversa e as mensagens seguem.
+//! No primário (diretório com `authority.key`): `kin pair answer` registra cada certificado emitido em
+//! `issued/`; `/devices` lista esses devices (ativo, revogado, conectado) e `/revoke PREFIXO` mostra qual
+//! é, e `/revoke PREFIXO confirmo` o revoga (tombstone assinado pela autoridade, enviado a quem aceita a
+//! identidade; ADR 0034). Não revoga o device do próprio primário.
 //! Device pareado sem copiar a mestra: `kin pair request/answer/accept` (ADR 0020) e depois `kin --data-dir DIR`
 //! normal; o diretório com `primary.id` abre como device da identidade do primário (ADR 0021).
 //! Segundo device da mesma identidade (modo antigo, com a mestra): `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
@@ -397,6 +401,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     history(&chat, line.strip_prefix("/history").unwrap_or("").trim(), current, &met);
                     continue;
                 }
+                if line == "/devices" {
+                    show_devices(&chat, &identity, &args.data_dir);
+                    continue;
+                }
+                if line == "/revoke" || line.starts_with("/revoke ") {
+                    revoke_device(
+                        &mut chat,
+                        &identity,
+                        &args.data_dir,
+                        line.strip_prefix("/revoke").unwrap_or("").trim(),
+                    );
+                    continue;
+                }
                 if line == "/untrust" || line.starts_with("/untrust ") {
                     untrust(&mut chat, line.strip_prefix("/untrust").unwrap_or("").trim(), current, &met);
                     continue;
@@ -583,6 +600,75 @@ fn untrust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerI
             println!("(nenhuma identidade conhecida assim; veja `conversa cifrada pronta`)");
         }
         Resolved::Ambiguous => println!("(prefixo ambíguo: digite mais caracteres)"),
+    }
+}
+
+const NOT_PRIMARY: &str = "(só o primário lista e revoga devices: rode a CLI no diretório com authority.key; no modo antigo da mestra, revogar não adianta, pois cada device tem a mestra)";
+
+/// `/devices`: os devices que este primário emitiu (`issued/`), com estado e se estão conectados.
+fn show_devices(chat: &Chat, identity: &keys::LocalIdentity, data_dir: &Path) {
+    if !matches!(identity, keys::LocalIdentity::Primary(_)) {
+        println!("{NOT_PRIMARY}");
+        return;
+    }
+    let issued = devices::list(data_dir, &identity.id());
+    if issued.is_empty() {
+        println!("(nenhum device emitido por este primário; veja `kin pair answer`)");
+        return;
+    }
+    for certificate in &issued {
+        match chat.is_revoked(certificate) {
+            Ok(revoked) => println!(
+                "{}",
+                devices::describe(
+                    certificate,
+                    revoked,
+                    chat.is_ready(&certificate.network_peer_id())
+                )
+            ),
+            Err(e) => {
+                println!("(não consegui ler as revogações: {e})");
+                return;
+            }
+        }
+    }
+}
+
+/// `/revoke PREFIXO [confirmo]`: o primário assina o tombstone do device e o `Chat` o grava e envia.
+/// Irreversível, por isso só com `confirmo`.
+fn revoke_device(chat: &mut Chat, identity: &keys::LocalIdentity, data_dir: &Path, args: &str) {
+    let keys::LocalIdentity::Primary(primary) = identity else {
+        println!("{NOT_PRIMARY}");
+        return;
+    };
+    let issued = devices::list(data_dir, &identity.id());
+    match devices::decide_revoke(args, &issued, &chat.peer_id()) {
+        Err(e) => println!("({e})"),
+        Ok(devices::RevokeAction::Ask(certificate)) => println!(
+            "revogar o device {} (emitido em {})? Não dá para desfazer. Para confirmar: /revoke {} confirmo",
+            certificate.network_peer_id(),
+            certificate.created_at,
+            args.trim()
+        ),
+        Ok(devices::RevokeAction::Revoke(certificate)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let result = primary
+                .revoke_device(certificate, now)
+                .map_err(|e| e.to_string())
+                .and_then(|revocation| {
+                    chat.broadcast_revocation(&revocation)
+                        .map_err(|e| e.to_string())
+                });
+            match result {
+                Ok(()) => println!(
+                    "(device {} revogado e tombstone enviado; quem estiver offline só saberá depois)",
+                    certificate.network_peer_id()
+                ),
+                Err(e) => println!("(não revoguei: {e})"),
+            }
+        }
     }
 }
 

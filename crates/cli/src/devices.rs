@@ -4,8 +4,6 @@
 //! nunca reescrito). É o "livro de registro": `/devices` o lista e `/revoke` tira dele o certificado
 //! que o `revoke_device` exige. O estado (ativo ou revogado) **não** mora aqui: vem do store de tombstones.
 
-#![allow(dead_code)] // esqueleto: sai quando o main.rs passar a usar estas funções
-
 use std::path::Path;
 
 use kin_identity::{DeviceCertificate, IdentityId, PeerId};
@@ -13,8 +11,14 @@ use kin_identity::{DeviceCertificate, IdentityId, PeerId};
 /// Pasta, dentro do `--data-dir` do primário, com os certificados emitidos.
 pub const ISSUED_DIR: &str = "issued";
 
-/// Menor tamanho aceito para o texto de `/revoke` (Peer IDs Ed25519 começam todos por `12D3KooW`).
-pub const MIN_PREFIX_LEN: usize = 12;
+/// Começo comum a todos os Peer IDs Ed25519: não ajuda a distinguir devices.
+const COMMON_PREFIX: &str = "12D3KooW";
+
+/// Menor número de caracteres, **depois** do `12D3KooW`, aceito em `/revoke`.
+pub const MIN_PREFIX_LEN: usize = 4;
+
+/// Teto do tamanho de um arquivo de `issued/` (um certificado v4 tem poucos KiB).
+const MAX_FILE_LEN: u64 = 64 * 1024;
 
 /// O que `/revoke` deve fazer com a linha digitada.
 #[derive(Debug, PartialEq, Eq)]
@@ -27,30 +31,105 @@ pub enum RevokeAction<'a> {
 
 /// Grava `certificate` em `<data_dir>/issued/<peer-id>.cert` (0600). Idempotente: se o arquivo do
 /// mesmo device já existe, não o reescreve e devolve `Ok`.
-pub fn record(_data_dir: &Path, _certificate: &DeviceCertificate) -> Result<(), String> {
-    Ok(())
+pub fn record(data_dir: &Path, certificate: &DeviceCertificate) -> Result<(), String> {
+    let dir = data_dir.join(ISSUED_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("não deu para criar {ISSUED_DIR}/: {e}"))?;
+    let path = dir.join(file_name(certificate));
+    match crate::pair::write_new_atomic(&path, &certificate.to_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("não deu para registrar o device emitido: {e}")),
+    }
+}
+
+fn file_name(certificate: &DeviceCertificate) -> String {
+    format!("{}.cert", certificate.network_peer_id())
 }
 
 /// Os certificados emitidos para `identity`, em ordem de Peer ID. Arquivo ilegível, corrompido, com
 /// assinatura inválida ou de **outra identidade** é ignorado (a listagem nunca falha por causa dele).
-pub fn list(_data_dir: &Path, _identity: &IdentityId) -> Vec<DeviceCertificate> {
-    Vec::new()
+pub fn list(data_dir: &Path, identity: &IdentityId) -> Vec<DeviceCertificate> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join(ISSUED_DIR)) else {
+        return Vec::new();
+    };
+    let mut issued: Vec<DeviceCertificate> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() || meta.len() > MAX_FILE_LEN {
+                return None;
+            }
+            let certificate =
+                DeviceCertificate::from_bytes(&std::fs::read(entry.path()).ok()?).ok()?;
+            certificate.verify().ok()?;
+            // Só da minha identidade, e só se o nome do arquivo é o do device (sem duplicata).
+            let named_right = entry.file_name().to_str() == Some(file_name(&certificate).as_str());
+            (certificate.identity() == identity && named_right).then_some(certificate)
+        })
+        .collect();
+    issued.sort_by_key(|certificate| certificate.network_peer_id());
+    issued
 }
 
 /// Resolve o que foi digitado em `/revoke ARGS`: `PREFIXO` ou `PREFIXO confirmo`. O prefixo é do Peer
 /// ID (com ou sem o `12D3KooW` do começo) e precisa ser único entre `issued`; o device `own` (o do
 /// próprio primário) nunca pode ser o alvo.
 pub fn decide_revoke<'a>(
-    _args: &str,
-    _issued: &'a [DeviceCertificate],
-    _own: &PeerId,
+    args: &str,
+    issued: &'a [DeviceCertificate],
+    own: &PeerId,
 ) -> Result<RevokeAction<'a>, String> {
-    Err("não implementado".into())
+    let mut words: Vec<&str> = args.split_whitespace().collect();
+    let confirmed = words.last() == Some(&"confirmo");
+    if confirmed {
+        words.pop();
+    }
+    let [typed] = words.as_slice() else {
+        return Err("uso: /revoke PREFIXO_DO_PEER_ID [confirmo] (veja /devices)".into());
+    };
+    let tail = typed.strip_prefix(COMMON_PREFIX).unwrap_or(typed);
+    if tail.chars().count() < MIN_PREFIX_LEN {
+        return Err(format!(
+            "prefixo curto demais: use pelo menos {MIN_PREFIX_LEN} caracteres depois de {COMMON_PREFIX}"
+        ));
+    }
+    let wanted = format!("{COMMON_PREFIX}{tail}");
+    let mut matches = issued.iter().filter(|certificate| {
+        certificate
+            .network_peer_id()
+            .to_string()
+            .starts_with(&wanted)
+    });
+    let (Some(target), None) = (matches.next(), matches.next()) else {
+        let count = issued
+            .iter()
+            .filter(|c| c.network_peer_id().to_string().starts_with(&wanted))
+            .count();
+        return Err(if count == 0 {
+            format!("nenhum device emitido começa por {typed} (veja /devices)")
+        } else {
+            format!("prefixo {typed} é ambíguo ({count} devices): digite mais caracteres")
+        });
+    };
+    if &target.network_peer_id() == own {
+        return Err("este é o próprio device do primário: não dá para revogá-lo aqui".into());
+    }
+    Ok(if confirmed {
+        RevokeAction::Revoke(target)
+    } else {
+        RevokeAction::Ask(target)
+    })
 }
 
 /// Uma linha de `/devices`: Peer ID, data de emissão (segundos Unix) e estado.
-pub fn describe(_certificate: &DeviceCertificate, _revoked: bool, _connected: bool) -> String {
-    String::new()
+pub fn describe(certificate: &DeviceCertificate, revoked: bool, connected: bool) -> String {
+    let state = if revoked { "revogado" } else { "ativo" };
+    let link = if connected { ", conectado" } else { "" };
+    format!(
+        "{}  emitido em {}  {state}{link}",
+        certificate.network_peer_id(),
+        certificate.created_at
+    )
 }
 
 #[cfg(test)]

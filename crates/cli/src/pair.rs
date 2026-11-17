@@ -312,13 +312,15 @@ pub fn answer(
 /// que `/devices` e `/revoke` o achem. Se o registro falhar, o erro é devolvido e o link **não** é
 /// entregue: um device que o primário não consegue revogar mais tarde não deve ser emitido.
 pub fn answer_and_record(
-    _data_dir: &Path,
+    data_dir: &Path,
     primary: &AuthorityIdentity,
     request_link: &str,
     typed_sas: &str,
     now: u64,
 ) -> Result<String, String> {
-    answer(primary, request_link, typed_sas, now)
+    let link = answer(primary, request_link, typed_sas, now)?;
+    crate::devices::record(data_dir, &certificate_from_link(&link)?)?;
+    Ok(link)
 }
 
 /// Device novo: instala o certificado, conferindo a identidade de `primary.id` (nunca a do certificado).
