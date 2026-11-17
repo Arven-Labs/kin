@@ -458,7 +458,10 @@ fn print_invite(chat: &Chat) {
         ),
         Err(e) => println!("(não deu para gerar o QR: {e})"),
     }
-    println!("convite: {link}");
+    println!(
+        "convite (válido por {} h): {link}",
+        DEFAULT_INVITE_TTL.as_secs() / 3600
+    );
 }
 
 /// `/pair`: mostra o link de pareamento (a chave mestra!) e o QR, só depois de `/pair confirmo`. O

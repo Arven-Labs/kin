@@ -9,7 +9,7 @@ use common::{
 };
 use kin_chat::{Chat, ChatEvent, DEFAULT_INVITE_TTL, Error, Invite, MAX_INVITE_TTL};
 use kin_identity::{DeviceKey, IdentityProvider, StandaloneIdentity};
-use kin_transport::NodeConfig;
+use kin_transport::{Multiaddr, NodeConfig};
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -147,6 +147,106 @@ async fn extending_the_expiry_without_the_device_key_breaks_the_link() {
     assert!(matches!(
         Invite::from_link_at(&link_of(&bytes), NOW),
         Err(Error::InvalidInvite)
+    ));
+}
+
+fn addr(text: &str) -> Multiaddr {
+    text.parse().unwrap()
+}
+
+/// Troca a assinatura do link (os últimos 2 + 64 bytes) por `signature` sobre `message`.
+fn resigned(ana: &Person, link: &str, message: impl Fn(&[u8]) -> Vec<u8>) -> String {
+    let bytes = bytes_of(link);
+    let body = &bytes[..bytes.len() - 2 - 64];
+    let signature = ana.device.keypair().sign(&message(body)).unwrap();
+    let mut out = body.to_vec();
+    out.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    out.extend_from_slice(&signature);
+    link_of(&out)
+}
+
+/// O domínio `kin/invite/v2` faz parte do que se assina: sem ele, ou com outro, o link é recusado.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_signature_must_cover_the_invite_domain() {
+    let ana = person();
+    let link = signed_link(&ana, NOW + DAY);
+
+    // Controle: refazer a assinatura com o domínio certo mantém o link válido.
+    let ok = resigned(&ana, &link, |body| [&b"kin/invite/v2"[..], body].concat());
+    assert!(Invite::from_link_at(&ok, NOW).is_ok());
+
+    for (name, domain) in [
+        ("sem domínio", &b""[..]),
+        ("domínio v1", &b"kin/invite/v1"[..]),
+        ("outro protocolo", &b"kin/pair/v1"[..]),
+    ] {
+        let bad = resigned(&ana, &link, |body| [domain, body].concat());
+        assert!(
+            matches!(Invite::from_link_at(&bad, NOW), Err(Error::InvalidInvite)),
+            "assinatura {name} passou"
+        );
+    }
+}
+
+/// Com endereços no link, qualquer byte alterado e qualquer truncamento ainda quebram o link, e a lista
+/// de endereços de um link não serve com a assinatura de outro (redirecionar a discagem).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_addresses_are_covered_by_the_signature() {
+    let ana = person();
+    let one = ana
+        .chat
+        .invite(vec![
+            addr("/ip4/203.0.113.7/tcp/4001"),
+            addr("/ip4/198.51.100.9/udp/4001/quic-v1"),
+        ])
+        .to_link(&ana.device, NOW + DAY);
+    let other = ana
+        .chat
+        .invite(vec![addr("/ip4/192.0.2.66/tcp/4001")])
+        .to_link(&ana.device, NOW + DAY);
+    assert!(Invite::from_link_at(&one, NOW).is_ok());
+    let bytes = bytes_of(&one);
+
+    for i in 1..bytes.len() {
+        let mut tampered = bytes.clone();
+        tampered[i] ^= 0x01;
+        assert!(
+            Invite::from_link_at(&link_of(&tampered), NOW).is_err(),
+            "byte {i} alterado passou"
+        );
+        assert!(
+            Invite::from_link_at(&link_of(&bytes[..i]), NOW).is_err(),
+            "truncado em {i} passou"
+        );
+    }
+
+    // Endereços de `other` com a assinatura de `one` (mesmo device, mesma validade).
+    let (b_one, b_other) = (bytes_of(&one), bytes_of(&other));
+    let tail = &b_one[b_one.len() - 2 - 64..];
+    let spliced = [&b_other[..b_other.len() - 2 - 64], tail].concat();
+    assert!(matches!(
+        Invite::from_link_at(&link_of(&spliced), NOW),
+        Err(Error::InvalidInvite)
+    ));
+}
+
+/// `Chat::invite_link` nunca emite um link que o leitor recusa só pelo prazo pedido.
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_link_clamps_the_ttl_to_what_a_reader_accepts() {
+    let ana = person();
+
+    for ttl in [MAX_INVITE_TTL, Duration::from_secs(u64::MAX), Duration::MAX] {
+        let link = ana.chat.invite_link(vec![], ttl);
+        assert!(
+            Invite::from_link(&link).is_ok(),
+            "ttl {ttl:?} gerou link ilegível"
+        );
+    }
+    // Prazo zero: o link já nasce vencido (o chamador pediu isso), nunca inválido nem aceito.
+    let link = ana.chat.invite_link(vec![], Duration::ZERO);
+    assert!(matches!(
+        Invite::from_link_at(&link, now() + 1),
+        Err(Error::ExpiredInvite)
     ));
 }
 

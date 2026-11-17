@@ -33,8 +33,10 @@ const MAX_ADDRS: usize = 32;
 /// do outro lado (`Chat::accept`). Gerar e compartilhar o link é o consentimento de quem convida
 /// (D5, nível "só por link"): não há pedido de amizade nem caixa de entrada.
 ///
-/// Formato v1 (manual, como `Message`): `versão u8 | len16 certificado | n u8 | n × (len16 endereço)`,
-/// em base64url sem padding, depois de `kin://invite/`.
+/// Formato do convite (manual, como `Message`): `versão u8 | len16 certificado | n u8 | n × (len16
+/// endereço)`. A versão 1 é a que a `DeviceList` carrega por item. O **link** usa a versão 2 (ver
+/// [`Invite::to_link`]), com validade e assinatura, em base64url sem padding, depois de `kin://invite/`.
+/// A validade só existe no link: depois de `from_link`, o `Invite` não a carrega (ADR 0033).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
     certificate: DeviceCertificate,
