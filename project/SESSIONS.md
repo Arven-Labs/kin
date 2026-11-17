@@ -1892,4 +1892,16 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Tropeços**: errei 2 previsões da tabela de testes (acima); a mutação D inicial não valeu (acima), e quase a registrei como pega: conferi que o run falhou no clippy e não em teste.
 - **Não verificado**: a fiação `show_devices`/`revoke_device` no `main.rs` (sem teste, o `main.rs` não tem infraestrutura com `Chat`); revogar com tombstone entre dois `Chat` reais a partir da CLI
   (o `broadcast_revocation` já tem testes no `chat`); devices pareados antes da fatia; revisão externa.
-- **Próximo passo**: decidir o `signer`; fatia 6 (migração das identidades v3 e remoção do `kin://pair/` com a mestra), em plan mode.
+- **Próximo passo**: fatia 6 (migração das identidades v3 e remoção do `kin://pair/` com a mestra), em plan mode. *(O `signer` foi resolvido na mesma sessão, abaixo.)*
+
+#### `InviteSigner`: o `signer` do convite sem a chave Nostr (fecha o item 1 da auditoria do ADR 0033)
+
+- **Decisão do dono**: "pode ser" à minha recomendação de resolver o `signer` antes da fatia 6. A escolha final foi uma **terceira opção**, melhor que as duas oferecidas: um tipo
+  `InviteSigner` no `identity` (só a chave de rede, domínio fixo dentro do crate, sem dependência nova). Aprovou a tabela de testes antes do push.
+- **Feito**: `identity` (`InviteSigner`, `DeviceKey::invite_signer`, `DeviceCertificate::verify_invite`), `chat` (o `Chat` guarda o `InviteSigner`; `Invite::to_link` recebe `&InviteSigner`; o domínio saiu
+  do `chat`). Formato do link **inalterado**: links já emitidos seguem válidos. Some a cópia do `DeviceKey` e o `Vec` sem zeroizar.
+- **Prova de que testam algo**: esqueleto (sem o domínio), **2 testes falharam** (`the_signer_enforces_the_invite_domain` no `identity`, `the_signature_must_cover_the_invite_domain` no `chat`) e os controles passaram
+  (run 44099071123); verde com a implementação (44099857706). **O esqueleto sem domínio é a própria mutação** "tirar o domínio", então não rodei outra.
+- **Não feito**: auditoria `security-auditor` nova (mudança pequena, de refatoração sobre código já auditado e com 5 testes novos; **diga se quer**); mutação de `verify_invite` sempre verdadeiro.
+- **Tropeços**: tentei editar testes com `sed -i`, contra o `CLAUDE.md`; o hook barrou e refiz com `Edit`; nada foi alterado pelo `sed`.
+- **Não verificado**: consumidores fora deste repo (p. ex. `warden/mobile`) da API `to_link`; revisão externa.
