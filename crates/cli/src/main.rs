@@ -25,9 +25,9 @@
 //! identidade; ADR 0034). Não revoga o device do próprio primário.
 //! Device pareado sem copiar a mestra: `kin pair request/answer/accept` (ADR 0020) e depois `kin --data-dir DIR`
 //! normal; o diretório com `primary.id` abre como device da identidade do primário (ADR 0021).
-//! Segundo device da mesma identidade (modo antigo, com a mestra): `/pair` (depois `/pair confirmo`) mostra a chave mestra como link
-//! `kin://pair/...`; no device novo, `--pair ARQUIVO` (ou `-` para stdin) a importa na primeira execução
-//! e recusa se já houver identidade. É o segredo inteiro, sem cifra: use só em terminal privado.
+//! O `/pair` antigo (copiar a chave mestra por `kin://pair/...` e `--pair`) foi **removido** (ADR 0035): a CLI no modo
+//! `Master` (mestra neste device, v3) avisa e mostra o roteiro de migração para a identidade nova; `/pair` imprime o mesmo
+//! caminho (`kin cold init` + `kin pair`). A trava de envio continua barrando um `kin://pair/` colado por engano.
 //! Linhas digitadas vão à identidade da conversa atual (a todos os devices dela) e são espelhadas
 //! nos meus outros devices (`eu → ...`);
 //! `/history [prefixo] [N]` mostra as últimas N linhas (padrão 20, teto 200) do histórico local com a
@@ -45,7 +45,7 @@ use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{
     Chat, ChatEvent, DEFAULT_INVITE_TTL, Error, HistoryEntry, Invite, Message, MessageId,
 };
-use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
+use kin_identity::{DeviceKey, IdentityId};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -55,7 +55,6 @@ struct Args {
     listen: Option<Multiaddr>,
     dial: Option<Multiaddr>,
     accept: Option<String>,
-    pair: Option<String>,
     relays: Vec<Multiaddr>,
     relay_count: Option<usize>,
     external_addrs: Vec<Multiaddr>,
@@ -85,7 +84,6 @@ fn parse_from(
         listen: None,
         dial: None,
         accept: None,
-        pair: None,
         relays: Vec::new(),
         relay_count: None,
         external_addrs: Vec::new(),
@@ -103,7 +101,6 @@ fn parse_from(
             "--listen" => args.listen = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--dial" => args.dial = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--accept" => args.accept = Some(value()?),
-            "--pair" => args.pair = Some(value()?),
             "--passphrase-file" => args.keys.passphrase_file = Some(value()?.into()),
             "--protect" => args.keys.protect = true,
             "--no-passphrase" => args.keys.no_passphrase = true,
@@ -142,11 +139,6 @@ fn parse_from(
 /// ADR 0012). Por padrão ficam **cifradas** com uma senha (prompt, `--passphrase-file` ou
 /// `KIN_PASSPHRASE_FILE`); `--no-passphrase` grava em claro; `--protect` cifra no lugar um diretório
 /// antigo em claro.
-///
-/// `--pair` (ADR 0006): o link `kin://pair/...` de outro device desta identidade, lido de um arquivo
-/// (`-` = stdin; nunca do argv, que aparece em `ps`). Só vale na primeira execução: com `identity.key`
-/// já existente falha, em vez de sobrescrever uma identidade. O device continua com `device.key`
-/// próprio, gerado aqui.
 fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
     let dir = &args.data_dir;
     std::fs::create_dir_all(dir)?;
@@ -172,7 +164,6 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
             (Some(pass), *protect)
         }
     };
-    let pair_text = args.pair.as_deref().map(read_pair_link).transpose()?;
     if protect {
         eprintln!(
             "aviso: o arquivo em claro antigo pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate a chave como exposta"
@@ -180,17 +171,10 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
     }
     let loaded = keys::load(
         dir,
-        pair_text.as_deref(),
         passphrase.as_ref().map(|p| p.as_slice()),
         protect,
         kin_identity::KdfParams::DEFAULT,
     )?;
-    if let Some(source) = &args.pair {
-        println!("identidade importada: {}", loaded.0.id().to_base58());
-        if source != "-" {
-            println!("(apague o arquivo do link: ele guarda a chave mestra em claro)");
-        }
-    }
     // O pareado só se anuncia depois de o `Chat::open_paired` e o `ensure_current_issuer` passarem (em
     // `main`): antes disso ainda pode ser um pareamento pendente ou um banco v3.
     if matches!(loaded.0, keys::LocalIdentity::Primary(_)) {
@@ -243,7 +227,7 @@ fn read_pair_link(source: &str) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Cria `path` (falha se existir) com 0600 e grava `bytes`. Se a escrita falhar, apaga o arquivo
-/// parcial: um segredo truncado travaria o próximo `--pair` ("já existe") e a abertura normal.
+/// parcial: um segredo truncado travaria a próxima criação ("já existe") e a abertura normal.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -312,6 +296,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
     keys::ensure_current_issuer(&identity, chat.certificate())?;
+    if let Some(notice) = keys::notice_for(&identity) {
+        eprintln!("{notice}");
+    }
     if matches!(identity, keys::LocalIdentity::Paired(_)) {
         println!(
             "device pareado da identidade {} (certificado v4 do primário; sem mestra nem autoridade aqui)",
@@ -380,13 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
-                    match identity.master() {
-                        Some(master) => print_pair(master, line == "/pair confirmo"),
-                        None => println!(
-                            "(a mestra não está neste diretório (primário ou device pareado), então não há link de pareamento.\n \
-                             Para parear outro device sem copiar a mestra, use `kin pair request/answer/accept`)"
-                        ),
-                    }
+                    println!("{}", pair_reply(&identity));
                     continue;
                 }
                 if let Some(link) = line.strip_prefix("/accept ") {
@@ -419,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 // A chave mestra nunca vai a um contato por engano (ex.: Ctrl+V do link de pareamento).
-                if line.contains("kin://pair/") {
+                if is_pair_link(line) {
                     println!("(não enviado: isto é um link de pareamento, a sua chave mestra)");
                     continue;
                 }
@@ -479,44 +460,6 @@ fn print_invite(chat: &Chat) {
     println!(
         "convite (válido por {} h): {link}",
         DEFAULT_INVITE_TTL.as_secs() / 3600
-    );
-}
-
-/// `/pair`: mostra o link de pareamento (a chave mestra!) e o QR, só depois de `/pair confirmo`. O
-/// segredo vai só para a tela: nada de log nem de arquivo.
-fn print_pair(identity: &StandaloneIdentity, confirmed: bool) {
-    if !confirmed {
-        println!(
-            "(isto mostra a CHAVE MESTRA: quem vir o link ou o QR é esta identidade e não há revogação.\n \
-             Use só em terminal privado, passe o link ao outro device por arquivo ou stdin e limpe a tela.\n \
-             Para continuar: /pair confirmo)"
-        );
-        return;
-    }
-    // Saída redirecionada (`> log`, `| tee`, supervisor) gravaria a chave mestra em disco.
-    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-        println!("(recusado: a saída não é um terminal, o link iria para um arquivo ou pipe)");
-        return;
-    }
-    let link = match identity.to_pair_link() {
-        Ok(link) => link,
-        Err(e) => {
-            println!("(não deu para gerar o link: {e})");
-            return;
-        }
-    };
-    match qrcode::QrCode::new(link.as_bytes()) {
-        Ok(code) => println!(
-            "{}",
-            code.render::<qrcode::render::unicode::Dense1x2>()
-                .quiet_zone(true)
-                .build()
-        ),
-        Err(e) => println!("(não deu para gerar o QR: {e})"),
-    }
-    println!("pareamento: {link}");
-    println!(
-        "(no outro device: kin --data-dir NOVO --pair ARQUIVO, com o link no arquivo ou `-` para stdin)"
     );
 }
 
@@ -601,6 +544,32 @@ fn untrust(chat: &mut Chat, prefix: &str, current: Option<PeerId>, met: &[(PeerI
         }
         Resolved::Ambiguous => println!("(prefixo ambíguo: digite mais caracteres)"),
     }
+}
+
+/// Resposta a `/pair` depois que a cópia da mestra foi removida (P30 fatia 6, ADR 0035).
+const PAIR_REMOVED_MASTER: &str = "(o /pair foi removido: ele copiava a chave mestra para outro device, e copiar o identity.key à mão é a mesma \
+coisa: essa mestra nunca revoga nada. Para ter vários devices é preciso uma identidade NOVA (outro ID): `kin cold init`, \
+depois `kin pair request`, `kin pair answer` e `kin pair accept`, e reconfirmar com cada contato. Veja o aviso de migração \
+da abertura.)";
+const PAIR_REMOVED_PRIMARY: &str = "(o /pair foi removido. Para adicionar um device a este primário: no device novo, `kin pair request`; \
+aqui, `kin pair answer`; e de volta no device novo, `kin pair accept`. Veja também /devices e /revoke.)";
+const PAIR_REMOVED_PAIRED: &str = "(o /pair foi removido. Este é um device pareado: quem adiciona e revoga devices é o primário, \
+com `kin pair answer`.)";
+
+/// A resposta a `/pair` para o modo em que a CLI está: cada um tem um caminho diferente, e mandar o
+/// primário rodar `kin cold init` criaria uma segunda identidade por engano (auditoria da fatia 6, I1).
+fn pair_reply(identity: &keys::LocalIdentity) -> &'static str {
+    match identity {
+        keys::LocalIdentity::Master(_) => PAIR_REMOVED_MASTER,
+        keys::LocalIdentity::Primary(_) => PAIR_REMOVED_PRIMARY,
+        keys::LocalIdentity::Paired(_) => PAIR_REMOVED_PAIRED,
+    }
+}
+
+/// A linha parece um link de pareamento antigo (`kin://pair/`, que carregava a chave mestra)? A trava de
+/// envio a barra mesmo sem o `/pair`: links velhos ainda podem circular (ADR 0035).
+fn is_pair_link(line: &str) -> bool {
+    line.contains("kin://pair/")
 }
 
 const NOT_PRIMARY: &str = "(só o primário lista e revoga devices: rode a CLI no diretório com authority.key; no modo antigo da mestra, revogar não adianta, pois cada device tem a mestra)";
@@ -934,10 +903,66 @@ fn on_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kin_identity::IdentityProvider;
+    use kin_identity::{IdentityProvider, StandaloneIdentity};
 
     fn parse(argv: &[&str], env: Option<&str>) -> Result<Args, String> {
         parse_from(argv.iter().map(|s| s.to_string()), env.map(str::to_string))
+    }
+
+    // ---- remoção da cópia da mestra (P30 fatia 6, ADR 0035) ----
+
+    #[test]
+    fn the_pair_flag_no_longer_exists() {
+        // `--pair ARQUIVO` importava a mestra de outro device: agora é uma flag desconhecida.
+        assert!(parse(&["--pair", "arquivo"], None).is_err());
+        assert!(parse(&["--pair", "-"], None).is_err());
+        // controle: uma flag válida segue sendo aceita
+        assert!(parse(&["--no-nostr"], None).is_ok());
+    }
+
+    #[test]
+    fn the_slash_pair_reply_depends_on_the_mode_and_carries_no_link() {
+        let master = StandaloneIdentity::generate();
+        let key = kin_identity::AuthorityKey::generate();
+        let chain = master.certify_authority(&key.public_key(), 1).unwrap();
+        let primary = kin_identity::AuthorityIdentity::new(key, chain).unwrap();
+        let paired = keys::LocalIdentity::Paired(master.id());
+        let master = keys::LocalIdentity::Master(Box::new(master));
+        let primary = keys::LocalIdentity::Primary(Box::new(primary));
+
+        // Master: o caminho é uma identidade NOVA, e o texto tem de dizer isso.
+        let text = pair_reply(&master);
+        for needle in [
+            "kin cold init",
+            "kin pair request",
+            "identidade NOVA",
+            "identity.key",
+        ] {
+            assert!(text.contains(needle), "o Master não ouve {needle}: {text}");
+        }
+        // Primário: só `kin pair answer`; mandá-lo rodar `kin cold init` criaria uma segunda identidade.
+        let text = pair_reply(&primary);
+        assert!(text.contains("kin pair answer"), "{text}");
+        assert!(!text.contains("kin cold init"), "{text}");
+        // Pareado: quem adiciona devices é o primário.
+        let text = pair_reply(&paired);
+        assert!(text.contains("primário"), "{text}");
+        assert!(!text.contains("kin cold init"), "{text}");
+        // Nenhuma resposta pode disparar a própria trava nem sugerir o link antigo.
+        for mode in [&master, &primary, &paired] {
+            assert!(!is_pair_link(pair_reply(mode)));
+        }
+    }
+
+    #[test]
+    fn the_send_guard_still_blocks_an_old_pair_link_but_not_other_links() {
+        assert!(is_pair_link("kin://pair/AAAA"));
+        assert!(is_pair_link("olha isso kin://pair/AAAA ok?"));
+        // pedido e certificado do pareamento novo não carregam a mestra
+        assert!(!is_pair_link("kin://pair-request/AAAA"));
+        assert!(!is_pair_link("kin://pair-cert/AAAA"));
+        assert!(!is_pair_link("kin://invite/AAAA"));
+        assert!(!is_pair_link("oi, tudo bem?"));
     }
 
     #[test]

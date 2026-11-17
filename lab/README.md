@@ -33,8 +33,8 @@ storage failed"). Cenários que só leem o arquivo copiado (como o `identity.key
 
 `REPEAT=5 lab/run.sh` roda cada cenário 5 vezes e imprime `x/5` por cenário (o hole punching varia de rodada para rodada).
 
-No `multi-device`, o `a2` recebe o `identity.key` de `a` por `compose cp` (é o que o `--pair` grava): o `/pair` da CLI recusa
-saída que não é terminal, e o log do Docker é um pipe.
+No `multi-device`, o `a2` recebe o `identity.key` de `a` por `compose cp`: é o modo `Master` (v3), em que a mestra mora nos dois
+devices. O `/pair` e o `--pair` antigos foram removidos (ADR 0035); o caminho com revogação é o cenário `paired-device`.
 
 **Chaves cifradas (ADR 0012):** por padrão os nós do lab guardam `identity.key` e `device.key` cifrados. O stdin é uma fifo
 (sem terminal), então a senha vem de `lab/passphrase` (senha só do laboratório, montada em `/lab/passphrase`); o `node.sh` a

@@ -11,9 +11,6 @@ pub enum Error {
     InvalidNostrKey,
     #[error("arquivo de chave do device inválido ou de formato antigo")]
     InvalidDeviceKey,
-    /// Sem detalhe de propósito: o link carrega a chave mestra e não pode ser ecoado.
-    #[error("link de pareamento inválido (esperado kin://pair/ + chave mestra em base64url)")]
-    InvalidPairLink,
     /// Sem detalhe de propósito: o texto veio de fora (digitado ou colado).
     #[error("identidade inválida (esperado o ID em base58 de uma chave Ed25519)")]
     InvalidIdentityId,

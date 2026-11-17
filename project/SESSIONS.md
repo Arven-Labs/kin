@@ -1905,3 +1905,18 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não feito**: auditoria `security-auditor` nova (mudança pequena, de refatoração sobre código já auditado e com 5 testes novos; **diga se quer**); mutação de `verify_invite` sempre verdadeiro.
 - **Tropeços**: tentei editar testes com `sed -i`, contra o `CLAUDE.md`; o hook barrou e refiz com `Edit`; nada foi alterado pelo `sed`.
 - **Não verificado**: consumidores fora deste repo (p. ex. `warden/mobile`) da API `to_link`; revisão externa.
+
+#### Remoção da cópia da mestra (`kin://pair/`, `--pair`, `/pair`) e roteiro de migração (P30, fatia 6, ADR 0035)
+
+- **Decisões do dono** (plan mode + 2 perguntas + aprovação da tabela de testes): o modo `Master` **fica**, só para 1 device; migração = **aviso + roteiro**, sem `kin migrate`. Antes, "p6" era ambíguo
+  (a fatia 6 do P30 ou o P6 do PENDING, privacidade de metadados): perguntei, e era a fatia 6.
+- **Feito** (`identity`, `cli`, `lab`): saem `to_pair_link`/`from_pair_link`, `Error::InvalidPairLink`, a dependência `base64` do `kin-identity` (também no `Cargo.lock`, à mão), `--pair`, `/pair` antigo,
+  `pair_text` do `keys::load` e os testes disso. Entram `keys::notice_for` (aviso do modo `Master` na abertura), `pair_reply` (resposta a `/pair` por modo) e `is_pair_link` (a trava de envio, mantida).
+- **Prova de que testam algo**: esqueleto, **3 de 6** falharam como previsto (1, 2 e 4), controles 3, 5 e 6 passaram (run 44103056285). **Previsão certa desta vez.** A remoção em si não tem teste de "deixou de existir";
+  a prova é compilar e passar. Verde de primeira com a remoção (44104297895) e com as correções (44106344725).
+- **Mutações** (2 de 2 pegas, branches apagadas): aviso também no primário (44105548294, 1 teste); trava de `kin://pair/` removida (44105580644, 1 teste). **Conferi que os dois runs não tinham erro de compilação nem de clippy** antes de contar.
+- **Auditoria** (`security-auditor`, somente leitura): 0 críticos, 4 importantes, 4 sugestões. Corrigidos: I1 (`/pair` mandava o primário rodar `kin cold init`; agora responde por modo, com teste), I2 (o aviso prometia
+  mais do que entregava), S2 (comentários do lab), S3. **Não feitos**: I3 (o fio da trava e do aviso no laço da CLI não tem teste) e I4 (a trava não pega o corpo base64 sem prefixo nem em pedaços), documentados no ADR.
+- **Tropeços**: o auditor, que devia ser só leitura, fez `git checkout` e deixou o repositório em `main` (voltei ao branch e nada se perdeu); editei `Cargo.lock` à mão (conferido pelo auditor com `cargo metadata --locked`).
+- **Não verificado**: o lab `multi-device` e `history-sync` (rodam fora do CI) depois da mudança, embora só copiem `identity.key`; consumidores de `kin-identity` fora do repo; revisão externa.
+- **Próximo passo**: fatia 7 (cenário de lab: revogar um irmão atrás de NAT; contato offline, contato só conectado ao device roubado, rollback, backup), em plan mode. **Depois dela o P30 fecha.**
