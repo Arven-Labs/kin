@@ -50,7 +50,9 @@ fn now() -> u64 {
 
 /// Link da Ana, assinado pelo device dela, válido até `expires_at`.
 fn signed_link(ana: &Person, expires_at: u64) -> String {
-    ana.chat.invite(vec![]).to_link(&ana.device, expires_at)
+    ana.chat
+        .invite(vec![])
+        .to_link(&ana.device.invite_signer(), expires_at)
 }
 
 fn bytes_of(link: &str) -> Vec<u8> {
@@ -69,7 +71,7 @@ async fn link_roundtrips_and_carries_identity_peer_and_addresses() {
     let addr = listen(&mut ana.chat).await;
     let invite = ana.chat.invite(vec![addr.clone()]);
 
-    let link = invite.to_link(&ana.device, NOW + DAY);
+    let link = invite.to_link(&ana.device.invite_signer(), NOW + DAY);
     assert!(link.starts_with("kin://invite/"));
     assert!(link.len() < 1000, "cabe num QR: {} caracteres", link.len());
     let read = Invite::from_link_at(&link, NOW).unwrap();
@@ -199,11 +201,11 @@ async fn the_addresses_are_covered_by_the_signature() {
             addr("/ip4/203.0.113.7/tcp/4001"),
             addr("/ip4/198.51.100.9/udp/4001/quic-v1"),
         ])
-        .to_link(&ana.device, NOW + DAY);
+        .to_link(&ana.device.invite_signer(), NOW + DAY);
     let other = ana
         .chat
         .invite(vec![addr("/ip4/192.0.2.66/tcp/4001")])
-        .to_link(&ana.device, NOW + DAY);
+        .to_link(&ana.device.invite_signer(), NOW + DAY);
     assert!(Invite::from_link_at(&one, NOW).is_ok());
     let bytes = bytes_of(&one);
 
@@ -254,7 +256,10 @@ async fn invite_link_clamps_the_ttl_to_what_a_reader_accepts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_link_signed_by_another_device_is_refused() {
     let (ana, mallory) = (person(), person());
-    let link = ana.chat.invite(vec![]).to_link(&mallory.device, NOW + DAY);
+    let link = ana
+        .chat
+        .invite(vec![])
+        .to_link(&mallory.device.invite_signer(), NOW + DAY);
 
     assert!(matches!(
         Invite::from_link_at(&link, NOW),
@@ -354,7 +359,10 @@ async fn invite_claiming_another_identity_for_the_same_peer_is_refused() {
     let forged = Invite::new(forged_cert, vec![addr]);
     // Como link, a falsificação já morre na assinatura: a Mallory não tem a chave de rede da Ana.
     assert!(matches!(
-        Invite::from_link_at(&forged.to_link(&mallory_device, NOW + DAY), NOW),
+        Invite::from_link_at(
+            &forged.to_link(&mallory_device.invite_signer(), NOW + DAY),
+            NOW
+        ),
         Err(Error::InvalidInvite)
     ));
     // Já com o objeto `Invite` na mão (sem link), `accept` ainda exige a identidade no handshake.

@@ -19,7 +19,9 @@ O ADR 0011 tornou o frescor obrigatório: sem validade, o link de convite de um 
 3. **Emissão**: `Chat::invite_link(addrs, ttl)`; `DEFAULT_INVITE_TTL` = 24 h; `ttl` é limitado a 7 dias menos 5 minutos (folga para relógio do leitor).
 4. **Só no link**: `DeviceList`/`Payload::DeviceList` seguem com o convite v1 sem validade; `Invite` não carrega `expires_at` depois de `from_link`, e
    `Chat::accept(&Invite)` **não** confere validade (o único chamador hoje, a CLI, lê o link e aceita na hora).
-5. `Chat` guarda uma cópia do `DeviceKey` (`signer`) só para assinar links.
+5. `Chat` guarda um `InviteSigner` (do `identity`): **só a chave de rede**, sem a Nostr. O domínio `kin/invite/v2` é imposto dentro do `identity`
+   (`InviteSigner::sign` e `DeviceCertificate::verify_invite`), não pelo chamador. *(Na primeira versão do ADR o `Chat` guardava uma cópia inteira do `DeviceKey`
+   reconstruída por `to_bytes`/`from_bytes`; trocado na Sessão 28, ver auditoria item 1.)*
 
 ## Alternativas descartadas
 
@@ -42,7 +44,7 @@ O ADR 0011 tornou o frescor obrigatório: sem validade, o link de convite de um 
 
 | # | Achado | Gravidade | Destino |
 |---|---|---|---|
-| 1 | `signer` copia o `DeviceKey` inteiro (inclui a chave Nostr) por um `Vec` sem zeroizar | importante | **aberto**, decisão do dono: guardar só a chave de rede |
+| 1 | `signer` copia o `DeviceKey` inteiro (inclui a chave Nostr) por um `Vec` sem zeroizar | importante | **corrigido** (Sessão 28): `InviteSigner` só com a chave de rede e o domínio imposto no `identity`; 5 testes novos em `crates/identity/tests/invite_signer.rs` |
 | 2 | Teste não pegava a remoção do domínio, nem adulteração de endereços | importante | corrigido (3 testes novos) |
 | 3 | `invite_link` aceitava `ttl` que gera link morto | importante | corrigido (limite e testes) |
 | 4 | `accept` não vê a validade | sugestão | documentado em `Chat::accept` e acima |
