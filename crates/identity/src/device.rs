@@ -173,6 +173,14 @@ pub enum Issuer {
     Authority(Box<AuthorityCertificate>),
 }
 
+/// Domínio da assinatura do link de convite (nenhum domínio do Kin é prefixo de outro).
+const INVITE_DOMAIN: &[u8] = b"kin/invite/v2";
+
+/// O que se assina de fato: o domínio e o corpo do link.
+fn invite_message(body: &[u8]) -> Vec<u8> {
+    [INVITE_DOMAIN, body].concat()
+}
+
 /// Assina links de convite com a chave de rede de um device (P18, ADR 0033). Não assina bytes livres:
 /// o domínio `kin/invite/v2` é imposto aqui, e a chave Nostr do device não vem junto.
 pub struct InviteSigner(Keypair);
@@ -180,7 +188,9 @@ pub struct InviteSigner(Keypair);
 impl InviteSigner {
     /// Assinatura Ed25519 de `body` no domínio do convite.
     pub fn sign(&self, body: &[u8]) -> Vec<u8> {
-        self.0.sign(body).expect("assinar com Ed25519 não falha")
+        self.0
+            .sign(&invite_message(body))
+            .expect("assinar com Ed25519 não falha")
     }
 }
 
@@ -367,7 +377,7 @@ impl DeviceCertificate {
     /// `signature` é de [`InviteSigner::sign`] sobre `body`, feita pela chave de rede deste certificado?
     /// Não confere o certificado (use [`Self::verify`]).
     pub fn verify_invite(&self, body: &[u8], signature: &[u8]) -> bool {
-        self.network_key.verify(body, signature)
+        self.network_key.verify(&invite_message(body), signature)
     }
 }
 
