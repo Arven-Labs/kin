@@ -37,7 +37,7 @@ services:
   relay:
     <<: *kin
     environment:
-      KIN_ARGS: "--serve-relay --data-dir /data --listen /ip4/0.0.0.0/tcp/4001"
+      KIN_ARGS: "--serve-relay --data-dir /data --listen ${RELAY_LISTEN:-/ip4/0.0.0.0/tcp/4001}"
     networks:
       pub: { ipv4_address: 203.0.113.10 }
 
@@ -45,7 +45,7 @@ services:
   relay2:
     <<: *kin
     environment:
-      KIN_ARGS: "--serve-relay --data-dir /data --listen /ip4/0.0.0.0/tcp/4001"
+      KIN_ARGS: "--serve-relay --data-dir /data --listen ${RELAY_LISTEN:-/ip4/0.0.0.0/tcp/4001}"
     networks:
       pub: { ipv4_address: 203.0.113.11 }
 
