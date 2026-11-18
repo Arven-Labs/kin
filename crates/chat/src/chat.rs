@@ -3892,6 +3892,7 @@ mod tests {
         bia.schedule_deposit_retry(ana_peer);
         assert_eq!(bia.deposit_spent[&ana_peer], 3, "a conta é por recusa");
         assert!(!bia.deposit_retry[&ana_peer].armed, "3 de 3: esgotou");
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só o depósito importa
         assert_eq!(bia.wake_in(), None);
     }
 
@@ -3950,6 +3951,7 @@ mod tests {
         bia.retry_base = Duration::from_secs(3600);
         bia.retry_cap = Duration::from_secs(86_400);
         bia.deposit_retry.clear();
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só o depósito importa
         bia.schedule_deposit_retry(ana_peer);
         let wake = bia.wake_in().expect("com novo depósito agendado, acorda");
         assert!(wake <= Duration::from_secs(3600) && wake > Duration::from_secs(3000));
@@ -3985,7 +3987,8 @@ mod tests {
     #[tokio::test]
     async fn a_confirmed_deposit_arms_the_age_sweep() {
         let week = std::time::Duration::from_secs(7 * 24 * 3600);
-        let (bia, _ana, _peer, _relay, _) = deposited_once(Some(week)).await;
+        let (mut bia, _ana, _peer, _relay, _) = deposited_once(Some(week)).await;
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só a varredura importa
 
         assert!(bia.sweep_due.is_some());
         let wake = bia.wake_in().expect("a varredura pede o relógio");
@@ -3998,7 +4001,8 @@ mod tests {
     /// P21: backend sem retenção declarada não tem o que varrer.
     #[tokio::test]
     async fn no_retention_means_no_age_sweep() {
-        let (bia, _ana, _peer, _relay, _) = deposited_once(None).await;
+        let (mut bia, _ana, _peer, _relay, _) = deposited_once(None).await;
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só a varredura importa
 
         assert!(bia.sweep_due.is_none());
         assert_eq!(bia.wake_in(), None);
@@ -4398,6 +4402,7 @@ mod tests {
         for _ in 0..20 {
             let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
             bia.redial_base = Duration::from_secs(3600);
+            bia.redial_cap = Duration::from_secs(86_400); // acima da base, senão o teto corta
             let before = Instant::now();
             bia.send(ana_peer, "oi", None).unwrap();
             let after = Instant::now();
@@ -4567,6 +4572,7 @@ mod tests {
     async fn the_clock_wakes_for_the_redial_deadline() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.redial_base = Duration::from_secs(3600);
+        bia.redial_cap = Duration::from_secs(86_400); // acima da base, senão o teto corta
         assert_eq!(bia.wake_in(), None);
 
         bia.send(ana_peer, "oi", None).unwrap();
@@ -4582,6 +4588,7 @@ mod tests {
         bia.redial_base = Duration::from_millis(10);
         identify(&mut bia, ana_peer, &[GLOBAL_A]);
         bia.send(ana_peer, "oi", None).unwrap();
+        events(&mut bia); // o `Queued` do envio sairia já, sem o laço esperar o relógio
 
         let _ = tokio::time::timeout(Duration::from_millis(500), bia.next_event()).await;
 
