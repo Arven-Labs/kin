@@ -2000,3 +2000,18 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: o `reconnect` do lab continua sem prova (o #233 ainda não foi rebaseado sobre esta correção); a mutação de propósito não foi feita; o intervalo do `identify` periódico no libp2p em uso.
 - **Prova no lab** (depois do #234 mesclado e do #233 rebaseado sobre a `main` `d725044`): 5 tentativas do workflow Lab no mesmo commit (run 44318772785, tentativas 1 a 5), `reconnect` em sucesso nas 5 e nenhum outro cenário falhou. **Evidência moderada, não prova**: antes da correção o `reconnect` tinha 1 falha e 1 aprovação, então 5 aprovações seguidas já aconteceriam por acaso (~3% com 50% de falha, mais com taxa menor). Não rodei o `reconnect` contra `250acbf` (sem o P32) nem contra a `main` sem o #234 para ter o contraste.
 - **Próximo passo**: decidir se o #233 sai de rascunho e é mesclado; só então persistir endereços (schema v8) ou a decisão SimpleX/Matrix.
+
+### 2026-11-18 — Sessão 34
+
+#### Persistir os endereços de peer (schema v8) e rediscar depois de reiniciar (PR #235, P32 a, ADR 0037)
+
+- **Decisões do dono** (plan mode): persistir (e não SimpleX/Matrix) primeiro; cenário de lab `reconnect-restart` neste PR; ADR 0037; despejar estranho no teto (#234). Confirmação de schema (§4) pela aprovação do plano.
+- **Achado do levantamento**: persistir não bastava. `start_redial` só roda dentro de `flush` (envio, queda, conversa pronta), então quem só tem fila no banco depois de reiniciar não era rediscado. A abertura passou a chamar `restore_peer_addrs`.
+- **Feito**: `kin_peer_addrs` na outbox (schema v8, aditivo); `learn_peer_addrs` e a conversa pronta gravam (só peer com conversa); `restore_peer_addrs` na abertura relê pelo `dial_addrs` e agenda a rediscagem de quem tem fila; `forget_peer` apaga a linha; lab: cenário `reconnect-restart` e `/tmp/kin-args` no `node.sh`; ADR 0037 (e o 0036 aponta para ele).
+- **Prova de falha** (CI): commit só de testes com stubs: clippy passou e 13 de 351 falharam, todos por `todo!()` (comportamento ausente). O teste da auditoria #1 também falhou antes da correção (1 de 352).
+- **Prova no lab**: `reconnect-restart` passou em 5 tentativas (run 44326855660, tentativas 1 a 5). **Contraste**: numa branch descartável sem `restore_peer_addrs` na abertura, **um** run (44330704255) falhou só o `reconnect-restart` (o `reconnect` passou). Um contraste só, não vários.
+- **Auditoria** (`security-auditor`, 0 críticos/altos/médios, 6 baixos): corrigido o #1 (o retorno antecipado impedia refazer uma gravação que falhou; agora grava a cada `identify`) e o comentário do #4. **Aceitos e registrados no ADR 0037**: #2, #3, #5, #6.
+- **Final**: head `a32a170` com CI (run 44330660789) e Lab (44330660785) verdes.
+- **Não verificado**: a mutação de propósito (ex.: tirar o `dial_addrs` da releitura) não foi feita; a admissão em `Conversation::invite/join` (se um estranho ganha conversa com facilidade, achado #2); o `identify` periódico do libp2p; rede real fora do Docker.
+- **Erros meus**: tentei `cargo clippy` local (barrado pelo hook, ADR 0009); rodei `cargo fmt` em vez de só `--check`; digitei um caractere cirílico em "redisca" no título do PR e no 2º commit (título corrigido; o commit some no squash); tentei acrescentar a sessão por heredoc (barrado, refeito com `Edit`) na sessão anterior.
+- **Próximo passo**: decisão SimpleX/Matrix (`docs/pesquisa/reuso/kin.md`); abrir o P18 (revogação de convite) ou o P16 (re-handshake) são alternativas.

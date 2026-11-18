@@ -13,7 +13,7 @@ fica fora até alguém agir, e a mensagem só sai pelo caminho direto depois dis
 
 1. **No `chat`, não no `Node`**: só o `chat` sabe quem tem conversa e fila. Reusa o relógio do P19/P21 (`wake_in`, `Next::Tick`), sem timer nem tarefa nova.
 2. **Só com mensagem na fila** (`redial_want`): sem fila, só a caixa postal e o mDNS trazem o peer de volta. Poupa bateria e não vaza tentativas de IP a quem não tem o que receber.
-3. **Só memória**: sem schema novo (nada de v8). Depois de reiniciar o processo o peer não tem endereço até novo convite, `identify` ou mDNS.
+3. **Só memória** (**substituída pelo [ADR 0037](0037-persistir-enderecos-de-peer.md): os endereços passam a ser gravados, schema v8**): sem schema novo (nada de v8). Depois de reiniciar o processo o peer não tem endereço até novo convite, `identify` ou mDNS.
 4. **Endereços** = os do `identify` (filtrados, mesclados, até 4; irmão até 16), os do convite aceito (`accept`) e os do handshake esperado. O filtro `dialable` virou **allowlist** de IPv6
    unicast global (`2000::/3`, sem 6to4 nem Teredo) e nega as faixas especiais do IPv4.
 5. **Estados** `Waiting` → `InFlight` (60 s) → `Waiting` ou `Exhausted`. Espera de 2 s dobrando até 5 min, com jitter de 20%; orçamento de 100 tentativas (~8 h). Dial sem notícia no prazo conta
