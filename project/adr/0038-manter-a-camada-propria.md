@@ -22,4 +22,5 @@ O diferencial do kin é o *zero-infrastructure bootstrap*: funciona com 2 dispos
 
 - Continuam a cargo do kin: NAT (hole punching, relay), entrega assíncrona e multi-device.
 - A Fase 4 só começa depois do teste em rede real; o resultado entra no `SESSIONS.md`.
-- **Não verificado** (não muda a decisão, que se apoia no diferencial e no custo de reverter): o que a AGPL do SimpleX exigiria de um derivado; se o `matrix-rust-sdk` serviria de base; o estado atual de Briar e Berty. Reabrir a decisão se um deles resolver o "funciona com 2".
+- **Verificado em 2026-11-18** (nada muda a decisão): SimpleX é AGPL-3.0 e está ativo; o `matrix-rust-sdk` é Apache-2.0, ativo, mas só cliente-servidor (não serve de base para o "funciona com 2"); Berty está ativo (v2.472.2), Apache-2.0 ou MIT, com BLE e mDNS na rede local; Briar é GPL-3.0 ou posterior no Android e AGPL no desktop (fontes secundárias), e tem um repo `briar-mailbox` (dispositivo sempre ligado para entrega assíncrona), o que reforça o P33.
+- **Ainda não verificado**: o que a AGPL do SimpleX exigiria de um cliente que fala o protocolo SMP (pede parecer jurídico); a FAQ do Briar; se o Berty entrega a quem está offline fora da rede local; o desenho do `briar-mailbox`. Reabrir a decisão se um deles resolver o "funciona com 2".
