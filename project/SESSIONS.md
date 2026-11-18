@@ -1975,3 +1975,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Resultado**: CI verde na branch, 336 testes no `kin-chat` (run 44225945086).
 - **Não verificado**: o cenário de lab (Docker local barrado; o laboratório não roda no CI); a rediscagem em rede real; o `V6ONLY` do transporte (relevante só para o bypass IPv4-mapeado, agora barrado pela allowlist); o `next_event_redials_by_itself` usa relógio real de 10 ms e dial real para `203.0.113.10` (passou em todas as rodadas); a interação com mDNS e dials simultâneos dos dois lados.
 - **Próximo passo**: cenário de lab da reconexão (precisa de decisão sobre rodar o laboratório no CI), persistir endereços (schema v8, §4) ou a decisão sobre SimpleX/Matrix (`docs/pesquisa/reuso/kin.md`).
+
+### 2026-11-18 — Sessão 33
+
+#### Rediscagem usa o endereço informado antes de a conversa existir (PR #234)
+
+- **Causa** (a hipótese da Sessão 32, agora provada em teste unitário): `learn_peer_addrs` exigia conversa ou `expected`, mas o `identify` chega com a conexão, antes da conversa; quem disca com `dial` não tem `expected`. Resultado: o peer que caía com mensagem na fila não tinha endereço e nada era rediscado.
+- **Feito** (`crates/chat/src/chat.rs`): `learn_peer_addrs` aceita também peer conectado; `PeerDisconnected` apaga `peer_addrs` de quem não tem conversa nem `expected`; com o mapa cheio, quem tem conversa ou `expected` despeja um estranho (`evict_stranger_for`).
+- **Prova de falha** (CI): commit só de testes, 2 de 340 falharam (`addresses_told_before_the_conversation_exists_are_used_to_redial`, com `dial_log` vazio, e `addresses_of_a_connected_stranger_are_dropped_when_it_disconnects`); depois da auditoria, mais 2 falharam em outro commit de testes (`a_contact_evicts_a_stranger_when_the_map_is_full`, `an_expected_peer_keeps_its_addresses_when_it_drops_before_the_handshake`). Com a correção, CI verde (run 44316744590, clippy e testes).
+- **Auditoria** (`security-auditor`): média, estranhos conectados esgotavam as 8 vagas e bloqueavam o endereço de contato (corrigido, decisão do dono: despejar estranho); baixa, `expected` que cai perdia o endereço (corrigido). **Aceitos sem mudança**: um peer descartado por `drop_peer` mas ainda conectado pode reocupar uma vaga até a conexão cair (depende do `identify` periódico, não verificado); a janela pré-conversa usa o filtro de contato mesmo para irmão (restrição, não brecha).
+- **Não verificado**: o `reconnect` do lab continua sem prova (o #233 ainda não foi rebaseado sobre esta correção); a mutação de propósito não foi feita; o intervalo do `identify` periódico no libp2p em uso.
+- **Próximo passo**: mesclar o #234; rebasear o #233 sobre a `main`, rodar o `reconnect` em 5 rodadas e conferir que não é mais intermitente; só então persistir endereços (schema v8) ou a decisão SimpleX/Matrix.

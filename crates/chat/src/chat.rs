@@ -517,8 +517,9 @@ pub struct Chat {
     sweep_rounds: HashMap<PeerId, u32>,
     /// Teto de rodadas da varredura por peer (campo, para o teste não rodar 8 vezes).
     sweep_budget: u32,
-    /// Endereços de escuta que cada peer com conversa informou ao conectar (`PeerIdentified`) (P32). Só
-    /// memória; peer sem conversa não entra, então o mapa é limitado pelo número de contatos.
+    /// Endereços de escuta que cada peer informou ao conectar (`PeerIdentified`) (P32). Só memória; peer sem
+    /// conversa só fica enquanto conectado (sai em `PeerDisconnected`), então o mapa é limitado pelo teto
+    /// [`MAX_KNOWN_DEVICES`] e, fora de conexões vivas, pelo número de contatos.
     peer_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     /// Rediscagem agendada por peer que caiu com mensagem na fila (P32). Só existe com o peer desconectado e
     /// a fila não vazia; sai ao conectar, ao esvaziar a fila e ao esquecer o peer.
@@ -1408,6 +1409,11 @@ impl Chat {
                 self.history_sessions.remove(&peer);
                 self.history_requests
                     .retain(|_, requested| *requested != peer);
+                // Sem conversa nem handshake esperado, o endereço informado não tem dono a rediscar: não
+                // ocupa vaga do teto.
+                if !self.conversations.contains_key(&peer) && !self.expected.contains_key(&peer) {
+                    self.peer_addrs.remove(&peer);
+                }
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -1849,19 +1855,26 @@ impl Chat {
     /// endereços de terceiros ([`dial_addrs`]: sem loopback, rede privada nem DNS; no máximo
     /// [`CONTACT_DIAL_ADDRS`] para contato). O que o peer diz é dado dele, não verdade: a conexão só vale se
     /// ele provar o Peer ID, mas o filtro impede que um contato aponte a minha rediscagem para a minha rede.
-    /// Só entra peer com conversa ou com handshake esperado (`expected`, o `identify` chega antes da conversa
-    /// existir), e o mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
+    /// Só entra peer com conversa, com handshake esperado (`expected`) ou conectado: o `identify` chega com a
+    /// conexão, antes de a conversa existir, e quem disca com `dial` não tem `expected`. O conectado sem
+    /// conversa sai de `peer_addrs` quando a conexão cai (`PeerDisconnected`), então um estranho só ocupa
+    /// vaga enquanto estiver conectado, e com o mapa cheio quem tem conversa ou `expected` despeja um estranho
+    /// ([`Self::evict_stranger_for`]). O mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
     /// completa até o limite (auditoria I3: mudança de endereço não apaga o que ainda pode valer); uma lista
     /// que o filtro esvazia (um peer na LAN que só anuncia IP privado) não apaga a velha.
     fn learn_peer_addrs(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
-        if !(self.conversations.contains_key(&peer) || self.expected.contains_key(&peer))
-            || !has_room(&self.peer_addrs, &peer)
+        if !(self.conversations.contains_key(&peer)
+            || self.expected.contains_key(&peer)
+            || self.connected.contains(&peer))
         {
             return;
         }
         let sibling = self.is_sibling(&peer);
         let mut merged = dial_addrs(&addrs, sibling);
         if merged.is_empty() {
+            return;
+        }
+        if !has_room(&self.peer_addrs, &peer) && !self.evict_stranger_for(&peer) {
             return;
         }
         for old in self.peer_addrs.get(&peer).into_iter().flatten() {
@@ -1875,6 +1888,21 @@ impl Chat {
             CONTACT_DIAL_ADDRS
         });
         self.peer_addrs.insert(peer, merged);
+    }
+
+    /// Mapa `peer_addrs` cheio: abre vaga para `peer` despejando um peer **sem conversa e sem handshake
+    /// esperado** (estranho conectado). Só quem tem conversa ou `expected` despeja; um estranho nunca tira a
+    /// vaga de um contato, e o contrário impede que estranhos conectados bloqueiem o endereço de contato real
+    /// (auditoria #1). `false` se `peer` não tem prioridade ou não há estranho a despejar.
+    fn evict_stranger_for(&mut self, peer: &PeerId) -> bool {
+        let known = |chat: &Self, p: &PeerId| {
+            chat.conversations.contains_key(p) || chat.expected.contains_key(p)
+        };
+        if !known(self, peer) {
+            return false;
+        }
+        let victim = self.peer_addrs.keys().find(|p| !known(self, p)).copied();
+        victim.is_some_and(|victim| self.peer_addrs.remove(&victim).is_some())
     }
 
     /// Endereços a discar para rediscar `peer` (P32): os que ele informou; sem eles, os do convite que eu
@@ -4513,6 +4541,118 @@ mod tests {
         let stranger = PeerId::random();
 
         identify(&mut bia, stranger, &[GLOBAL_A]);
+
+        assert!(bia.peer_addrs.is_empty());
+    }
+
+    /// P32:o `identify` chega com a conexão, antes de a conversa existir (quem disca com `dial` não tem
+    /// `expected`). O endereço informado nessa janela tem de valer na rediscagem depois da queda.
+    #[tokio::test]
+    async fn addresses_told_before_the_conversation_exists_are_used_to_redial() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let conversation = bia.conversations.remove(&ana_peer).unwrap();
+        bia.connected.insert(ana_peer);
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        bia.conversations.insert(ana_peer, conversation);
+        bia.send(ana_peer, "oi", None).unwrap();
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+
+        assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
+    }
+
+    /// P32:estranho conectado só ocupa vaga em `peer_addrs` enquanto a conexão durar.
+    #[tokio::test]
+    async fn addresses_of_a_connected_stranger_are_dropped_when_it_disconnects() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(&mut bia, stranger, &[GLOBAL_A]);
+        assert!(bia.peer_addrs.contains_key(&stranger), "conectado: guarda");
+
+        bia.handle(NodeEvent::PeerDisconnected(stranger));
+        assert!(bia.peer_addrs.is_empty(), "caiu sem conversa: esquece");
+    }
+
+    /// P32:com o mapa no teto, estranho conectado não entra (e quem já estava continua).
+    #[tokio::test]
+    async fn a_connected_stranger_cannot_push_past_the_cap() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_B]);
+        for _ in 1..MAX_KNOWN_DEVICES {
+            bia.peer_addrs
+                .insert(PeerId::random(), vec![addr(GLOBAL_A)]);
+        }
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(&mut bia, stranger, &[GLOBAL_A]);
+
+        assert_eq!(bia.peer_addrs.len(), MAX_KNOWN_DEVICES);
+        assert!(!bia.peer_addrs.contains_key(&stranger));
+        assert!(bia.peer_addrs.contains_key(&ana_peer));
+    }
+
+    /// P32 (auditoria #1): estranhos conectados enchem o mapa primeiro; o contato com conversa que informa o
+    /// endereço depois despeja um estranho em vez de ser descartado.
+    #[tokio::test]
+    async fn a_contact_evicts_a_stranger_when_the_map_is_full() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let strangers: Vec<PeerId> = (0..MAX_KNOWN_DEVICES).map(|_| PeerId::random()).collect();
+        for stranger in &strangers {
+            bia.connected.insert(*stranger);
+            identify(&mut bia, *stranger, &[GLOBAL_A]);
+        }
+        assert_eq!(bia.peer_addrs.len(), MAX_KNOWN_DEVICES, "mapa cheio");
+
+        identify(&mut bia, ana_peer, &[GLOBAL_B]);
+
+        assert_eq!(bia.redial_targets(&ana_peer), [addr(GLOBAL_B)]);
+        assert_eq!(bia.peer_addrs.len(), MAX_KNOWN_DEVICES, "o teto vale");
+        assert_eq!(
+            strangers
+                .iter()
+                .filter(|s| bia.peer_addrs.contains_key(s))
+                .count(),
+            MAX_KNOWN_DEVICES - 1,
+            "um estranho saiu"
+        );
+    }
+
+    /// P32 (auditoria #3): peer com handshake esperado (`expected`) que cai antes da conversa nascer mantém o
+    /// endereço aprendido (como antes de a janela pré-conversa existir).
+    #[tokio::test]
+    async fn an_expected_peer_keeps_its_addresses_when_it_drops_before_the_handshake() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let peer = PeerId::random();
+        let identity = invite_for(&StandaloneIdentity::generate())
+            .identity()
+            .clone();
+        bia.expected.insert(peer, identity);
+        bia.connected.insert(peer);
+        identify(&mut bia, peer, &[GLOBAL_A]);
+
+        bia.handle(NodeEvent::PeerDisconnected(peer));
+
+        assert!(bia.peer_addrs.contains_key(&peer));
+    }
+
+    /// P32:estranho conectado que só anuncia IP privado ou loopback não deixa nada (mesmo filtro).
+    #[tokio::test]
+    async fn a_connected_stranger_with_only_private_addresses_leaves_nothing() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(
+            &mut bia,
+            stranger,
+            &["/ip4/127.0.0.1/tcp/4001", "/ip4/192.168.0.5/tcp/4001"],
+        );
 
         assert!(bia.peer_addrs.is_empty());
     }
