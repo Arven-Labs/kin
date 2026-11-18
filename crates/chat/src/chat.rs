@@ -3701,6 +3701,7 @@ mod tests {
         bia.deposit_budget = 3;
         bia.retry_base = Duration::from_secs(3600);
         bia.deposit_retry.clear();
+        bia.deposit_spent.clear(); // a recusa do helper já gastou 1
         for _ in 0..2 {
             bia.schedule_deposit_retry(ana_peer);
         }
