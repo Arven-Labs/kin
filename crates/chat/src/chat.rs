@@ -1954,11 +1954,17 @@ impl Chat {
             .values()
             .filter(|retry| retry.armed)
             .map(|retry| retry.due.saturating_duration_since(now));
+        let redials = self
+            .redial
+            .values()
+            .filter(|retry| retry.armed)
+            .map(|retry| retry.due.saturating_duration_since(now));
         let sweep = self.sweep_due.map(|due| due.saturating_duration_since(now));
         self.sibling_wake_in()
             .into_iter()
             .chain(retries)
             .chain(deposits)
+            .chain(redials)
             .chain(sweep)
             .min()
     }
