@@ -4713,6 +4713,20 @@ mod tests {
         assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
     }
 
+    /// P32 a (auditoria #1): o mesmo endereço informado de novo é gravado de novo, então uma gravação que
+    /// falhou (disco cheio, banco ocupado) é refeita no próximo `identify` em vez de ficar só na memória.
+    #[tokio::test]
+    async fn an_unchanged_address_is_written_again_on_the_next_identify() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.outbox.forget_peer(&ana_peer).unwrap(); // some com a linha, como uma gravação que falhou
+        assert!(bia.outbox.peer_addrs(&ana_peer).unwrap().is_empty());
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
+    }
+
     /// P32 a: o endereço da janela pré-conversa (só em memória) vai para o banco quando a conversa nasce.
     #[tokio::test]
     async fn an_address_told_before_the_conversation_is_written_when_it_is_born() {
