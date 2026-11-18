@@ -76,6 +76,7 @@ jobs:
           - history-sync
           - paired-device
           - revoke-device
+          - reconnect
     steps:
       - name: Checkout
         uses: actions/checkout@v7
