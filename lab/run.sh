@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -48,11 +48,11 @@ infra() { # nat [relay2]
   cleanup
   export NAT_MODE=$nat A_ARGS="" B_ARGS=""
   compose up -d relay routera routerb "$@" >/dev/null || return 1
-  wait_log relay "relay em /ip4/172.30.0.10/tcp/4001/p2p/" 30 || { echo "relay não subiu"; return 1; }
-  RELAY_ADDR=$(first relay '/ip4/172.30.0.10/tcp/4001/p2p/[A-Za-z0-9]+')
+  wait_log relay "relay em /ip4/203.0.113.10/tcp/4001/p2p/" 30 || { echo "relay não subiu"; return 1; }
+  RELAY_ADDR=$(first relay '/ip4/203.0.113.10/tcp/4001/p2p/[A-Za-z0-9]+')
   if [ "${1:-}" = relay2 ]; then
-    wait_log relay2 "relay em /ip4/172.30.0.11/tcp/4001/p2p/" 30 || { echo "relay2 não subiu"; return 1; }
-    RELAY2_ADDR=$(first relay2 '/ip4/172.30.0.11/tcp/4001/p2p/[A-Za-z0-9]+')
+    wait_log relay2 "relay em /ip4/203.0.113.11/tcp/4001/p2p/" 30 || { echo "relay2 não subiu"; return 1; }
+    RELAY2_ADDR=$(first relay2 '/ip4/203.0.113.11/tcp/4001/p2p/[A-Za-z0-9]+')
   fi
 }
 
@@ -64,7 +64,7 @@ setup() {
   export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
   compose up -d a >/dev/null || return 1
   wait_log a "reserva aceita no relay" 30 || { echo "a não conseguiu reserva no relay"; logs a; return 1; }
-  A_CIRCUIT=$(first a '/ip4/172.30.0.10/tcp/4001/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+')
+  A_CIRCUIT=$(first a '/ip4/203.0.113.10/tcp/4001/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+')
 
   export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --dial $A_CIRCUIT"
   compose up -d b >/dev/null || return 1
@@ -594,6 +594,45 @@ scenario_history_sync() {
     test "$(logs a2 | grep -cE "\[$ID4\] peer: h4")" -eq 2 -a "$(logs a | grep -cE "\[$ID4\] peer: h4")" -eq 1
 }
 
+# Quantas vezes `padrão` aparece no log do container, e espera até `n` vezes (o log de um container
+# parado e religado com `stop`/`start` é cumulativo, então "apareceu" não basta: precisa ser de novo).
+count_log() { logs "$1" | grep -cE "$2"; }
+wait_log_n() { # container, padrão, n, segundos
+  local c=$1 pat=$2 n=$3 t=${4:-30}
+  for _ in $(seq $((t * 2))); do
+    [ "$(count_log "$c" "$pat")" -ge "$n" ] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Reconexão automática (P32, ADR 0036): a e b conversam; `a` cai; `b` manda uma mensagem (fica na fila);
+# `a` volta COM A MESMA IDENTIDADE (`stop`/`start` mantém o /data, então não há re-handshake: P16). O
+# laboratório roda com --no-mdns e ninguém digita nada depois da volta, então só a rediscagem do `b` (pelo
+# endereço de circuito do relay que o `a` anunciou no identify) pode fazer a mensagem chegar. A rede
+# pública é 203.0.113.0/24 justamente para esse endereço passar no filtro de endereços do chat.
+scenario_reconnect() {
+  echo "== Reconexão automática: o peer cai e volta, e quem tinha mensagem na fila o redisca sozinho"
+  setup cone || { fail "montar o laboratório"; return; }
+  check "mensagem chega antes da queda (rede viva)" delivered a b "antes da queda"
+
+  compose stop a >/dev/null
+  check "b percebe que a caiu" wait_log b "desconectado de $A_ID" 30 || { logs b | tail -20; return; }
+  say b "enquanto a esteve fora"
+  check "a mensagem fica na fila do b (a está fora)" wait_log b "na fila, sai quando o peer conectar" 10
+
+  compose start a >/dev/null
+  wait_log_n a "reserva aceita no relay" 2 30 \
+    || { fail "a não refez a reserva no relay depois de voltar"; logs a | tail -20; return; }
+  # Nenhum comando manual daqui em diante. Espera até 90 s: a rampa de espera do b é 2, 4, 8, 16, 32 s.
+  if wait_log a "peer: enquanto a esteve fora" 90; then
+    pass "a mensagem enfileirada chega ao a sem nenhum comando (rediscagem automática do b)"
+  else
+    fail "a mensagem não chegou em 90 s: o b não rediscou o a"; logs b | tail -30; logs a | tail -30; return
+  fi
+  check "b reconectou ao a (segunda conexão)" wait_log_n b "conectado a $A_ID" 2 10
+}
+
 # run_scenario NOME: roda um cenário (FAILED fica 1 se algo falhou).
 run_scenario() {
   case "$1" in
@@ -607,12 +646,13 @@ run_scenario() {
     history-sync) scenario_history_sync ;;
     paired-device) scenario_paired_device ;;
     revoke-device) scenario_revoke_device ;;
+    reconnect) scenario_reconnect ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}

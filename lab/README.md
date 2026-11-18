@@ -3,9 +3,9 @@
 Prova a escada de fallback do Kin (direto → relay → hole punching) com NAT de verdade, na sua máquina:
 
 ```text
-a (10.1.0.10) -- lana --[routera NAT]-- pub (172.30.0.0/24) --[routerb NAT]-- lanb -- b (10.2.0.10)
+a (10.1.0.10) -- lana --[routera NAT]-- pub (203.0.113.0/24) --[routerb NAT]-- lanb -- b (10.2.0.10)
                                            |
-                                         relay (172.30.0.10)
+                                         relay (203.0.113.10)
 ```
 
 ```bash
