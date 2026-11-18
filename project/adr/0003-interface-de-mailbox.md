@@ -50,9 +50,11 @@ O `Chat` usa o `Node` para muito mais que mensagens (NAT, relays, hole punching)
 
 ## Em aberto
 
-- **P21**: ao ligar o mailbox, mensagens que já estavam na fila só são depositadas no próximo envio ou queda do
-  peer (não há varredura inicial). Mesma família do P19 (gatilhos de reenvio); um depósito recusado também só é
-  repetido no próximo gatilho.
+- **P21** (fechado na Sessão 30, resta o que está no `PENDING.md`): `set_mailbox` deposita a fila dos peers
+  desconectados; um depósito recusado é repetido com espera 2 s a 60 s e orçamento de 500 recusas por peer (cada
+  depósito re-cifra e gasta uma geração MLS, ADR 0002); uma varredura por idade roda a cada um quarto da retenção
+  do backend, com teto de 8 rodadas por peer. Tudo no `Chat`, no mesmo relógio do reenvio direto (P19). O trait
+  `Mailbox` não mudou.
 - Backend assíncrono real: cancel-safety, ordem de entrega e starvation entre rede e mailbox só serão
   exercitados na 3.3. O laço lê o canal sem bloquear antes de esperar a rede, mas isso não foi medido sob carga.
 - Como o backend Nostr descobre a chave do destinatário (provável extensão do certificado do device).
