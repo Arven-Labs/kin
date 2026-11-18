@@ -190,6 +190,9 @@ const MAILBOX_WINDOW: usize = 8;
 /// Quantos endereços de cada device listado por um contato se tentam. Irmão (a minha identidade) não
 /// tem este limite. Limita a amplificação de uma lista hostil (auditoria I1).
 const CONTACT_DIAL_ADDRS: usize = 4;
+/// O mesmo limite para um irmão, bem mais folgado: ele é a minha identidade, mas o `identify` aceita dezenas
+/// de endereços e a rediscagem por timer os multiplicaria (auditoria P31, I4).
+const SIBLING_DIAL_ADDRS: usize = 16;
 
 /// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
 /// `expected`). É o mesmo teto da lista do codec: a lista que sai já corta nesse número, então guardar
@@ -224,9 +227,41 @@ const REDIAL_CAP: Duration = Duration::from_secs(300);
 /// Rediscagens seguidas, sem conectar, depois das quais o timer para de armar (P31). Não gasta geração MLS
 /// (o dial só abre transporte): o orçamento protege rede e bateria. Com o teto de 5 min são ~8 h.
 const REDIAL_BUDGET: u32 = 100;
+/// Quanto esperar o resultado de um dial pedido pela rediscagem antes de contá-lo como falha (P31, auditoria
+/// I2): cobre o evento perdido e o dial que o nó engole (`DialPeerConditionFalse`) sem avisar.
+const REDIAL_INFLIGHT: Duration = Duration::from_secs(60);
 /// Teto da espera entre reenvios diretos (P19). Cada tentativa re-cifra e gasta uma geração de chave MLS (ADR
 /// 0002); quem limita o total é [`RETRY_BUDGET`], não este teto (outros gatilhos também reenviam na hora).
 const RETRY_CAP: Duration = Duration::from_secs(60);
+
+/// Em que pé está a rediscagem de um peer (P31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedialState {
+    /// Esperando o prazo (`due`) para discar.
+    Waiting,
+    /// O dial foi pedido ao nó; `due` é o prazo para contá-lo como falha se não vier `DialFailed` nem conexão
+    /// ([`REDIAL_INFLIGHT`]).
+    InFlight,
+    /// O orçamento acabou: sem timer. Só uma mensagem nova rearma uma tentativa.
+    Exhausted,
+}
+
+/// Rediscagem agendada para um peer que caiu com mensagem na fila (P31).
+struct Redial {
+    /// Tentativas seguidas sem conectar; decide a espera ([`Chat::redial_backoff`]).
+    attempts: u32,
+    /// Prazo do estado atual (discar, ou dar o dial por perdido). Sem efeito em `Exhausted`.
+    due: Instant,
+    state: RedialState,
+}
+
+/// O peer vale uma rediscagem agora? (ver [`Chat::redial_want`])
+enum Want {
+    Yes,
+    No,
+    /// A outbox não respondeu: não dá para dizer que a fila está vazia.
+    Unknown,
+}
 
 /// Reenvio direto agendado para um peer depois de um `SendFailed` de mensagem de chat (P19).
 struct Retry {
@@ -317,7 +352,7 @@ fn insert_bounded(
 /// é irmão e poucos se é contato.
 fn dial_addrs(addrs: &[Multiaddr], from_sibling: bool) -> Vec<Multiaddr> {
     let limit = if from_sibling {
-        addrs.len()
+        SIBLING_DIAL_ADDRS
     } else {
         CONTACT_DIAL_ADDRS
     };
@@ -327,6 +362,33 @@ fn dial_addrs(addrs: &[Multiaddr], from_sibling: bool) -> Vec<Multiaddr> {
         .take(limit)
         .cloned()
         .collect()
+}
+
+/// IPv4 público? Nega as faixas que não são destino de um contato: loopback, "esta rede" (`0/8`),
+/// privadas, link-local, CGNAT, multicast, reservadas (`240/4`), broadcast, protocolo IETF (`192.0.0.0/24`)
+/// e teste de desempenho (`198.18.0.0/15`). As de documentação (`203.0.113.0/24`) passam: os testes as usam.
+fn global_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || a == 0
+        || a >= 240
+        || (a == 100 && b & 0xc0 == 64)
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 198 && b & 0xfe == 18))
+}
+
+/// IPv6 unicast global? Lista de permissão, não de negação: só `2000::/3`. Isso barra de uma vez o
+/// IPv4 embutido (`::ffff:10.0.0.1`, `::10.0.0.1`), NAT64 (`64:ff9b::/96`), loopback, `fc00::/7`, `fe80::/10`,
+/// site-local e multicast, que um contato usaria para me fazer discar a minha rede (auditoria P31, I1). Dentro
+/// de `2000::/3` ainda nega 6to4 (`2002::/16`, embute IPv4 arbitrário) e Teredo (`2001:0::/32`).
+fn global_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let [first, second, ..] = ip.segments();
+    first & 0xe000 == 0x2000 && first != 0x2002 && !(first == 0x2001 && second == 0)
 }
 
 /// Um endereço vindo de um terceiro vale discar? `/dnsaddr` nunca (resolve TXT escolhido por ele, vaza o
@@ -339,25 +401,18 @@ fn dialable(addr: &Multiaddr, from_sibling: bool) -> bool {
         return false;
     }
     if from_sibling {
-        return true;
+        // Irmão é a minha identidade, então o resto vale (inclusive loopback, nos testes e no lab), mas
+        // "qualquer endereço" e multicast nunca são um destino (auditoria P31, I4).
+        return match addr.iter().next() {
+            Some(Ip4(ip)) => !(ip.is_unspecified() || ip.is_multicast()),
+            Some(Ip6(ip)) => !(ip.is_unspecified() || ip.is_multicast()),
+            _ => true,
+        };
     }
     let mut parts = addr.iter();
     let global = match parts.next() {
-        Some(Ip4(ip)) => {
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_private()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64))
-        }
-        Some(Ip6(ip)) => {
-            let first = ip.segments()[0];
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || first & 0xfe00 == 0xfc00
-                || first & 0xffc0 == 0xfe80)
-        }
+        Some(Ip4(ip)) => global_ipv4(ip),
+        Some(Ip6(ip)) => global_ipv6(ip),
         _ => false,
     };
     global && parts.all(|part| matches!(part, Tcp(_) | Udp(_) | QuicV1 | P2p(_) | P2pCircuit))
@@ -467,7 +522,10 @@ pub struct Chat {
     peer_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     /// Rediscagem agendada por peer que caiu com mensagem na fila (P31). Só existe com o peer desconectado e
     /// a fila não vazia; sai ao conectar, ao esvaziar a fila e ao esquecer o peer.
-    redial: HashMap<PeerId, Retry>,
+    redial: HashMap<PeerId, Redial>,
+    /// Endereços do convite que eu aceitei (`accept`), já filtrados: último recurso da rediscagem, antes de o
+    /// peer ter informado os dele. Só memória, limitado por [`MAX_KNOWN_DEVICES`], esquecido com o peer.
+    invite_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     /// Espera inicial, teto e orçamento da rediscagem (campos, para o teste não esperar 2 s a 5 min nem 100 vezes).
     redial_base: Duration,
     redial_cap: Duration,
@@ -650,6 +708,7 @@ impl Chat {
             sweep_budget: SWEEP_BUDGET,
             peer_addrs: HashMap::new(),
             redial: HashMap::new(),
+            invite_addrs: HashMap::new(),
             redial_base: REDIAL_BASE,
             redial_cap: REDIAL_CAP,
             redial_budget: REDIAL_BUDGET,
@@ -855,6 +914,11 @@ impl Chat {
         }
         self.trust(invite.identity().clone())?;
         self.expected.insert(peer, invite.identity().clone());
+        // Guarda onde o convite diz que o peer está, para a rediscagem ter por onde começar (P31, I3).
+        let addrs = dial_addrs(invite.addrs(), false);
+        if !addrs.is_empty() && has_room(&self.invite_addrs, &peer) {
+            self.invite_addrs.insert(peer, addrs);
+        }
         Ok(self.node.dial_peer(peer, invite.addrs().to_vec())?)
     }
 
@@ -1432,7 +1496,11 @@ impl Chat {
                 if let Some(peer) = peer {
                     self.expected.remove(&peer);
                     self.forget_unreachable(&peer);
-                    self.redial_failed(peer);
+                    // Falha da rediscagem de fundo é do registro, não da aplicação: um evento por tentativa
+                    // (até ~100 por peer e episódio, com os endereços no texto) seria ruído (auditoria S2).
+                    if self.redial_failed(peer) {
+                        return;
+                    }
                 }
                 self.queue.push_back(ChatEvent::DialFailed { peer, reason });
             }
@@ -1781,24 +1849,41 @@ impl Chat {
     /// endereços de terceiros ([`dial_addrs`]: sem loopback, rede privada nem DNS; no máximo
     /// [`CONTACT_DIAL_ADDRS`] para contato). O que o peer diz é dado dele, não verdade: a conexão só vale se
     /// ele provar o Peer ID, mas o filtro impede que um contato aponte a minha rediscagem para a minha rede.
-    /// Peer sem conversa não entra, então o mapa é limitado pelo número de contatos. A informação nova
-    /// substitui a velha; uma lista que o filtro esvazia apaga a velha (valem os do convite).
+    /// Só entra peer com conversa ou com handshake esperado (`expected`, o `identify` chega antes da conversa
+    /// existir), e o mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
+    /// completa até o limite (auditoria I3: mudança de endereço não apaga o que ainda pode valer); uma lista
+    /// que o filtro esvazia (um peer na LAN que só anuncia IP privado) não apaga a velha.
     fn learn_peer_addrs(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
-        if !self.conversations.contains_key(&peer) {
+        if !(self.conversations.contains_key(&peer) || self.expected.contains_key(&peer))
+            || !has_room(&self.peer_addrs, &peer)
+        {
             return;
         }
-        let addrs = dial_addrs(&addrs, self.is_sibling(&peer));
-        if addrs.is_empty() {
-            self.peer_addrs.remove(&peer);
-        } else {
-            self.peer_addrs.insert(peer, addrs);
+        let sibling = self.is_sibling(&peer);
+        let mut merged = dial_addrs(&addrs, sibling);
+        if merged.is_empty() {
+            return;
         }
+        for old in self.peer_addrs.get(&peer).into_iter().flatten() {
+            if !merged.contains(old) {
+                merged.push(old.clone());
+            }
+        }
+        merged.truncate(if sibling {
+            SIBLING_DIAL_ADDRS
+        } else {
+            CONTACT_DIAL_ADDRS
+        });
+        self.peer_addrs.insert(peer, merged);
     }
 
-    /// Endereços a discar para rediscar `peer` (P31): os que ele informou; sem eles, os do convite dele
-    /// (irmão em `household`, contato em `contact_devices`), com o mesmo filtro.
+    /// Endereços a discar para rediscar `peer` (P31): os que ele informou; sem eles, os do convite que eu
+    /// aceitei (`accept`), os de irmão em `household` e os de contato em `contact_devices`, com o mesmo filtro.
     fn redial_targets(&self, peer: &PeerId) -> Vec<Multiaddr> {
         if let Some(addrs) = self.peer_addrs.get(peer) {
+            return addrs.clone();
+        }
+        if let Some(addrs) = self.invite_addrs.get(peer) {
             return addrs.clone();
         }
         if let Some(invite) = self.household.get(peer) {
@@ -1826,86 +1911,135 @@ impl Chat {
         Instant::now() + self.redial_backoff(attempts).mul_f64(jitter)
     }
 
-    /// Peer que ainda vale rediscar: com conversa, desconectado e com mensagem na fila.
-    fn wants_redial(&self, peer: &PeerId) -> bool {
-        self.conversations.contains_key(peer)
-            && !self.connected.contains(peer)
-            && self.queued(peer) > 0
-    }
-
-    /// Agenda a primeira rediscagem de `peer` (P31) se ele vale rediscar e ainda não há registro. Com
-    /// registro (esperando o prazo, em andamento ou com o orçamento esgotado) não faz nada: só conectar, a
-    /// fila esvaziar ou esquecer o peer apaga o registro.
-    fn start_redial(&mut self, peer: PeerId) {
-        if self.redial.contains_key(&peer) || !self.wants_redial(&peer) {
-            return;
+    /// Vale rediscar `peer`? `No`: sem conversa, já conectado, identidade desconfiada (`untrust`: auditoria I6)
+    /// ou fila vazia. `Unknown`: a outbox não respondeu (auditoria I5): não é "fila vazia", o registro fica e
+    /// reagenda em vez de morrer num erro transitório de SQLite.
+    fn redial_want(&self, peer: &PeerId) -> Want {
+        if !self.conversations.contains_key(peer)
+            || self.connected.contains(peer)
+            || self
+                .sole_identity(peer)
+                .is_some_and(|identity| self.is_distrusted(&identity))
+        {
+            return Want::No;
         }
-        self.redial.insert(
-            peer,
-            Retry {
-                attempts: 1,
-                due: self.redial_due(1),
-                armed: 1 < self.redial_budget,
-            },
-        );
+        match self.outbox.entries(peer) {
+            Ok(entries) if entries.is_empty() => Want::No,
+            Ok(_) => Want::Yes,
+            Err(_) => Want::Unknown,
+        }
     }
 
-    /// O dial a `peer` falhou (P31): agenda o próximo, com espera maior. Só conta se a rediscagem já tinha
-    /// disparado (registro desarmado): uma falha que chega com o prazo ainda esperando é de um dial antigo e
-    /// não dobra a espera. Passado o `redial_budget` o registro fica, sem armar o timer.
-    fn redial_failed(&mut self, peer: PeerId) {
-        let Some(waiting) = self.redial.get(&peer) else {
-            return;
+    /// Registra a tentativa de número `attempts` como falha ou como a próxima a esperar: `Waiting` com o prazo
+    /// da espera, ou `Exhausted` (sem timer) quando o orçamento acaba.
+    fn redial_next(&mut self, peer: PeerId, attempts: u32) {
+        let state = if attempts >= self.redial_budget {
+            RedialState::Exhausted
+        } else {
+            RedialState::Waiting
         };
-        if waiting.armed {
-            return;
-        }
-        if !self.wants_redial(&peer) {
-            self.redial.remove(&peer);
-            return;
-        }
-        let attempts = waiting.attempts.saturating_add(1);
         self.redial.insert(
             peer,
-            Retry {
+            Redial {
                 attempts,
                 due: self.redial_due(attempts),
-                armed: attempts < self.redial_budget,
+                state,
             },
         );
     }
 
-    /// Rediscaa os peers cujo prazo venceu (P31). Quem reconectou, ficou sem fila ou perdeu a conversa no meio
-    /// do caminho perde o registro. O de quem disparou fica, desarmado, para contar a próxima falha seguida
-    /// (e para o prazo vencido não manter o laço girando). Sem endereço nenhum não há o que discar.
+    /// Agenda a rediscagem de `peer` (P31) se vale rediscar. Sem registro, começa pela espera base. `Waiting` e
+    /// `InFlight` seguem como estão. `Exhausted` (orçamento acabou, ~8 h offline) rearma **uma** tentativa
+    /// quando chega mensagem nova (auditoria I2): a ação do usuário é o sinal de que vale tentar, e o registro só
+    /// volta a esgotado depois dela, então não vira laço. Conectar, esquecer o peer ou a fila vazia (conferida no
+    /// prazo) apagam o registro.
+    fn start_redial(&mut self, peer: PeerId) {
+        let state = self.redial.get(&peer).map(|redial| redial.state);
+        if matches!(state, Some(RedialState::Waiting | RedialState::InFlight))
+            || !matches!(self.redial_want(&peer), Want::Yes)
+        {
+            return;
+        }
+        let attempts = match state {
+            Some(_) => self.redial_budget.saturating_sub(1).max(1),
+            None => 1,
+        };
+        self.redial_next(peer, attempts);
+    }
+
+    /// O nó avisou que um dial a `peer` falhou (P31). Só conta se há uma rediscagem `InFlight` (a espera
+    /// dobra): falha de outro dial (mDNS, `/dial` manual) ou atrasada não mexe no registro (auditoria S1).
+    /// Devolve `true` se era da rediscagem de fundo, para o `chat` não emitir um `DialFailed` por tentativa
+    /// (auditoria S2).
+    fn redial_failed(&mut self, peer: PeerId) -> bool {
+        let Some(redial) = self
+            .redial
+            .get(&peer)
+            .filter(|redial| redial.state == RedialState::InFlight)
+        else {
+            return false;
+        };
+        let attempts = redial.attempts.saturating_add(1);
+        if matches!(self.redial_want(&peer), Want::No) {
+            self.redial.remove(&peer);
+        } else {
+            self.redial_next(peer, attempts);
+        }
+        true
+    }
+
+    /// Trata os peers cujo prazo venceu (P31). `Waiting`: se ainda vale, disca (e passa a `InFlight` com prazo
+    /// de [`REDIAL_INFLIGHT`]); sem endereço nenhum, ou com a outbox sem responder, conta como tentativa e
+    /// reagenda sem discar (rearma sozinho quando um endereço for aprendido: auditoria I2). `InFlight` que
+    /// venceu sem `DialFailed` nem conexão (evento perdido, dial que o nó engoliu) conta como falha. O prazo
+    /// vencido sempre muda o estado, então não mantém o laço girando.
     fn flush_due_redials(&mut self) {
         let now = Instant::now();
         let due: Vec<PeerId> = self
             .redial
             .iter()
-            .filter(|(_, retry)| retry.armed && retry.due <= now)
+            .filter(|(_, redial)| redial.state != RedialState::Exhausted && redial.due <= now)
             .map(|(peer, _)| *peer)
             .collect();
         for peer in due {
-            if !self.wants_redial(&peer) {
-                self.redial.remove(&peer);
+            let Some(&Redial {
+                attempts, state, ..
+            }) = self.redial.get(&peer)
+            else {
                 continue;
+            };
+            match self.redial_want(&peer) {
+                Want::No => {
+                    self.redial.remove(&peer);
+                    continue;
+                }
+                Want::Unknown => {
+                    self.redial_next(peer, attempts.saturating_add(1));
+                    continue;
+                }
+                Want::Yes => {}
             }
-            if let Some(retry) = self.redial.get_mut(&peer) {
-                retry.armed = false;
+            if state == RedialState::InFlight {
+                self.redial_next(peer, attempts.saturating_add(1));
+                continue;
             }
             let addrs = self.redial_targets(&peer);
             if addrs.is_empty() {
+                self.redial_next(peer, attempts.saturating_add(1));
                 continue;
             }
+            self.redial.insert(
+                peer,
+                Redial {
+                    attempts,
+                    due: now + REDIAL_INFLIGHT,
+                    state: RedialState::InFlight,
+                },
+            );
             #[cfg(test)]
             self.dial_log.push((peer, addrs.clone()));
-            if let Err(e) = self.node.dial_peer(peer, addrs) {
-                self.queue.push_back(ChatEvent::DialFailed {
-                    peer: Some(peer),
-                    reason: e.to_string(),
-                });
-                self.redial_failed(peer);
+            if self.node.dial_peer(peer, addrs).is_err() {
+                self.redial_next(peer, attempts.saturating_add(1));
             }
         }
     }
@@ -2053,8 +2187,8 @@ impl Chat {
         let redials = self
             .redial
             .values()
-            .filter(|retry| retry.armed)
-            .map(|retry| retry.due.saturating_duration_since(now));
+            .filter(|redial| redial.state != RedialState::Exhausted)
+            .map(|redial| redial.due.saturating_duration_since(now));
         let sweep = self.sweep_due.map(|due| due.saturating_duration_since(now));
         self.sibling_wake_in()
             .into_iter()
@@ -2312,6 +2446,7 @@ impl Chat {
         self.forget_deposit_retry(&peer);
         self.forget_redial(&peer);
         self.peer_addrs.remove(&peer);
+        self.invite_addrs.remove(&peer);
         self.sweep_rounds.remove(&peer);
         self.depositing.retain(|_, (p, _)| *p != peer);
         self.household.remove(&peer);
@@ -4288,7 +4423,7 @@ mod tests {
         let (bia, ana_peer) = bia_after_ana_dropped_with_a_queue();
 
         assert_eq!(bia.redial[&ana_peer].attempts, 1);
-        assert!(bia.redial[&ana_peer].armed);
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
     }
 
     /// P31: sem nada na fila não há por que rediscar (só a caixa postal e o mDNS trazem o peer de volta).
@@ -4326,7 +4461,11 @@ mod tests {
         make_redial_due(&mut bia, ana_peer);
         bia.flush_due_redials();
         assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
-        assert!(!bia.redial[&ana_peer].armed, "disparou: não acorda à toa");
+        assert_eq!(
+            bia.redial[&ana_peer].state,
+            RedialState::InFlight,
+            "disparou: espera o resultado do dial"
+        );
     }
 
     /// P31: o que o peer informa passa pelo mesmo filtro dos endereços de terceiros (sem loopback, rede
@@ -4359,7 +4498,12 @@ mod tests {
         );
 
         identify(&mut bia, ana_peer, &[GLOBAL_B]);
-        assert_eq!(bia.redial_targets(&ana_peer), [addr(GLOBAL_B)]);
+        assert_eq!(
+            bia.redial_targets(&ana_peer)[0],
+            addr(GLOBAL_B),
+            "a informação nova vai na frente"
+        );
+        assert!(bia.redial_targets(&ana_peer).len() <= CONTACT_DIAL_ADDRS);
     }
 
     /// P31: peer sem conversa não entra em `peer_addrs` (memória limitada pelo número de contatos).
@@ -4436,7 +4580,7 @@ mod tests {
         });
 
         assert_eq!(bia.redial[&ana_peer].attempts, 2);
-        assert!(bia.redial[&ana_peer].armed);
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
         assert!(
             bia.redial[&ana_peer].due > Instant::now() + Duration::from_secs(5700),
             "2 falhas: ~2 x 3600 s, menos o jitter"
@@ -4457,25 +4601,132 @@ mod tests {
         assert_eq!(bia.redial[&ana_peer].attempts, 1);
     }
 
-    /// P31: depois de `redial_budget` rediscagens seguidas o timer para de armar; o registro fica, desarmado.
+    /// P31: depois de `redial_budget` tentativas o registro esgota: sem timer, e o orçamento de 3 dá exatamente
+    /// 2 dials (a tentativa 1 é a primeira espera; a 3ª é a que esgota). Falha avulsa de outro dial não conta.
     #[tokio::test]
-    async fn the_redial_budget_stops_the_timer() {
+    async fn the_redial_budget_stops_the_timer_and_the_dials() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.redial_budget = 3;
         identify(&mut bia, ana_peer, &[GLOBAL_A]);
         bia.send(ana_peer, "oi", None).unwrap();
-        for round in 1..=3 {
+        for _ in 1..=2 {
             make_redial_due(&mut bia, ana_peer);
             bia.flush_due_redials();
             bia.handle(NodeEvent::DialFailed {
                 peer: Some(ana_peer),
                 reason: "sem rota".into(),
             });
-            assert_eq!(bia.redial[&ana_peer].attempts, round + 1);
         }
 
-        assert!(!bia.redial[&ana_peer].armed, "esgotou");
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Exhausted);
+        assert_eq!(bia.redial[&ana_peer].attempts, 3);
+        assert_eq!(bia.dial_log.len(), 2);
         assert_eq!(bia.wake_in(), None);
+
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "de outro dial".into(),
+        });
+        assert_eq!(bia.dial_log.len(), 2, "esgotado: nada mais é discado");
+        assert_eq!(
+            bia.redial[&ana_peer].attempts, 3,
+            "e a falha avulsa não conta"
+        );
+    }
+
+    /// P31, I2: esgotado o orçamento, uma mensagem nova rearma UMA tentativa; depois dela volta a esgotar.
+    #[tokio::test]
+    async fn a_new_message_rearms_one_attempt_after_the_budget_is_exhausted() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.redial_budget = 2;
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.send(ana_peer, "um", None).unwrap();
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "sem rota".into(),
+        });
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Exhausted);
+
+        bia.send(ana_peer, "dois", None).unwrap();
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting, "rearmou");
+        assert!(bia.wake_in().is_some());
+
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "sem rota".into(),
+        });
+        assert_eq!(bia.dial_log.len(), 2, "uma tentativa a mais, não um laço");
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Exhausted);
+    }
+
+    /// P31, I2: o dial que não deu notícia (nem `DialFailed` nem conexão) conta como falha no prazo.
+    #[tokio::test]
+    async fn an_in_flight_dial_that_never_reports_counts_as_a_failure() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.send(ana_peer, "oi", None).unwrap();
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::InFlight);
+        let left = bia.redial[&ana_peer]
+            .due
+            .saturating_duration_since(Instant::now());
+        assert!(left > Duration::from_secs(50) && left <= REDIAL_INFLIGHT);
+
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+
+        assert_eq!(bia.redial[&ana_peer].attempts, 2);
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
+        assert_eq!(bia.dial_log.len(), 1, "contou a falha sem discar de novo");
+    }
+
+    /// P31, S2: a falha da rediscagem de fundo não vira um `ChatEvent::DialFailed` por tentativa.
+    #[tokio::test]
+    async fn a_background_redial_failure_is_not_surfaced_as_an_event() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.send(ana_peer, "oi", None).unwrap();
+        events(&mut bia);
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "sem rota".into(),
+        });
+
+        assert!(
+            !events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::DialFailed { .. })),
+            "a falha é do registro, não da aplicação"
+        );
+    }
+
+    /// P31, S1: um `DialFailed` de outro dial (mDNS, `/dial` manual) sem rediscagem em andamento segue
+    /// visível para a aplicação e não cria registro.
+    #[tokio::test]
+    async fn a_failure_of_another_dial_is_still_surfaced() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "manual".into(),
+        });
+
+        assert!(
+            events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::DialFailed { .. }))
+        );
+        assert!(bia.redial.is_empty());
     }
 
     /// P31: um dial que falha para peer sem conversa não cria rediscagem.
@@ -4532,10 +4783,10 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31: sem nenhum endereço (nem informado nem do convite) não há o que discar: o registro desarma, sem
-    /// deixar o laço girando.
+    /// P31, I2: sem nenhum endereço (nem informado nem do convite) não há o que discar: conta como tentativa e
+    /// reagenda com espera maior, sem discar; ao aprender um endereço, a próxima tentativa disca.
     #[tokio::test]
-    async fn a_due_redial_without_any_address_disarms_without_dialing() {
+    async fn a_due_redial_without_any_address_backs_off_and_dials_once_one_is_learned() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.send(ana_peer, "oi", None).unwrap();
         make_redial_due(&mut bia, ana_peer);
@@ -4543,8 +4794,140 @@ mod tests {
         bia.flush_due_redials();
 
         assert!(bia.dial_log.is_empty());
-        assert!(!bia.redial[&ana_peer].armed);
-        assert_eq!(bia.wake_in(), None);
+        assert_eq!(bia.redial[&ana_peer].attempts, 2);
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
+        assert!(bia.wake_in().is_some(), "não ficou preso: tenta de novo");
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
+    }
+
+    /// P31, I5: a outbox que não responde não é "fila vazia": o registro fica e reagenda.
+    #[tokio::test]
+    async fn an_unreadable_queue_keeps_the_redial_and_reschedules() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.send(ana_peer, "oi", None).unwrap();
+        make_redial_due(&mut bia, ana_peer);
+        bia.outbox
+            .run_sql("ALTER TABLE kin_outbox RENAME TO kin_outbox_quebrada");
+
+        bia.flush_due_redials();
+
+        assert_eq!(bia.redial[&ana_peer].attempts, 2);
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
+        assert!(bia.dial_log.is_empty());
+    }
+
+    /// P31, I6: depois de `untrust`, a identidade desconfiada deixa de ser rediscada e o registro some.
+    #[tokio::test]
+    async fn a_distrusted_identity_is_no_longer_redialed() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.send(ana_peer, "oi", None).unwrap();
+        let ana = bia
+            .sole_identity(&ana_peer)
+            .expect("conversa com 1 identidade");
+        bia.untrust(&ana).unwrap();
+        make_redial_due(&mut bia, ana_peer);
+
+        bia.flush_due_redials();
+
+        assert!(bia.dial_log.is_empty());
+        assert!(bia.redial.is_empty());
+    }
+
+    /// P31, I3: o `identify` que chega antes de a conversa existir (handshake esperado por `accept`) já vale.
+    #[tokio::test]
+    async fn addresses_are_learned_for_a_peer_whose_handshake_is_expected() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let invite = invite_for(&StandaloneIdentity::generate());
+        let peer = invite.peer_id();
+        bia.expected.insert(peer, invite.identity().clone());
+
+        identify(&mut bia, peer, &[GLOBAL_A]);
+
+        assert_eq!(bia.redial_targets(&peer), [addr(GLOBAL_A)]);
+    }
+
+    /// P31, I3: o convite aceito vira o último recurso de endereço da rediscagem.
+    #[tokio::test]
+    async fn an_accepted_invite_keeps_its_addresses_for_the_redial() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let invite = invite_for(&StandaloneIdentity::generate());
+
+        bia.accept(&invite).unwrap();
+
+        assert_eq!(
+            bia.redial_targets(&invite.peer_id()),
+            [addr("/ip4/203.0.113.1/tcp/1")]
+        );
+    }
+
+    /// P31, I3: uma lista que o filtro esvazia (peer na LAN que só anuncia IP privado) não apaga a velha, e a
+    /// informação nova vai na frente da velha.
+    #[tokio::test]
+    async fn learned_addresses_merge_and_an_emptied_list_keeps_the_old_ones() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        identify(&mut bia, ana_peer, &["/ip4/192.168.0.5/tcp/4001"]);
+        assert_eq!(bia.redial_targets(&ana_peer), [addr(GLOBAL_A)]);
+
+        identify(&mut bia, ana_peer, &[GLOBAL_B]);
+        assert_eq!(
+            bia.redial_targets(&ana_peer),
+            [addr(GLOBAL_B), addr(GLOBAL_A)]
+        );
+    }
+
+    /// P31, I1: o filtro de endereço de contato não deixa passar IPv4 embutido em IPv6, NAT64, 6to4, Teredo,
+    /// multicast nem as faixas reservadas do IPv4, que um contato usaria para me fazer discar a minha rede.
+    #[test]
+    fn contact_filter_rejects_embedded_and_special_addresses() {
+        for bad in [
+            "/ip6/::ffff:10.0.0.1/tcp/80",
+            "/ip6/::ffff:127.0.0.1/tcp/80",
+            "/ip6/::ffff:169.254.169.254/tcp/80",
+            "/ip6/::10.0.0.1/tcp/80",
+            "/ip6/64:ff9b::a00:1/tcp/80",
+            "/ip6/2002:a00:1::1/tcp/80",
+            "/ip6/2001:0:4136:e378::1/tcp/80",
+            "/ip6/fec0::1/tcp/80",
+            "/ip6/ff02::1/tcp/80",
+            "/ip4/224.0.0.1/tcp/80",
+            "/ip4/240.0.0.1/tcp/80",
+            "/ip4/0.1.2.3/tcp/80",
+            "/ip4/192.0.0.8/tcp/80",
+            "/ip4/198.18.0.1/tcp/80",
+        ] {
+            assert!(
+                !dialable(&bad.parse::<Multiaddr>().unwrap(), false),
+                "{bad}"
+            );
+        }
+        for good in ["/ip6/2606:4700::1111/tcp/443", "/ip4/8.8.8.8/tcp/443"] {
+            assert!(
+                dialable(&good.parse::<Multiaddr>().unwrap(), false),
+                "{good}"
+            );
+        }
+    }
+
+    /// P31, I4: de irmão vale quase tudo, mas nunca "qualquer endereço" nem multicast, e há teto de quantidade.
+    #[test]
+    fn sibling_filter_rejects_unspecified_and_multicast_and_is_bounded() {
+        let ok = |s: &str| s.parse::<Multiaddr>().unwrap();
+        assert!(!dialable(&ok("/ip4/0.0.0.0/tcp/1"), true));
+        assert!(!dialable(&ok("/ip6/::/tcp/1"), true));
+        assert!(!dialable(&ok("/ip4/224.0.0.1/tcp/1"), true));
+        assert!(!dialable(&ok("/ip6/ff02::1/tcp/1"), true));
+        let many: Vec<Multiaddr> = (1..=40)
+            .map(|n| ok(&format!("/ip4/203.0.113.{n}/tcp/1")))
+            .collect();
+        assert_eq!(dial_addrs(&many, true).len(), SIBLING_DIAL_ADDRS);
     }
 
     /// P31: esquecer o peer (conversa caiu) apaga a rediscagem e os endereços dele.
@@ -4553,18 +4936,20 @@ mod tests {
         let mut r = revoked_ana();
         r.bia.redial.insert(
             r.ana_peer,
-            Retry {
+            Redial {
                 attempts: 1,
                 due: Instant::now(),
-                armed: true,
+                state: RedialState::Waiting,
             },
         );
         r.bia.peer_addrs.insert(r.ana_peer, vec![addr(GLOBAL_A)]);
+        r.bia.invite_addrs.insert(r.ana_peer, vec![addr(GLOBAL_B)]);
 
         r.bia.on_mls(r.sibling, &r.wire).unwrap();
         assert!(!r.bia.is_ready(&r.ana_peer), "a conversa caiu");
         assert!(!r.bia.redial.contains_key(&r.ana_peer));
         assert!(!r.bia.peer_addrs.contains_key(&r.ana_peer));
+        assert!(!r.bia.invite_addrs.contains_key(&r.ana_peer));
     }
 
     /// P31: o relógio acorda no prazo da rediscagem.
