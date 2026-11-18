@@ -4517,6 +4517,74 @@ mod tests {
         assert!(bia.peer_addrs.is_empty());
     }
 
+    /// P32:o `identify` chega com a conexão, antes de a conversa existir (quem disca com `dial` não tem
+    /// `expected`). O endereço informado nessa janela tem de valer na rediscagem depois da queda.
+    #[tokio::test]
+    async fn addresses_told_before_the_conversation_exists_are_used_to_redial() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let conversation = bia.conversations.remove(&ana_peer).unwrap();
+        bia.connected.insert(ana_peer);
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        bia.conversations.insert(ana_peer, conversation);
+        bia.send(ana_peer, "oi", None).unwrap();
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+
+        assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
+    }
+
+    /// P32:estranho conectado só ocupa vaga em `peer_addrs` enquanto a conexão durar.
+    #[tokio::test]
+    async fn addresses_of_a_connected_stranger_are_dropped_when_it_disconnects() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(&mut bia, stranger, &[GLOBAL_A]);
+        assert!(bia.peer_addrs.contains_key(&stranger), "conectado: guarda");
+
+        bia.handle(NodeEvent::PeerDisconnected(stranger));
+        assert!(bia.peer_addrs.is_empty(), "caiu sem conversa: esquece");
+    }
+
+    /// P32:com o mapa no teto, estranho conectado não entra (e quem já estava continua).
+    #[tokio::test]
+    async fn a_connected_stranger_cannot_push_past_the_cap() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_B]);
+        for _ in 1..MAX_KNOWN_DEVICES {
+            bia.peer_addrs
+                .insert(PeerId::random(), vec![addr(GLOBAL_A)]);
+        }
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(&mut bia, stranger, &[GLOBAL_A]);
+
+        assert_eq!(bia.peer_addrs.len(), MAX_KNOWN_DEVICES);
+        assert!(!bia.peer_addrs.contains_key(&stranger));
+        assert!(bia.peer_addrs.contains_key(&ana_peer));
+    }
+
+    /// P32:estranho conectado que só anuncia IP privado ou loopback não deixa nada (mesmo filtro).
+    #[tokio::test]
+    async fn a_connected_stranger_with_only_private_addresses_leaves_nothing() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(
+            &mut bia,
+            stranger,
+            &["/ip4/127.0.0.1/tcp/4001", "/ip4/192.168.0.5/tcp/4001"],
+        );
+
+        assert!(bia.peer_addrs.is_empty());
+    }
+
     /// P32:sem endereço informado, valem os do convite do contato.
     #[tokio::test]
     async fn the_contact_invite_addresses_are_the_fallback() {
