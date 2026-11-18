@@ -191,7 +191,7 @@ const MAILBOX_WINDOW: usize = 8;
 /// tem este limite. Limita a amplificação de uma lista hostil (auditoria I1).
 const CONTACT_DIAL_ADDRS: usize = 4;
 /// O mesmo limite para um irmão, bem mais folgado: ele é a minha identidade, mas o `identify` aceita dezenas
-/// de endereços e a rediscagem por timer os multiplicaria (auditoria P31, I4).
+/// de endereços e a rediscagem por timer os multiplicaria (auditoria P32, I4).
 const SIBLING_DIAL_ADDRS: usize = 16;
 
 /// Quantos devices conhecidos se guardam em cada mapa só-memória (`household`, `contact_devices`,
@@ -219,22 +219,22 @@ const RETRY_BUDGET: u32 = 500;
 /// re-cifrar até [`MAILBOX_WINDOW`] mensagens (uma geração MLS cada): 8 x 8 = 64 gerações por peer, longe do
 /// salto de 2000 que o receptor tolera. Com retenção de 7 dias e varredura a cada quarto dela, são ~2 retenções.
 const SWEEP_BUDGET: u32 = 8;
-/// Espera antes da primeira rediscagem a um peer que caiu com mensagem na fila (P31). Cada falha seguida dobra
+/// Espera antes da primeira rediscagem a um peer que caiu com mensagem na fila (P32). Cada falha seguida dobra
 /// a espera, até [`REDIAL_CAP`]; conectar zera.
 const REDIAL_BASE: Duration = Duration::from_secs(2);
-/// Teto da espera entre rediscagens (P31).
+/// Teto da espera entre rediscagens (P32).
 const REDIAL_CAP: Duration = Duration::from_secs(300);
-/// Rediscagens seguidas, sem conectar, depois das quais o timer para de armar (P31). Não gasta geração MLS
+/// Rediscagens seguidas, sem conectar, depois das quais o timer para de armar (P32). Não gasta geração MLS
 /// (o dial só abre transporte): o orçamento protege rede e bateria. Com o teto de 5 min são ~8 h.
 const REDIAL_BUDGET: u32 = 100;
-/// Quanto esperar o resultado de um dial pedido pela rediscagem antes de contá-lo como falha (P31, auditoria
+/// Quanto esperar o resultado de um dial pedido pela rediscagem antes de contá-lo como falha (P32,auditoria
 /// I2): cobre o evento perdido e o dial que o nó engole (`DialPeerConditionFalse`) sem avisar.
 const REDIAL_INFLIGHT: Duration = Duration::from_secs(60);
 /// Teto da espera entre reenvios diretos (P19). Cada tentativa re-cifra e gasta uma geração de chave MLS (ADR
 /// 0002); quem limita o total é [`RETRY_BUDGET`], não este teto (outros gatilhos também reenviam na hora).
 const RETRY_CAP: Duration = Duration::from_secs(60);
 
-/// Em que pé está a rediscagem de um peer (P31).
+/// Em que pé está a rediscagem de um peer (P32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedialState {
     /// Esperando o prazo (`due`) para discar.
@@ -246,7 +246,7 @@ enum RedialState {
     Exhausted,
 }
 
-/// Rediscagem agendada para um peer que caiu com mensagem na fila (P31).
+/// Rediscagem agendada para um peer que caiu com mensagem na fila (P32).
 struct Redial {
     /// Tentativas seguidas sem conectar; decide a espera ([`Chat::redial_backoff`]).
     attempts: u32,
@@ -384,7 +384,7 @@ fn global_ipv4(ip: std::net::Ipv4Addr) -> bool {
 
 /// IPv6 unicast global? Lista de permissão, não de negação: só `2000::/3`. Isso barra de uma vez o
 /// IPv4 embutido (`::ffff:10.0.0.1`, `::10.0.0.1`), NAT64 (`64:ff9b::/96`), loopback, `fc00::/7`, `fe80::/10`,
-/// site-local e multicast, que um contato usaria para me fazer discar a minha rede (auditoria P31, I1). Dentro
+/// site-local e multicast, que um contato usaria para me fazer discar a minha rede (auditoria P32, I1). Dentro
 /// de `2000::/3` ainda nega 6to4 (`2002::/16`, embute IPv4 arbitrário) e Teredo (`2001:0::/32`).
 fn global_ipv6(ip: std::net::Ipv6Addr) -> bool {
     let [first, second, ..] = ip.segments();
@@ -402,7 +402,7 @@ fn dialable(addr: &Multiaddr, from_sibling: bool) -> bool {
     }
     if from_sibling {
         // Irmão é a minha identidade, então o resto vale (inclusive loopback, nos testes e no lab), mas
-        // "qualquer endereço" e multicast nunca são um destino (auditoria P31, I4).
+        // "qualquer endereço" e multicast nunca são um destino (auditoria P32, I4).
         return match addr.iter().next() {
             Some(Ip4(ip)) => !(ip.is_unspecified() || ip.is_multicast()),
             Some(Ip6(ip)) => !(ip.is_unspecified() || ip.is_multicast()),
@@ -517,10 +517,10 @@ pub struct Chat {
     sweep_rounds: HashMap<PeerId, u32>,
     /// Teto de rodadas da varredura por peer (campo, para o teste não rodar 8 vezes).
     sweep_budget: u32,
-    /// Endereços de escuta que cada peer com conversa informou ao conectar (`PeerIdentified`) (P31). Só
+    /// Endereços de escuta que cada peer com conversa informou ao conectar (`PeerIdentified`) (P32). Só
     /// memória; peer sem conversa não entra, então o mapa é limitado pelo número de contatos.
     peer_addrs: HashMap<PeerId, Vec<Multiaddr>>,
-    /// Rediscagem agendada por peer que caiu com mensagem na fila (P31). Só existe com o peer desconectado e
+    /// Rediscagem agendada por peer que caiu com mensagem na fila (P32). Só existe com o peer desconectado e
     /// a fila não vazia; sai ao conectar, ao esvaziar a fila e ao esquecer o peer.
     redial: HashMap<PeerId, Redial>,
     /// Endereços do convite que eu aceitei (`accept`), já filtrados: último recurso da rediscagem, antes de o
@@ -914,7 +914,7 @@ impl Chat {
         }
         self.trust(invite.identity().clone())?;
         self.expected.insert(peer, invite.identity().clone());
-        // Guarda onde o convite diz que o peer está, para a rediscagem ter por onde começar (P31, I3).
+        // Guarda onde o convite diz que o peer está, para a rediscagem ter por onde começar (P32,I3).
         let addrs = dial_addrs(invite.addrs(), false);
         if !addrs.is_empty() && has_room(&self.invite_addrs, &peer) {
             self.invite_addrs.insert(peer, addrs);
@@ -1845,7 +1845,7 @@ impl Chat {
         }
     }
 
-    /// Guarda os endereços de escuta que `peer` informou ao conectar (P31), passados pelo mesmo filtro dos
+    /// Guarda os endereços de escuta que `peer` informou ao conectar (P32), passados pelo mesmo filtro dos
     /// endereços de terceiros ([`dial_addrs`]: sem loopback, rede privada nem DNS; no máximo
     /// [`CONTACT_DIAL_ADDRS`] para contato). O que o peer diz é dado dele, não verdade: a conexão só vale se
     /// ele provar o Peer ID, mas o filtro impede que um contato aponte a minha rediscagem para a minha rede.
@@ -1877,7 +1877,7 @@ impl Chat {
         self.peer_addrs.insert(peer, merged);
     }
 
-    /// Endereços a discar para rediscar `peer` (P31): os que ele informou; sem eles, os do convite que eu
+    /// Endereços a discar para rediscar `peer` (P32): os que ele informou; sem eles, os do convite que eu
     /// aceitei (`accept`), os de irmão em `household` e os de contato em `contact_devices`, com o mesmo filtro.
     fn redial_targets(&self, peer: &PeerId) -> Vec<Multiaddr> {
         if let Some(addrs) = self.peer_addrs.get(peer) {
@@ -1948,7 +1948,7 @@ impl Chat {
         );
     }
 
-    /// Agenda a rediscagem de `peer` (P31) se vale rediscar. Sem registro, começa pela espera base. `Waiting` e
+    /// Agenda a rediscagem de `peer` (P32) se vale rediscar. Sem registro, começa pela espera base. `Waiting` e
     /// `InFlight` seguem como estão. `Exhausted` (orçamento acabou, ~8 h offline) rearma **uma** tentativa
     /// quando chega mensagem nova (auditoria I2): a ação do usuário é o sinal de que vale tentar, e o registro só
     /// volta a esgotado depois dela, então não vira laço. Conectar, esquecer o peer ou a fila vazia (conferida no
@@ -1967,7 +1967,7 @@ impl Chat {
         self.redial_next(peer, attempts);
     }
 
-    /// O nó avisou que um dial a `peer` falhou (P31). Só conta se há uma rediscagem `InFlight` (a espera
+    /// O nó avisou que um dial a `peer` falhou (P32). Só conta se há uma rediscagem `InFlight` (a espera
     /// dobra): falha de outro dial (mDNS, `/dial` manual) ou atrasada não mexe no registro (auditoria S1).
     /// Devolve `true` se era da rediscagem de fundo, para o `chat` não emitir um `DialFailed` por tentativa
     /// (auditoria S2).
@@ -1988,7 +1988,7 @@ impl Chat {
         true
     }
 
-    /// Trata os peers cujo prazo venceu (P31). `Waiting`: se ainda vale, disca (e passa a `InFlight` com prazo
+    /// Trata os peers cujo prazo venceu (P32). `Waiting`: se ainda vale, disca (e passa a `InFlight` com prazo
     /// de [`REDIAL_INFLIGHT`]); sem endereço nenhum, ou com a outbox sem responder, conta como tentativa e
     /// reagenda sem discar (rearma sozinho quando um endereço for aprendido: auditoria I2). `InFlight` que
     /// venceu sem `DialFailed` nem conexão (evento perdido, dial que o nó engoliu) conta como falha. O prazo
@@ -4027,7 +4027,7 @@ mod tests {
         bia.schedule_deposit_retry(ana_peer);
         assert_eq!(bia.deposit_spent[&ana_peer], 3, "a conta é por recusa");
         assert!(!bia.deposit_retry[&ana_peer].armed, "3 de 3: esgotou");
-        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só o depósito importa
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P32): aqui só o depósito importa
         assert_eq!(bia.wake_in(), None);
     }
 
@@ -4086,7 +4086,7 @@ mod tests {
         bia.retry_base = Duration::from_secs(3600);
         bia.retry_cap = Duration::from_secs(86_400);
         bia.deposit_retry.clear();
-        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só o depósito importa
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P32): aqui só o depósito importa
         bia.schedule_deposit_retry(ana_peer);
         let wake = bia.wake_in().expect("com novo depósito agendado, acorda");
         assert!(wake <= Duration::from_secs(3600) && wake > Duration::from_secs(3000));
@@ -4123,7 +4123,7 @@ mod tests {
     async fn a_confirmed_deposit_arms_the_age_sweep() {
         let week = std::time::Duration::from_secs(7 * 24 * 3600);
         let (mut bia, _ana, _peer, _relay, _) = deposited_once(Some(week)).await;
-        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só a varredura importa
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P32): aqui só a varredura importa
 
         assert!(bia.sweep_due.is_some());
         let wake = bia.wake_in().expect("a varredura pede o relógio");
@@ -4137,7 +4137,7 @@ mod tests {
     #[tokio::test]
     async fn no_retention_means_no_age_sweep() {
         let (mut bia, _ana, _peer, _relay, _) = deposited_once(None).await;
-        bia.redial.clear(); // o envio offline também agenda rediscagem (P31): aqui só a varredura importa
+        bia.redial.clear(); // o envio offline também agenda rediscagem (P32): aqui só a varredura importa
 
         assert!(bia.sweep_due.is_none());
         assert_eq!(bia.wake_in(), None);
@@ -4382,13 +4382,13 @@ mod tests {
         assert!(bia.deposit_spent.is_empty());
     }
 
-    // ---- P31: reconexão automática ----
+    // ---- P32: reconexão automática ----
 
     fn addr(text: &str) -> Multiaddr {
         text.parse().unwrap()
     }
 
-    /// P31: o peer informa onde escuta (o que o transporte entrega depois do `identify`).
+    /// P32:o peer informa onde escuta (o que o transporte entrega depois do `identify`).
     fn identify(bia: &mut Chat, peer: PeerId, listen: &[&str]) {
         bia.handle(NodeEvent::PeerIdentified {
             peer,
@@ -4397,7 +4397,7 @@ mod tests {
         });
     }
 
-    /// P31: vence o prazo da rediscagem de `peer` sem esperar.
+    /// P32:vence o prazo da rediscagem de `peer` sem esperar.
     fn make_redial_due(bia: &mut Chat, peer: PeerId) {
         bia.redial
             .get_mut(&peer)
@@ -4405,7 +4405,7 @@ mod tests {
             .due = Instant::now();
     }
 
-    /// P31: Bia com Ana conectada e uma mensagem na fila (em voo), depois Ana cai.
+    /// P32:Bia com Ana conectada e uma mensagem na fila (em voo), depois Ana cai.
     fn bia_after_ana_dropped_with_a_queue() -> (Chat, PeerId) {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.handle(NodeEvent::PeerConnected(ana_peer));
@@ -4417,7 +4417,7 @@ mod tests {
     const GLOBAL_A: &str = "/ip4/203.0.113.10/tcp/4001";
     const GLOBAL_B: &str = "/ip4/203.0.113.11/tcp/4001";
 
-    /// P31: peer que cai com mensagem na fila agenda a primeira rediscagem.
+    /// P32:peer que cai com mensagem na fila agenda a primeira rediscagem.
     #[tokio::test]
     async fn a_dropped_peer_with_a_queue_is_scheduled_for_redial() {
         let (bia, ana_peer) = bia_after_ana_dropped_with_a_queue();
@@ -4426,7 +4426,7 @@ mod tests {
         assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
     }
 
-    /// P31: sem nada na fila não há por que rediscar (só a caixa postal e o mDNS trazem o peer de volta).
+    /// P32:sem nada na fila não há por que rediscar (só a caixa postal e o mDNS trazem o peer de volta).
     #[tokio::test]
     async fn a_dropped_peer_without_a_queue_is_not_redialed() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4437,7 +4437,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31: mensagem enfileirada com o peer que nunca conectou nesta execução também agenda.
+    /// P32:mensagem enfileirada com o peer que nunca conectou nesta execução também agenda.
     #[tokio::test]
     async fn an_offline_send_schedules_a_redial() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4447,7 +4447,7 @@ mod tests {
         assert_eq!(bia.redial[&ana_peer].attempts, 1);
     }
 
-    /// P31: antes do prazo nada é discado; no prazo disca o peer com os endereços que ele informou.
+    /// P32:antes do prazo nada é discado; no prazo disca o peer com os endereços que ele informou.
     #[tokio::test]
     async fn the_redial_waits_for_its_deadline_then_dials_the_learned_addresses() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4468,7 +4468,7 @@ mod tests {
         );
     }
 
-    /// P31: o que o peer informa passa pelo mesmo filtro dos endereços de terceiros (sem loopback, rede
+    /// P32:o que o peer informa passa pelo mesmo filtro dos endereços de terceiros (sem loopback, rede
     /// privada nem DNS), no máximo `CONTACT_DIAL_ADDRS`, e a informação nova substitui a velha.
     #[tokio::test]
     async fn learned_addresses_are_filtered_bounded_and_replaced() {
@@ -4506,7 +4506,7 @@ mod tests {
         assert!(bia.redial_targets(&ana_peer).len() <= CONTACT_DIAL_ADDRS);
     }
 
-    /// P31: peer sem conversa não entra em `peer_addrs` (memória limitada pelo número de contatos).
+    /// P32:peer sem conversa não entra em `peer_addrs` (memória limitada pelo número de contatos).
     #[tokio::test]
     async fn addresses_of_a_peer_without_a_conversation_are_ignored() {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
@@ -4517,7 +4517,7 @@ mod tests {
         assert!(bia.peer_addrs.is_empty());
     }
 
-    /// P31: sem endereço informado, valem os do convite do contato.
+    /// P32:sem endereço informado, valem os do convite do contato.
     #[tokio::test]
     async fn the_contact_invite_addresses_are_the_fallback() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4530,7 +4530,7 @@ mod tests {
         );
     }
 
-    /// P31: a espera é 2 s, 4 s, 8 s... e para no teto de 5 min; muitas falhas não estouram a conta.
+    /// P32:a espera é 2 s, 4 s, 8 s... e para no teto de 5 min; muitas falhas não estouram a conta.
     #[tokio::test]
     async fn the_redial_wait_doubles_up_to_the_cap() {
         let (bia, _ana, _peer) = bia_and_raw_ana();
@@ -4540,7 +4540,7 @@ mod tests {
         assert_eq!(secs(1000), 300, "sem estouro de aritmética");
     }
 
-    /// P31: o prazo agendado tem jitter de no máximo 20% para cada lado (dois peers não rediscam em sincronia).
+    /// P32:o prazo agendado tem jitter de no máximo 20% para cada lado (dois peers não rediscam em sincronia).
     #[tokio::test]
     async fn the_scheduled_deadline_has_a_bounded_jitter() {
         for _ in 0..20 {
@@ -4563,7 +4563,7 @@ mod tests {
         }
     }
 
-    /// P31: o dial falhou: agenda o próximo, com espera maior (2 falhas = o dobro da base).
+    /// P32:o dial falhou: agenda o próximo, com espera maior (2 falhas = o dobro da base).
     #[tokio::test]
     async fn a_failed_dial_schedules_the_next_one_with_a_longer_wait() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4587,7 +4587,7 @@ mod tests {
         );
     }
 
-    /// P31: uma falha que chega com a rediscagem ainda esperando o prazo (dial antigo) não dobra a espera.
+    /// P32:uma falha que chega com a rediscagem ainda esperando o prazo (dial antigo) não dobra a espera.
     #[tokio::test]
     async fn a_late_failure_while_waiting_does_not_double_the_wait() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4601,7 +4601,7 @@ mod tests {
         assert_eq!(bia.redial[&ana_peer].attempts, 1);
     }
 
-    /// P31: depois de `redial_budget` tentativas o registro esgota: sem timer, e o orçamento de 3 dá exatamente
+    /// P32:depois de `redial_budget` tentativas o registro esgota: sem timer, e o orçamento de 3 dá exatamente
     /// 2 dials (a tentativa 1 é a primeira espera; a 3ª é a que esgota). Falha avulsa de outro dial não conta.
     #[tokio::test]
     async fn the_redial_budget_stops_the_timer_and_the_dials() {
@@ -4636,7 +4636,7 @@ mod tests {
         );
     }
 
-    /// P31, I2: esgotado o orçamento, uma mensagem nova rearma UMA tentativa; depois dela volta a esgotar.
+    /// P32,I2: esgotado o orçamento, uma mensagem nova rearma UMA tentativa; depois dela volta a esgotar.
     #[tokio::test]
     async fn a_new_message_rearms_one_attempt_after_the_budget_is_exhausted() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4665,7 +4665,7 @@ mod tests {
         assert_eq!(bia.redial[&ana_peer].state, RedialState::Exhausted);
     }
 
-    /// P31, I2: o dial que não deu notícia (nem `DialFailed` nem conexão) conta como falha no prazo.
+    /// P32,I2: o dial que não deu notícia (nem `DialFailed` nem conexão) conta como falha no prazo.
     #[tokio::test]
     async fn an_in_flight_dial_that_never_reports_counts_as_a_failure() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4687,7 +4687,7 @@ mod tests {
         assert_eq!(bia.dial_log.len(), 1, "contou a falha sem discar de novo");
     }
 
-    /// P31, S2: a falha da rediscagem de fundo não vira um `ChatEvent::DialFailed` por tentativa.
+    /// P32,S2: a falha da rediscagem de fundo não vira um `ChatEvent::DialFailed` por tentativa.
     #[tokio::test]
     async fn a_background_redial_failure_is_not_surfaced_as_an_event() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4710,7 +4710,7 @@ mod tests {
         );
     }
 
-    /// P31, S1: um `DialFailed` de outro dial (mDNS, `/dial` manual) sem rediscagem em andamento segue
+    /// P32,S1: um `DialFailed` de outro dial (mDNS, `/dial` manual) sem rediscagem em andamento segue
     /// visível para a aplicação e não cria registro.
     #[tokio::test]
     async fn a_failure_of_another_dial_is_still_surfaced() {
@@ -4729,7 +4729,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31: um dial que falha para peer sem conversa não cria rediscagem.
+    /// P32:um dial que falha para peer sem conversa não cria rediscagem.
     #[tokio::test]
     async fn a_failed_dial_to_a_peer_without_a_conversation_schedules_nothing() {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
@@ -4742,7 +4742,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31: conectar apaga a rediscagem agendada.
+    /// P32:conectar apaga a rediscagem agendada.
     #[tokio::test]
     async fn connecting_clears_the_redial() {
         let (mut bia, ana_peer) = bia_after_ana_dropped_with_a_queue();
@@ -4753,7 +4753,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31: prazo vencido com a fila já vazia (a mensagem saiu por outro caminho) não disca e esquece o registro.
+    /// P32:prazo vencido com a fila já vazia (a mensagem saiu por outro caminho) não disca e esquece o registro.
     #[tokio::test]
     async fn a_due_redial_with_an_empty_queue_forgets_and_does_not_dial() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4768,7 +4768,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31: prazo vencido com o peer já reconectado não disca.
+    /// P32:prazo vencido com o peer já reconectado não disca.
     #[tokio::test]
     async fn a_due_redial_for_a_connected_peer_does_not_dial() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4783,7 +4783,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31, I2: sem nenhum endereço (nem informado nem do convite) não há o que discar: conta como tentativa e
+    /// P32,I2: sem nenhum endereço (nem informado nem do convite) não há o que discar: conta como tentativa e
     /// reagenda com espera maior, sem discar; ao aprender um endereço, a próxima tentativa disca.
     #[tokio::test]
     async fn a_due_redial_without_any_address_backs_off_and_dials_once_one_is_learned() {
@@ -4804,7 +4804,7 @@ mod tests {
         assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
     }
 
-    /// P31, I5: a outbox que não responde não é "fila vazia": o registro fica e reagenda.
+    /// P32,I5: a outbox que não responde não é "fila vazia": o registro fica e reagenda.
     #[tokio::test]
     async fn an_unreadable_queue_keeps_the_redial_and_reschedules() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4821,7 +4821,7 @@ mod tests {
         assert!(bia.dial_log.is_empty());
     }
 
-    /// P31, I6: depois de `untrust`, a identidade desconfiada deixa de ser rediscada e o registro some.
+    /// P32,I6: depois de `untrust`, a identidade desconfiada deixa de ser rediscada e o registro some.
     #[tokio::test]
     async fn a_distrusted_identity_is_no_longer_redialed() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4839,7 +4839,7 @@ mod tests {
         assert!(bia.redial.is_empty());
     }
 
-    /// P31, I3: o `identify` que chega antes de a conversa existir (handshake esperado por `accept`) já vale.
+    /// P32,I3: o `identify` que chega antes de a conversa existir (handshake esperado por `accept`) já vale.
     #[tokio::test]
     async fn addresses_are_learned_for_a_peer_whose_handshake_is_expected() {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
@@ -4852,7 +4852,7 @@ mod tests {
         assert_eq!(bia.redial_targets(&peer), [addr(GLOBAL_A)]);
     }
 
-    /// P31, I3: o convite aceito vira o último recurso de endereço da rediscagem.
+    /// P32,I3: o convite aceito vira o último recurso de endereço da rediscagem.
     #[tokio::test]
     async fn an_accepted_invite_keeps_its_addresses_for_the_redial() {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
@@ -4866,7 +4866,7 @@ mod tests {
         );
     }
 
-    /// P31, I3: uma lista que o filtro esvazia (peer na LAN que só anuncia IP privado) não apaga a velha, e a
+    /// P32,I3: uma lista que o filtro esvazia (peer na LAN que só anuncia IP privado) não apaga a velha, e a
     /// informação nova vai na frente da velha.
     #[tokio::test]
     async fn learned_addresses_merge_and_an_emptied_list_keeps_the_old_ones() {
@@ -4883,7 +4883,7 @@ mod tests {
         );
     }
 
-    /// P31, I1: o filtro de endereço de contato não deixa passar IPv4 embutido em IPv6, NAT64, 6to4, Teredo,
+    /// P32,I1: o filtro de endereço de contato não deixa passar IPv4 embutido em IPv6, NAT64, 6to4, Teredo,
     /// multicast nem as faixas reservadas do IPv4, que um contato usaria para me fazer discar a minha rede.
     #[test]
     fn contact_filter_rejects_embedded_and_special_addresses() {
@@ -4916,7 +4916,7 @@ mod tests {
         }
     }
 
-    /// P31, I4: de irmão vale quase tudo, mas nunca "qualquer endereço" nem multicast, e há teto de quantidade.
+    /// P32,I4: de irmão vale quase tudo, mas nunca "qualquer endereço" nem multicast, e há teto de quantidade.
     #[test]
     fn sibling_filter_rejects_unspecified_and_multicast_and_is_bounded() {
         let ok = |s: &str| s.parse::<Multiaddr>().unwrap();
@@ -4930,7 +4930,7 @@ mod tests {
         assert_eq!(dial_addrs(&many, true).len(), SIBLING_DIAL_ADDRS);
     }
 
-    /// P31: esquecer o peer (conversa caiu) apaga a rediscagem e os endereços dele.
+    /// P32:esquecer o peer (conversa caiu) apaga a rediscagem e os endereços dele.
     #[tokio::test]
     async fn dropping_a_peer_clears_its_redial_and_addresses() {
         let mut r = revoked_ana();
@@ -4952,7 +4952,7 @@ mod tests {
         assert!(!r.bia.invite_addrs.contains_key(&r.ana_peer));
     }
 
-    /// P31: o relógio acorda no prazo da rediscagem.
+    /// P32:o relógio acorda no prazo da rediscagem.
     #[tokio::test]
     async fn the_clock_wakes_for_the_redial_deadline() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
@@ -4966,7 +4966,7 @@ mod tests {
         assert!(wake <= Duration::from_secs(4320) && wake > Duration::from_secs(2800));
     }
 
-    /// P31: o laço do `next_event` de fato acorda no prazo e rediscaa sozinho, sem tráfego algum.
+    /// P32:o laço do `next_event` de fato acorda no prazo e rediscaa sozinho, sem tráfego algum.
     #[tokio::test]
     async fn next_event_redials_by_itself() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
