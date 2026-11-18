@@ -2015,3 +2015,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: a mutação de propósito (ex.: tirar o `dial_addrs` da releitura) não foi feita; a admissão em `Conversation::invite/join` (se um estranho ganha conversa com facilidade, achado #2); o `identify` periódico do libp2p; rede real fora do Docker.
 - **Erros meus**: tentei `cargo clippy` local (barrado pelo hook, ADR 0009); rodei `cargo fmt` em vez de só `--check`; digitei um caractere cirílico em "redisca" no título do PR e no 2º commit (título corrigido; o commit some no squash); tentei acrescentar a sessão por heredoc (barrado, refeito com `Edit`) na sessão anterior.
 - **Próximo passo**: decisão SimpleX/Matrix (`docs/pesquisa/reuso/kin.md`); abrir o P18 (revogação de convite) ou o P16 (re-handshake) são alternativas.
+
+### 2026-11-18 — Sessão 35
+
+#### Decisão: manter a camada própria (ADR 0038, P33)
+
+- **Origem**: `docs/pesquisa/reuso/kin.md` do workspace (2026-11-13), decisões 1 e 2.
+- **Decisão do dono**: manter a camada própria (opção A) com a porta C aberta (SimpleX ou outro backend como mailbox opcional, depois, atrás do ADR 0003); aceitar o custo de NAT e de entrega assíncrona, com teste em rede real antes da Fase 4 (P33). ADR 0038.
+- **Alternativa descartada**: B, cliente de SimpleX ou Matrix (anula o diferencial, difícil de reverter, AGPL).
+- **Não verificado**: a AGPL do SimpleX num derivado; o SDK Rust do Matrix como base; o estado de Briar e Berty. Não mudam a decisão.
+- **Só documentação**: sem código, sem CI relevante.
+- **Próximo passo**: P18 (revogação de convite) ou P16 (re-handshake); ou o teste em rede real (P33).
