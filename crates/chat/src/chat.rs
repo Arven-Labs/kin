@@ -517,8 +517,9 @@ pub struct Chat {
     sweep_rounds: HashMap<PeerId, u32>,
     /// Teto de rodadas da varredura por peer (campo, para o teste não rodar 8 vezes).
     sweep_budget: u32,
-    /// Endereços de escuta que cada peer com conversa informou ao conectar (`PeerIdentified`) (P32). Só
-    /// memória; peer sem conversa não entra, então o mapa é limitado pelo número de contatos.
+    /// Endereços de escuta que cada peer informou ao conectar (`PeerIdentified`) (P32). Só memória; peer sem
+    /// conversa só fica enquanto conectado (sai em `PeerDisconnected`), então o mapa é limitado pelo teto
+    /// [`MAX_KNOWN_DEVICES`] e, fora de conexões vivas, pelo número de contatos.
     peer_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     /// Rediscagem agendada por peer que caiu com mensagem na fila (P32). Só existe com o peer desconectado e
     /// a fila não vazia; sai ao conectar, ao esvaziar a fila e ao esquecer o peer.
@@ -1408,6 +1409,10 @@ impl Chat {
                 self.history_sessions.remove(&peer);
                 self.history_requests
                     .retain(|_, requested| *requested != peer);
+                // Sem conversa, o endereço informado não tem dono a rediscar: não ocupa vaga do teto.
+                if !self.conversations.contains_key(&peer) {
+                    self.peer_addrs.remove(&peer);
+                }
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
                 // O que ficou na fila sem poder sair direto vai para a caixa postal.
                 self.flush(peer);
@@ -1849,12 +1854,16 @@ impl Chat {
     /// endereços de terceiros ([`dial_addrs`]: sem loopback, rede privada nem DNS; no máximo
     /// [`CONTACT_DIAL_ADDRS`] para contato). O que o peer diz é dado dele, não verdade: a conexão só vale se
     /// ele provar o Peer ID, mas o filtro impede que um contato aponte a minha rediscagem para a minha rede.
-    /// Só entra peer com conversa ou com handshake esperado (`expected`, o `identify` chega antes da conversa
-    /// existir), e o mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
+    /// Só entra peer com conversa, com handshake esperado (`expected`) ou conectado: o `identify` chega com a
+    /// conexão, antes de a conversa existir, e quem disca com `dial` não tem `expected`. O conectado sem
+    /// conversa sai de `peer_addrs` quando a conexão cai (`PeerDisconnected`), então um estranho só ocupa
+    /// vaga enquanto estiver conectado. O mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
     /// completa até o limite (auditoria I3: mudança de endereço não apaga o que ainda pode valer); uma lista
     /// que o filtro esvazia (um peer na LAN que só anuncia IP privado) não apaga a velha.
     fn learn_peer_addrs(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
-        if !(self.conversations.contains_key(&peer) || self.expected.contains_key(&peer))
+        if !(self.conversations.contains_key(&peer)
+            || self.expected.contains_key(&peer)
+            || self.connected.contains(&peer))
             || !has_room(&self.peer_addrs, &peer)
         {
             return;
