@@ -1889,10 +1889,9 @@ impl Chat {
         } else {
             CONTACT_DIAL_ADDRS
         });
-        if self.peer_addrs.get(&peer) == Some(&merged) {
-            return;
-        }
         self.peer_addrs.insert(peer, merged);
+        // Sem comparar com o que já estava: a gravação anterior pode ter falhado, e o `identify` (um por
+        // conexão) é a chance de refazê-la (auditoria #1).
         self.persist_peer_addrs(&peer);
     }
 

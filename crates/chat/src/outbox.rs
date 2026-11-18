@@ -489,7 +489,9 @@ impl Outbox {
     }
 
     /// Grava os endereços de escuta que `peer` informou (P32 a), já filtrados por quem chama; a última lista
-    /// substitui a anterior. Um endereço por linha: `Multiaddr` em texto não tem quebra de linha.
+    /// substitui a anterior. Um endereço por linha. Os endereços de contato passam pelo `dial_addrs` (só IP
+    /// global e `Tcp`/`Udp`/`QuicV1`/`P2p`/`P2pCircuit`), que não deixa passar quebra de linha; o de irmão
+    /// é mais aberto e, no pior caso, um endereço extra vira linha ilegível, ignorada na leitura.
     pub(crate) fn set_peer_addrs(&self, peer: &PeerId, addrs: &[Multiaddr]) -> Result<(), Error> {
         let text = addrs
             .iter()
