@@ -1777,46 +1777,142 @@ impl Chat {
         }
     }
 
-    /// ESQUELETO (P31): guarda os endereços de escuta que `peer` informou (só de peer com conversa).
+    /// Guarda os endereços de escuta que `peer` informou ao conectar (P31), passados pelo mesmo filtro dos
+    /// endereços de terceiros ([`dial_addrs`]: sem loopback, rede privada nem DNS; no máximo
+    /// [`CONTACT_DIAL_ADDRS`] para contato). O que o peer diz é dado dele, não verdade: a conexão só vale se
+    /// ele provar o Peer ID, mas o filtro impede que um contato aponte a minha rediscagem para a minha rede.
+    /// Peer sem conversa não entra, então o mapa é limitado pelo número de contatos. A informação nova
+    /// substitui a velha; uma lista que o filtro esvazia apaga a velha (valem os do convite).
     fn learn_peer_addrs(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
-        let _ = (peer, addrs, &self.peer_addrs);
+        if !self.conversations.contains_key(&peer) {
+            return;
+        }
+        let addrs = dial_addrs(&addrs, self.is_sibling(&peer));
+        if addrs.is_empty() {
+            self.peer_addrs.remove(&peer);
+        } else {
+            self.peer_addrs.insert(peer, addrs);
+        }
     }
 
-    /// ESQUELETO (P31): endereços a discar para rediscar `peer`.
-    #[allow(dead_code)] // ESQUELETO: ninguém chama ainda
+    /// Endereços a discar para rediscar `peer` (P31): os que ele informou; sem eles, os do convite dele
+    /// (irmão em `household`, contato em `contact_devices`), com o mesmo filtro.
     fn redial_targets(&self, peer: &PeerId) -> Vec<Multiaddr> {
-        let _ = (
-            peer,
-            &self.redial_base,
-            &self.redial_cap,
-            self.redial_budget,
-        );
-        Vec::new()
+        if let Some(addrs) = self.peer_addrs.get(peer) {
+            return addrs.clone();
+        }
+        if let Some(invite) = self.household.get(peer) {
+            return dial_addrs(invite.addrs(), true);
+        }
+        self.contact_devices
+            .get(peer)
+            .map(|invite| dial_addrs(invite.addrs(), false))
+            .unwrap_or_default()
     }
 
-    /// ESQUELETO (P31): espera depois de `attempts` rediscagens seguidas, sem jitter.
-    #[allow(dead_code)] // ESQUELETO: ninguém chama ainda
+    /// Espera depois de `attempts` rediscagens seguidas, sem jitter: a base, dobrando a cada uma, até o teto.
+    /// O deslocamento é limitado, então muitas falhas não estouram a conta.
     fn redial_backoff(&self, attempts: u32) -> Duration {
-        let _ = attempts;
-        Duration::ZERO
+        let doublings = attempts.saturating_sub(1).min(16);
+        self.redial_base
+            .saturating_mul(1 << doublings)
+            .min(self.redial_cap)
     }
 
-    /// ESQUELETO (P31): agenda a primeira rediscagem de `peer` (desconectado, com conversa e fila).
+    /// Prazo da rediscagem depois de `attempts` tentativas: a espera com jitter de ±20%, para dois peers
+    /// que se rediscam não ficarem em sincronia.
+    fn redial_due(&self, attempts: u32) -> Instant {
+        let jitter = 0.8 + rand::random::<f64>() * 0.4;
+        Instant::now() + self.redial_backoff(attempts).mul_f64(jitter)
+    }
+
+    /// Peer que ainda vale rediscar: com conversa, desconectado e com mensagem na fila.
+    fn wants_redial(&self, peer: &PeerId) -> bool {
+        self.conversations.contains_key(peer)
+            && !self.connected.contains(peer)
+            && self.queued(peer) > 0
+    }
+
+    /// Agenda a primeira rediscagem de `peer` (P31) se ele vale rediscar e ainda não há registro. Com
+    /// registro (esperando o prazo, em andamento ou com o orçamento esgotado) não faz nada: só conectar, a
+    /// fila esvaziar ou esquecer o peer apaga o registro.
     fn start_redial(&mut self, peer: PeerId) {
-        let _ = (peer, &self.redial);
+        if self.redial.contains_key(&peer) || !self.wants_redial(&peer) {
+            return;
+        }
+        self.redial.insert(
+            peer,
+            Retry {
+                attempts: 1,
+                due: self.redial_due(1),
+                armed: 1 < self.redial_budget,
+            },
+        );
     }
 
-    /// ESQUELETO (P31): o dial a `peer` falhou; agenda o próximo, com espera maior.
+    /// O dial a `peer` falhou (P31): agenda o próximo, com espera maior. Só conta se a rediscagem já tinha
+    /// disparado (registro desarmado): uma falha que chega com o prazo ainda esperando é de um dial antigo e
+    /// não dobra a espera. Passado o `redial_budget` o registro fica, sem armar o timer.
     fn redial_failed(&mut self, peer: PeerId) {
-        let _ = peer;
+        let Some(waiting) = self.redial.get(&peer) else {
+            return;
+        };
+        if waiting.armed {
+            return;
+        }
+        if !self.wants_redial(&peer) {
+            self.redial.remove(&peer);
+            return;
+        }
+        let attempts = waiting.attempts.saturating_add(1);
+        self.redial.insert(
+            peer,
+            Retry {
+                attempts,
+                due: self.redial_due(attempts),
+                armed: attempts < self.redial_budget,
+            },
+        );
     }
 
-    /// ESQUELETO (P31): rediscaa os peers cujo prazo venceu.
-    fn flush_due_redials(&mut self) {}
+    /// Rediscaa os peers cujo prazo venceu (P31). Quem reconectou, ficou sem fila ou perdeu a conversa no meio
+    /// do caminho perde o registro. O de quem disparou fica, desarmado, para contar a próxima falha seguida
+    /// (e para o prazo vencido não manter o laço girando). Sem endereço nenhum não há o que discar.
+    fn flush_due_redials(&mut self) {
+        let now = Instant::now();
+        let due: Vec<PeerId> = self
+            .redial
+            .iter()
+            .filter(|(_, retry)| retry.armed && retry.due <= now)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            if !self.wants_redial(&peer) {
+                self.redial.remove(&peer);
+                continue;
+            }
+            if let Some(retry) = self.redial.get_mut(&peer) {
+                retry.armed = false;
+            }
+            let addrs = self.redial_targets(&peer);
+            if addrs.is_empty() {
+                continue;
+            }
+            #[cfg(test)]
+            self.dial_log.push((peer, addrs.clone()));
+            if let Err(e) = self.node.dial_peer(peer, addrs) {
+                self.queue.push_back(ChatEvent::DialFailed {
+                    peer: Some(peer),
+                    reason: e.to_string(),
+                });
+                self.redial_failed(peer);
+            }
+        }
+    }
 
-    /// ESQUELETO (P31): esquece a rediscagem agendada de `peer`.
+    /// Esquece a rediscagem agendada de `peer`.
     fn forget_redial(&mut self, peer: &PeerId) {
-        let _ = peer;
+        self.redial.remove(peer);
     }
 
     /// Esquece o novo depósito agendado de `peer` e a conta de recusas dele.
