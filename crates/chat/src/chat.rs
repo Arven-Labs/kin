@@ -865,6 +865,11 @@ impl Chat {
         for peer in offline {
             self.deposit(peer);
         }
+        // Depois de reiniciar, o que já estava depositado envelhece sem ninguém para re-depositar: só o
+        // `Deposited` armava a varredura, e talvez nenhum aconteça (auditoria I2).
+        if self.conversations.keys().any(|peer| self.queued(peer) > 0) {
+            self.arm_sweep();
+        }
     }
 
     /// Diz à caixa postal a chave Nostr do `peer`, lida do certificado dele (já validado pelo MLS).
@@ -1220,11 +1225,19 @@ impl Chat {
         match event {
             MailboxEvent::Deposited { id } => {
                 if let Some((peer, message)) = self.depositing.remove(&id) {
-                    // Aceito: zera a conta de recusas e garante que a varredura por idade está armada.
-                    self.deposit_retry.remove(&peer);
+                    // Aceito: garante que a varredura por idade está armada.
                     self.arm_sweep();
                     if let Err(e) = self.outbox.mark_deposited(&peer, &message, now_secs()) {
                         self.drop_message(peer, e);
+                    }
+                    // E zera a conta de recusas, mas só se nada mais do peer ficou sem depósito (auditoria I3):
+                    // o aceite de uma mensagem não pode apagar o agendamento de outra, recusada.
+                    if self
+                        .outbox
+                        .undeposited(&peer)
+                        .is_ok_and(|waiting| waiting.is_empty())
+                    {
+                        self.forget_deposit_retry(&peer);
                     }
                     self.queue.push_back(ChatEvent::Deposited { peer, message });
                 }
@@ -1274,7 +1287,8 @@ impl Chat {
             NodeEvent::PeerConnected(peer) => {
                 self.connected.insert(peer);
                 // Conectado, a fila sai direto (`flush` abaixo): o novo depósito agendado não faz mais sentido.
-                self.deposit_retry.remove(&peer);
+                self.forget_deposit_retry(&peer);
+                self.sweep_rounds.remove(&peer);
                 self.queue.push_back(ChatEvent::PeerConnected(peer));
                 self.announce_if_ready(peer);
                 // Conversa recarregada do banco: os dois lados já a têm, então dá para anunciar já.
@@ -1320,6 +1334,8 @@ impl Chat {
                     self.leave_flight(peer, &message);
                     // O ack prova que o caminho voltou: o próximo reenvio recomeça da espera base (P19).
                     self.retry.remove(&peer);
+                    // E à varredura por idade: com ack o peer está de volta, as rodadas gastas não valem mais.
+                    self.sweep_rounds.remove(&peer);
                     if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
@@ -1725,22 +1741,43 @@ impl Chat {
         }
     }
 
+    /// Esquece o novo depósito agendado de `peer` e a conta de recusas dele.
+    fn forget_deposit_retry(&mut self, peer: &PeerId) {
+        self.deposit_retry.remove(peer);
+        self.deposit_spent.remove(peer);
+    }
+
     /// Registra uma recusa de depósito para `peer` e agenda o novo depósito (P21), com a mesma espera do
-    /// reenvio direto. Passado o `deposit_budget` o registro fica, sem armar o timer: a mensagem segue na
-    /// outbox e sai ao reconectar, na varredura por idade ou no próximo `send`.
+    /// reenvio direto. São duas contas (auditoria I4): o backoff conta por **rodada** (várias recusas de uma
+    /// janela cheia, enquanto o prazo já agendado não venceu, são um só passo), e o orçamento conta por
+    /// **recusa** (`deposit_spent`: cada uma gastou uma geração MLS). Passado o `deposit_budget` o registro
+    /// fica, sem armar o timer: a mensagem segue na outbox e sai ao reconectar, na varredura ou no `send`.
+    /// Peer conectado não agenda nada: a recusa é de um depósito antigo e a fila sai direto.
     fn schedule_deposit_retry(&mut self, peer: PeerId) {
-        let attempts = self
-            .deposit_retry
+        if self.connected.contains(&peer) {
+            return;
+        }
+        let spent = self
+            .deposit_spent
             .get(&peer)
-            .map_or(0, |retry| retry.attempts)
+            .copied()
+            .unwrap_or(0)
             .saturating_add(1);
-        let due = Instant::now() + self.retry_delay(attempts);
+        self.deposit_spent.insert(peer, spent);
+        let now = Instant::now();
+        let (attempts, due) = match self.deposit_retry.get(&peer) {
+            Some(waiting) if waiting.armed && waiting.due > now => (waiting.attempts, waiting.due),
+            previous => {
+                let attempts = previous.map_or(0, |retry| retry.attempts).saturating_add(1);
+                (attempts, now + self.retry_delay(attempts))
+            }
+        };
         self.deposit_retry.insert(
             peer,
             Retry {
                 attempts,
                 due,
-                armed: attempts < self.deposit_budget,
+                armed: spent < self.deposit_budget,
             },
         );
     }
@@ -1757,7 +1794,7 @@ impl Chat {
             .collect();
         for peer in due {
             if self.connected.contains(&peer) {
-                self.deposit_retry.remove(&peer);
+                self.forget_deposit_retry(&peer);
                 continue;
             }
             if let Some(retry) = self.deposit_retry.get_mut(&peer) {
@@ -1767,32 +1804,37 @@ impl Chat {
             // Nada foi pedido (a entrada sumiu, ou não há mais caixa): o registro velho faria a próxima
             // mensagem herdar a contagem.
             if !self.depositing.values().any(|(p, _)| *p == peer) {
-                self.deposit_retry.remove(&peer);
+                self.forget_deposit_retry(&peer);
             }
         }
     }
 
-    /// Prazo da varredura por idade: metade da retenção do backend, com piso de 1 s para uma retenção
-    /// minúscula não manter o laço girando.
+    /// Período da varredura por idade: um quarto da retenção do backend, com piso de 1 s para uma retenção
+    /// minúscula não manter o laço girando. O `deposit` re-deposita o que passou de metade da retenção; com a
+    /// varredura a cada quarto, um depósito é re-depositado com no máximo 3/4 da retenção de idade, e sobra
+    /// margem para atraso do relógio (auditoria I2).
     fn sweep_interval(&self) -> Option<Duration> {
         let retention = self.mailbox.as_ref()?.retention()?;
-        Some((retention / 2).max(Duration::from_secs(1)))
+        Some((retention / 4).max(Duration::from_secs(1)))
     }
 
     /// Arma a varredura por idade se ainda não está armada (P21). Sem retenção declarada não há o que varrer.
+    /// Uma retenção que estoura o `Instant` não arma nada, em vez de entrar em pânico.
     fn arm_sweep(&mut self) {
         if self.sweep_due.is_none()
             && let Some(interval) = self.sweep_interval()
         {
-            self.sweep_due = Some(Instant::now() + interval);
+            self.sweep_due = Instant::now().checked_add(interval);
         }
     }
 
     /// No prazo, re-deposita o que ficou velho sem ack nos peers desconectados (P21): o `expire_deposits`
     /// só roda dentro de `deposit`, e sem nenhum evento ninguém o chamaria antes de o relay esquecer. Rearma
-    /// enquanto houver depósito pendente; o que acabou de ser re-depositado rearma no próprio `Deposited`.
+    /// enquanto houver mensagem na fila; o que acabou de ser re-depositado rearma no próprio `Deposited`.
+    /// Cada peer tem `sweep_budget` rodadas (auditoria I1): uma rodada é uma passada em que algo foi de fato
+    /// pedido à caixa (re-cifrou), então uma varredura que só encontra depósitos novos não gasta rodada.
+    /// Esgotado, o peer sai da varredura até conectar, receber um ack ou ser esquecido.
     fn sweep_stale_deposits(&mut self) {
-        let _ = (&self.deposit_spent, &self.sweep_rounds, self.sweep_budget); // ESQUELETO
         if self.sweep_due.is_none_or(|due| due > Instant::now()) {
             return;
         }
@@ -1800,10 +1842,20 @@ impl Chat {
         let peers: Vec<PeerId> = self.conversations.keys().copied().collect();
         let mut pending = false;
         for peer in peers {
-            if !self.connected.contains(&peer) {
-                self.deposit(peer);
+            let rounds = self.sweep_rounds.get(&peer).copied().unwrap_or(0);
+            if self.queued(&peer) == 0 || rounds >= self.sweep_budget {
+                continue;
             }
-            pending |= self.outbox.deposited_count(&peer).is_ok_and(|n| n > 0);
+            pending = true;
+            if self.connected.contains(&peer) {
+                continue;
+            }
+            let asked = |chat: &Self| chat.depositing.values().filter(|(p, _)| *p == peer).count();
+            let before = asked(self);
+            self.deposit(peer);
+            if asked(self) > before {
+                self.sweep_rounds.insert(peer, rounds.saturating_add(1));
+            }
         }
         if pending {
             self.arm_sweep();
@@ -2077,7 +2129,8 @@ impl Chat {
         self.history_requests.retain(|_, p| *p != peer);
         self.in_flight.remove(&peer);
         self.retry.remove(&peer);
-        self.deposit_retry.remove(&peer);
+        self.forget_deposit_retry(&peer);
+        self.sweep_rounds.remove(&peer);
         self.depositing.retain(|_, (p, _)| *p != peer);
         self.household.remove(&peer);
         self.contact_devices.remove(&peer);
