@@ -659,6 +659,8 @@ impl Chat {
         for (peer, identity, reason) in to_drop {
             chat.drop_peer(peer, identity, reason)?;
         }
+        // Depois da varredura de revogados: quem foi derrubado não tem mais conversa e não é rediscado.
+        chat.restore_peer_addrs();
         Ok(chat)
     }
 
@@ -1888,6 +1890,47 @@ impl Chat {
             CONTACT_DIAL_ADDRS
         });
         self.peer_addrs.insert(peer, merged);
+        // Sem comparar com o que já estava: a gravação anterior pode ter falhado, e o `identify` (um por
+        // conexão) é a chance de refazê-la (auditoria #1).
+        self.persist_peer_addrs(&peer);
+    }
+
+    /// Grava no banco os endereços de `peer` (P32 a), só se ele tem conversa: estranho conectado fica só em
+    /// memória e nunca escreve no disco. Melhor esforço: se a gravação falhar a memória segue valendo e o
+    /// próximo `identify` tenta de novo; o custo é perder o endereço num reinício, que é o comportamento de
+    /// antes da persistência.
+    fn persist_peer_addrs(&self, peer: &PeerId) {
+        if !self.conversations.contains_key(peer) {
+            return;
+        }
+        if let Some(addrs) = self.peer_addrs.get(peer) {
+            let _ = self.outbox.set_peer_addrs(peer, addrs);
+        }
+    }
+
+    /// Na abertura (P32 a): devolve à memória os endereços gravados de cada contato com conversa e agenda a
+    /// rediscagem de quem tem fila. Sem isto, depois de um reinício nenhum evento (envio, queda, conversa
+    /// pronta) chamaria `start_redial` para quem só tem fila no banco. O que está no disco é entrada não
+    /// confiável (arquivo adulterado, regra de filtro mais nova): passa de novo pelo [`dial_addrs`] e pelos
+    /// mesmos tetos de quando foi aprendido. Erro de leitura de um contato não derruba a abertura: ele só fica
+    /// sem endereço, como antes.
+    fn restore_peer_addrs(&mut self) {
+        let peers: Vec<PeerId> = self.conversations.keys().copied().collect();
+        for peer in peers {
+            if let Ok(stored) = self.outbox.peer_addrs(&peer) {
+                let sibling = self.is_sibling(&peer);
+                let mut addrs = dial_addrs(&stored, sibling);
+                addrs.truncate(if sibling {
+                    SIBLING_DIAL_ADDRS
+                } else {
+                    CONTACT_DIAL_ADDRS
+                });
+                if !addrs.is_empty() && has_room(&self.peer_addrs, &peer) {
+                    self.peer_addrs.insert(peer, addrs);
+                }
+            }
+            self.start_redial(peer);
+        }
     }
 
     /// Mapa `peer_addrs` cheio: abre vaga para `peer` despejando um peer **sem conversa e sem handshake
@@ -2253,6 +2296,8 @@ impl Chat {
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
         self.teach_mailbox(peer);
+        // O endereço da janela pré-conversa (só em memória até aqui) agora tem dono: vai para o disco.
+        self.persist_peer_addrs(&peer);
         self.expected.remove(&peer);
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.
@@ -4655,6 +4700,112 @@ mod tests {
         );
 
         assert!(bia.peer_addrs.is_empty());
+    }
+
+    /// P32 a: o endereço que um contato com conversa informa vai também para o banco.
+    #[tokio::test]
+    async fn a_learned_address_of_a_contact_is_written_to_the_outbox() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
+    }
+
+    /// P32 a (auditoria #1): o mesmo endereço informado de novo é gravado de novo, então uma gravação que
+    /// falhou (disco cheio, banco ocupado) é refeita no próximo `identify` em vez de ficar só na memória.
+    #[tokio::test]
+    async fn an_unchanged_address_is_written_again_on_the_next_identify() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        bia.outbox.forget_peer(&ana_peer).unwrap(); // some com a linha, como uma gravação que falhou
+        assert!(bia.outbox.peer_addrs(&ana_peer).unwrap().is_empty());
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
+    }
+
+    /// P32 a: o endereço da janela pré-conversa (só em memória) vai para o banco quando a conversa nasce.
+    #[tokio::test]
+    async fn an_address_told_before_the_conversation_is_written_when_it_is_born() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let conversation = bia.conversations.remove(&ana_peer).unwrap();
+        bia.connected.insert(ana_peer);
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        assert!(
+            bia.outbox.peer_addrs(&ana_peer).unwrap().is_empty(),
+            "sem conversa, nada no disco"
+        );
+
+        bia.ready(ana_peer, conversation).unwrap();
+
+        assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
+    }
+
+    /// P32 a: estranho conectado (sem conversa) nunca escreve no disco.
+    #[tokio::test]
+    async fn the_address_of_a_stranger_is_never_written() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(&mut bia, stranger, &[GLOBAL_A]);
+
+        assert!(bia.outbox.peer_addrs(&stranger).unwrap().is_empty());
+    }
+
+    /// P32 a: depois de reiniciar, o contato com fila é rediscado pelo endereço do disco, sem nenhum envio
+    /// novo, e o que o filtro não aceita (rede privada gravada à mão) não é discado.
+    #[tokio::test]
+    async fn after_a_restart_a_contact_with_a_queue_is_redialed_from_the_stored_address() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.outbox
+            .set_peer_addrs(
+                &ana_peer,
+                &[addr(GLOBAL_A), addr("/ip4/192.168.0.5/tcp/4001")],
+            )
+            .unwrap();
+        bia.outbox
+            .enqueue(&ana_peer, &Message::new("oi".into(), None))
+            .unwrap();
+        assert!(
+            bia.peer_addrs.is_empty(),
+            "memória vazia, como depois de reiniciar"
+        );
+
+        bia.restore_peer_addrs();
+
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
+    }
+
+    /// P32 a: reaberto com a fila vazia, o endereço volta para a memória mas nada é agendado.
+    #[tokio::test]
+    async fn after_a_restart_an_empty_queue_schedules_no_redial() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.outbox
+            .set_peer_addrs(&ana_peer, &[addr(GLOBAL_A)])
+            .unwrap();
+
+        bia.restore_peer_addrs();
+
+        assert_eq!(bia.redial_targets(&ana_peer), [addr(GLOBAL_A)]);
+        assert!(bia.redial.is_empty());
+    }
+
+    /// P32 a: linha de peer sem conversa (sobra de um peer esquecido) não volta para a memória.
+    #[tokio::test]
+    async fn after_a_restart_the_stored_address_of_a_peer_without_a_conversation_is_ignored() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let gone = PeerId::random();
+        bia.outbox.set_peer_addrs(&gone, &[addr(GLOBAL_A)]).unwrap();
+
+        bia.restore_peer_addrs();
+
+        assert!(!bia.peer_addrs.contains_key(&gone));
     }
 
     /// P32:sem endereço informado, valem os do convite do contato.

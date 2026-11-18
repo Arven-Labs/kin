@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -633,6 +633,37 @@ scenario_reconnect() {
   check "b reconectou ao a (segunda conexão)" wait_log_n b "conectado a $A_ID" 2 10
 }
 
+# O `b` reinicia (mesmo /data, SEM o `--dial` do começo) com uma mensagem na fila para o `a`, que está fora.
+# Só a rediscagem a partir dos endereços gravados no disco (P32 a, schema v8) pode trazer o `a` de volta: sem
+# `--dial`, sem mDNS e sem nenhum comando depois do reinício.
+scenario_reconnect_restart() {
+  echo "== Reconexão depois de reiniciar: o b reinicia sem --dial e redisca o a pelo endereço gravado no disco"
+  setup cone || { fail "montar o laboratório"; return; }
+  check "mensagem chega antes da queda (rede viva)" delivered a b "antes da queda"
+
+  compose stop a >/dev/null
+  check "b percebe que a caiu" wait_log b "desconectado de $A_ID" 30 || { logs b | tail -20; return; }
+  say b "enquanto o b reiniciava"
+  check "a mensagem fica na fila do b (a está fora)" wait_log b "na fila, sai quando o peer conectar" 10
+
+  # Mesmo container: o /data (identidade, conversa, fila e endereços) e o /tmp sobrevivem; só os argumentos mudam.
+  compose exec -T b sh -c "echo '--data-dir /data --no-mdns --relay $RELAY_ADDR' > /tmp/kin-args"
+  compose stop b >/dev/null
+  compose start b >/dev/null
+  wait_log_n b "reserva aceita no relay" 2 30 \
+    || { fail "b não refez a reserva no relay depois de reiniciar"; logs b | tail -20; return; }
+
+  compose start a >/dev/null
+  wait_log_n a "reserva aceita no relay" 2 30 \
+    || { fail "a não refez a reserva no relay depois de voltar"; logs a | tail -20; return; }
+  # Nenhum comando manual daqui em diante. Espera até 90 s: a rampa de espera do b é 2, 4, 8, 16, 32 s.
+  if wait_log a "peer: enquanto o b reiniciava" 90; then
+    pass "a mensagem enfileirada chega ao a depois do reinício do b (rediscagem pelo endereço do disco)"
+  else
+    fail "a mensagem não chegou em 90 s: o b reiniciado não rediscou o a"; logs b | tail -30; logs a | tail -30; return
+  fi
+}
+
 # run_scenario NOME: roda um cenário (FAILED fica 1 se algo falhou).
 run_scenario() {
   case "$1" in
@@ -647,12 +678,13 @@ run_scenario() {
     paired-device) scenario_paired_device ;;
     revoke-device) scenario_revoke_device ;;
     reconnect) scenario_reconnect ;;
+    reconnect-restart) scenario_reconnect_restart ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}
