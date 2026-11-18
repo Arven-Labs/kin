@@ -659,6 +659,8 @@ impl Chat {
         for (peer, identity, reason) in to_drop {
             chat.drop_peer(peer, identity, reason)?;
         }
+        // Depois da varredura de revogados: quem foi derrubado não tem mais conversa e não é rediscado.
+        chat.restore_peer_addrs();
         Ok(chat)
     }
 
@@ -1887,13 +1889,49 @@ impl Chat {
         } else {
             CONTACT_DIAL_ADDRS
         });
+        if self.peer_addrs.get(&peer) == Some(&merged) {
+            return;
+        }
         self.peer_addrs.insert(peer, merged);
+        self.persist_peer_addrs(&peer);
     }
 
-    /// STUB do commit de testes (P32 a): lê os endereços gravados e agenda a rediscagem de quem tem fila.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Grava no banco os endereços de `peer` (P32 a), só se ele tem conversa: estranho conectado fica só em
+    /// memória e nunca escreve no disco. Melhor esforço: se a gravação falhar a memória segue valendo e o
+    /// próximo `identify` tenta de novo; o custo é perder o endereço num reinício, que é o comportamento de
+    /// antes da persistência.
+    fn persist_peer_addrs(&self, peer: &PeerId) {
+        if !self.conversations.contains_key(peer) {
+            return;
+        }
+        if let Some(addrs) = self.peer_addrs.get(peer) {
+            let _ = self.outbox.set_peer_addrs(peer, addrs);
+        }
+    }
+
+    /// Na abertura (P32 a): devolve à memória os endereços gravados de cada contato com conversa e agenda a
+    /// rediscagem de quem tem fila. Sem isto, depois de um reinício nenhum evento (envio, queda, conversa
+    /// pronta) chamaria `start_redial` para quem só tem fila no banco. O que está no disco é entrada não
+    /// confiável (arquivo adulterado, regra de filtro mais nova): passa de novo pelo [`dial_addrs`] e pelos
+    /// mesmos tetos de quando foi aprendido. Erro de leitura de um contato não derruba a abertura: ele só fica
+    /// sem endereço, como antes.
     fn restore_peer_addrs(&mut self) {
-        todo!("P32 a")
+        let peers: Vec<PeerId> = self.conversations.keys().copied().collect();
+        for peer in peers {
+            if let Ok(stored) = self.outbox.peer_addrs(&peer) {
+                let sibling = self.is_sibling(&peer);
+                let mut addrs = dial_addrs(&stored, sibling);
+                addrs.truncate(if sibling {
+                    SIBLING_DIAL_ADDRS
+                } else {
+                    CONTACT_DIAL_ADDRS
+                });
+                if !addrs.is_empty() && has_room(&self.peer_addrs, &peer) {
+                    self.peer_addrs.insert(peer, addrs);
+                }
+            }
+            self.start_redial(peer);
+        }
     }
 
     /// Mapa `peer_addrs` cheio: abre vaga para `peer` despejando um peer **sem conversa e sem handshake
@@ -2259,6 +2297,8 @@ impl Chat {
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
         self.teach_mailbox(peer);
+        // O endereço da janela pré-conversa (só em memória até aqui) agora tem dono: vai para o disco.
+        self.persist_peer_addrs(&peer);
         self.expected.remove(&peer);
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.

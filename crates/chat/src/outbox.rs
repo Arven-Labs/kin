@@ -22,9 +22,10 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// aditiva: só `CREATE TABLE IF NOT EXISTS`); 4 = P24 (tabela `kin_seen_mirror`, também aditiva);
 /// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva); 6 = P10a (tabela
 /// `kin_history`, o histórico das conversas, também aditiva); 7 = P10a (tabela `kin_history_cursor`, até
-/// onde já recebi do histórico de cada irmão, também aditiva). Um build antigo recusa o banco v7 (ver
-/// `migrate`): não há downgrade.
-const SCHEMA_VERSION: i64 = 7;
+/// onde já recebi do histórico de cada irmão, também aditiva); 8 = P32 a (tabela `kin_peer_addrs`, os
+/// endereços que cada contato informou, para rediscar depois de reiniciar, também aditiva). Um build
+/// antigo recusa o banco v8 (ver `migrate`): não há downgrade.
+const SCHEMA_VERSION: i64 = 8;
 
 /// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
 /// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
@@ -145,7 +146,10 @@ impl Outbox {
              CREATE INDEX IF NOT EXISTS kin_history_contact ON kin_history (contact, seq);
              CREATE TABLE IF NOT EXISTS kin_history_cursor (
                  peer TEXT PRIMARY KEY,
-                 cursor INTEGER NOT NULL);",
+                 cursor INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS kin_peer_addrs (
+                 peer TEXT PRIMARY KEY,
+                 addrs TEXT NOT NULL);",
         )
         .map_err(Error::storage)?;
         Ok(Self {
@@ -463,6 +467,7 @@ impl Outbox {
             "kin_seen",
             "kin_seen_mirror",
             "kin_history_cursor",
+            "kin_peer_addrs",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE peer = ?1"), [&peer])
                 .map_err(Error::storage)?;
@@ -483,16 +488,44 @@ impl Outbox {
         Ok(())
     }
 
-    /// STUB do commit de testes (P32 a): a implementação vem no commit seguinte.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn set_peer_addrs(&self, _peer: &PeerId, _addrs: &[Multiaddr]) -> Result<(), Error> {
-        todo!("P32 a")
+    /// Grava os endereços de escuta que `peer` informou (P32 a), já filtrados por quem chama; a última lista
+    /// substitui a anterior. Um endereço por linha: `Multiaddr` em texto não tem quebra de linha.
+    pub(crate) fn set_peer_addrs(&self, peer: &PeerId, addrs: &[Multiaddr]) -> Result<(), Error> {
+        let text = addrs
+            .iter()
+            .map(Multiaddr::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO kin_peer_addrs (peer, addrs) VALUES (?1, ?2)",
+                params![peer.to_string(), text],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
     }
 
-    /// STUB do commit de testes (P32 a).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn peer_addrs(&self, _peer: &PeerId) -> Result<Vec<Multiaddr>, Error> {
-        todo!("P32 a")
+    /// Endereços gravados de `peer`; vazio se não há linha. Linha que não lê como `Multiaddr` (banco
+    /// adulterado ou de outra versão) é ignorada: o que sai daqui ainda passa pelo filtro de quem chama.
+    pub(crate) fn peer_addrs(&self, peer: &PeerId) -> Result<Vec<Multiaddr>, Error> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT addrs FROM kin_peer_addrs WHERE peer = ?1",
+                [peer.to_string()],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .map_err(Error::storage)?;
+        Ok(text
+            .iter()
+            .flat_map(|t| t.lines())
+            .filter_map(|line| line.parse().ok())
+            .collect())
     }
 
     pub(crate) fn peer_relays(&self, peer: &PeerId) -> Result<Option<Vec<String>>, Error> {
@@ -1876,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_6_database_opens_as_version_7_keeps_its_history_and_gains_the_cursor_table() {
+    fn a_version_6_database_upgrades_keeps_its_history_and_gains_the_cursor_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("o.db");
         let (ana, peer) = (identity(), peer());
@@ -1899,7 +1932,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     /// P32 a: banco v7 abre como v8, mantém o que tinha (aqui, o histórico) e ganha a tabela dos endereços.
