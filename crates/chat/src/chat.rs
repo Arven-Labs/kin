@@ -1409,8 +1409,9 @@ impl Chat {
                 self.history_sessions.remove(&peer);
                 self.history_requests
                     .retain(|_, requested| *requested != peer);
-                // Sem conversa, o endereço informado não tem dono a rediscar: não ocupa vaga do teto.
-                if !self.conversations.contains_key(&peer) {
+                // Sem conversa nem handshake esperado, o endereço informado não tem dono a rediscar: não
+                // ocupa vaga do teto.
+                if !self.conversations.contains_key(&peer) && !self.expected.contains_key(&peer) {
                     self.peer_addrs.remove(&peer);
                 }
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
@@ -1857,20 +1858,23 @@ impl Chat {
     /// Só entra peer com conversa, com handshake esperado (`expected`) ou conectado: o `identify` chega com a
     /// conexão, antes de a conversa existir, e quem disca com `dial` não tem `expected`. O conectado sem
     /// conversa sai de `peer_addrs` quando a conexão cai (`PeerDisconnected`), então um estranho só ocupa
-    /// vaga enquanto estiver conectado. O mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
+    /// vaga enquanto estiver conectado, e com o mapa cheio quem tem conversa ou `expected` despeja um estranho
+    /// ([`Self::evict_stranger_for`]). O mapa tem o teto de [`MAX_KNOWN_DEVICES`]. A informação nova vai na frente e a velha
     /// completa até o limite (auditoria I3: mudança de endereço não apaga o que ainda pode valer); uma lista
     /// que o filtro esvazia (um peer na LAN que só anuncia IP privado) não apaga a velha.
     fn learn_peer_addrs(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
         if !(self.conversations.contains_key(&peer)
             || self.expected.contains_key(&peer)
             || self.connected.contains(&peer))
-            || !has_room(&self.peer_addrs, &peer)
         {
             return;
         }
         let sibling = self.is_sibling(&peer);
         let mut merged = dial_addrs(&addrs, sibling);
         if merged.is_empty() {
+            return;
+        }
+        if !has_room(&self.peer_addrs, &peer) && !self.evict_stranger_for(&peer) {
             return;
         }
         for old in self.peer_addrs.get(&peer).into_iter().flatten() {
@@ -1884,6 +1888,21 @@ impl Chat {
             CONTACT_DIAL_ADDRS
         });
         self.peer_addrs.insert(peer, merged);
+    }
+
+    /// Mapa `peer_addrs` cheio: abre vaga para `peer` despejando um peer **sem conversa e sem handshake
+    /// esperado** (estranho conectado). Só quem tem conversa ou `expected` despeja; um estranho nunca tira a
+    /// vaga de um contato, e o contrário impede que estranhos conectados bloqueiem o endereço de contato real
+    /// (auditoria #1). `false` se `peer` não tem prioridade ou não há estranho a despejar.
+    fn evict_stranger_for(&mut self, peer: &PeerId) -> bool {
+        let known = |chat: &Self, p: &PeerId| {
+            chat.conversations.contains_key(p) || chat.expected.contains_key(p)
+        };
+        if !known(self, peer) {
+            return false;
+        }
+        let victim = self.peer_addrs.keys().find(|p| !known(self, p)).copied();
+        victim.is_some_and(|victim| self.peer_addrs.remove(&victim).is_some())
     }
 
     /// Endereços a discar para rediscar `peer` (P32): os que ele informou; sem eles, os do convite que eu
