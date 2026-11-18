@@ -13,6 +13,9 @@ if [ -r /lab/passphrase ]; then
   install -m 600 /lab/passphrase /tmp/kin-passphrase
   export KIN_PASSPHRASE_FILE=/tmp/kin-passphrase
 fi
+# Um cenário que reinicia o processo com outros argumentos (por exemplo sem o `--dial` do começo) grava
+# /tmp/kin-args antes do `stop`/`start`: o /tmp e o /data do container sobrevivem ao reinício.
+[ -r /tmp/kin-args ] && KIN_ARGS=$(cat /tmp/kin-args)
 # O laboratório mede só a rede P2P: sem a caixa postal Nostr (que, por padrão, falaria com relays públicos).
 # shellcheck disable=SC2086
 exec kin --no-nostr $KIN_ARGS <> /tmp/in
