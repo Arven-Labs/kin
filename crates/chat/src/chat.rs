@@ -1890,6 +1890,12 @@ impl Chat {
         self.peer_addrs.insert(peer, merged);
     }
 
+    /// STUB do commit de testes (P32 a): lê os endereços gravados e agenda a rediscagem de quem tem fila.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn restore_peer_addrs(&mut self) {
+        todo!("P32 a")
+    }
+
     /// Mapa `peer_addrs` cheio: abre vaga para `peer` despejando um peer **sem conversa e sem handshake
     /// esperado** (estranho conectado). Só quem tem conversa ou `expected` despeja; um estranho nunca tira a
     /// vaga de um contato, e o contrário impede que estranhos conectados bloqueiem o endereço de contato real
@@ -4655,6 +4661,98 @@ mod tests {
         );
 
         assert!(bia.peer_addrs.is_empty());
+    }
+
+    /// P32 a: o endereço que um contato com conversa informa vai também para o banco.
+    #[tokio::test]
+    async fn a_learned_address_of_a_contact_is_written_to_the_outbox() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+
+        assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
+    }
+
+    /// P32 a: o endereço da janela pré-conversa (só em memória) vai para o banco quando a conversa nasce.
+    #[tokio::test]
+    async fn an_address_told_before_the_conversation_is_written_when_it_is_born() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let conversation = bia.conversations.remove(&ana_peer).unwrap();
+        bia.connected.insert(ana_peer);
+        identify(&mut bia, ana_peer, &[GLOBAL_A]);
+        assert!(
+            bia.outbox.peer_addrs(&ana_peer).unwrap().is_empty(),
+            "sem conversa, nada no disco"
+        );
+
+        bia.ready(ana_peer, conversation).unwrap();
+
+        assert_eq!(bia.outbox.peer_addrs(&ana_peer).unwrap(), [addr(GLOBAL_A)]);
+    }
+
+    /// P32 a: estranho conectado (sem conversa) nunca escreve no disco.
+    #[tokio::test]
+    async fn the_address_of_a_stranger_is_never_written() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        bia.connected.insert(stranger);
+
+        identify(&mut bia, stranger, &[GLOBAL_A]);
+
+        assert!(bia.outbox.peer_addrs(&stranger).unwrap().is_empty());
+    }
+
+    /// P32 a: depois de reiniciar, o contato com fila é rediscado pelo endereço do disco, sem nenhum envio
+    /// novo, e o que o filtro não aceita (rede privada gravada à mão) não é discado.
+    #[tokio::test]
+    async fn after_a_restart_a_contact_with_a_queue_is_redialed_from_the_stored_address() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.outbox
+            .set_peer_addrs(
+                &ana_peer,
+                &[addr(GLOBAL_A), addr("/ip4/192.168.0.5/tcp/4001")],
+            )
+            .unwrap();
+        bia.outbox
+            .enqueue(&ana_peer, &Message::new("oi".into(), None))
+            .unwrap();
+        assert!(
+            bia.peer_addrs.is_empty(),
+            "memória vazia, como depois de reiniciar"
+        );
+
+        bia.restore_peer_addrs();
+
+        assert_eq!(bia.redial[&ana_peer].state, RedialState::Waiting);
+        make_redial_due(&mut bia, ana_peer);
+        bia.flush_due_redials();
+        assert_eq!(bia.dial_log, [(ana_peer, vec![addr(GLOBAL_A)])]);
+    }
+
+    /// P32 a: reaberto com a fila vazia, o endereço volta para a memória mas nada é agendado.
+    #[tokio::test]
+    async fn after_a_restart_an_empty_queue_schedules_no_redial() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.outbox
+            .set_peer_addrs(&ana_peer, &[addr(GLOBAL_A)])
+            .unwrap();
+
+        bia.restore_peer_addrs();
+
+        assert_eq!(bia.redial_targets(&ana_peer), [addr(GLOBAL_A)]);
+        assert!(bia.redial.is_empty());
+    }
+
+    /// P32 a: linha de peer sem conversa (sobra de um peer esquecido) não volta para a memória.
+    #[tokio::test]
+    async fn after_a_restart_the_stored_address_of_a_peer_without_a_conversation_is_ignored() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let gone = PeerId::random();
+        bia.outbox.set_peer_addrs(&gone, &[addr(GLOBAL_A)]).unwrap();
+
+        bia.restore_peer_addrs();
+
+        assert!(!bia.peer_addrs.contains_key(&gone));
     }
 
     /// P32:sem endereço informado, valem os do convite do contato.

@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use kin_identity::{IdentityId, PublicKey};
-use kin_transport::PeerId;
+use kin_transport::{Multiaddr, PeerId};
 use rusqlite::{Connection, params};
 
 use crate::payload::HistoryItem;
@@ -481,6 +481,18 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         Ok(())
+    }
+
+    /// STUB do commit de testes (P32 a): a implementação vem no commit seguinte.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_peer_addrs(&self, _peer: &PeerId, _addrs: &[Multiaddr]) -> Result<(), Error> {
+        todo!("P32 a")
+    }
+
+    /// STUB do commit de testes (P32 a).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peer_addrs(&self, _peer: &PeerId) -> Result<Vec<Multiaddr>, Error> {
+        todo!("P32 a")
     }
 
     pub(crate) fn peer_relays(&self, peer: &PeerId) -> Result<Option<Vec<String>>, Error> {
@@ -1890,6 +1902,68 @@ mod tests {
         assert_eq!(version, 7);
     }
 
+    /// P32 a: banco v7 abre como v8, mantém o que tinha (aqui, o histórico) e ganha a tabela dos endereços.
+    #[test]
+    fn a_version_7_database_opens_as_version_8_keeps_its_data_and_gains_the_addresses_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (ana, peer) = (identity(), peer());
+        let message = Message::new("antes".into(), None);
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.record_history(&ana, true, &message).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_peer_addrs; PRAGMA user_version = 7;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+        outbox.set_peer_addrs(&peer, &[global_addr(1)]).unwrap();
+
+        assert_eq!(outbox.history(&ana, None, 10).unwrap()[0].message, message);
+        assert_eq!(outbox.peer_addrs(&peer).unwrap(), [global_addr(1)]);
+        let version: i64 = outbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+    }
+
+    /// P32 a: ida e volta; a última gravação substitui a anterior e peer sem linha devolve vazio.
+    #[test]
+    fn peer_addresses_round_trip_and_the_last_write_wins() {
+        let outbox = Outbox::memory().unwrap();
+        let (one, two, unknown) = (peer(), peer(), peer());
+
+        outbox
+            .set_peer_addrs(&one, &[global_addr(1), global_addr(2)])
+            .unwrap();
+        outbox.set_peer_addrs(&two, &[global_addr(3)]).unwrap();
+        outbox.set_peer_addrs(&one, &[global_addr(4)]).unwrap();
+
+        assert_eq!(outbox.peer_addrs(&one).unwrap(), [global_addr(4)]);
+        assert_eq!(outbox.peer_addrs(&two).unwrap(), [global_addr(3)]);
+        assert!(outbox.peer_addrs(&unknown).unwrap().is_empty());
+    }
+
+    /// P32 a: linha ilegível no banco (adulterada ou de outra versão) é ignorada, não derruba a leitura.
+    #[test]
+    fn an_unparsable_stored_address_is_skipped() {
+        let outbox = Outbox::memory().unwrap();
+        let peer = peer();
+        outbox.set_peer_addrs(&peer, &[global_addr(1)]).unwrap();
+        outbox
+            .conn
+            .execute(
+                "UPDATE kin_peer_addrs SET addrs = addrs || char(10) || 'isto não é multiaddr' WHERE peer = ?1",
+                [peer.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(outbox.peer_addrs(&peer).unwrap(), [global_addr(1)]);
+    }
+
     /// Enche todas as tabelas por device de `peer`: uma mensagem comum depositada, um espelho, relays,
     /// um id visto de cada tipo e o cursor do histórico. Devolve (comum, espelho).
     fn populate(outbox: &Outbox, peer: &PeerId, tag: &str) -> (Message, Message) {
@@ -1908,10 +1982,17 @@ mod tests {
             .mark_seen(peer, &MessageId::from_bytes([2; 16]), SeenKind::Mirror)
             .unwrap();
         outbox.set_history_cursor(peer, 5).unwrap();
+        outbox.set_peer_addrs(peer, &[global_addr(1)]).unwrap();
         (plain, mirror)
     }
 
-    /// As 6 primeiras tabelas por device; a sétima, `kin_history_cursor`, é a que o teste 18 apaga.
+    /// Endereço de documentação (203.0.113.0/24) com o último octeto `n`.
+    fn global_addr(n: u8) -> Multiaddr {
+        format!("/ip4/203.0.113.{n}/tcp/4001").parse().unwrap()
+    }
+
+    /// As 6 primeiras tabelas por device; a sétima, `kin_history_cursor`, é a que o teste 18 apaga; a oitava,
+    /// `kin_peer_addrs`, é a do P32 a.
     const FIRST_SIX: [&str; 6] = [
         "kin_outbox",
         "kin_deposited",
@@ -1921,9 +2002,10 @@ mod tests {
         "kin_seen_mirror",
     ];
 
-    /// Quantas linhas as 7 tabelas por device guardam de `peer`.
+    /// Quantas linhas as 8 tabelas por device guardam de `peer`.
     fn rows_of(outbox: &Outbox, peer: &PeerId) -> i64 {
-        rows_in(outbox, peer, &FIRST_SIX) + rows_in(outbox, peer, &["kin_history_cursor"])
+        rows_in(outbox, peer, &FIRST_SIX)
+            + rows_in(outbox, peer, &["kin_history_cursor", "kin_peer_addrs"])
     }
 
     fn rows_in(outbox: &Outbox, peer: &PeerId, tables: &[&str]) -> i64 {
@@ -1944,7 +2026,7 @@ mod tests {
 
     // 13
     #[test]
-    fn forgetting_a_peer_empties_all_seven_per_device_tables_and_only_for_that_peer() {
+    fn forgetting_a_peer_empties_all_eight_per_device_tables_and_only_for_that_peer() {
         let (outbox, gone, kept) = (Outbox::memory().unwrap(), peer(), peer());
         populate(&outbox, &gone, "gone");
         let (kept_plain, _) = populate(&outbox, &kept, "kept");
