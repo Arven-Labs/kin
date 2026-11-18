@@ -434,6 +434,14 @@ pub struct Chat {
     retry_cap: Duration,
     /// Falhas seguidas depois das quais o timer para de armar (campo, para o teste não falhar 500 vezes).
     retry_budget: u32,
+    /// Novo depósito agendado por peer depois de um `DepositFailed` (P21). Mesma estrutura e mesma espera
+    /// do reenvio direto, mas conta à parte: sai no `Deposited`, ao reconectar ou ao esquecer o peer.
+    deposit_retry: HashMap<PeerId, Retry>,
+    /// Falhas seguidas de depósito depois das quais o timer para de armar (campo, para o teste não falhar 500 vezes).
+    deposit_budget: u32,
+    /// Quando a varredura por idade dos depósitos roda (P21): metade da retenção do backend depois do último
+    /// depósito confirmado. `None` = nada a varrer (sem retenção declarada ou sem depósito pendente).
+    sweep_due: Option<Instant>,
     /// Teto de linhas importadas por sessão de sincronização de histórico (campo, para o teste não
     /// alimentar 100 000 linhas).
     history_cap: usize,
@@ -601,6 +609,9 @@ impl Chat {
             retry_base: RETRY_BASE,
             retry_cap: RETRY_CAP,
             retry_budget: RETRY_BUDGET,
+            deposit_retry: HashMap::new(),
+            deposit_budget: RETRY_BUDGET,
+            sweep_due: None,
             history_cap: MAX_SYNC_ENTRIES,
             history_requested: Default::default(),
             history_requests: HashMap::new(),
@@ -1168,6 +1179,8 @@ impl Chat {
                 Next::Tick => {
                     self.flush_sibling_pending();
                     self.flush_due_retries();
+                    self.flush_due_deposits();
+                    self.sweep_stale_deposits();
                 }
                 Next::Node(event) => self.handle(event),
                 Next::Mailbox(Some(event)) => self.handle_mailbox(event),
@@ -1202,6 +1215,7 @@ impl Chat {
             }
             MailboxEvent::DepositFailed { id, reason } => {
                 if let Some((peer, message)) = self.depositing.remove(&id) {
+                    self.schedule_deposit_retry(peer);
                     self.queue.push_back(ChatEvent::DepositFailed {
                         peer,
                         message,
@@ -1676,6 +1690,19 @@ impl Chat {
                 self.retry.remove(&peer);
             }
         }
+    }
+
+    /// ESQUELETO (P21): agenda o novo depósito de `peer` depois de um `DepositFailed`.
+    fn schedule_deposit_retry(&mut self, peer: PeerId) {
+        let _ = (peer, self.deposit_budget, &self.deposit_retry);
+    }
+
+    /// ESQUELETO (P21): deposita de novo para os peers cujo prazo venceu.
+    fn flush_due_deposits(&mut self) {}
+
+    /// ESQUELETO (P21): re-deposita por idade os depósitos sem ack, com o processo parado.
+    fn sweep_stale_deposits(&mut self) {
+        let _ = self.sweep_due;
     }
 
     /// Quanto falta para o próximo prazo que pede o relógio: o do re-anúncio dos irmãos (P24) ou o de um
@@ -3387,6 +3414,290 @@ mod tests {
             .collect();
         let expected: Vec<String> = (0..MAILBOX_WINDOW).map(|i| i.to_string()).collect();
         assert_eq!(again, expected);
+    }
+
+    // ---- P21: gatilhos de depósito da caixa postal ----
+
+    /// P21: espera o próximo `DepositFailed` (o relay está recusando).
+    async fn until_deposit_fails(bia: &mut Chat) {
+        let failed = until(bia, |e| {
+            matches!(e, ChatEvent::DepositFailed { .. }).then_some(())
+        })
+        .await;
+        assert!(failed.is_some(), "esperava a recusa do depósito");
+    }
+
+    /// P21: Bia com Ana offline e uma caixa postal que recusa tudo; manda uma mensagem e espera a recusa.
+    async fn bia_with_a_refused_deposit() -> (Chat, PeerId, MemoryRelay) {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let relay = MemoryRelay::default();
+        relay.fail_deposits(true);
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+        bia.send(ana_peer, "oi", None).unwrap();
+        until_deposit_fails(&mut bia).await;
+        (bia, ana_peer, relay)
+    }
+
+    /// P21: vence o prazo do novo depósito de `peer` sem esperar.
+    fn make_deposit_due(bia: &mut Chat, peer: PeerId) {
+        bia.deposit_retry
+            .get_mut(&peer)
+            .expect("sem novo depósito agendado")
+            .due = Instant::now();
+    }
+
+    /// P21: o que já estava na fila quando a caixa postal foi ligada é depositado na hora, sem esperar
+    /// outro `send` nem a queda do peer.
+    #[tokio::test]
+    async fn turning_the_mailbox_on_deposits_what_was_already_queued() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let message = bia.send(ana_peer, "esperando", None).unwrap();
+        let relay = MemoryRelay::default();
+
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        let deposited = until(&mut bia, |e| match e {
+            ChatEvent::Deposited { message, .. } => Some(message),
+            _ => None,
+        })
+        .await;
+        assert_eq!(deposited, Some(message));
+        let deposits = relay.deposits();
+        assert_eq!(deposits.len(), 1);
+        assert_eq!(text_of(&mut ana, &deposits[0].blob), "esperando");
+    }
+
+    /// P21: com o peer conectado, ligar a caixa postal não deposita (vale o caminho direto).
+    #[tokio::test]
+    async fn turning_the_mailbox_on_does_not_deposit_for_a_connected_peer() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        bia.send(ana_peer, "direto", None).unwrap();
+        let relay = MemoryRelay::default();
+
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+
+        assert!(relay.deposits().is_empty());
+    }
+
+    /// P21: depósito recusado agenda um novo; antes do prazo nada sai, no prazo sai.
+    #[tokio::test]
+    async fn a_refused_deposit_is_tried_again_only_after_the_wait() {
+        let (mut bia, ana_peer, relay) = {
+            let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+            bia.retry_base = Duration::from_secs(3600);
+            let relay = MemoryRelay::default();
+            relay.fail_deposits(true);
+            bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+            bia.send(ana_peer, "oi", None).unwrap();
+            until_deposit_fails(&mut bia).await;
+            (bia, ana_peer, relay)
+        };
+        relay.fail_deposits(false);
+        assert_eq!(bia.deposit_retry[&ana_peer].attempts, 1);
+
+        bia.flush_due_deposits();
+        assert!(relay.deposits().is_empty(), "o prazo não venceu: nada sai");
+
+        make_deposit_due(&mut bia, ana_peer);
+        bia.flush_due_deposits();
+        assert_eq!(relay.deposits().len(), 1, "venceu: deposita de novo");
+    }
+
+    /// P21: recusar de novo depois do novo depósito dobra a espera (2 falhas = o dobro da base).
+    #[tokio::test]
+    async fn a_second_refusal_doubles_the_wait() {
+        let (mut bia, ana_peer, _relay) = bia_with_a_refused_deposit().await;
+        bia.retry_base = Duration::from_secs(3600);
+        bia.retry_cap = Duration::from_secs(86_400);
+        bia.deposit_retry.clear();
+        bia.schedule_deposit_retry(ana_peer);
+        make_deposit_due(&mut bia, ana_peer);
+        bia.flush_due_deposits();
+        until_deposit_fails(&mut bia).await;
+
+        assert_eq!(bia.deposit_retry[&ana_peer].attempts, 2);
+        assert!(
+            bia.deposit_retry[&ana_peer].due > Instant::now() + Duration::from_secs(7000),
+            "2 recusas: ~2 x 3600 s"
+        );
+    }
+
+    /// P21 (auditoria I1 do P19, mesma conta): depois de `deposit_budget` recusas seguidas o timer para de
+    /// armar; o registro fica, desarmado, e o relógio não acorda mais por ele.
+    #[tokio::test]
+    async fn the_deposit_budget_stops_the_timer() {
+        let (mut bia, ana_peer, _relay) = bia_with_a_refused_deposit().await;
+        bia.deposit_budget = 3;
+        bia.retry_base = Duration::from_secs(3600);
+        bia.deposit_retry.clear();
+        for _ in 0..2 {
+            bia.schedule_deposit_retry(ana_peer);
+        }
+        assert!(bia.deposit_retry[&ana_peer].armed, "2 de 3: ainda arma");
+
+        bia.schedule_deposit_retry(ana_peer);
+        assert_eq!(bia.deposit_retry[&ana_peer].attempts, 3);
+        assert!(!bia.deposit_retry[&ana_peer].armed, "3 de 3: esgotou");
+        assert_eq!(bia.wake_in(), None);
+    }
+
+    /// P21: depósito aceito zera a conta: a próxima recusa recomeça da espera base.
+    #[tokio::test]
+    async fn an_accepted_deposit_resets_the_backoff() {
+        let (mut bia, ana_peer, relay) = bia_with_a_refused_deposit().await;
+        relay.fail_deposits(false);
+        make_deposit_due(&mut bia, ana_peer);
+        bia.flush_due_deposits();
+
+        let deposited = until(&mut bia, |e| {
+            matches!(e, ChatEvent::Deposited { .. }).then_some(())
+        })
+        .await;
+        assert!(deposited.is_some());
+        assert!(bia.deposit_retry.is_empty(), "o aceite zera");
+    }
+
+    /// P21: reconectar apaga o novo depósito agendado (o `PeerConnected` já envia direto).
+    #[tokio::test]
+    async fn reconnecting_clears_the_deposit_retry() {
+        let (mut bia, ana_peer, _relay) = bia_with_a_refused_deposit().await;
+        assert!(bia.deposit_retry.contains_key(&ana_peer));
+
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        assert!(bia.deposit_retry.is_empty());
+    }
+
+    /// P21: esquecer o peer (conversa caiu) apaga o novo depósito agendado.
+    #[tokio::test]
+    async fn dropping_a_peer_clears_its_deposit_retry() {
+        let mut r = revoked_ana();
+        r.bia.deposit_retry.insert(
+            r.ana_peer,
+            Retry {
+                attempts: 1,
+                due: Instant::now(),
+                armed: true,
+            },
+        );
+
+        r.bia.on_mls(r.sibling, &r.wire).unwrap();
+        assert!(!r.bia.is_ready(&r.ana_peer), "a conversa caiu");
+        assert!(!r.bia.deposit_retry.contains_key(&r.ana_peer));
+    }
+
+    /// P21: o relógio acorda no prazo do novo depósito e dorme de novo depois que ele dispara.
+    #[tokio::test]
+    async fn the_clock_wakes_for_the_deposit_deadline_and_sleeps_after_it_fires() {
+        let (mut bia, ana_peer, relay) = bia_with_a_refused_deposit().await;
+        bia.retry_base = Duration::from_secs(3600);
+        bia.retry_cap = Duration::from_secs(86_400);
+        bia.deposit_retry.clear();
+        bia.schedule_deposit_retry(ana_peer);
+        let wake = bia.wake_in().expect("com novo depósito agendado, acorda");
+        assert!(wake <= Duration::from_secs(3600) && wake > Duration::from_secs(3000));
+
+        relay.fail_deposits(false);
+        make_deposit_due(&mut bia, ana_peer);
+        bia.flush_due_deposits();
+        assert_eq!(bia.wake_in(), None, "disparou: não acorda à toa");
+    }
+
+    /// P21: o laço do `next_event` de fato acorda no prazo e deposita sozinho, sem tráfego algum.
+    #[tokio::test]
+    async fn next_event_redeposits_by_itself_after_a_refusal() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.retry_base = Duration::from_millis(10);
+        let relay = MemoryRelay::default();
+        relay.fail_deposits(true);
+        bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
+        let message = bia.send(ana_peer, "oi", None).unwrap();
+        until_deposit_fails(&mut bia).await;
+        relay.fail_deposits(false);
+
+        let deposited = until(&mut bia, |e| match e {
+            ChatEvent::Deposited { message, .. } => Some(message),
+            _ => None,
+        })
+        .await;
+        assert_eq!(deposited, Some(message));
+        assert_eq!(relay.deposits().len(), 1);
+    }
+
+    /// P21: depósito confirmado arma a varredura por idade para metade da retenção do backend.
+    #[tokio::test]
+    async fn a_confirmed_deposit_arms_the_age_sweep() {
+        let week = std::time::Duration::from_secs(7 * 24 * 3600);
+        let (bia, _ana, _peer, _relay, _) = deposited_once(Some(week)).await;
+
+        assert!(bia.sweep_due.is_some());
+        let wake = bia.wake_in().expect("a varredura pede o relógio");
+        assert!(wake <= week / 2 && wake > week / 2 - Duration::from_secs(60));
+    }
+
+    /// P21: backend sem retenção declarada não tem o que varrer.
+    #[tokio::test]
+    async fn no_retention_means_no_age_sweep() {
+        let (bia, _ana, _peer, _relay, _) = deposited_once(None).await;
+
+        assert!(bia.sweep_due.is_none());
+        assert_eq!(bia.wake_in(), None);
+    }
+
+    /// P21: no prazo, a varredura re-deposita o que ficou velho sem ack, mesmo sem nenhum outro evento.
+    #[tokio::test]
+    async fn the_age_sweep_redeposits_a_stale_deposit() {
+        let (mut bia, mut ana, _peer, relay, _) =
+            deposited_once(Some(std::time::Duration::ZERO)).await;
+        bia.sweep_due = Some(Instant::now());
+
+        bia.sweep_stale_deposits();
+
+        let deposits = relay.deposits();
+        assert_eq!(deposits.len(), 2);
+        assert_eq!(text_of(&mut ana, &deposits[1].blob), "oi");
+    }
+
+    /// P21: antes do prazo a varredura não faz nada, mesmo com depósito velho.
+    #[tokio::test]
+    async fn the_age_sweep_waits_for_its_deadline() {
+        let (mut bia, _ana, _peer, relay, _) =
+            deposited_once(Some(std::time::Duration::ZERO)).await;
+        bia.sweep_due = Some(Instant::now() + Duration::from_secs(3600));
+
+        bia.sweep_stale_deposits();
+
+        assert_eq!(relay.deposits().len(), 1);
+    }
+
+    /// P21: a varredura não deposita para peer conectado (vale o caminho direto).
+    #[tokio::test]
+    async fn the_age_sweep_skips_a_connected_peer() {
+        let (mut bia, _ana, ana_peer, relay, _) =
+            deposited_once(Some(std::time::Duration::ZERO)).await;
+        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        bia.sweep_due = Some(Instant::now());
+
+        bia.sweep_stale_deposits();
+
+        assert_eq!(relay.deposits().len(), 1);
+    }
+
+    /// P21: enquanto ainda há depósito pendente a varredura se rearma; sem nenhum, ela se desarma.
+    #[tokio::test]
+    async fn the_age_sweep_rearms_while_deposits_remain_and_stops_after() {
+        let week = std::time::Duration::from_secs(7 * 24 * 3600);
+        let (mut bia, _ana, ana_peer, _relay, id) = deposited_once(Some(week)).await;
+        bia.sweep_due = Some(Instant::now());
+
+        bia.sweep_stale_deposits();
+        let again = bia.sweep_due.expect("ainda há depósito: rearma");
+        assert!(again > Instant::now() + Duration::from_secs(3 * 24 * 3600));
+
+        bia.outbox.remove(&ana_peer, &id).unwrap();
+        bia.sweep_due = Some(Instant::now());
+        bia.sweep_stale_deposits();
+        assert!(bia.sweep_due.is_none(), "nada pendente: desarma");
     }
 
     /// Caixa postal que só anota as listas de relays que o `Chat` lhe ensina.
