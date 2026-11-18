@@ -48,11 +48,11 @@ infra() { # nat [relay2]
   cleanup
   export NAT_MODE=$nat A_ARGS="" B_ARGS=""
   compose up -d relay routera routerb "$@" >/dev/null || return 1
-  wait_log relay "relay em /ip4/172.30.0.10/tcp/4001/p2p/" 30 || { echo "relay não subiu"; return 1; }
-  RELAY_ADDR=$(first relay '/ip4/172.30.0.10/tcp/4001/p2p/[A-Za-z0-9]+')
+  wait_log relay "relay em /ip4/203.0.113.10/tcp/4001/p2p/" 30 || { echo "relay não subiu"; return 1; }
+  RELAY_ADDR=$(first relay '/ip4/203.0.113.10/tcp/4001/p2p/[A-Za-z0-9]+')
   if [ "${1:-}" = relay2 ]; then
-    wait_log relay2 "relay em /ip4/172.30.0.11/tcp/4001/p2p/" 30 || { echo "relay2 não subiu"; return 1; }
-    RELAY2_ADDR=$(first relay2 '/ip4/172.30.0.11/tcp/4001/p2p/[A-Za-z0-9]+')
+    wait_log relay2 "relay em /ip4/203.0.113.11/tcp/4001/p2p/" 30 || { echo "relay2 não subiu"; return 1; }
+    RELAY2_ADDR=$(first relay2 '/ip4/203.0.113.11/tcp/4001/p2p/[A-Za-z0-9]+')
   fi
 }
 
@@ -64,7 +64,7 @@ setup() {
   export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
   compose up -d a >/dev/null || return 1
   wait_log a "reserva aceita no relay" 30 || { echo "a não conseguiu reserva no relay"; logs a; return 1; }
-  A_CIRCUIT=$(first a '/ip4/172.30.0.10/tcp/4001/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+')
+  A_CIRCUIT=$(first a '/ip4/203.0.113.10/tcp/4001/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+')
 
   export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --dial $A_CIRCUIT"
   compose up -d b >/dev/null || return 1

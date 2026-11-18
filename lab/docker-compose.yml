@@ -1,9 +1,12 @@
 # Laboratório de NAT do Kin (Fase 2). Topologia:
 #
-#   a (10.1.0.10) -- lana --[routera NAT]-- pub (172.30.0.0/24) --[routerb NAT]-- lanb -- b (10.2.0.10)
+#   a (10.1.0.10) -- lana --[routera NAT]-- pub (203.0.113.0/24) --[routerb NAT]-- lanb -- b (10.2.0.10)
 #                                              |
-#                                            relay (172.30.0.10)
+#                                            relay (203.0.113.10)
 #
+# A rede "pública" usa 203.0.113.0/24 (faixa de documentação, nunca roteada de verdade) e não 172.x: o
+# filtro de endereços do chat (`dialable`, P32) recusa IP privado de contato, então com 172.x a rediscagem
+# nunca discaria o circuito do relay. As LANs (10.x) seguem privadas, como atrás de um NAT de verdade.
 # a e b só conseguem sair pelos roteadores, que fazem NAT (cone ou simétrico, via NAT_MODE).
 # Use `lab/run.sh`; não suba isto à mão.
 name: kinlab
@@ -36,7 +39,7 @@ services:
     environment:
       KIN_ARGS: "--serve-relay --data-dir /data --listen /ip4/0.0.0.0/tcp/4001"
     networks:
-      pub: { ipv4_address: 172.30.0.10 }
+      pub: { ipv4_address: 203.0.113.10 }
 
   # Segundo relay, para o cenário de failover.
   relay2:
@@ -44,27 +47,27 @@ services:
     environment:
       KIN_ARGS: "--serve-relay --data-dir /data --listen /ip4/0.0.0.0/tcp/4001"
     networks:
-      pub: { ipv4_address: 172.30.0.11 }
+      pub: { ipv4_address: 203.0.113.11 }
 
   routera:
     <<: *router
     environment:
       NAT_MODE: "${NAT_MODE:-cone}"
       LAN_PREFIX: "10.1.0."
-      WAN_PREFIX: "172.30.0."
+      WAN_PREFIX: "203.0.113."
     networks:
       lana: { ipv4_address: 10.1.0.2 }
-      pub: { ipv4_address: 172.30.0.2 }
+      pub: { ipv4_address: 203.0.113.2 }
 
   routerb:
     <<: *router
     environment:
       NAT_MODE: "${NAT_MODE:-cone}"
       LAN_PREFIX: "10.2.0."
-      WAN_PREFIX: "172.30.0."
+      WAN_PREFIX: "203.0.113."
     networks:
       lanb: { ipv4_address: 10.2.0.2 }
-      pub: { ipv4_address: 172.30.0.3 }
+      pub: { ipv4_address: 203.0.113.3 }
 
   a:
     <<: *kin
@@ -102,7 +105,7 @@ services:
 
 networks:
   pub:
-    ipam: { config: [{ subnet: 172.30.0.0/24 }] }
+    ipam: { config: [{ subnet: 203.0.113.0/24 }] }
   lana:
     internal: true
     ipam: { config: [{ subnet: 10.1.0.0/24 }] }

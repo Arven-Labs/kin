@@ -1,0 +1,102 @@
+name: Lab
+
+# Laboratório de NAT (lab/run.sh) no CI: Docker, roteadores com NAT, relay e dois peers. NÃO é check
+# obrigatório da main (o ruleset exige só `Rust (clippy and tests)` e `guard`): o hole punching varia de
+# rodada para rodada (ver lab/README.md), e um flake não deve travar o merge. O resultado aparece no PR.
+# Roda em PR que toca código ou o próprio laboratório, uma vez por semana e pelo botão "Run workflow".
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "lab/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/lab.yml"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Um push novo na mesma ref cancela a rodada que ainda está em andamento.
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build kin-cli
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Mesma versão do ci.yml (ver o comentário lá sobre o 1.100.0).
+      - name: Rust
+        uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p kin-cli
+
+      # O binário é montado do host nos containers (glibc do Ubuntu 24.04 é mais antiga que a da imagem
+      # debian:stable-slim do laboratório, então roda lá).
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: kin
+          path: target/debug/kin
+          if-no-files-found: error
+          retention-days: 1
+
+  scenario:
+    name: ${{ matrix.scenario }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      # Um cenário vermelho não esconde os outros: a rodada mostra qual quebrou.
+      fail-fast: false
+      matrix:
+        scenario:
+          - cone
+          - symmetric
+          - relay-down
+          - invite
+          - relay-failover
+          - multi-device
+          - multi-device-plain
+          - history-sync
+          - paired-device
+          - revoke-device
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: kin
+          path: target/debug
+
+      # Artefato não guarda o bit de execução.
+      - name: Make binary executable
+        run: chmod +x target/debug/kin
+
+      # KEEP=1 deixa os containers de pé ao fim, para o passo de logs abaixo; a máquina do job é descartada.
+      - name: Run scenario
+        env:
+          KEEP: "1"
+        run: lab/run.sh ${{ matrix.scenario }}
+
+      - name: Container logs
+        if: failure()
+        working-directory: lab
+        run: docker compose logs --no-color --tail 300
