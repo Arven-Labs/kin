@@ -4578,6 +4578,50 @@ mod tests {
         assert!(bia.peer_addrs.contains_key(&ana_peer));
     }
 
+    /// P32 (auditoria #1): estranhos conectados enchem o mapa primeiro; o contato com conversa que informa o
+    /// endereço depois despeja um estranho em vez de ser descartado.
+    #[tokio::test]
+    async fn a_contact_evicts_a_stranger_when_the_map_is_full() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let strangers: Vec<PeerId> = (0..MAX_KNOWN_DEVICES).map(|_| PeerId::random()).collect();
+        for stranger in &strangers {
+            bia.connected.insert(*stranger);
+            identify(&mut bia, *stranger, &[GLOBAL_A]);
+        }
+        assert_eq!(bia.peer_addrs.len(), MAX_KNOWN_DEVICES, "mapa cheio");
+
+        identify(&mut bia, ana_peer, &[GLOBAL_B]);
+
+        assert_eq!(bia.redial_targets(&ana_peer), [addr(GLOBAL_B)]);
+        assert_eq!(bia.peer_addrs.len(), MAX_KNOWN_DEVICES, "o teto vale");
+        assert_eq!(
+            strangers
+                .iter()
+                .filter(|s| bia.peer_addrs.contains_key(s))
+                .count(),
+            MAX_KNOWN_DEVICES - 1,
+            "um estranho saiu"
+        );
+    }
+
+    /// P32 (auditoria #3): peer com handshake esperado (`expected`) que cai antes da conversa nascer mantém o
+    /// endereço aprendido (como antes de a janela pré-conversa existir).
+    #[tokio::test]
+    async fn an_expected_peer_keeps_its_addresses_when_it_drops_before_the_handshake() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let peer = PeerId::random();
+        let identity = invite_for(&StandaloneIdentity::generate())
+            .identity()
+            .clone();
+        bia.expected.insert(peer, identity);
+        bia.connected.insert(peer);
+        identify(&mut bia, peer, &[GLOBAL_A]);
+
+        bia.handle(NodeEvent::PeerDisconnected(peer));
+
+        assert!(bia.peer_addrs.contains_key(&peer));
+    }
+
     /// P32:estranho conectado que só anuncia IP privado ou loopback não deixa nada (mesmo filtro).
     #[tokio::test]
     async fn a_connected_stranger_with_only_private_addresses_leaves_nothing() {
