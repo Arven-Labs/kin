@@ -63,7 +63,7 @@ async fn a_trusted_identity_opens_a_conversation_without_a_token() {
         let (mut ana, mut bia) = pair(ana_lower);
         ana.chat.set_require_invite(true);
         ana.chat.trust(identity_of(&bia)).unwrap();
-        let addr = listen(&mut ana.chat).await;
+        let addr = pinned_addr(&mut ana).await;
 
         bia.chat.dial(addr).unwrap();
         connect_until_ready(&mut ana.chat, &mut bia.chat).await;
@@ -79,7 +79,7 @@ async fn an_untrusted_identity_is_refused_again() {
         ana.chat.set_require_invite(true);
         ana.chat.trust(identity_of(&bia)).unwrap();
         ana.chat.untrust(&identity_of(&bia)).unwrap();
-        let addr = listen(&mut ana.chat).await;
+        let addr = pinned_addr(&mut ana).await;
 
         bia.chat.dial(addr).unwrap();
         settle(&mut ana.chat, &mut bia.chat, SHORT).await;
@@ -95,7 +95,7 @@ async fn trusting_someone_else_does_not_admit_a_stranger() {
         let caio = person();
         ana.chat.set_require_invite(true);
         ana.chat.trust(identity_of(&caio)).unwrap();
-        let addr = listen(&mut ana.chat).await;
+        let addr = pinned_addr(&mut ana).await;
 
         bia.chat.dial(addr).unwrap();
         settle(&mut ana.chat, &mut bia.chat, SHORT).await;
@@ -119,7 +119,7 @@ async fn a_new_device_of_my_own_identity_passes_without_a_token() {
         let mut first = open(&identity, &d1);
         let mut second = open(&copy, &d2);
         first.set_require_invite(true);
-        let addr = listen(&mut first).await;
+        let addr = listen(&mut first).await.with(Protocol::P2p(d1.peer_id()));
 
         second.dial(addr).unwrap();
         connect_until_ready(&mut first, &mut second).await;
@@ -175,7 +175,7 @@ async fn dialing_someone_does_not_admit_a_different_stranger() {
         ana.chat.set_require_invite(true);
         let caio_addr = pinned_addr(&mut caio).await;
         ana.chat.dial(caio_addr).unwrap();
-        let addr = listen(&mut ana.chat).await;
+        let addr = pinned_addr(&mut ana).await;
 
         bia.chat.dial(addr).unwrap();
         settle(&mut ana.chat, &mut bia.chat, SHORT).await;
