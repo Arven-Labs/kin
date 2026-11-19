@@ -77,10 +77,15 @@ struct Args {
     open_admission: bool,
 }
 
-/// O aviso de conversa refeita (P16, auditoria do PR #254, médio 3). Provisório: o texto entra na
-/// implementação, depois dos testes.
-fn reset_notice(_peer: &str, _identity: &str) -> String {
-    String::new()
+/// O aviso de conversa refeita (P16, auditoria do PR #254, médio 3). O sinal "o outro lado perdeu o estado"
+/// não é verificável (quem tem as chaves de identidade o produz igual), então o aviso diz **quem** e pede
+/// a confirmação por outro canal.
+fn reset_notice(peer: &str, identity: &str) -> String {
+    format!(
+        "(conversa com {peer} refeita: a identidade {identity} disse que perdeu o estado da conversa; \
+         se você não esperava isso, confirme por outro canal que é ela mesma; \
+         mensagens que enviei sem ela perceber podem ter sido perdidas)"
+    )
 }
 
 /// Em que modo de admissão o kin subiu (auditoria do PR 3b, baixo 1): o portão fechado recusa estranhos
@@ -895,8 +900,8 @@ fn on_event(
             met.push((peer, identity));
             *current = Some(peer);
         }
-        ChatEvent::ConversationReset { peer, .. } => {
-            println!("{}", reset_notice(&peer.to_string(), ""));
+        ChatEvent::ConversationReset { peer, identity } => {
+            println!("{}", reset_notice(&peer.to_string(), &identity.to_base58()));
         }
         ChatEvent::Received { message, .. } => {
             let Message {

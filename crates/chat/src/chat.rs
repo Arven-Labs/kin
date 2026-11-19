@@ -72,6 +72,8 @@ pub enum ChatEvent {
     /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido.
     ConversationReset {
         peer: PeerId,
+        /// A identidade do outro lado (a mesma da conversa antiga): quem a aplicação mostra ao usuário.
+        identity: IdentityId,
     },
     /// Mensagem recebida e decifrada.
     Received {
@@ -483,6 +485,12 @@ pub struct Chat {
     /// ou o `Welcome` deles pode, então, substituir a conversa antiga (só com a mesma identidade). Em
     /// memória: cai com a conexão e a conversa pronta.
     lost_state: HashSet<PeerId>,
+    /// Peers com conversa que acabaram de conectar e cujo `Hello` ainda não chegou (P16, auditoria, médio 1):
+    /// a fila deles espera, porque o `Hello` pode dizer que eles perderam a conversa e o que eu despejasse
+    /// no grupo antigo seria confirmado pelo transporte (`Delivered`) e descartado por eles.
+    hello_pending: HashSet<PeerId>,
+    /// Peers com quem já refiz a conversa nesta conexão: um reset por conexão (auditoria, médio 2).
+    reset_done: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
     dialed: HashSet<PeerId>,
@@ -728,6 +736,8 @@ impl Chat {
             admitted: HashMap::new(),
             hello_identity: HashMap::new(),
             lost_state: HashSet::new(),
+            hello_pending: HashSet::new(),
+            reset_done: HashSet::new(),
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
@@ -1388,6 +1398,10 @@ impl Chat {
     /// ([`SEND_WINDOW`]). Cada mensagem é cifrada agora, então uma nova tentativa sai com bytes
     /// diferentes; quem recebe deduplica pelo `MessageId`.
     fn send_direct(&mut self, peer: PeerId) {
+        // A fila espera o `Hello` do peer (e a troca da conversa, se ele a perdeu): ver `hello_pending`.
+        if self.hello_pending.contains(&peer) || self.lost_state.contains(&peer) {
+            return;
+        }
         let entries = match self.outbox.entries(&peer) {
             Ok(entries) => entries,
             Err(e) => return self.drop_message(peer, e),
@@ -1549,11 +1563,17 @@ impl Chat {
                 self.announce_relays(peer);
                 self.announce_devices(peer);
                 self.announce_revocations(peer);
+                // Com conversa, a fila só sai depois do `Hello` do peer (P16): ele pode ter perdido o estado.
+                if self.conversations.contains_key(&peer) {
+                    self.hello_pending.insert(peer);
+                }
                 self.send_hello(peer);
                 self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.hello_pending.remove(&peer);
+                self.reset_done.remove(&peer);
                 self.retry.remove(&peer);
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
@@ -1724,6 +1744,12 @@ impl Chat {
         if has_conversation == Some(false) && self.lost_state_candidate(&peer) {
             self.lost_state.insert(peer);
         }
+        // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
+        // (então ela sai pela conversa nova, depois da troca, em `ready`).
+        self.hello_pending.remove(&peer);
+        if self.conversations.contains_key(&peer) && !self.lost_state.contains(&peer) {
+            self.flush(peer);
+        }
         let mut introduced = token.is_some();
         // Um certificado inválido, ou de outro Peer ID, é recusado inteiro (nem o token vale): quem o manda
         // está forjando ou com defeito.
@@ -1756,7 +1782,8 @@ impl Chat {
     /// Posso marcar `peer` como "perdeu o estado" (P16)? Só com uma conversa **1:1** com ele (a identidade
     /// da conversa antiga é o que o `KeyPackage` novo tem de repetir) e com vaga (teto de `held`).
     fn lost_state_candidate(&self, peer: &PeerId) -> bool {
-        (self.lost_state.contains(peer) || self.lost_state.len() < MAX_HELD_KEY_PACKAGES)
+        !self.reset_done.contains(peer)
+            && (self.lost_state.contains(peer) || self.lost_state.len() < MAX_HELD_KEY_PACKAGES)
             && self.old_identity(peer).is_some()
     }
 
@@ -1915,6 +1942,8 @@ impl Chat {
         conversation: Conversation,
     ) -> Result<(), Error> {
         self.lost_state.remove(&peer);
+        self.reset_done.insert(peer);
+        let identity = self.old_identity(&peer);
         let old = self.conversations.remove(&peer);
         self.future.remove(&peer);
         self.announced.remove(&peer);
@@ -1926,8 +1955,20 @@ impl Chat {
         self.history_requested.remove(&peer);
         self.history_sessions.remove(&peer);
         self.history_requests.retain(|_, p| *p != peer);
-        self.queue.push_back(ChatEvent::ConversationReset { peer });
-        self.ready(peer, conversation)?;
+        if let Some(identity) = identity {
+            self.queue
+                .push_back(ChatEvent::ConversationReset { peer, identity });
+        }
+        if let Err(e) = self.ready(peer, conversation) {
+            // Se a nova não entrou, a antiga volta: sem conversa nenhuma não há cura até a próxima conexão
+            // (auditoria, baixo 3). Se entrou e algo depois falhou, a nova fica.
+            if let Some(old) = old
+                && !self.conversations.contains_key(&peer)
+            {
+                self.conversations.insert(peer, old);
+            }
+            return Err(e);
+        }
         if let Some(old) = old
             && let Err(e) = old.delete()
         {
