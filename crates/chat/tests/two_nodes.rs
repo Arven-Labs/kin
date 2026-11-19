@@ -258,7 +258,10 @@ async fn peer_that_lost_its_database_is_rehandshaked() {
         let mut b = pb.open();
         assert!(!b.is_ready(&pa.peer_id()));
         b.dial(addr).unwrap();
-        let (seen_a, seen_b) = connect_until_ready_within(&mut a, &mut b, WAIT).await;
+        // `settle`, e não `connect_until_ready_within`: ao reconectar, `a` reanuncia a conversa antiga (o
+        // `ConversationReady` "enganoso"), então esperar os dois `Ready` volta antes de `a` processar o
+        // `Welcome` e emitir o `ConversationReset`.
+        let (seen_a, seen_b) = settle(&mut a, &mut b, Duration::from_secs(4)).await;
         let b_id = pb.peer_id();
         assert!(
             seen_a
