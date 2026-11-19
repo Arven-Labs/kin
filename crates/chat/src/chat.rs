@@ -3513,6 +3513,15 @@ mod tests {
             .unwrap()
     }
 
+    /// Conecta `peer` como o `PeerConnected` real e, se a fila ficou segura à espera do `Hello` (P16), simula
+    /// a chegada dele: os testes de envio descrevem uma reconexão normal, em que o `Hello` chega.
+    fn connect_peer(chat: &mut Chat, peer: PeerId) {
+        chat.handle(NodeEvent::PeerConnected(peer));
+        if chat.hello_pending.remove(&peer) {
+            chat.flush(peer);
+        }
+    }
+
     fn events(chat: &mut Chat) -> Vec<ChatEvent> {
         chat.queue.drain(..).collect()
     }
@@ -3638,7 +3647,7 @@ mod tests {
             bia.send(ana_peer, text, None).unwrap();
         }
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert_eq!(in_flight(&bia), SEND_WINDOW);
         assert_eq!(bia.queued(&ana_peer), 3, "só sai da fila com o ack");
     }
@@ -3647,7 +3656,7 @@ mod tests {
     #[tokio::test]
     async fn the_send_window_limits_messages_in_flight() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         for i in 0..20 {
             bia.send(ana_peer, i.to_string(), None).unwrap();
         }
@@ -3670,7 +3679,7 @@ mod tests {
     #[tokio::test]
     async fn the_queue_drains_oldest_first_one_at_a_time() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let ids: Vec<_> = ["a", "b", "c"]
             .into_iter()
             .map(|t| bia.send(ana_peer, t, None).unwrap())
@@ -3689,7 +3698,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_send_keeps_the_message_queued() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let message = bia.send(ana_peer, "tentando", None).unwrap();
         events(&mut bia);
 
@@ -3735,7 +3744,7 @@ mod tests {
     async fn a_failed_chat_send_is_retried_only_after_the_wait() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
 
         assert_eq!(bia.retry[&ana_peer].attempts, 1);
@@ -3754,7 +3763,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
         bia.retry_cap = Duration::from_secs(86_400); // acima do dobro da base, senão o teto corta
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
         bia.flush_due_retries();
@@ -3787,7 +3796,7 @@ mod tests {
     #[tokio::test]
     async fn an_ack_resets_the_backoff() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
         bia.flush_due_retries();
@@ -3804,7 +3813,7 @@ mod tests {
     #[tokio::test]
     async fn disconnecting_clears_the_retry() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         assert!(bia.retry.contains_key(&ana_peer));
 
@@ -3816,7 +3825,7 @@ mod tests {
     #[tokio::test]
     async fn a_due_retry_does_not_send_to_a_disconnected_peer() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
         bia.connected.remove(&ana_peer);
@@ -3835,8 +3844,8 @@ mod tests {
             ana_device: (ana_peer, _),
             ..
         } = household();
-        bia.handle(NodeEvent::PeerConnected(sibling));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, sibling);
+        connect_peer(&mut bia, ana_peer);
         events(&mut bia);
         bia.send(ana_peer, "para a ana", None).unwrap();
         let to_sibling = bia.send(sibling, "para o irmão", None).unwrap();
@@ -3860,7 +3869,7 @@ mod tests {
     #[tokio::test]
     async fn queued_is_announced_on_the_first_failure_only() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let message = bia.send(ana_peer, "tentando", None).unwrap();
         events(&mut bia);
         let fail = |bia: &mut Chat| {
@@ -3891,7 +3900,7 @@ mod tests {
     async fn retries_stop_after_the_budget_and_resume_on_reconnect() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_budget = 3;
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         for _ in 0..2 {
             make_due(&mut bia, ana_peer);
@@ -3910,7 +3919,7 @@ mod tests {
         assert_eq!(bia.queued(&ana_peer), 1, "a mensagem segue na outbox");
 
         bia.handle(NodeEvent::PeerDisconnected(ana_peer));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert!(bia.retry.is_empty(), "reconectar zera a conta");
         assert_eq!(in_flight(&bia), 1, "e a fila sai de novo");
     }
@@ -3920,7 +3929,7 @@ mod tests {
     #[tokio::test]
     async fn the_clock_sleeps_again_after_the_retry_fires() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
 
@@ -3952,7 +3961,7 @@ mod tests {
     #[tokio::test]
     async fn a_retry_that_finds_nothing_to_send_is_forgotten() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let first = send_and_fail(&mut bia, ana_peer, "some");
         bia.outbox.remove(&ana_peer, &first).unwrap();
         make_due(&mut bia, ana_peer);
@@ -3984,7 +3993,7 @@ mod tests {
     async fn a_failed_control_message_does_not_schedule_a_retry() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         let hello = only_pending(&bia);
 
         fail_send(&mut bia, peer, hello);
@@ -3995,7 +4004,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_after_the_peer_disconnected_schedules_nothing() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "tentando", None).unwrap();
         events(&mut bia);
         let id = first_in_flight(&bia);
@@ -4015,7 +4024,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
         bia.retry_cap = Duration::from_secs(86_400);
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert_eq!(bia.wake_in(), None, "sem nada agendado, espera só a rede");
 
         send_and_fail(&mut bia, ana_peer, "tentando");
@@ -4179,7 +4188,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         let relay = MemoryRelay::default();
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         bia.send(ana_peer, "direto", None).unwrap();
         assert!(relay.deposits().is_empty());
@@ -4625,7 +4634,7 @@ mod tests {
     #[tokio::test]
     async fn turning_the_mailbox_on_does_not_deposit_for_a_connected_peer() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "direto", None).unwrap();
         let relay = MemoryRelay::default();
 
@@ -4720,7 +4729,7 @@ mod tests {
         let (mut bia, ana_peer, _relay) = bia_with_a_refused_deposit().await;
         assert!(bia.deposit_retry.contains_key(&ana_peer));
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert!(bia.deposit_retry.is_empty());
     }
 
@@ -4841,7 +4850,7 @@ mod tests {
     async fn the_age_sweep_skips_a_connected_peer() {
         let (mut bia, _ana, ana_peer, relay, _) =
             deposited_once(Some(std::time::Duration::ZERO)).await;
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.sweep_due = Some(Instant::now());
 
         bia.sweep_stale_deposits();
@@ -4946,7 +4955,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.sweep_rounds.insert(ana_peer, 5);
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         assert!(bia.sweep_rounds.is_empty());
     }
@@ -4955,7 +4964,7 @@ mod tests {
     #[tokio::test]
     async fn an_ack_resets_the_sweep_rounds() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "oi", None).unwrap();
         let id = first_in_flight(&bia);
         bia.sweep_rounds.insert(ana_peer, 5);
@@ -5038,7 +5047,7 @@ mod tests {
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
         bia.send(ana_peer, "oi", None).unwrap();
         let id = *bia.depositing.keys().next().unwrap();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         bia.handle_mailbox(MailboxEvent::DepositFailed {
             id,
@@ -5075,7 +5084,7 @@ mod tests {
     /// P32:Bia com Ana conectada e uma mensagem na fila (em voo), depois Ana cai.
     fn bia_after_ana_dropped_with_a_queue() -> (Chat, PeerId) {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "oi", None).unwrap();
         bia.handle(NodeEvent::PeerDisconnected(ana_peer));
         (bia, ana_peer)
@@ -5097,7 +5106,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_peer_without_a_queue_is_not_redialed() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         bia.handle(NodeEvent::PeerDisconnected(ana_peer));
 
@@ -5633,7 +5642,7 @@ mod tests {
         let (mut bia, ana_peer) = bia_after_ana_dropped_with_a_queue();
         assert!(bia.redial.contains_key(&ana_peer));
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         assert!(bia.redial.is_empty());
     }
@@ -7042,7 +7051,7 @@ mod tests {
     async fn a_failed_hello_is_resent_while_the_peer_is_connected_without_a_conversation() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         let first = only_pending(&bia);
 
         fail_send(&mut bia, peer, first);
@@ -7060,13 +7069,13 @@ mod tests {
             ..
         } = household();
         let gone = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(gone));
+        connect_peer(&mut bia, gone);
         let id = only_pending(&bia);
         bia.handle(NodeEvent::PeerDisconnected(gone));
         fail_send(&mut bia, gone, id);
         assert!(bia.pending.is_empty(), "peer desconectado: sem reenvio");
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let id = only_pending(&bia);
         fail_send(&mut bia, ana_peer, id);
         assert!(bia.pending.is_empty(), "já há conversa: sem reenvio");
@@ -7077,7 +7086,7 @@ mod tests {
     async fn hello_resends_stop_at_three_per_connection_and_reset_on_reconnect() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
 
         for _ in 0..3 {
             let id = only_pending(&bia);
@@ -7091,7 +7100,7 @@ mod tests {
         );
 
         bia.handle(NodeEvent::PeerDisconnected(peer));
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         let id = only_pending(&bia);
         fail_send(&mut bia, peer, id);
         only_pending(&bia);
@@ -7227,7 +7236,7 @@ mod tests {
             ..
         } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         bia.connected.insert(with_conversation);
         for _ in 0..4 {
             let id = only_pending(&bia);
@@ -7841,7 +7850,7 @@ mod tests {
             ana_device: (ana_peer, _),
             ..
         } = household();
-        bia.handle(NodeEvent::PeerConnected(sibling));
+        connect_peer(&mut bia, sibling);
         let id = bia.send_to(&ana, "oi", None).unwrap();
         events(&mut bia);
 
@@ -7859,7 +7868,7 @@ mod tests {
             "irmão não é entrega: {after_sibling:?}"
         );
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.handle(NodeEvent::MessageDelivered {
             peer: ana_peer,
             id: first_in_flight(&bia),
@@ -7888,7 +7897,7 @@ mod tests {
         bia.outbox.corrupt_destination(&sibling, &broken);
         events(&mut bia);
 
-        bia.handle(NodeEvent::PeerConnected(sibling));
+        connect_peer(&mut bia, sibling);
 
         let all = events(&mut bia);
         assert!(
@@ -9455,7 +9464,7 @@ mod tests {
         assert!(bia.revocations_checked.contains(&sibling), "on_mls");
 
         assert!(!bia.revocations_checked.contains(&ana_peer));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert!(bia.revocations_checked.contains(&ana_peer), "PeerConnected");
     }
 
