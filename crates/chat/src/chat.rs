@@ -305,12 +305,14 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 const MAX_HELD_KEY_PACKAGES: usize = 64;
 
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
-/// O Peer ID fixado num endereço discado (`.../p2p/<id>`), se houver.
+/// O Peer ID fixado num endereço discado: só vale o `/p2p/<id>` que **termina** o endereço (em circuito,
+/// o destino depois de `/p2p-circuit`). Circuito sem destino ou Peer ID no meio não fixam ninguém, e a
+/// conexão que o libp2p fizer não é a esse peer (auditoria, baixo 4).
 fn pinned_peer(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().fold(None, |last, part| match part {
-        kin_transport::Protocol::P2p(peer) => Some(peer),
-        _ => last,
-    })
+    match addr.iter().last() {
+        Some(kin_transport::Protocol::P2p(peer)) => Some(peer),
+        _ => None,
+    }
 }
 
 fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
@@ -1528,6 +1530,9 @@ impl Chat {
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
                 self.hello_identity.remove(&peer);
+                // Discar vale para esta conexão: se não virou conversa, a permissão não fica aberta
+                // para o peer me discar depois (auditoria, baixo 3). Com conversa, `admits` já passa.
+                self.dialed.remove(&peer);
                 self.held_key_packages.remove(&peer);
                 self.handshake_retries.retain(|(p, _), _| *p != peer);
                 self.announced.remove(&peer);
@@ -1746,11 +1751,7 @@ impl Chat {
     /// revogado desde o `Hello`).
     fn admits(&self, peer: &PeerId) -> Result<bool, Error> {
         if !self.require_invite
-            || self.conversations.contains_key(peer)
-            || self.expected.contains_key(peer)
-            || self.household.contains_key(peer)
-            || self.contact_devices.contains_key(peer)
-            || self.dialed.contains(peer)
+            || self.knows(peer)
             || self
                 .hello_identity
                 .get(peer)
@@ -1762,6 +1763,17 @@ impl Chat {
             Some(token) => self.outbox.invite_token_is_live(token, now_secs()),
             None => Ok(false),
         }
+    }
+
+    /// A identidade que o `KeyPackage`/`Welcome` de `peer` tem de ter: a do convite que eu aceitei, ou, na
+    /// falta dela, a que o certificado do `Hello` autenticou. Sem esta amarração, quem tem as chaves de um
+    /// device de uma identidade confiável passaria pelo portão com o `Hello` dela e abriria a conversa com
+    /// um certificado de outra identidade (auditoria, médio 1). A revogação é conferida no `credential::verify`
+    /// que o `invite`/`join` fazem sobre esse mesmo certificado.
+    fn expected_identity(&self, peer: &PeerId) -> Option<&IdentityId> {
+        self.expected
+            .get(peer)
+            .or_else(|| self.hello_identity.get(peer))
     }
 
     fn on_key_package(&mut self, peer: PeerId, key_package: &[u8]) -> Result<(), Error> {
@@ -1783,7 +1795,7 @@ impl Chat {
         let invite = match conversation.invite(
             key_package,
             &Expected {
-                identity: self.expected.get(&peer),
+                identity: self.expected_identity(&peer),
                 peer: Some(&peer),
             },
         ) {
@@ -1814,7 +1826,7 @@ impl Chat {
             &self.device,
             welcome,
             &Expected {
-                identity: self.expected.get(&peer),
+                identity: self.expected_identity(&peer),
                 peer: Some(&peer),
             },
         )?;
@@ -3178,9 +3190,24 @@ impl Chat {
         }
     }
 
+    /// Já conheço `peer`: tenho conversa, ele é device de uma identidade confiável, eu o disquei ou o
+    /// esperava por convite. É a mesma lista que dispensa o token em [`Chat::admits`], sem a parte do
+    /// certificado do `Hello` (que é dele para mim).
+    fn knows(&self, peer: &PeerId) -> bool {
+        self.conversations.contains_key(peer)
+            || self.expected.contains_key(peer)
+            || self.household.contains_key(peer)
+            || self.contact_devices.contains_key(peer)
+            || self.dialed.contains(peer)
+    }
+
     fn send_hello(&mut self, peer: PeerId) {
         let token = self.hello_tokens.get(&peer).copied();
-        let certificate = Some(self.device.certificate().to_bytes());
+        // Identidade e chave Nostr só a quem já conheço: estranho recebe o `Hello` sem certificado
+        // (auditoria, médio 2; decisão do dono).
+        let certificate = self
+            .knows(&peer)
+            .then(|| self.device.certificate().to_bytes());
         self.transmit(peer, &Envelope::Hello(token, certificate));
     }
 
