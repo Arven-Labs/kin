@@ -4150,6 +4150,38 @@ mod tests {
         assert!(ana.is_ready(&dev_b.peer_id()));
     }
 
+    /// O certificado que o `Hello` leva a `peer` (`None` se foi sem), lido do envelope em voo.
+    fn hello_certificate_sent_to(chat: &mut Chat, peer: PeerId) -> Option<Option<Vec<u8>>> {
+        chat.handshake.clear();
+        chat.send_hello(peer);
+        chat.handshake.values().find_map(|envelope| match envelope {
+            Envelope::Hello(_, certificate) => Some(certificate.clone()),
+            _ => None,
+        })
+    }
+
+    /// P18 PR 3 (auditoria, médio 2; decisão do dono): o certificado (identidade e chave Nostr) só vai no
+    /// `Hello` a quem já conheço. Estranho recebe o `Hello` sem identidade.
+    #[tokio::test]
+    async fn the_hello_certificate_goes_only_to_peers_i_already_know() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let stranger = PeerId::random();
+        assert_eq!(hello_certificate_sent_to(&mut bia, stranger), Some(None));
+
+        // Com conversa (a Ana do `household`), discado por mim ou esperado por convite: leva.
+        let own = Some(bia.device.certificate().to_bytes());
+        assert_eq!(hello_certificate_sent_to(&mut bia, ana_peer), Some(own.clone()));
+        let (dialed, expected) = (PeerId::random(), PeerId::random());
+        bia.dialed.insert(dialed);
+        bia.expected.insert(expected, StandaloneIdentity::generate().id());
+        assert_eq!(hello_certificate_sent_to(&mut bia, dialed), Some(own.clone()));
+        assert_eq!(hello_certificate_sent_to(&mut bia, expected), Some(own));
+    }
+
     /// Auditoria (baixo 3): quem eu disquei e não virou conversa deixa de ser admitido quando a conexão cai.
     #[tokio::test]
     async fn a_dialed_peer_is_forgotten_when_it_disconnects_without_a_conversation() {
