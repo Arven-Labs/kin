@@ -482,7 +482,6 @@ pub struct Chat {
     /// Peers que disseram no `Hello` que **não** têm a conversa que eu tenho com eles (P16): o `KeyPackage`
     /// ou o `Welcome` deles pode, então, substituir a conversa antiga (só com a mesma identidade). Em
     /// memória: cai com a conexão e a conversa pronta.
-    #[allow(dead_code)] // provisório: o uso entra na implementação, depois dos testes
     lost_state: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
@@ -1559,6 +1558,7 @@ impl Chat {
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
                 self.hello_identity.remove(&peer);
+                self.lost_state.remove(&peer);
                 // Discar vale para esta conexão: se não virou conversa, a permissão não fica aberta
                 // para o peer me discar depois (auditoria, baixo 3). Com conversa, `admits` já passa.
                 self.dialed.remove(&peer);
@@ -1667,6 +1667,7 @@ impl Chat {
                 if let Some(peer) = peer {
                     self.expected.remove(&peer);
                     self.dialed.remove(&peer);
+                    self.lost_state.remove(&peer);
                     self.forget_unreachable(&peer);
                     // Falha da rediscagem de fundo é do registro, não da aplicação: um evento por tentativa
                     // (até ~100 por peer e episódio, com os endereços no texto) seria ruído (auditoria S2).
@@ -1697,7 +1698,9 @@ impl Chat {
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
         let result = match envelope {
-            Envelope::Hello(token, certificate) => self.on_hello(peer, token, certificate),
+            Envelope::Hello(token, certificate, has_conversation) => {
+                self.on_hello(peer, token, certificate, has_conversation)
+            }
             Envelope::KeyPackage(kp) => self.on_key_package(peer, &kp),
             Envelope::Welcome(welcome) => self.on_welcome(peer, &welcome),
             Envelope::Mls(wire) => self.on_mls(peer, &wire),
@@ -1713,7 +1716,14 @@ impl Chat {
         peer: PeerId,
         token: Option<[u8; 16]>,
         certificate: Option<Vec<u8>>,
+        has_conversation: Option<bool>,
     ) -> Result<(), Error> {
+        // P16: `peer` diz que não tem a conversa que eu tenho com ele (perdeu o banco). Só marca: a conversa
+        // antiga continua valendo até um `KeyPackage`/`Welcome` novo, da mesma identidade, a substituir.
+        // `None` (formatos antigos do `Hello`) não diz nada.
+        if has_conversation == Some(false) && self.lost_state_candidate(&peer) {
+            self.lost_state.insert(peer);
+        }
         let mut introduced = token.is_some();
         // Um certificado inválido, ou de outro Peer ID, é recusado inteiro (nem o token vale): quem o manda
         // está forjando ou com defeito.
@@ -1726,10 +1736,14 @@ impl Chat {
         }
         // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o token ou
         // a identidade chegou, ele é processado (e guardado de novo se ainda não for admitido).
-        if introduced && let Some(key_package) = self.held_key_packages.remove(&peer) {
+        if (introduced || self.lost_state.contains(&peer))
+            && let Some(key_package) = self.held_key_packages.remove(&peer)
+        {
             return self.on_key_package(peer, &key_package);
         }
-        if !self.conversations.contains_key(&peer) && self.peer_id() > peer {
+        let needs_handshake =
+            !self.conversations.contains_key(&peer) || self.lost_state.contains(&peer);
+        if needs_handshake && self.peer_id() > peer {
             if !self.admits(&peer)? {
                 return Ok(());
             }
@@ -1737,6 +1751,22 @@ impl Chat {
             self.transmit(peer, &Envelope::KeyPackage(kp));
         }
         Ok(())
+    }
+
+    /// Posso marcar `peer` como "perdeu o estado" (P16)? Só com uma conversa **1:1** com ele (a identidade
+    /// da conversa antiga é o que o `KeyPackage` novo tem de repetir) e com vaga (teto de `held`).
+    fn lost_state_candidate(&self, peer: &PeerId) -> bool {
+        (self.lost_state.contains(peer) || self.lost_state.len() < MAX_HELD_KEY_PACKAGES)
+            && self.old_identity(peer).is_some()
+    }
+
+    /// A identidade da conversa 1:1 que tenho com `peer`, se há uma.
+    fn old_identity(&self, peer: &PeerId) -> Option<IdentityId> {
+        let peers = self.conversations.get(peer)?.peers().ok()?;
+        match peers.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// O `Hello` de `peer` trouxe `certificate`. Só vale se a cadeia confere (`verify`) e o Peer ID de rede
@@ -1805,26 +1835,52 @@ impl Chat {
             .or_else(|| self.hello_identity.get(peer))
     }
 
+    /// Guarda (com teto) o `KeyPackage` de `peer` até chegar o `Hello` que o torna utilizável: o `Hello` e o
+    /// `KeyPackage` vão por substreams sem ordem. Serve ao token (P18), à identidade (PR 3a) e ao "não tenho
+    /// conversa" (P16).
+    fn hold_key_package(&mut self, peer: PeerId, key_package: &[u8]) {
+        if key_package.len() <= MAX_HELD_KEY_PACKAGE
+            && (self.held_key_packages.contains_key(&peer)
+                || self.held_key_packages.len() < MAX_HELD_KEY_PACKAGES)
+        {
+            self.held_key_packages.insert(peer, key_package.to_vec());
+        }
+    }
+
     fn on_key_package(&mut self, peer: PeerId, key_package: &[u8]) -> Result<(), Error> {
-        if self.conversations.contains_key(&peer) || self.peer_id() > peer {
+        if self.peer_id() > peer {
+            return Ok(());
+        }
+        // P16: com a conversa antiga e `peer` dizendo que a perdeu, este `KeyPackage` pode substituí-la.
+        let replacing = self.lost_state.contains(&peer) && self.conversations.contains_key(&peer);
+        if self.conversations.contains_key(&peer) && !replacing {
+            // O `Hello` "não tenho conversa" pode ainda não ter chegado: guarda em vez de perder.
+            self.hold_key_package(peer, key_package);
             return Ok(());
         }
         // Erro de leitura do banco conta como "não admitido" (falha fechada) e guarda igual (auditoria, baixo 2).
         if !self.admits(&peer).unwrap_or(false) {
             // Pode ser o `Hello` com o token que ainda não chegou: guarda (com teto) em vez de perder.
-            if key_package.len() <= MAX_HELD_KEY_PACKAGE
-                && (self.held_key_packages.contains_key(&peer)
-                    || self.held_key_packages.len() < MAX_HELD_KEY_PACKAGES)
-            {
-                self.held_key_packages.insert(peer, key_package.to_vec());
-            }
+            self.hold_key_package(peer, key_package);
             return Ok(());
         }
+        // Substituir exige a identidade da conversa antiga; sem ela (a conversa mudou), nada é refeito.
+        let old_identity = if replacing {
+            let Some(identity) = self.old_identity(&peer) else {
+                self.lost_state.remove(&peer);
+                return Ok(());
+            };
+            Some(identity)
+        } else {
+            None
+        };
         let mut conversation = Conversation::create(&self.device)?;
         let invite = match conversation.invite(
             key_package,
             &Expected {
-                identity: self.expected_identity(&peer),
+                identity: old_identity
+                    .as_ref()
+                    .or_else(|| self.expected_identity(&peer)),
                 peer: Some(&peer),
             },
         ) {
@@ -1835,15 +1891,57 @@ impl Chat {
                 if let Err(delete) = conversation.delete() {
                     self.drop_message(peer, delete.into());
                 }
+                // Recusado, a conversa antiga fica intacta e a suspeita de perda acaba aqui (uma por vez).
+                self.lost_state.remove(&peer);
                 return Err(e.into());
             }
         };
         self.transmit(peer, &Envelope::Welcome(invite.welcome));
-        self.ready(peer, conversation)
+        if replacing {
+            self.replace_conversation(peer, conversation)
+        } else {
+            self.ready(peer, conversation)
+        }
+    }
+
+    /// P16: troca a conversa antiga com `peer` pela nova, **já verificada** (identidade e Peer ID da antiga,
+    /// revogação). Descarta o que valia só para o grupo antigo (anúncios, sessões de histórico, mensagens de
+    /// época futura), avisa com `ConversationReset` antes do `ConversationReady`, e só no fim apaga o grupo
+    /// antigo: se o apagamento falhar a conversa nova já funciona e o erro vira `Dropped`. A fila (`outbox`)
+    /// **não** é tocada: o que estava para sair sai pela conversa nova.
+    fn replace_conversation(
+        &mut self,
+        peer: PeerId,
+        conversation: Conversation,
+    ) -> Result<(), Error> {
+        self.lost_state.remove(&peer);
+        let old = self.conversations.remove(&peer);
+        self.future.remove(&peer);
+        self.announced.remove(&peer);
+        self.devices_announced.remove(&peer);
+        self.lists_acted.remove(&peer);
+        self.last_sibling_announce.remove(&peer);
+        self.revocations_checked.remove(&peer);
+        self.sibling_pending.remove(&peer);
+        self.history_requested.remove(&peer);
+        self.history_sessions.remove(&peer);
+        self.history_requests.retain(|_, p| *p != peer);
+        self.queue.push_back(ChatEvent::ConversationReset { peer });
+        self.ready(peer, conversation)?;
+        if let Some(old) = old
+            && let Err(e) = old.delete()
+        {
+            self.drop_message(peer, e.into());
+        }
+        Ok(())
     }
 
     fn on_welcome(&mut self, peer: PeerId, welcome: &[u8]) -> Result<(), Error> {
-        if self.conversations.contains_key(&peer) || self.peer_id() < peer {
+        if self.peer_id() < peer {
+            return Ok(());
+        }
+        let replacing = self.lost_state.contains(&peer) && self.conversations.contains_key(&peer);
+        if self.conversations.contains_key(&peer) && !replacing {
             return Ok(());
         }
         // Repetido aqui de propósito: o token pode ter sido gasto por outro peer ou revogado entre o
@@ -1851,15 +1949,37 @@ impl Chat {
         if !self.admits(&peer)? {
             return Ok(());
         }
-        let conversation = Conversation::join(
+        let old_identity = if replacing {
+            let Some(identity) = self.old_identity(&peer) else {
+                self.lost_state.remove(&peer);
+                return Ok(());
+            };
+            Some(identity)
+        } else {
+            None
+        };
+        let conversation = match Conversation::join(
             &self.device,
             welcome,
             &Expected {
-                identity: self.expected_identity(&peer),
+                identity: old_identity
+                    .as_ref()
+                    .or_else(|| self.expected_identity(&peer)),
                 peer: Some(&peer),
             },
-        )?;
-        self.ready(peer, conversation)?;
+        ) {
+            Ok(conversation) => conversation,
+            Err(e) => {
+                // Recusado, a conversa antiga fica intacta e a suspeita de perda acaba aqui.
+                self.lost_state.remove(&peer);
+                return Err(e.into());
+            }
+        };
+        if replacing {
+            self.replace_conversation(peer, conversation)?;
+        } else {
+            self.ready(peer, conversation)?;
+        }
         // Quem entra por Welcome anuncia primeiro: o convidador já tem a conversa. O convidador só
         // anuncia ao receber algo do outro (ver `on_mls`), porque o Welcome e esta mensagem seguem
         // por substreams diferentes e a ordem de chegada não é garantida.
@@ -2574,6 +2694,7 @@ impl Chat {
         self.held_key_packages.remove(&peer);
         self.hello_identity.remove(&peer);
         self.dialed.remove(&peer);
+        self.lost_state.remove(&peer);
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
         if let Some(token) = self.admitted.remove(&peer)
@@ -3237,7 +3358,9 @@ impl Chat {
         let certificate = self
             .knows(&peer)
             .then(|| self.device.certificate().to_bytes());
-        self.transmit(peer, &Envelope::Hello(token, certificate));
+        // "Tenho conversa com você" (P16): é por este bit que quem tem a conversa percebe que eu a perdi.
+        let has_conversation = Some(self.conversations.contains_key(&peer));
+        self.transmit(peer, &Envelope::Hello(token, certificate, has_conversation));
     }
 
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
@@ -4117,7 +4240,7 @@ mod tests {
         let relay = MemoryRelay::default();
         let stranger = DeviceKey::generate().peer_id();
         MemoryMailbox::new(&relay, stranger)
-            .deposit(bia.peer_id(), Envelope::Hello(None, None).encode());
+            .deposit(bia.peer_id(), Envelope::Hello(None, None, None).encode());
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
 
         let dropped = until(&mut bia, |e| match e {
@@ -4189,7 +4312,12 @@ mod tests {
         ana.trust(id_t.id()).unwrap();
 
         // O `Hello` diz T (aceita); o `KeyPackage` traz X, desconhecida, para as mesmas chaves do device.
-        ana.on_hello(dev_b.peer_id(), None, Some(device_of(&id_t).certificate().to_bytes()))
+        ana.on_hello(
+            dev_b.peer_id(),
+            None,
+            Some(device_of(&id_t).certificate().to_bytes()),
+            None,
+        )
             .unwrap();
         let err = ana
             .on_key_package(dev_b.peer_id(), &device_of(&id_x).key_package().unwrap())
@@ -4211,7 +4339,7 @@ mod tests {
         chat.handshake.clear();
         chat.send_hello(peer);
         chat.handshake.values().find_map(|envelope| match envelope {
-            Envelope::Hello(_, certificate) => Some(certificate.clone()),
+            Envelope::Hello(_, certificate, _) => Some(certificate.clone()),
             _ => None,
         })
     }
@@ -6082,8 +6210,10 @@ mod tests {
         );
         assert!(ana.conversations.get(&b).unwrap().id() == old);
         assert!(!events(&mut ana).iter().any(is_reset));
+        assert!(!ana.lost_state.contains(&b), "a recusa consome a suspeita");
 
         // Com `lost_state`, a mesma identidade: troca, avisa antes do `ConversationReady`.
+        ana.lost_state.insert(b);
         ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
         assert!(ana.conversations.get(&b).unwrap().id() != old);
         let seen = events(&mut ana);
@@ -6110,11 +6240,11 @@ mod tests {
         let certificate = certificate_for(&ana_key);
         let owner = certificate.network_peer_id();
 
-        let forged = bia.on_hello(PeerId::random(), None, Some(certificate.to_bytes()));
+        let forged = bia.on_hello(PeerId::random(), None, Some(certificate.to_bytes()), None);
         assert!(matches!(forged, Err(Error::Malformed)), "{forged:?}");
         assert!(bia.hello_identity.is_empty());
 
-        bia.on_hello(owner, None, Some(certificate.to_bytes()))
+        bia.on_hello(owner, None, Some(certificate.to_bytes()), None)
             .unwrap();
         assert_eq!(bia.hello_identity.get(&owner), Some(&ana_key.id()));
     }
@@ -6125,7 +6255,7 @@ mod tests {
         let Household { mut bia, .. } = household();
         for bytes in [vec![], vec![0; 8], vec![0xFF; 4096]] {
             let peer = PeerId::random();
-            let result = bia.on_hello(peer, None, Some(bytes));
+            let result = bia.on_hello(peer, None, Some(bytes), None);
             assert!(matches!(result, Err(Error::Malformed)), "{result:?}");
             assert!(bia.hello_identity.is_empty());
         }
@@ -6143,9 +6273,9 @@ mod tests {
         bia.set_require_invite(true);
         let (ana_cert, own_cert) = (certificate_for(&ana_key), certificate_for(&bia_key));
         let (ana_peer, own_peer) = (ana_cert.network_peer_id(), own_cert.network_peer_id());
-        bia.on_hello(ana_peer, None, Some(ana_cert.to_bytes()))
+        bia.on_hello(ana_peer, None, Some(ana_cert.to_bytes()), None)
             .unwrap();
-        bia.on_hello(own_peer, None, Some(own_cert.to_bytes()))
+        bia.on_hello(own_peer, None, Some(own_cert.to_bytes()), None)
             .unwrap();
 
         assert!(!bia.admits(&ana_peer).unwrap(), "desconhecida sem token");
@@ -6799,7 +6929,7 @@ mod tests {
         bia.announced.insert(ana_peer);
         bia.devices_announced.insert(ana_peer);
 
-        bia.transmit(ana_peer, &Envelope::Hello(None, None));
+        bia.transmit(ana_peer, &Envelope::Hello(None, None, None));
         let chat_id = *bia.pending.keys().next().unwrap();
         bia.pending
             .insert(chat_id, Some(MessageId::from_bytes([7; 16])));
@@ -6811,7 +6941,7 @@ mod tests {
         assert!(bia.announced.contains(&ana_peer), "mensagem de chat");
         assert!(bia.devices_announced.contains(&ana_peer));
 
-        bia.transmit(ana_peer, &Envelope::Hello(None, None));
+        bia.transmit(ana_peer, &Envelope::Hello(None, None, None));
         let control_id = *bia.pending.keys().next().unwrap();
         bia.handle(NodeEvent::SendFailed {
             peer: ana_peer,
@@ -9869,7 +9999,7 @@ mod tests {
         assert_eq!(r.bia.pending.len(), before, "nada foi transmitido");
         assert!(r.bia.handshake_retries.is_empty());
         r.bia
-            .resend_handshake(r.ana_peer, Envelope::Hello(None, None));
+            .resend_handshake(r.ana_peer, Envelope::Hello(None, None, None));
         assert!(
             !r.bia.handshake_retries.is_empty(),
             "o Hello continua saindo"
