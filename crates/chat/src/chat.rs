@@ -2444,9 +2444,7 @@ impl Chat {
         // `Hello`, para um handshake que falha no meio não queimar o link de quem convidei.
         self.hello_tokens.remove(&peer);
         self.held_key_packages.remove(&peer);
-        if let Some(token) = self.admitted.remove(&peer) {
-            self.outbox.take_invite_token(&token, now_secs())?;
-        }
+        if let Some(_token) = self.admitted.remove(&peer) {}
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.
         self.flush(peer);
