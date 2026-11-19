@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -459,6 +459,13 @@ pub struct Chat {
     /// Peers que apresentaram, no `Hello`, um token vivo de convite meu. O token só é gasto em `ready`.
     /// Em memória: cai com a conexão, e o `Hello` seguinte o apresenta de novo.
     admitted: HashMap<PeerId, [u8; 16]>,
+    /// Identidade de quem se apresentou no `Hello` com um certificado cuja cadeia confere e cujo Peer ID de
+    /// rede é o da conexão (P18 PR 3, ADR 0039). É por ela que o portão admite a minha identidade e as
+    /// aceitas por `trust`, sem token. Em memória: cai com a conexão e a conversa pronta.
+    hello_identity: HashMap<PeerId, IdentityId>,
+    /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
+    /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
+    dialed: HashSet<PeerId>,
     /// `KeyPackage` recusado só por falta de token: o `Hello` com o token e o `KeyPackage` vão por
     /// substreams diferentes, sem ordem garantida. Guardado até o token chegar (ou a conexão cair).
     held_key_packages: HashMap<PeerId, Vec<u8>>,
@@ -699,6 +706,8 @@ impl Chat {
             require_invite: false,
             hello_tokens: HashMap::new(),
             admitted: HashMap::new(),
+            hello_identity: HashMap::new(),
+            dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
             outbox,
@@ -775,8 +784,22 @@ impl Chat {
 
     /// Conecta direto ou, se `addr` for um endereço de circuito (`.../p2p-circuit/p2p/<peer>`), por
     /// um relay.
+    ///
+    /// Com o portão ([`Chat::set_require_invite`]) ligado, discar com o Peer ID fixado (`/p2p/<id>`, o
+    /// último do endereço) admite esse peer sem token: o ato é seu, e o outro lado prova o Peer ID no
+    /// handshake. Sem `/p2p/<id>` não há quem admitir e o portão segue valendo (ADR 0039).
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), Error> {
-        Ok(self.node.dial(addr)?)
+        let pinned = addr.iter().fold(None, |last, part| match part {
+            kin_transport::Protocol::P2p(peer) => Some(peer),
+            _ => last,
+        });
+        self.node.dial(addr)?;
+        if let Some(peer) = pinned
+            && (self.dialed.contains(&peer) || self.dialed.len() < MAX_KNOWN_DEVICES)
+        {
+            self.dialed.insert(peer);
+        }
+        Ok(())
     }
 
     /// Endereço pelo qual outros discam este nó através do relay `relay_addr`.
@@ -1499,6 +1522,7 @@ impl Chat {
                 self.retry.remove(&peer);
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
+                self.hello_identity.remove(&peer);
                 self.held_key_packages.remove(&peer);
                 self.handshake_retries.retain(|(p, _), _| *p != peer);
                 self.announced.remove(&peer);
@@ -1603,6 +1627,7 @@ impl Chat {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
                     self.expected.remove(&peer);
+                    self.dialed.remove(&peer);
                     self.forget_unreachable(&peer);
                     // Falha da rediscagem de fundo é do registro, não da aplicação: um evento por tentativa
                     // (até ~100 por peer e episódio, com os endereços no texto) seria ruído (auditoria S2).
@@ -1633,7 +1658,7 @@ impl Chat {
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
         let result = match envelope {
-            Envelope::Hello(token) => self.on_hello(peer, token),
+            Envelope::Hello(token, certificate) => self.on_hello(peer, token, certificate),
             Envelope::KeyPackage(kp) => self.on_key_package(peer, &kp),
             Envelope::Welcome(welcome) => self.on_welcome(peer, &welcome),
             Envelope::Mls(wire) => self.on_mls(peer, &wire),
@@ -1644,14 +1669,26 @@ impl Chat {
     }
 
     /// Só o de maior Peer ID responde com KeyPackage; o de menor convida (evita convite duplo).
-    fn on_hello(&mut self, peer: PeerId, token: Option<[u8; 16]>) -> Result<(), Error> {
+    fn on_hello(
+        &mut self,
+        peer: PeerId,
+        token: Option<[u8; 16]>,
+        certificate: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        let mut introduced = token.is_some();
+        // Um certificado inválido, ou de outro Peer ID, é recusado inteiro (nem o token vale): quem o manda
+        // está forjando ou com defeito.
+        if let Some(certificate) = certificate {
+            self.note_hello_identity(peer, &certificate)?;
+            introduced = true;
+        }
         if let Some(token) = token {
             self.note_invite_token(peer, token)?;
-            // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o
-            // token chegou, ele é processado.
-            if let Some(key_package) = self.held_key_packages.remove(&peer) {
-                return self.on_key_package(peer, &key_package);
-            }
+        }
+        // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o token ou
+        // a identidade chegou, ele é processado (e guardado de novo se ainda não for admitido).
+        if introduced && let Some(key_package) = self.held_key_packages.remove(&peer) {
+            return self.on_key_package(peer, &key_package);
         }
         if !self.conversations.contains_key(&peer) && self.peer_id() > peer {
             if !self.admits(&peer)? {
@@ -1659,6 +1696,22 @@ impl Chat {
             }
             let kp = self.device.key_package()?;
             self.transmit(peer, &Envelope::KeyPackage(kp));
+        }
+        Ok(())
+    }
+
+    /// O `Hello` de `peer` trouxe `certificate`. Só vale se a cadeia confere (`verify`) e o Peer ID de rede
+    /// certificado é o da conexão, que o libp2p já autenticou: sem isso, qualquer um repetiria o certificado
+    /// de uma identidade confiável. Guarda a identidade para o portão (`admits`). Não confere revogação:
+    /// isso é do `Conversation::invite`/`join`, que vêm depois do portão.
+    fn note_hello_identity(&mut self, peer: PeerId, certificate: &[u8]) -> Result<(), Error> {
+        let certificate = DeviceCertificate::from_bytes(certificate).map_err(|_| Error::Malformed)?;
+        if certificate.verify().is_err() || certificate.network_peer_id() != peer {
+            return Err(Error::Malformed);
+        }
+        if self.hello_identity.contains_key(&peer) || self.hello_identity.len() < MAX_HELD_KEY_PACKAGES {
+            self.hello_identity
+                .insert(peer, certificate.identity().clone());
         }
         Ok(())
     }
@@ -1682,14 +1735,21 @@ impl Chat {
     }
 
     /// `peer` pode abrir conversa comigo? Sem a exigência, sempre. Com ela, só quem já tem conversa, quem
-    /// eu discei por convite, os devices de uma identidade confiável, ou quem apresentou um token que
-    /// **ainda** está vivo (outro peer pode tê-lo gastado ou eu o ter revogado desde o `Hello`).
+    /// eu discei (por convite ou por `dial` com Peer ID fixado), os devices de uma identidade confiável
+    /// (por lista ou pelo certificado autenticado do `Hello`: a minha identidade e as aceitas por `trust`),
+    /// ou quem apresentou um token que **ainda** está vivo (outro peer pode tê-lo gastado ou eu o ter
+    /// revogado desde o `Hello`).
     fn admits(&self, peer: &PeerId) -> Result<bool, Error> {
         if !self.require_invite
             || self.conversations.contains_key(peer)
             || self.expected.contains_key(peer)
             || self.household.contains_key(peer)
             || self.contact_devices.contains_key(peer)
+            || self.dialed.contains(peer)
+            || self
+                .hello_identity
+                .get(peer)
+                .is_some_and(|identity| self.is_trusted(identity))
         {
             return Ok(true);
         }
@@ -2466,6 +2526,8 @@ impl Chat {
         // `Hello`, para um handshake que falha no meio não queimar o link de quem convidei.
         self.hello_tokens.remove(&peer);
         self.held_key_packages.remove(&peer);
+        self.hello_identity.remove(&peer);
+        self.dialed.remove(&peer);
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
         if let Some(token) = self.admitted.remove(&peer)
@@ -3113,7 +3175,8 @@ impl Chat {
 
     fn send_hello(&mut self, peer: PeerId) {
         let token = self.hello_tokens.get(&peer).copied();
-        self.transmit(peer, &Envelope::Hello(token));
+        let certificate = Some(self.device.certificate().to_bytes());
+        self.transmit(peer, &Envelope::Hello(token, certificate));
     }
 
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
@@ -3147,7 +3210,7 @@ impl Chat {
         self.pending.insert(id, None);
         if matches!(
             envelope,
-            Envelope::Hello(_) | Envelope::KeyPackage(_) | Envelope::Welcome(_)
+            Envelope::Hello(..) | Envelope::KeyPackage(_) | Envelope::Welcome(_)
         ) {
             self.handshake.insert(id, envelope.clone());
         }
@@ -3992,7 +4055,8 @@ mod tests {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
         let relay = MemoryRelay::default();
         let stranger = DeviceKey::generate().peer_id();
-        MemoryMailbox::new(&relay, stranger).deposit(bia.peer_id(), Envelope::Hello(None).encode());
+        MemoryMailbox::new(&relay, stranger)
+            .deposit(bia.peer_id(), Envelope::Hello(None, None).encode());
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
 
         let dropped = until(&mut bia, |e| match e {
@@ -6428,7 +6492,7 @@ mod tests {
         bia.announced.insert(ana_peer);
         bia.devices_announced.insert(ana_peer);
 
-        bia.transmit(ana_peer, &Envelope::Hello(None));
+        bia.transmit(ana_peer, &Envelope::Hello(None, None));
         let chat_id = *bia.pending.keys().next().unwrap();
         bia.pending
             .insert(chat_id, Some(MessageId::from_bytes([7; 16])));
@@ -6440,7 +6504,7 @@ mod tests {
         assert!(bia.announced.contains(&ana_peer), "mensagem de chat");
         assert!(bia.devices_announced.contains(&ana_peer));
 
-        bia.transmit(ana_peer, &Envelope::Hello(None));
+        bia.transmit(ana_peer, &Envelope::Hello(None, None));
         let control_id = *bia.pending.keys().next().unwrap();
         bia.handle(NodeEvent::SendFailed {
             peer: ana_peer,
@@ -9497,7 +9561,8 @@ mod tests {
 
         assert_eq!(r.bia.pending.len(), before, "nada foi transmitido");
         assert!(r.bia.handshake_retries.is_empty());
-        r.bia.resend_handshake(r.ana_peer, Envelope::Hello(None));
+        r.bia
+            .resend_handshake(r.ana_peer, Envelope::Hello(None, None));
         assert!(
             !r.bia.handshake_retries.is_empty(),
             "o Hello continua saindo"

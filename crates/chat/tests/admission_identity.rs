@@ -10,7 +10,7 @@ mod common;
 use common::{connect_until_ready, listen, settle};
 use kin_chat::Chat;
 use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
-use kin_transport::NodeConfig;
+use kin_transport::{Multiaddr, NodeConfig, Protocol};
 use std::time::Duration;
 
 struct P {
@@ -130,17 +130,38 @@ async fn a_new_device_of_my_own_identity_passes_without_a_token() {
     }
 }
 
-/// Quem **eu** disco é admitido (discar é um ato meu): a Ana, com o portão ligado, disca a Bia.
+/// O endereço de `p` com o Peer ID fixado (`/p2p/<id>`), como a CLI recebe em `--dial`.
+async fn pinned_addr(p: &mut P) -> Multiaddr {
+    let addr = listen(&mut p.chat).await;
+    addr.with(Protocol::P2p(p.device.peer_id()))
+}
+
+/// Quem **eu** disco, com o Peer ID fixado no endereço, é admitido (discar é um ato meu): a Ana, com o
+/// portão ligado, disca a Bia.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_peer_i_dialed_is_admitted_without_a_token() {
+async fn a_peer_i_dialed_by_its_peer_id_is_admitted_without_a_token() {
+    for ana_lower in [true, false] {
+        let (mut ana, mut bia) = pair(ana_lower);
+        ana.chat.set_require_invite(true);
+        let addr = pinned_addr(&mut bia).await;
+
+        ana.chat.dial(addr).unwrap();
+        connect_until_ready(&mut ana.chat, &mut bia.chat).await;
+        assert!(ready_between(&ana, &bia), "ana_lower={ana_lower}");
+    }
+}
+
+/// Endereço **sem** `/p2p/<id>`: não há Peer ID para admitir, então não vale como autorização.
+#[tokio::test(flavor = "multi_thread")]
+async fn dialing_an_address_without_a_peer_id_admits_nobody() {
     for ana_lower in [true, false] {
         let (mut ana, mut bia) = pair(ana_lower);
         ana.chat.set_require_invite(true);
         let addr = listen(&mut bia.chat).await;
 
         ana.chat.dial(addr).unwrap();
-        connect_until_ready(&mut ana.chat, &mut bia.chat).await;
-        assert!(ready_between(&ana, &bia), "ana_lower={ana_lower}");
+        settle(&mut ana.chat, &mut bia.chat, SHORT).await;
+        assert!(!ready_between(&ana, &bia), "ana_lower={ana_lower}");
     }
 }
 
@@ -152,7 +173,7 @@ async fn dialing_someone_does_not_admit_a_different_stranger() {
         let (mut ana, mut bia) = pair(ana_lower);
         let mut caio = person();
         ana.chat.set_require_invite(true);
-        let caio_addr = listen(&mut caio.chat).await;
+        let caio_addr = pinned_addr(&mut caio).await;
         ana.chat.dial(caio_addr).unwrap();
         let addr = listen(&mut ana.chat).await;
 
