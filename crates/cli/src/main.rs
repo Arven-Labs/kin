@@ -16,9 +16,12 @@
 //! `ws://` só para o próprio computador; repetível), senão de `<data-dir>/relays.txt` (uma URL por linha,
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
 //! O link do `/invite` é de **uso único** (P18, ADR 0039): `/invites` lista os vivos (id e tempo restante) e
-//! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device). Com
-//! `--require-invite`, quem não é conhecido só abre conversa se apresentar o token de um convite seu;
-//! **desligado por padrão**: ligado, `--dial` simples e o pareamento de devices ainda não passam.
+//! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device).
+//! **Portão de admissão, fechado por padrão** (P18 PR 3b): quem não é conhecido só abre conversa se
+//! apresentar o token de um convite seu. Conhecido é quem já tem conversa, quem eu aceitei por link, quem
+//! eu disquei com `--dial` **com o Peer ID** (`/p2p/<id>`; sem ele ninguém é admitido) e os devices de uma
+//! identidade minha ou aceita por `/trust`. `--open-admission` abre mão do portão. Dois devices que só se
+//! acharam por mDNS não passam sozinhos: usam `--dial` com Peer ID ou um link.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -68,9 +71,20 @@ struct Args {
     serve_relay: bool,
     relay_limits: RelayLimits,
     mdns: bool,
-    /// `--require-invite`: só abre conversa com quem é conhecido ou apresenta um token de convite meu
-    /// (P18, ADR 0039). Desligado por padrão: ligado, `--dial` simples e o pareamento ainda não passam.
-    require_invite: bool,
+    /// `--open-admission`: abre mão do portão (P18 PR 3b, ADR 0039). Sem ela, só abre conversa quem é
+    /// conhecido (conversa, convite aceito, `--dial` com Peer ID, identidade minha ou aceita) ou apresenta
+    /// o token de um convite meu.
+    open_admission: bool,
+}
+
+/// Em que modo de admissão o kin subiu (auditoria do PR 3b, baixo 1): o portão fechado recusa estranhos
+/// em silêncio, então o usuário precisa saber que ele está ligado, ou desligado.
+fn admission_notice(open_admission: bool) -> &'static str {
+    if open_admission {
+        "aviso: admissão aberta (--open-admission): qualquer peer que conectar abre conversa"
+    } else {
+        "admissão: fechada; abre conversa quem tem conversa, convite seu, --dial com Peer ID ou identidade aceita (--open-admission abre)"
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -100,7 +114,7 @@ fn parse_from(
         serve_relay: false,
         relay_limits: RelayLimits::default(),
         mdns: true,
-        require_invite: false,
+        open_admission: false,
     };
     let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
@@ -133,7 +147,7 @@ fn parse_from(
                 args.relay_limits.max_circuits = value()?.parse().map_err(|e| format!("{e}"))?;
             }
             "--no-mdns" => args.mdns = false,
-            "--require-invite" => args.require_invite = true,
+            "--open-admission" => args.open_admission = true,
             other => return Err(format!("argumento desconhecido: {other}")),
         }
     }
@@ -281,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--require-invite]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -305,7 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // contra a identidade de `primary.id` a cada abertura.
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
-    chat.set_require_invite(args.require_invite);
+    chat.set_require_invite(!args.open_admission);
     keys::ensure_current_issuer(&identity, chat.certificate())?;
     if let Some(notice) = keys::notice_for(&identity) {
         eprintln!("{notice}");
@@ -324,6 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         chat.peer_id()
     );
+    println!("{}", admission_notice(args.open_admission));
     if !args.no_nostr {
         let choice = resolve_relays(&args.nostr_relays, &args.data_dir.join("relays.txt"))?;
         let origin = match choice.source {
@@ -988,15 +1003,29 @@ mod tests {
     }
 
     #[test]
-    fn require_invite_is_off_by_default_and_the_flag_turns_it_on() {
-        assert!(!parse(&[], None).unwrap().require_invite);
+    fn admission_is_closed_by_default_and_open_admission_opens_it() {
+        assert!(!parse(&[], None).unwrap().open_admission);
         assert!(
-            parse(&["--require-invite"], None).unwrap().require_invite,
+            parse(&["--open-admission"], None).unwrap().open_admission,
             "a flag foi aceita mas não guardada"
         );
         // convive com as outras flags, em qualquer ordem
-        let args = parse(&["--no-mdns", "--require-invite", "--no-nostr"], None).unwrap();
-        assert!(args.require_invite && !args.mdns && args.no_nostr);
+        let args = parse(&["--no-mdns", "--open-admission", "--no-nostr"], None).unwrap();
+        assert!(args.open_admission && !args.mdns && args.no_nostr);
+    }
+
+    /// O modo de admissão aparece na partida: aberto como aviso, fechado como informação.
+    #[test]
+    fn the_admission_mode_is_announced_at_startup() {
+        let open = admission_notice(true);
+        assert!(open.starts_with("aviso:") && open.contains("aberta"));
+        assert!(admission_notice(false).contains("fechada"));
+    }
+
+    /// `--require-invite` virou o padrão (PR 3b): a flag antiga some, e quem a passava vê um erro claro.
+    #[test]
+    fn the_old_require_invite_flag_is_gone() {
+        assert!(parse(&["--require-invite"], None).is_err());
     }
 
     #[test]

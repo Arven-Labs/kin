@@ -67,7 +67,9 @@ infra() { # nat [relay2]
 setup() {
   infra "$1" || return 1
 
-  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
+  # Estes cenários testam NAT e transporte, não a admissão: o `b` disca o `a` sem link, então o `a` abre mão
+  # do portão (P18 PR 3b). Os cenários de convite, multi-device, pareado e revogação o deixam fechado.
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission"
   compose up -d a >/dev/null || return 1
   wait_log a "reserva aceita no relay" 30 || { echo "a não conseguiu reserva no relay"; logs a; return 1; }
   A_CIRCUIT=$(first a "/ip4/203.0.113.10/$RELAY_PROTO/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+")
@@ -197,10 +199,10 @@ scenario_invite() {
   fi
 }
 
-# `a` (com `--require-invite`) gera um convite e devolve o link em LINK e o id do convite em INVITE_ID.
+# `a` (com o portão fechado, que é o padrão) gera um convite e devolve o link em LINK e o id em INVITE_ID.
 invite_setup() {
   infra cone || { fail "montar o laboratório"; return 1; }
-  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --require-invite"
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
   compose up -d a >/dev/null
   wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; return 1; }
   A_ID=$(peer_id a)
