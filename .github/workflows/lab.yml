@@ -73,6 +73,8 @@ jobs:
           - lossy
           - relay-down
           - invite
+          - invite-single-use
+          - invite-revoked
           - relay-failover
           - multi-device
           - multi-device-plain

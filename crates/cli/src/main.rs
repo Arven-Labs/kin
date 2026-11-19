@@ -15,6 +15,10 @@
 //! buscadas ao voltar (só com conversa já fechada). Os relays vêm de `--nostr-relay URL` (`wss://...`;
 //! `ws://` só para o próprio computador; repetível), senão de `<data-dir>/relays.txt` (uma URL por linha,
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
+//! O link do `/invite` é de **uso único** (P18, ADR 0039): `/invites` lista os vivos (id e tempo restante) e
+//! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device). Com
+//! `--require-invite`, quem não é conhecido só abre conversa se apresentar o token de um convite seu;
+//! **desligado por padrão**: ligado, `--dial` simples e o pareamento de devices ainda não passam.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -43,7 +47,8 @@ mod pair;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{
-    Chat, ChatEvent, DEFAULT_INVITE_TTL, Error, HistoryEntry, Invite, Message, MessageId,
+    Chat, ChatEvent, DEFAULT_INVITE_TTL, Error, HistoryEntry, Invite, LiveInvite, Message,
+    MessageId,
 };
 use kin_identity::{DeviceKey, IdentityId};
 use kin_transport::{Multiaddr, Node, NodeConfig, NodeEvent, PeerId, RelayLimits};
@@ -63,6 +68,9 @@ struct Args {
     serve_relay: bool,
     relay_limits: RelayLimits,
     mdns: bool,
+    /// `--require-invite`: só abre conversa com quem é conhecido ou apresenta um token de convite meu
+    /// (P18, ADR 0039). Desligado por padrão: ligado, `--dial` simples e o pareamento ainda não passam.
+    require_invite: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -92,6 +100,7 @@ fn parse_from(
         serve_relay: false,
         relay_limits: RelayLimits::default(),
         mdns: true,
+        require_invite: false,
     };
     let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
@@ -124,6 +133,7 @@ fn parse_from(
                 args.relay_limits.max_circuits = value()?.parse().map_err(|e| format!("{e}"))?;
             }
             "--no-mdns" => args.mdns = false,
+            "--require-invite" => args.require_invite = true,
             other => return Err(format!("argumento desconhecido: {other}")),
         }
     }
@@ -271,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--require-invite]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -295,6 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // contra a identidade de `primary.id` a cada abertura.
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
+    chat.set_require_invite(args.require_invite);
     keys::ensure_current_issuer(&identity, chat.certificate())?;
     if let Some(notice) = keys::notice_for(&identity) {
         eprintln!("{notice}");
@@ -364,6 +375,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if line == "/invite" {
                     print_invite(&mut chat);
+                    continue;
+                }
+                if line == "/invites" {
+                    println!("{}", invites_reply(&chat.invites(), now_secs()));
+                    continue;
+                }
+                if line == "/revoke-invite" || line.starts_with("/revoke-invite ") {
+                    let prefix = line.strip_prefix("/revoke-invite").unwrap_or("").trim();
+                    println!("{}", revoke_invite_reply(prefix, chat.revoke_invite(prefix)));
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
@@ -464,9 +484,52 @@ fn print_invite(chat: &mut Chat) {
         Err(e) => println!("(não deu para gerar o QR: {e})"),
     }
     println!(
-        "convite (válido por {} h): {link}",
+        "convite (válido por {} h, uso único): {link}",
         DEFAULT_INVITE_TTL.as_secs() / 3600
     );
+}
+
+/// Segundos desde a época Unix (0 se o relógio do sistema falhar).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Resposta de `/invites`: um convite vivo por linha, com o `id` que `/revoke-invite` aceita e quanto
+/// falta para vencer; ou o aviso de que não há nenhum.
+fn invites_reply(invites: &[LiveInvite], now: u64) -> String {
+    if invites.is_empty() {
+        return "(nenhum convite vivo)".to_string();
+    }
+    invites
+        .iter()
+        .map(|invite| {
+            let left = time_left(invite.expires_at.saturating_sub(now));
+            format!("convite {}: vence em {left}", invite.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Tempo restante em linguagem humana: `23 h 59 min`, `5 min` ou `menos de 1 min`.
+fn time_left(secs: u64) -> String {
+    match (secs / 3600, secs % 3600 / 60) {
+        (0, 0) => "menos de 1 min".to_string(),
+        (0, minutes) => format!("{minutes} min"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
+/// Resposta de `/revoke-invite PREFIXO` a partir do resultado de `Chat::revoke_invite`.
+fn revoke_invite_reply(prefix: &str, result: Result<bool, Error>) -> String {
+    match result {
+        Ok(true) => format!("convite {prefix} revogado"),
+        Ok(false) => format!("(nenhum convite vivo começa por {prefix})"),
+        // Curto demais (mínimo de 4 caracteres) ou que bate em mais de um: a biblioteca não distingue.
+        Err(Error::InvalidInvite) => "(prefixo curto demais (mínimo de 4 caracteres) ou que bate em mais de um convite: veja os ids com /invites)".to_string(),
+        Err(e) => format!("(não deu para revogar: {e})"),
+    }
 }
 
 /// Abre um link de convite: disca o dono e exige a identidade do convite.
@@ -913,6 +976,89 @@ mod tests {
 
     fn parse(argv: &[&str], env: Option<&str>) -> Result<Args, String> {
         parse_from(argv.iter().map(|s| s.to_string()), env.map(str::to_string))
+    }
+
+    // ---- convite com token de uso único (P18, ADR 0039) ----
+
+    fn live(id: &str, expires_at: u64) -> LiveInvite {
+        LiveInvite {
+            id: id.to_string(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn require_invite_is_off_by_default_and_the_flag_turns_it_on() {
+        assert!(!parse(&[], None).unwrap().require_invite);
+        assert!(
+            parse(&["--require-invite"], None).unwrap().require_invite,
+            "a flag foi aceita mas não guardada"
+        );
+        // convive com as outras flags, em qualquer ordem
+        let args = parse(&["--no-mdns", "--require-invite", "--no-nostr"], None).unwrap();
+        assert!(args.require_invite && !args.mdns && args.no_nostr);
+    }
+
+    #[test]
+    fn slash_invites_without_any_invite_says_so() {
+        let text = invites_reply(&[], 1_000);
+        assert!(text.contains("nenhum convite"), "{text:?}");
+    }
+
+    #[test]
+    fn slash_invites_lists_each_id_with_the_time_left() {
+        let now = 1_000_000;
+        let text = invites_reply(
+            &[
+                live("a1b2c3d4", now + 24 * 3600 - 60),
+                live("0f0f0f0f", now + 90 * 60),
+                live("deadbeef", now + 5 * 60),
+                live("cafe0001", now + 20),
+            ],
+            now,
+        );
+        assert_eq!(text.lines().count(), 4, "uma linha por convite: {text}");
+        for (id, left) in [
+            ("a1b2c3d4", "23 h 59 min"),
+            ("0f0f0f0f", "1 h 30 min"),
+            ("deadbeef", "5 min"),
+            ("cafe0001", "menos de 1 min"),
+        ] {
+            let line = text.lines().find(|l| l.contains(id)).expect(id);
+            assert!(line.contains(left), "{id} deveria mostrar {left:?}: {line}");
+        }
+    }
+
+    #[test]
+    fn slash_invites_never_prints_a_link_or_more_than_the_id() {
+        let text = invites_reply(&[live("a1b2c3d4", 2_000)], 1_000);
+        assert!(!text.contains("kin://"), "{text}");
+        assert!(text.contains("a1b2c3d4"), "{text}");
+    }
+
+    #[test]
+    fn slash_revoke_invite_replies_for_each_outcome() {
+        let revoked = revoke_invite_reply("a1b2", Ok(true));
+        assert!(
+            revoked.contains("revogado") && revoked.contains("a1b2"),
+            "{revoked}"
+        );
+
+        let none = revoke_invite_reply("zzzz", Ok(false));
+        assert!(
+            none.contains("nenhum convite") && none.contains("zzzz"),
+            "{none}"
+        );
+
+        // Prefixo curto ou ambíguo: o erro da biblioteca vira uma dica que diz o mínimo.
+        let invalid = revoke_invite_reply("a1", Err(Error::InvalidInvite));
+        assert!(
+            invalid.contains('4') && invalid.contains("mais de um"),
+            "{invalid}"
+        );
+
+        let other = revoke_invite_reply("a1b2", Err(Error::Malformed));
+        assert!(other.contains("não deu para revogar"), "{other}");
     }
 
     // ---- remoção da cópia da mestra (P30 fatia 6, ADR 0035) ----
