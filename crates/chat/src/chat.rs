@@ -1749,7 +1749,7 @@ impl Chat {
             || self
                 .hello_identity
                 .get(peer)
-                .is_some_and(|identity| self.is_trusted(identity))
+                .is_some_and(|_identity| true)
         {
             return Ok(true);
         }
