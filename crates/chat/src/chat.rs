@@ -19,7 +19,7 @@ use crate::outbox::{EntryKind, Outbox, SeenKind};
 use crate::payload::{HISTORY_CHUNK_BUDGET, HistoryItem, MAX_DECODED_HISTORY, Payload};
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
-use crate::{Error, HistoryEntry, Invite, Message, MessageId};
+use crate::{Error, HistoryEntry, Invite, LiveInvite, Message, MessageId};
 
 /// O que o [`Chat`] avisa à aplicação.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -772,10 +772,33 @@ impl Chat {
     /// Link de convite deste device com os endereços `addrs`, válido por `ttl` a partir de agora e
     /// assinado pela chave de rede do device (P18). `ttl` passa de [`MAX_INVITE_TTL`] menos 5 minutos
     /// vira esse teto (folga para relógios desencontrados): quem lê recusa validade além de 7 dias.
-    pub fn invite_link(&self, addrs: Vec<Multiaddr>, ttl: Duration) -> String {
+    pub fn invite_link(&mut self, addrs: Vec<Multiaddr>, ttl: Duration) -> Result<String, Error> {
+        // STUB (testes primeiro): ainda emite o v2, sem token e sem gravar nada.
         let ttl = ttl.min(MAX_INVITE_TTL - INVITE_CLOCK_SLACK);
-        self.invite(addrs)
-            .to_link(&self.signer, now_secs().saturating_add(ttl.as_secs()))
+        Ok(self
+            .invite(addrs)
+            .to_link(&self.signer, now_secs().saturating_add(ttl.as_secs())))
+    }
+
+    /// Convites emitidos por este device que ainda não foram usados nem venceram (P18, ADR 0039).
+    pub fn invites(&self) -> Vec<LiveInvite> {
+        // STUB (testes primeiro).
+        Vec::new()
+    }
+
+    /// Revoga o convite vivo cujo `id` começa por `prefix`. `Ok(false)` se nenhum bate; prefixo vazio
+    /// ou que bate em mais de um é `Error::InvalidInvite` (nada é revogado por engano).
+    pub fn revoke_invite(&mut self, prefix: &str) -> Result<bool, Error> {
+        // STUB (testes primeiro).
+        let _ = prefix;
+        Ok(false)
+    }
+
+    /// Com `true`, quem não é conhecido só abre conversa se apresentar um token vivo de um convite meu
+    /// (P18, ADR 0039). Padrão `false`: a biblioteca segue aberta; o aplicativo liga a exigência.
+    pub fn set_require_invite(&mut self, require: bool) {
+        // STUB (testes primeiro).
+        let _ = require;
     }
 
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e
@@ -1533,7 +1556,7 @@ impl Chat {
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
         let result = match envelope {
-            Envelope::Hello => self.on_hello(peer),
+            Envelope::Hello(_) => self.on_hello(peer),
             Envelope::KeyPackage(kp) => self.on_key_package(peer, &kp),
             Envelope::Welcome(welcome) => self.on_welcome(peer, &welcome),
             Envelope::Mls(wire) => self.on_mls(peer, &wire),
@@ -2938,7 +2961,7 @@ impl Chat {
     }
 
     fn send_hello(&mut self, peer: PeerId) {
-        self.transmit(peer, &Envelope::Hello);
+        self.transmit(peer, &Envelope::Hello(None));
     }
 
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
@@ -2972,7 +2995,7 @@ impl Chat {
         self.pending.insert(id, None);
         if matches!(
             envelope,
-            Envelope::Hello | Envelope::KeyPackage(_) | Envelope::Welcome(_)
+            Envelope::Hello(_) | Envelope::KeyPackage(_) | Envelope::Welcome(_)
         ) {
             self.handshake.insert(id, envelope.clone());
         }
@@ -3808,7 +3831,7 @@ mod tests {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
         let relay = MemoryRelay::default();
         let stranger = DeviceKey::generate().peer_id();
-        MemoryMailbox::new(&relay, stranger).deposit(bia.peer_id(), Envelope::Hello.encode());
+        MemoryMailbox::new(&relay, stranger).deposit(bia.peer_id(), Envelope::Hello(None).encode());
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
 
         let dropped = until(&mut bia, |e| match e {
@@ -6244,7 +6267,7 @@ mod tests {
         bia.announced.insert(ana_peer);
         bia.devices_announced.insert(ana_peer);
 
-        bia.transmit(ana_peer, &Envelope::Hello);
+        bia.transmit(ana_peer, &Envelope::Hello(None));
         let chat_id = *bia.pending.keys().next().unwrap();
         bia.pending
             .insert(chat_id, Some(MessageId::from_bytes([7; 16])));
@@ -6256,7 +6279,7 @@ mod tests {
         assert!(bia.announced.contains(&ana_peer), "mensagem de chat");
         assert!(bia.devices_announced.contains(&ana_peer));
 
-        bia.transmit(ana_peer, &Envelope::Hello);
+        bia.transmit(ana_peer, &Envelope::Hello(None));
         let control_id = *bia.pending.keys().next().unwrap();
         bia.handle(NodeEvent::SendFailed {
             peer: ana_peer,
@@ -9313,7 +9336,7 @@ mod tests {
 
         assert_eq!(r.bia.pending.len(), before, "nada foi transmitido");
         assert!(r.bia.handshake_retries.is_empty());
-        r.bia.resend_handshake(r.ana_peer, Envelope::Hello);
+        r.bia.resend_handshake(r.ana_peer, Envelope::Hello(None));
         assert!(
             !r.bia.handshake_retries.is_empty(),
             "o Hello continua saindo"

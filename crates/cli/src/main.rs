@@ -363,7 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line == "/invite" {
-                    print_invite(&chat);
+                    print_invite(&mut chat);
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
@@ -439,7 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Imprime o convite deste nó (link e QR). Sem endereço compartilhável ainda, avisa.
-fn print_invite(chat: &Chat) {
+fn print_invite(chat: &mut Chat) {
     let invite = chat.shareable_invite();
     if invite.addrs().is_empty() {
         println!(
@@ -447,7 +447,13 @@ fn print_invite(chat: &Chat) {
         );
         return;
     }
-    let link = chat.invite_link(invite.addrs().to_vec(), DEFAULT_INVITE_TTL);
+    let link = match chat.invite_link(invite.addrs().to_vec(), DEFAULT_INVITE_TTL) {
+        Ok(link) => link,
+        Err(e) => {
+            println!("(não deu para gerar o convite: {e})");
+            return;
+        }
+    };
     match qrcode::QrCode::new(link.as_bytes()) {
         Ok(code) => println!(
             "{}",

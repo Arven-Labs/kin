@@ -235,17 +235,17 @@ async fn the_addresses_are_covered_by_the_signature() {
 /// `Chat::invite_link` nunca emite um link que o leitor recusa só pelo prazo pedido.
 #[tokio::test(flavor = "multi_thread")]
 async fn invite_link_clamps_the_ttl_to_what_a_reader_accepts() {
-    let ana = person();
+    let mut ana = person();
 
     for ttl in [MAX_INVITE_TTL, Duration::from_secs(u64::MAX), Duration::MAX] {
-        let link = ana.chat.invite_link(vec![], ttl);
+        let link = ana.chat.invite_link(vec![], ttl).unwrap();
         assert!(
             Invite::from_link(&link).is_ok(),
             "ttl {ttl:?} gerou link ilegível"
         );
     }
     // Prazo zero: o link já nasce vencido (o chamador pediu isso), nunca inválido nem aceito.
-    let link = ana.chat.invite_link(vec![], Duration::ZERO);
+    let link = ana.chat.invite_link(vec![], Duration::ZERO).unwrap();
     assert!(matches!(
         Invite::from_link_at(&link, now() + 1),
         Err(Error::ExpiredInvite)
@@ -300,9 +300,9 @@ async fn the_old_v1_link_without_expiry_is_refused() {
 /// `Chat::invite_link` assina com o próprio device e usa o prazo pedido a partir de agora.
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_invite_link_is_signed_by_the_own_device_and_lasts_the_requested_ttl() {
-    let ana = person();
+    let mut ana = person();
     let before = now();
-    let link = ana.chat.invite_link(vec![], DEFAULT_INVITE_TTL);
+    let link = ana.chat.invite_link(vec![], DEFAULT_INVITE_TTL).unwrap();
     let after = now();
 
     let invite = Invite::from_link(&link).unwrap();
@@ -319,7 +319,10 @@ async fn chat_invite_link_is_signed_by_the_own_device_and_lasts_the_requested_tt
 async fn accepting_an_invite_connects_and_pins_the_identity() {
     let (mut ana, mut bia) = (person(), person());
     let addr = listen(&mut ana.chat).await;
-    let link = ana.chat.invite_link(vec![addr], DEFAULT_INVITE_TTL);
+    let link = ana
+        .chat
+        .invite_link(vec![addr], DEFAULT_INVITE_TTL)
+        .unwrap();
     let invite = Invite::from_link(&link).unwrap();
 
     bia.chat.accept(&invite).unwrap();

@@ -25,6 +25,15 @@ const LINK_VERSION: u8 = 2;
 const PREFIX: &str = "kin://invite/";
 const MAX_ADDRS: usize = 32;
 
+/// Um convite emitido por este device e ainda não usado nem vencido (P18, ADR 0039).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveInvite {
+    /// Os 4 primeiros bytes do token em hexadecimal: basta para `Chat::revoke_invite` e não revela o token.
+    pub id: String,
+    /// Quando o token vence (segundos Unix).
+    pub expires_at: u64,
+}
+
 /// Convite para conversar: o certificado do device de quem convida e onde alcançá-lo.
 ///
 /// O certificado é assinado pela identidade e cobre a chave de rede do device, então o convite prova
@@ -77,6 +86,24 @@ impl Invite {
         let signature = signer.sign(&out);
         put(&mut out, &signature);
         format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(out))
+    }
+
+    /// Token de uso único que o link carrega (P18, ADR 0039); só `from_link` o preenche.
+    pub fn token(&self) -> Option<[u8; 16]> {
+        // STUB (testes primeiro): ainda não há token no link.
+        None
+    }
+
+    /// Como [`Self::to_link`], mas no formato v3, com o `token` dentro da parte assinada.
+    pub fn to_link_with_token(
+        &self,
+        signer: &InviteSigner,
+        expires_at: u64,
+        token: [u8; 16],
+    ) -> String {
+        // STUB (testes primeiro): ainda emite o v2, sem token.
+        let _ = token;
+        self.to_link(signer, expires_at)
     }
 
     /// Lê um link de convite com o relógio do sistema. Ver [`Self::from_link_at`].
