@@ -2468,10 +2468,10 @@ impl Chat {
         self.held_key_packages.remove(&peer);
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
-        if let Some(token) = self.admitted.remove(&peer) {
-            if let Err(e) = self.outbox.take_invite_token(&token, now_secs()) {
-                self.drop_message(peer, e);
-            }
+        if let Some(token) = self.admitted.remove(&peer)
+            && let Err(e) = self.outbox.take_invite_token(&token, now_secs())
+        {
+            self.drop_message(peer, e);
         }
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.
