@@ -71,6 +71,9 @@ struct Args {
     /// `--require-invite`: só abre conversa com quem é conhecido ou apresenta um token de convite meu
     /// (P18, ADR 0039). Desligado por padrão: ligado, `--dial` simples e o pareamento ainda não passam.
     require_invite: bool,
+    /// `--open-admission`: abre mão do portão (P18 PR 3b, ADR 0039): qualquer peer abre conversa.
+    #[allow(dead_code)] // provisório: a leitura entra na implementação, depois dos testes
+    open_admission: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -101,6 +104,7 @@ fn parse_from(
         relay_limits: RelayLimits::default(),
         mdns: true,
         require_invite: false,
+        open_admission: false,
     };
     let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
@@ -988,15 +992,21 @@ mod tests {
     }
 
     #[test]
-    fn require_invite_is_off_by_default_and_the_flag_turns_it_on() {
-        assert!(!parse(&[], None).unwrap().require_invite);
+    fn admission_is_closed_by_default_and_open_admission_opens_it() {
+        assert!(!parse(&[], None).unwrap().open_admission);
         assert!(
-            parse(&["--require-invite"], None).unwrap().require_invite,
+            parse(&["--open-admission"], None).unwrap().open_admission,
             "a flag foi aceita mas não guardada"
         );
         // convive com as outras flags, em qualquer ordem
-        let args = parse(&["--no-mdns", "--require-invite", "--no-nostr"], None).unwrap();
-        assert!(args.require_invite && !args.mdns && args.no_nostr);
+        let args = parse(&["--no-mdns", "--open-admission", "--no-nostr"], None).unwrap();
+        assert!(args.open_admission && !args.mdns && args.no_nostr);
+    }
+
+    /// `--require-invite` virou o padrão (PR 3b): a flag antiga some, e quem a passava vê um erro claro.
+    #[test]
+    fn the_old_require_invite_flag_is_gone() {
+        assert!(parse(&["--require-invite"], None).is_err());
     }
 
     #[test]
