@@ -8,7 +8,7 @@
 mod common;
 
 use common::{connect_until_ready, listen, settle};
-use kin_chat::Chat;
+use kin_chat::{Chat, DEFAULT_INVITE_TTL, Invite};
 use kin_identity::{DeviceKey, IdentityId, StandaloneIdentity};
 use kin_transport::{Multiaddr, NodeConfig, Protocol};
 use std::time::Duration;
@@ -162,6 +162,37 @@ async fn dialing_an_address_without_a_peer_id_admits_nobody() {
         ana.chat.dial(addr).unwrap();
         settle(&mut ana.chat, &mut bia.chat, SHORT).await;
         assert!(!ready_between(&ana, &bia), "ana_lower={ana_lower}");
+    }
+}
+
+/// Achado do lab (`revoke-device`, PR 3b): os dois já estão **conectados** (a Bia discou a Ana antes, sem
+/// link, e foi recusada) quando a Ana aceita o link da Bia. O `Hello` com o token só saía ao conectar, então
+/// o convite nunca era apresentado; `accept` com o peer conectado tem de reapresentá-lo.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepting_a_link_of_a_peer_already_connected_presents_the_token() {
+    for ana_lower in [true, false] {
+        let (mut ana, mut bia) = pair(ana_lower);
+        ana.chat.set_require_invite(true);
+        bia.chat.set_require_invite(true);
+        let ana_addr = pinned_addr(&mut ana).await;
+        let bia_addr = listen(&mut bia.chat).await;
+        let link = bia
+            .chat
+            .invite_link(vec![bia_addr], DEFAULT_INVITE_TTL)
+            .unwrap();
+
+        // Conectados antes do link: a Bia disca a Ana, que ainda não a conhece, e a conversa não abre.
+        bia.chat.dial(ana_addr).unwrap();
+        settle(&mut ana.chat, &mut bia.chat, SHORT).await;
+        assert!(!ready_between(&ana, &bia), "ana_lower={ana_lower}");
+
+        ana.chat.accept(&Invite::from_link(&link).unwrap()).unwrap();
+        connect_until_ready(&mut ana.chat, &mut bia.chat).await;
+        assert!(ready_between(&ana, &bia), "ana_lower={ana_lower}");
+        assert!(
+            bia.chat.invites().is_empty(),
+            "o token foi gasto (ana_lower={ana_lower})"
+        );
     }
 }
 
