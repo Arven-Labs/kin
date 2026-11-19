@@ -89,8 +89,11 @@ fn reset_notice(peer: &str, identity: &str) -> String {
 }
 
 /// P34: o portão fechado recusou `peer`. Só local (nada vai ao peer): diz **quem** e os caminhos para admitir.
-fn not_admitted_notice(_peer: &str) -> String {
-    String::new()
+fn not_admitted_notice(peer: &str) -> String {
+    format!(
+        "(peer {peer} conectou e não admitido: o portão está fechado; para abrir conversa use /accept com um \
+         convite meu, --dial com o Peer ID (/p2p/<id>) ou /trust na identidade dele, ou suba com --open-admission)"
+    )
 }
 
 /// Em que modo de admissão o kin subiu (auditoria do PR 3b, baixo 1): o portão fechado recusa estranhos

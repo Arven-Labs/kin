@@ -497,6 +497,9 @@ pub struct Chat {
     hello_pending: HashSet<PeerId>,
     /// Peers com quem já refiz a conversa nesta conexão: um reset por conexão (auditoria, médio 2).
     reset_done: HashSet<PeerId>,
+    /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
+    /// teto. Em memória; some com a conexão.
+    not_admitted_notified: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
     dialed: HashSet<PeerId>,
@@ -744,6 +747,7 @@ impl Chat {
             lost_state: HashSet::new(),
             hello_pending: HashSet::new(),
             reset_done: HashSet::new(),
+            not_admitted_notified: HashSet::new(),
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
@@ -1580,6 +1584,7 @@ impl Chat {
                 self.connected.remove(&peer);
                 self.hello_pending.remove(&peer);
                 self.reset_done.remove(&peer);
+                self.not_admitted_notified.remove(&peer);
                 self.retry.remove(&peer);
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
@@ -1766,6 +1771,9 @@ impl Chat {
         if let Some(token) = token {
             self.note_invite_token(peer, token)?;
         }
+        // Só aqui a recusa é definitiva para quem ainda não tem conversa: o `Hello` já trouxe o que o peer
+        // tinha a apresentar (token, certificado). Antes disso (só o `KeyPackage`), ele ainda pode se apresentar.
+        self.notify_not_admitted(peer);
         // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o token ou
         // a identidade chegou, ele é processado (e guardado de novo se ainda não for admitido).
         if (introduced || self.lost_state.contains(&peer))
@@ -1854,6 +1862,18 @@ impl Chat {
         match self.admitted.get(peer) {
             Some(token) => self.outbox.invite_token_is_live(token, now_secs()),
             None => Ok(false),
+        }
+    }
+
+    /// P34: avisa (`NotAdmitted`) que o portão recusou `peer`, uma vez por conexão e com teto. Só quando
+    /// `admits` devolveu `Ok(false)`: erro de banco não é recusa. Nada vai ao peer.
+    fn notify_not_admitted(&mut self, peer: PeerId) {
+        if !matches!(self.admits(&peer), Ok(false)) || self.not_admitted_notified.contains(&peer) {
+            return;
+        }
+        if self.not_admitted_notified.len() < MAX_HELD_KEY_PACKAGES {
+            self.not_admitted_notified.insert(peer);
+            self.queue.push_back(ChatEvent::NotAdmitted { peer });
         }
     }
 
