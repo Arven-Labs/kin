@@ -305,6 +305,14 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 const MAX_HELD_KEY_PACKAGES: usize = 64;
 
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
+/// O Peer ID fixado num endereço discado (`.../p2p/<id>`), se houver.
+fn pinned_peer(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().fold(None, |last, part| match part {
+        kin_transport::Protocol::P2p(peer) => Some(peer),
+        _ => last,
+    })
+}
+
 fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
     map.contains_key(key) || map.len() < MAX_KNOWN_DEVICES
 }
@@ -789,10 +797,7 @@ impl Chat {
     /// último do endereço) admite esse peer sem token: o ato é seu, e o outro lado prova o Peer ID no
     /// handshake. Sem `/p2p/<id>` não há quem admitir e o portão segue valendo (ADR 0039).
     pub fn dial(&mut self, addr: Multiaddr) -> Result<(), Error> {
-        let pinned = addr.iter().fold(None, |last, part| match part {
-            kin_transport::Protocol::P2p(peer) => Some(peer),
-            _ => last,
-        });
+        let pinned = pinned_peer(&addr);
         self.node.dial(addr)?;
         if let Some(peer) = pinned
             && (self.dialed.contains(&peer) || self.dialed.len() < MAX_KNOWN_DEVICES)
@@ -4102,6 +4107,90 @@ mod tests {
         // Vindo da própria Bia, o mesmo pacote é aceito.
         ana.on_key_package(dev_b.peer_id(), &bia_kp).unwrap();
         assert!(ana.is_ready(&dev_b.peer_id()));
+    }
+
+    /// P18 PR 3 (auditoria, médio 1): a identidade que o `Hello` autenticou é a que o `KeyPackage` tem de
+    /// ter. Sem isso, quem tem as chaves de um device de T (roubado ou revogado) passa pelo portão como T
+    /// e abre a conversa com um certificado de outra identidade X para as mesmas chaves.
+    #[tokio::test]
+    async fn a_key_package_of_another_identity_than_the_hello_is_refused() {
+        let (id_a, id_t, id_x) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let device_of = |identity: &StandaloneIdentity| {
+            CryptoDevice::new(identity, &dev_b.public_key(), &dev_b.nostr_public_key(), 1).unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.set_require_invite(true);
+        ana.trust(id_t.id()).unwrap();
+
+        // O `Hello` diz T (aceita); o `KeyPackage` traz X, desconhecida, para as mesmas chaves do device.
+        ana.on_hello(dev_b.peer_id(), None, Some(device_of(&id_t).certificate().to_bytes()))
+            .unwrap();
+        let err = ana
+            .on_key_package(dev_b.peer_id(), &device_of(&id_x).key_package().unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Crypto(CryptoError::UnexpectedIdentity)),
+            "{err:?}"
+        );
+        assert!(!ana.is_ready(&dev_b.peer_id()));
+
+        // O `KeyPackage` da mesma identidade do `Hello` é aceito.
+        ana.on_key_package(dev_b.peer_id(), &device_of(&id_t).key_package().unwrap())
+            .unwrap();
+        assert!(ana.is_ready(&dev_b.peer_id()));
+    }
+
+    /// Auditoria (baixo 3): quem eu disquei e não virou conversa deixa de ser admitido quando a conexão cai.
+    #[tokio::test]
+    async fn a_dialed_peer_is_forgotten_when_it_disconnects_without_a_conversation() {
+        let Household {
+            mut bia,
+            ana_device: (ana_peer, _),
+            ..
+        } = household();
+        let stranger = PeerId::random();
+        bia.dialed.insert(stranger);
+        bia.dialed.insert(ana_peer);
+
+        bia.handle(NodeEvent::PeerDisconnected(stranger));
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+
+        assert!(!bia.dialed.contains(&stranger));
+        assert!(!bia.dialed.contains(&ana_peer));
+    }
+
+    /// Auditoria (baixo 4): só vale o `/p2p/<id>` que **termina** o endereço; em circuito, o destino.
+    #[test]
+    fn only_a_trailing_p2p_component_pins_the_dialed_peer() {
+        let (relay, target) = (PeerId::random(), PeerId::random());
+        let parse = |s: String| pinned_peer(&s.parse::<Multiaddr>().unwrap());
+
+        assert_eq!(parse(format!("/ip4/10.0.0.1/tcp/1/p2p/{target}")), Some(target));
+        assert_eq!(
+            parse(format!("/ip4/10.0.0.1/tcp/1/p2p/{relay}/p2p-circuit/p2p/{target}")),
+            Some(target)
+        );
+        assert_eq!(parse("/ip4/10.0.0.1/tcp/1".into()), None);
+        assert_eq!(
+            parse(format!("/ip4/10.0.0.1/tcp/1/p2p/{relay}/p2p-circuit")),
+            None,
+            "circuito sem destino: o relay não vira admitido"
+        );
+        assert_eq!(
+            parse(format!("/p2p/{target}/ip4/10.0.0.1/tcp/1")),
+            None,
+            "o Peer ID não termina o endereço"
+        );
     }
 
     /// `MemoryMailbox` que declara por quanto tempo o backend guarda um depósito (como o Nostr com TTL).
