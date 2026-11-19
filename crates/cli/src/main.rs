@@ -91,8 +91,8 @@ fn reset_notice(peer: &str, identity: &str) -> String {
 /// P34: o portão fechado recusou `peer`. Só local (nada vai ao peer): diz **quem** e os caminhos para admitir.
 fn not_admitted_notice(peer: &str) -> String {
     format!(
-        "(peer {peer} conectou e não admitido: o portão está fechado; para abrir conversa use /accept com um \
-         convite meu, --dial com o Peer ID (/p2p/<id>) ou /trust na identidade dele, ou suba com --open-admission)"
+        "(peer {peer} conectou e não admitido: o portão está fechado; para abrir conversa mande a ele um /invite \
+         meu, use /accept com o link dele, ou --dial com o Peer ID (/p2p/<id>); --open-admission abre o portão)"
     )
 }
 
@@ -1056,9 +1056,11 @@ mod tests {
         let notice = not_admitted_notice("12D3KooWPeer");
         assert!(notice.contains("12D3KooWPeer"), "{notice}");
         assert!(notice.contains("não admitido"), "{notice}");
+        assert!(notice.contains("/invite"), "{notice}");
         assert!(notice.contains("/accept"), "{notice}");
         assert!(notice.contains("--dial"), "{notice}");
-        assert!(notice.contains("/trust"), "{notice}");
+        // `/trust` não abre o portão para estranho (o `Hello` dele não traz certificado): fora do aviso.
+        assert!(!notice.contains("/trust"), "{notice}");
     }
 
     /// O modo de admissão aparece na partida: aberto como aviso, fechado como informação.

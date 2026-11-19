@@ -317,6 +317,9 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 /// Quantos peers podem ter um `KeyPackage` guardado ao mesmo tempo (no pior caso, 1 MiB). Maior que o dos
 /// devices conhecidos de propósito: quem enche as vagas precisa de uma conexão por vaga (auditoria, médio 2).
 const MAX_HELD_KEY_PACKAGES: usize = 64;
+/// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
+/// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
+const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
 
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 /// O Peer ID fixado num endereço discado: só vale o `/p2p/<id>` que **termina** o endereço (em circuito,
@@ -1868,10 +1871,11 @@ impl Chat {
     /// P34: avisa (`NotAdmitted`) que o portão recusou `peer`, uma vez por conexão e com teto. Só quando
     /// `admits` devolveu `Ok(false)`: erro de banco não é recusa. Nada vai ao peer.
     fn notify_not_admitted(&mut self, peer: PeerId) {
-        if !matches!(self.admits(&peer), Ok(false)) || self.not_admitted_notified.contains(&peer) {
+        // `contains` antes de `admits`: um `Hello` repetido de quem já avisei não consulta o banco.
+        if self.not_admitted_notified.contains(&peer) || !matches!(self.admits(&peer), Ok(false)) {
             return;
         }
-        if self.not_admitted_notified.len() < MAX_HELD_KEY_PACKAGES {
+        if self.not_admitted_notified.len() < MAX_NOT_ADMITTED_NOTIFIED {
             self.not_admitted_notified.insert(peer);
             self.queue.push_back(ChatEvent::NotAdmitted { peer });
         }
@@ -6391,14 +6395,23 @@ mod tests {
     async fn the_announced_set_is_capped() {
         let mut ana = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
         ana.set_require_invite(true);
-        for _ in 0..MAX_HELD_KEY_PACKAGES + 10 {
-            ana.on_hello(PeerId::random(), None, None, None).unwrap();
+        let strangers: Vec<PeerId> = (0..MAX_NOT_ADMITTED_NOTIFIED + 10)
+            .map(|_| PeerId::random())
+            .collect();
+        for peer in &strangers {
+            ana.on_hello(*peer, None, None, None).unwrap();
         }
         let total = events(&mut ana)
             .iter()
             .filter(|e| matches!(e, ChatEvent::NotAdmitted { .. }))
             .count();
-        assert_eq!(total, MAX_HELD_KEY_PACKAGES);
+        assert_eq!(total, MAX_NOT_ADMITTED_NOTIFIED);
+
+        // Desconectar um peer avisado libera a vaga: o próximo recusado volta a ser avisado.
+        ana.handle(NodeEvent::PeerDisconnected(strangers[0]));
+        let late = strangers[MAX_NOT_ADMITTED_NOTIFIED + 5];
+        ana.on_hello(late, None, None, None).unwrap();
+        assert_eq!(not_admitted(&events(&mut ana), late), 1, "vaga liberada");
     }
 
     /// P18 PR 3: o certificado do `Hello` só vale para o Peer ID que ele certifica. Repetir o de uma

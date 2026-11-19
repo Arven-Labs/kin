@@ -70,6 +70,13 @@ Alternativas descartadas: `KeyPackage` a qualquer um e barrar no `Welcome` (perd
 - **Falha silenciosa que continua**: estranho recusado não gera evento nenhum; só o aviso da partida diz que o portão está ligado. Um evento "peer conectou e não foi admitido" fica como melhoria.
 - **Provas**: testes e lab primeiro (CI, 2 testes de parse e 10 cenários do lab falharam); teste do `accept` falhou antes da correção; mutação de propósito no PR descartável #252.
 
+## Atualização: P34, evento "peer não admitido" (PR #257, 2026-11-19)
+
+- **Decisão do dono** (plan mode): evento **sem motivo** (`admits` continua `bool`) e **um por conexão**. Alternativa descartada: enum de motivos (muda `admits` em 3 chamadores, e "token morto" viraria oráculo do estado do convite se o texto vazasse).
+- **Onde**: `notify_not_admitted`, chamado em `on_hello` depois de `note_hello_identity`/`note_invite_token`. É o único ponto em que a recusa é definitiva (o `KeyPackage` pode chegar antes do `Hello`). Só avisa com `admits == Ok(false)`: erro de banco não é recusa. Nada é transmitido ao peer.
+- **Limites aceitos** (auditoria do PR #257, baixos 2 a 4): o teto de 64 (`MAX_NOT_ADMITTED_NOTIFIED`) esgota com 64 conexões simultâneas de estranhos e então suprime o aviso, sem afetar a admissão; o set é limpo em `PeerDisconnected`, então reconexão em laço gera uma linha por ciclo; o aviso é um instantâneo e não é retratado se o peer for admitido depois.
+- **Achado corrigido**: o texto da CLI citava `/trust`, que não abre o portão para estranho (`send_hello` só manda o certificado a quem já conheço).
+
 ## Auditoria (`security-auditor`, somente leitura)
 
 | # | Achado | Gravidade | Destino |
