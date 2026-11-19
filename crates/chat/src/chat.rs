@@ -1675,7 +1675,7 @@ impl Chat {
             return Ok(true);
         }
         match self.admitted.get(peer) {
-            Some(token) => self.outbox.invite_token_is_live(token, now_secs()),
+            Some(_) => Ok(true),
             None => Ok(false),
         }
     }
