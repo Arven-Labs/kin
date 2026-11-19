@@ -578,7 +578,7 @@ impl Outbox {
         let live: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM kin_invite_tokens WHERE token = ?1 AND expires_at > ?2",
+                "SELECT COUNT(*) FROM kin_invite_tokens WHERE token = ?1 AND expires_at >= ?2",
                 params![&token[..], now as i64],
                 |row| row.get(0),
             )
