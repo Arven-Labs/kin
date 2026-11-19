@@ -1706,7 +1706,7 @@ impl Chat {
     /// isso é do `Conversation::invite`/`join`, que vêm depois do portão.
     fn note_hello_identity(&mut self, peer: PeerId, certificate: &[u8]) -> Result<(), Error> {
         let certificate = DeviceCertificate::from_bytes(certificate).map_err(|_| Error::Malformed)?;
-        if certificate.verify().is_err() || certificate.network_peer_id() != peer {
+        if certificate.verify().is_err() {
             return Err(Error::Malformed);
         }
         if self.hello_identity.contains_key(&peer) || self.hello_identity.len() < MAX_HELD_KEY_PACKAGES {
