@@ -2057,4 +2057,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Mutação de propósito** (PR #247, fechado): `/revoke-invite` imprimindo "revogado" sem chamar `revoke_invite` → o `invite-revoked` falhou nos 3 passos esperados ("o convite sumiu da lista", "link revogado abriu conversa", "a abriu conversa com o link revogado"); os outros 19 checks passaram.
 - **Erros meus**: o commit de testes e o de implementação quase se atropelaram (guardei o push da implementação até o CI do de testes terminar, porque o `concurrency` cancela runs em andamento); o 1º formato da verificação de `fmt` deixou duas linhas longas (corrigidas à mão, sem `cargo fmt`).
 - **Não verificado**: o padrão fechado e tudo que depende dele (pareamento, multi-device e `--dial` com o portão ligado: é o PR 3); a lista `/invites` com 16 convites vivos na CLI; QR do link v3 (tamanho não medido).
-- **Próximo passo**: PR 3 (admissão por identidade autenticada na biblioteca, depois o padrão fechado na CLI, com a regressão dos cenários `paired-device`, `multi-device` e `revoke-device` com o portão ligado); ou o teste em rede real (P33).
+- **Próximo passo**: PR 3 (admissão por identidade autenticada na biblioteca, depois o padrão fechado na CLI, com a regressão dos cenários `paired-device`, `multi-device` e `revoke-device` com o portão ligado); ou o teste em rede real (P33). *(Biblioteca feita na subseção abaixo; falta o padrão fechado na CLI, PR 3b.)*
+
+#### Convite com token: admissão por identidade autenticada (P18, PR 3a, ADR 0039, #248)
+
+- **Decisões do dono**: `dial` admite o peer com `/p2p/<id>` fixado; admissão pela identidade do certificado; o `Hello` passa a levar o certificado (achado ao ler `on_hello`: o de maior Peer ID decide antes de ver o `KeyPackage`); certificado só a quem já conheço (privacidade, auditoria médio 2).
+- **Feito**: `Envelope::Hello(token, certificado)` (tag 4), `hello_identity`, `dialed`, `knows`, `expected_identity`, `pinned_peer`.
+- **Prova de falha** (CI): 3 de 6 testes de integração (run 44526156174); depois da auditoria, 4 testes unitários (run 44531149351). Verde no fim (20 checks). **Mutação de propósito** (PRs #249 e #250, fechados): as duas pegas.
+- **Auditoria** (`security-auditor`: 0 críticos, 0 altos, 2 médios, 4 baixos): médios 1 e 2 e baixos 3 e 4 corrigidos; baixo 5 (64 vagas de `hello_identity`) e compatibilidade (tag 4) registrados no ADR.
+- **Erros meus**: (1) o filtro do `gh run view` no 1º CI da auditoria pegou ruído e o laço de espera saiu cedo (conferi o run depois); (2) a decisão de privacidade quebrou 2 testes que discavam sem `/p2p/` (ajustados: discar sem Peer ID não identifica o device); (3) tentei acrescentar este registro com `printf >>` no Bash, e o hook barrou (o `CLAUDE.md` manda `Edit`/`Write`).
+- **Não verificado**: cadeia v4 (`open_paired`) no `Hello`; pareamento e multi-device no lab com o portão ligado (PR 3b); `warden/mobile` (consome `Envelope`/`Chat::dial`?).
+- **Próximo passo**: PR 3b (CLI padrão fechado, `--open-admission`, lab `paired-device`/`multi-device`/`revoke-device` com o portão ligado).
