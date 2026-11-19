@@ -238,6 +238,7 @@ scenario_invite_single_use() {
   else
     pass "segundo uso do mesmo link não abre conversa"
   fi
+  check "a avisou que o a2 não foi admitido (P34)" wait_log a "não admitido" 10
   [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 1 ] \
     && pass "a tem uma conversa só (a do primeiro convidado)" \
     || fail "a tem mais de uma conversa"
@@ -261,6 +262,7 @@ scenario_invite_revoked() {
   else
     pass "link revogado não abre conversa"
   fi
+  check "a avisou que o b não foi admitido (P34)" wait_log a "não admitido" 10
   [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 0 ] \
     && pass "a não tem conversa nenhuma" \
     || fail "a abriu conversa com o link revogado"

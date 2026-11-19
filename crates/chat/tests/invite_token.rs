@@ -174,10 +174,32 @@ async fn a_stranger_without_a_token_is_refused_when_the_gate_is_on() {
         let addr = listen(&mut ana.chat).await;
 
         bia.chat.accept(&ana.chat.invite(vec![addr])).unwrap();
-        settle(&mut ana.chat, &mut bia.chat, SHORT).await;
+        let (seen_ana, seen_bia) = settle(&mut ana.chat, &mut bia.chat, SHORT).await;
         assert!(
             !ready_between(&ana, &bia),
             "sem token (ana_lower={ana_lower})"
+        );
+        // P34: a Ana (quem recusou) é avisada uma vez; a Bia não recebe aviso nenhum (não é oráculo).
+        let bia_id = bia.device.peer_id();
+        let notices = |seen: &[kin_chat::ChatEvent]| {
+            seen.iter()
+                .filter(|e| matches!(e, kin_chat::ChatEvent::NotAdmitted { .. }))
+                .count()
+        };
+        assert_eq!(
+            seen_ana
+                .iter()
+                .filter(
+                    |e| matches!(e, kin_chat::ChatEvent::NotAdmitted { peer } if *peer == bia_id)
+                )
+                .count(),
+            1,
+            "aviso na Ana (ana_lower={ana_lower})"
+        );
+        assert_eq!(
+            notices(&seen_bia),
+            0,
+            "nada para a Bia (ana_lower={ana_lower})"
         );
     }
 }
