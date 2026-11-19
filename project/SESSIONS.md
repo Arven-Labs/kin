@@ -2024,5 +2024,13 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Decisão do dono**: manter a camada própria (opção A) com a porta C aberta (SimpleX ou outro backend como mailbox opcional, depois, atrás do ADR 0003); aceitar o custo de NAT e de entrega assíncrona, com teste em rede real antes da Fase 4 (P33). ADR 0038.
 - **Alternativa descartada**: B, cliente de SimpleX ou Matrix (anula o diferencial, difícil de reverter, AGPL).
 - **Não verificado**: a AGPL do SimpleX num derivado; o SDK Rust do Matrix como base; o estado de Briar e Berty. Não mudam a decisão.
-- **Só documentação**: sem código, sem CI relevante.
-- **Próximo passo**: P18 (revogação de convite) ou P16 (re-handshake); ou o teste em rede real (P33).
+- **Verificação de licenças** (ADR 0038, PR #237): SimpleX AGPL-3.0; `matrix-rust-sdk` Apache-2.0 e só cliente-servidor; Berty ativo, Apache-2.0 ou MIT; Briar com `briar-mailbox` (até o projeto sem servidor adotou nó sempre ligado). Briar vem de fontes secundárias.
+
+#### Lab: QUIC/UDP e enlace ruim, simulados (P33, P17 a; PRs #238, #239, #240)
+
+- **Decisão do dono** (plan mode): o teste em rede real fica para depois (sem VPS nem segunda rede); simular o que der no lab, um PR por intenção.
+- **Feito**: `RELAY_LISTEN` no relay do compose e cenários `cone-quic` e `symmetric-quic` (relay só em UDP); `NETEM` no `router.sh` e cenário `lossy` (`tc netem`, 80 ms ± 20 ms, 3% de perda por roteador; o furo direto é só observado). Os três entram na matriz do workflow `Lab` (não obrigatório). Nenhuma mudança em `crates/`.
+- **Resultado**: 5 execuções do `Lab` na `main` por `workflow_dispatch`, uma por vez (o `concurrency` cancela as simultâneas): **15 cenários × 5 = 75 de 75 `success`** (runs 44428120206, 44428721907, 44429145358, 44429720485, 44430090744). `lossy` no runner: `sch_netem` disponível e furo direto mesmo com perda.
+- **Erros meus**: (1) afirmei que o lab não roda no CI; roda, em matriz, e os cenários novos só entraram nela no #239 (corrigido, com confirmação do dono por ser mudança de CI, §4); (2) rodei o `lab/run.sh` local para o 5/5 do #238 em vez de pedir ao CI (o binário era de 2026-11-17); (3) a 1ª checagem extra do `cone-quic` procurava o endereço do relay no log, mas a CLI imprime o Peer ID (refeita); (4) o hook barrou um comando por causa do texto "cargo build" no corpo do PR; (5) gravei esta sessão com `printf` no Bash em vez de `Edit` (contra o `CLAUDE.md`).
+- **Não verificado**: transporte da conexão direta (a CLI não o imprime; prova indireta); NAT sintético, não roteador doméstico; 3 devices em redes distintas; relay com IP público; mutação de propósito dos cenários novos.
+- **Próximo passo**: teste em rede real (P33, depende do dono); P18 (revogação de convite) ou P16 (re-handshake).
