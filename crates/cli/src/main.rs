@@ -77,6 +77,12 @@ struct Args {
     open_admission: bool,
 }
 
+/// O aviso de conversa refeita (P16, auditoria do PR #254, médio 3). Provisório: o texto entra na
+/// implementação, depois dos testes.
+fn reset_notice(_peer: &str, _identity: &str) -> String {
+    String::new()
+}
+
 /// Em que modo de admissão o kin subiu (auditoria do PR 3b, baixo 1): o portão fechado recusa estranhos
 /// em silêncio, então o usuário precisa saber que ele está ligado, ou desligado.
 fn admission_notice(open_admission: bool) -> &'static str {
@@ -889,9 +895,9 @@ fn on_event(
             met.push((peer, identity));
             *current = Some(peer);
         }
-        ChatEvent::ConversationReset { peer } => println!(
-            "(conversa com {peer} refeita: o outro lado perdeu o estado; o que enviei sem ele perceber pode ter se perdido)"
-        ),
+        ChatEvent::ConversationReset { peer, .. } => {
+            println!("{}", reset_notice(&peer.to_string(), ""));
+        }
         ChatEvent::Received { message, .. } => {
             let Message {
                 id, parent, text, ..
@@ -1015,6 +1021,17 @@ mod tests {
         // convive com as outras flags, em qualquer ordem
         let args = parse(&["--no-mdns", "--open-admission", "--no-nostr"], None).unwrap();
         assert!(args.open_admission && !args.mdns && args.no_nostr);
+    }
+
+    /// Conversa refeita (P16): o aviso diz **quem** (a identidade), que o sinal não é verificável e que, se não
+    /// era esperado, deve ser confirmado por outro canal; e que mensagens podem ter se perdido.
+    #[test]
+    fn the_reset_notice_names_the_identity_and_asks_for_confirmation() {
+        let notice = reset_notice("12D3KooWPeer", "IdentidadeBase58");
+        assert!(notice.contains("12D3KooWPeer"), "{notice}");
+        assert!(notice.contains("IdentidadeBase58"), "{notice}");
+        assert!(notice.contains("confirme por outro canal"), "{notice}");
+        assert!(notice.contains("perdid"), "{notice}");
     }
 
     /// O modo de admissão aparece na partida: aberto como aviso, fechado como informação.

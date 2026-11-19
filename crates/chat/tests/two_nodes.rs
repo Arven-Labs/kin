@@ -266,7 +266,7 @@ async fn peer_that_lost_its_database_is_rehandshaked() {
         assert!(
             seen_a
                 .iter()
-                .any(|e| matches!(e, ChatEvent::ConversationReset { peer } if *peer == b_id)),
+                .any(|e| matches!(e, ChatEvent::ConversationReset { peer, .. } if *peer == b_id)),
             "a não avisou a refeita (a_lower={a_lower}): {seen_a:?}"
         );
         assert!(
@@ -284,6 +284,41 @@ async fn peer_that_lost_its_database_is_rehandshaked() {
         b.send(pa.peer_id(), "e de volta", None).unwrap();
         let (_, message) = receive_while_driving(&mut a, &mut b).await;
         assert_eq!(message.text, "e de volta", "a_lower={a_lower}");
+    }
+}
+
+/// P16 (auditoria, médio 1): o que `a` tinha na fila para o `b` que perdeu o banco **chega**. Antes, a fila
+/// era despejada no grupo antigo ao reconectar (o transporte confirma, o `a` marca `Delivered`, o `b`
+/// descarta); agora ela espera o `Hello` do `b` e sai pela conversa nova.
+#[tokio::test(flavor = "multi_thread")]
+async fn messages_queued_for_a_peer_that_lost_its_database_still_arrive() {
+    for a_lower in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pa, mut pb) = loop {
+            let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+            if (pa.peer_id() < pb.peer_id()) == a_lower {
+                break (pa, pb);
+            }
+        };
+        let (mut a, mut b) = (pa.open(), pb.open());
+        let addr = connect(&mut a, &mut b).await;
+        drop(b);
+        timeout(
+            WAIT,
+            wait_for(&mut a, |e| {
+                matches!(e, ChatEvent::PeerDisconnected(_)).then_some(())
+            }),
+        )
+        .await
+        .expect("a não percebeu a queda");
+
+        a.send(pb.peer_id(), "na fila", None).unwrap();
+        pb.db = dir.path().join("b-novo.db");
+        let mut b = pb.open();
+        b.dial(addr).unwrap();
+
+        let (_, message) = receive_while_driving(&mut b, &mut a).await;
+        assert_eq!(message.text, "na fila", "a_lower={a_lower}");
     }
 }
 

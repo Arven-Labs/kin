@@ -6226,6 +6226,35 @@ mod tests {
         assert!(!ana.lost_state.contains(&b), "consumido pela troca");
     }
 
+    /// P16 (auditoria, médio 2): um reset por conexão. Depois da troca, outro `Hello` "não tenho conversa" na
+    /// mesma conexão não marca `lost_state` de novo: sem o limite, um contato repetiria o ciclo (KeyPackage,
+    /// invite, remember, delete, eventos) sem parar.
+    #[tokio::test]
+    async fn a_second_reset_in_the_same_connection_is_not_started() {
+        let (id_a, id_t) = (StandaloneIdentity::generate(), StandaloneIdentity::generate());
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package = || {
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package()).unwrap();
+        ana.lost_state.insert(b);
+        ana.on_key_package(b, &key_package()).unwrap();
+        assert!(events(&mut ana).iter().any(is_reset), "o 1º reset aconteceu");
+
+        ana.on_hello(b, None, None, Some(false)).unwrap();
+        assert!(!ana.lost_state.contains(&b), "o 2º reset na mesma conexão");
+    }
+
     fn is_reset(event: &ChatEvent) -> bool {
         matches!(event, ChatEvent::ConversationReset { .. })
     }
