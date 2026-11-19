@@ -44,6 +44,23 @@ O link de convite (ADR 0033) tem validade assinada, mas é *bearer* e multiuso: 
 - **Testes primeiro** (CI, run 44433226020): 13 dos 17 testes novos falharam com os stubs (`invites()` vazio, sem token no link, portão sem efeito), e 4 passaram de propósito (portão desligado, link v2, contato conhecido, `Hello` de tamanho errado). Depois da implementação (run 44434145874): tudo verde, 357 testes da biblioteca e 15 de `invite_token`.
 - **Mutação de propósito** (PRs descartáveis #243 a #245, fechados sem mesclar): (1) `admits` sem rechecar o token vivo → falhou `two_peers_racing_for_one_token_leave_only_one_conversation`; (2) `ready` sem gastar o token → falharam 3 (`accepting_a_token_link_opens_the_conversation_and_spends_the_token`, `a_spent_link_cannot_be_used_by_someone_else`, `two_peers_racing_...`); (3) `>` virando `>=` na checagem de vencimento → falhou `an_invite_token_is_live_until_it_expires_and_can_be_taken_only_once`. Nota: só **um** teste pega a mutação 1; é o da corrida.
 
+## Atualização: PR 3a, admissão por identidade autenticada (PR #248, 2026-11-19)
+
+Decisões do dono (plan mode e perguntas durante o PR):
+
+1. **O `Hello` leva o certificado do device** (`Envelope::Hello(token, certificado)`, tag 4: `tem token u8 | [token; 16] | certificado`). Quem recebe confere a cadeia (`verify`) e que `network_peer_id()` é o Peer ID da conexão (autenticado pelo libp2p); só então grava a identidade em `hello_identity` (teto 64, em memória). Motivo: o de **maior** Peer ID responde ao `Hello` com o `KeyPackage` e precisa decidir **antes** de ver o certificado do `KeyPackage`. A tag 0 (só token) ainda é lida.
+2. **`admits` passa também** por (a) identidade autenticada **minha ou aceita por `trust`** (recalculada a cada chamada: `untrust` fecha), e (b) **quem eu disquei** por `Chat::dial` com `/p2p/<id>` terminando o endereço (`dialed`, teto 8, some no `ready`, no `DialFailed` e no `PeerDisconnected`). Endereço sem `/p2p/` não admite ninguém.
+3. **O `KeyPackage` e o `Welcome` têm de ter a identidade do `Hello`** (`expected_identity`: a do convite aceito, senão a do `Hello`). Sem isso, quem tivesse as chaves de um device de T entrava pelo portão como T e abria a conversa com um certificado de outra identidade X (auditoria, médio 1). A revogação continua conferida no `credential::verify` do `invite`/`join`, sobre o certificado que vale.
+4. **O certificado só vai no `Hello` a quem já conheço** (`knows`: conversa, `expected`, `household`, `contact_devices`, `dialed`). Estranho recebe o `Hello` sem identidade (auditoria, médio 2: o certificado expõe identidade e chave Nostr). Consequência: **device que me disca sem `/p2p/` não se identifica**, e um par que só se achou por mDNS (nenhum dos dois "conhece" o outro) não passa pelo portão por identidade; usa `--dial` com Peer ID ou link.
+
+Alternativas descartadas: `KeyPackage` a qualquer um e barrar no `Welcome` (perde o efeito do portão, exige política dentro do `join`); registrar o Peer ID em `household` na emissão (não cobre device de contato); exigir link também no `--dial` (quebra o lab).
+
+**Compatibilidade:** nó antigo que recebe a tag 4 a trata como `Malformed`; se for o de maior Peer ID, nunca responde com `KeyPackage`. Metade dos pares novo/antigo falha o handshake. Aceito (pré-lançamento, mesmo custo do schema v9).
+
+**Limites conhecidos (auditoria, baixos 5 e informativo):** 64 conexões com certificados autoassinados esgotam `hello_identity` e o próximo `Hello` legítimo perde a vaga em silêncio (exige 64 conexões; não mitigado); o `trust` por repasse de irmão (`on_device_list`) é transitivo como antes e agora também abre o portão por identidade. **Não validado:** cadeia v4 (`Issuer::Authority`) no caminho do `Hello` (os testes usam certificado v3; o PR 3b cobre no lab com `paired-device`).
+
+**Provas:** testes primeiro (CI, run 44526156174): 3 de 6 falharam; depois, 7 de 7 verdes. Testes da auditoria falharam antes da correção (run 44531149351: 4 falhas, 363 passando) e passam depois. Mutação de propósito (PRs descartáveis #249 e #250, fechados): `admits` aceitando qualquer identidade derrubou 11 testes e 2 cenários de lab; sem conferir o Peer ID do certificado derrubou `a_hello_certificate_of_another_peer_is_refused`.
+
 ## Auditoria (`security-auditor`, somente leitura)
 
 | # | Achado | Gravidade | Destino |
