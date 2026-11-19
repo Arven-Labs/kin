@@ -16,9 +16,12 @@
 //! `ws://` só para o próprio computador; repetível), senão de `<data-dir>/relays.txt` (uma URL por linha,
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
 //! O link do `/invite` é de **uso único** (P18, ADR 0039): `/invites` lista os vivos (id e tempo restante) e
-//! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device). Com
-//! `--require-invite`, quem não é conhecido só abre conversa se apresentar o token de um convite seu;
-//! **desligado por padrão**: ligado, `--dial` simples e o pareamento de devices ainda não passam.
+//! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device).
+//! **Portão de admissão, fechado por padrão** (P18 PR 3b): quem não é conhecido só abre conversa se
+//! apresentar o token de um convite seu. Conhecido é quem já tem conversa, quem eu aceitei por link, quem
+//! eu disquei com `--dial` **com o Peer ID** (`/p2p/<id>`; sem ele ninguém é admitido) e os devices de uma
+//! identidade minha ou aceita por `/trust`. `--open-admission` abre mão do portão. Dois devices que só se
+//! acharam por mDNS não passam sozinhos: usam `--dial` com Peer ID ou um link.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -68,11 +71,9 @@ struct Args {
     serve_relay: bool,
     relay_limits: RelayLimits,
     mdns: bool,
-    /// `--require-invite`: só abre conversa com quem é conhecido ou apresenta um token de convite meu
-    /// (P18, ADR 0039). Desligado por padrão: ligado, `--dial` simples e o pareamento ainda não passam.
-    require_invite: bool,
-    /// `--open-admission`: abre mão do portão (P18 PR 3b, ADR 0039): qualquer peer abre conversa.
-    #[allow(dead_code)] // provisório: a leitura entra na implementação, depois dos testes
+    /// `--open-admission`: abre mão do portão (P18 PR 3b, ADR 0039). Sem ela, só abre conversa quem é
+    /// conhecido (conversa, convite aceito, `--dial` com Peer ID, identidade minha ou aceita) ou apresenta
+    /// o token de um convite meu.
     open_admission: bool,
 }
 
@@ -103,7 +104,6 @@ fn parse_from(
         serve_relay: false,
         relay_limits: RelayLimits::default(),
         mdns: true,
-        require_invite: false,
         open_admission: false,
     };
     let mut it = argv.into_iter();
@@ -137,7 +137,7 @@ fn parse_from(
                 args.relay_limits.max_circuits = value()?.parse().map_err(|e| format!("{e}"))?;
             }
             "--no-mdns" => args.mdns = false,
-            "--require-invite" => args.require_invite = true,
+            "--open-admission" => args.open_admission = true,
             other => return Err(format!("argumento desconhecido: {other}")),
         }
     }
@@ -285,7 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--require-invite]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -309,7 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // contra a identidade de `primary.id` a cada abertura.
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
-    chat.set_require_invite(args.require_invite);
+    chat.set_require_invite(!args.open_admission);
     keys::ensure_current_issuer(&identity, chat.certificate())?;
     if let Some(notice) = keys::notice_for(&identity) {
         eprintln!("{notice}");
