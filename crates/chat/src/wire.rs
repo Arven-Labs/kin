@@ -16,8 +16,8 @@ pub(crate) enum Envelope {
 impl Envelope {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let (tag, payload): (u8, &[u8]) = match self {
-            // STUB (testes primeiro): ainda não leva o token.
-            Self::Hello(_) => (0, &[]),
+            Self::Hello(None) => (0, &[]),
+            Self::Hello(Some(token)) => (0, token),
             Self::KeyPackage(b) => (1, b),
             Self::Welcome(b) => (2, b),
             Self::Mls(b) => (3, b),
@@ -30,7 +30,12 @@ impl Envelope {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let (&tag, payload) = bytes.split_first().ok_or(Error::Malformed)?;
         Ok(match tag {
+            // Payload vazio (sem token) ou exatamente 16 bytes (o token); qualquer outro tamanho é
+            // entrada malformada.
             0 if payload.is_empty() => Self::Hello(None),
+            0 => Self::Hello(Some(
+                <[u8; 16]>::try_from(payload).map_err(|_| Error::Malformed)?,
+            )),
             1 => Self::KeyPackage(payload.to_vec()),
             2 => Self::Welcome(payload.to_vec()),
             3 => Self::Mls(payload.to_vec()),

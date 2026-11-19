@@ -20,8 +20,10 @@ fn now_secs() -> u64 {
 
 /// Versão do convite dentro da `DeviceList` (sem validade nem assinatura própria).
 const VERSION: u8 = 1;
-/// Versão do link, com validade e assinatura (P18).
-const LINK_VERSION: u8 = 2;
+/// Versão do link com validade e assinatura (P18, ADR 0033). Ainda é lida, sem token.
+const LINK_V2: u8 = 2;
+/// Versão do link com validade, assinatura e o token de uso único (P18, ADR 0039).
+const LINK_V3: u8 = 3;
 const PREFIX: &str = "kin://invite/";
 const MAX_ADDRS: usize = 32;
 
@@ -42,13 +44,16 @@ pub struct LiveInvite {
 /// (D5, nível "só por link"): não há pedido de amizade nem caixa de entrada.
 ///
 /// Formato do convite (manual, como `Message`): `versão u8 | len16 certificado | n u8 | n × (len16
-/// endereço)`. A versão 1 é a que a `DeviceList` carrega por item. O **link** usa a versão 2 (ver
-/// [`Invite::to_link`]), com validade e assinatura, em base64url sem padding, depois de `kin://invite/`.
-/// A validade só existe no link: depois de `from_link`, o `Invite` não a carrega (ADR 0033).
+/// endereço)`. A versão 1 é a que a `DeviceList` carrega por item. O **link** usa a versão 3 (ver
+/// [`Invite::to_link_with_token`]; a 2, sem token, ainda é lida), com validade e assinatura, em base64url
+/// sem padding, depois de `kin://invite/`. A validade só existe no link: depois de `from_link`, o `Invite`
+/// não a carrega (ADR 0033); o token (ADR 0039) fica em [`Invite::token`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invite {
     certificate: DeviceCertificate,
     addrs: Vec<Multiaddr>,
+    /// Só o link v3 traz; `new` e a `DeviceList` ficam sem.
+    token: Option<[u8; 16]>,
 }
 
 impl Invite {
@@ -56,7 +61,11 @@ impl Invite {
     /// `Chat::invite`; aqui o certificado não é conferido (`from_link` confere).
     pub fn new(certificate: DeviceCertificate, mut addrs: Vec<Multiaddr>) -> Self {
         addrs.truncate(MAX_ADDRS);
-        Self { certificate, addrs }
+        Self {
+            certificate,
+            addrs,
+            token: None,
+        }
     }
 
     /// Identidade de quem convidou.
@@ -81,7 +90,20 @@ impl Invite {
     /// len16 assinatura`. A assinatura (Ed25519, chave de rede, domínio `kin/invite/v2` imposto pelo
     /// `InviteSigner`) cobre tudo antes dela.
     pub fn to_link(&self, signer: &InviteSigner, expires_at: u64) -> String {
-        let mut out = self.encode_as(LINK_VERSION);
+        self.signed_link(LINK_V2, None, signer, expires_at)
+    }
+
+    fn signed_link(
+        &self,
+        version: u8,
+        token: Option<[u8; 16]>,
+        signer: &InviteSigner,
+        expires_at: u64,
+    ) -> String {
+        let mut out = self.encode_as(version);
+        if let Some(token) = token {
+            out.extend_from_slice(&token);
+        }
         out.extend_from_slice(&expires_at.to_be_bytes());
         let signature = signer.sign(&out);
         put(&mut out, &signature);
@@ -90,20 +112,21 @@ impl Invite {
 
     /// Token de uso único que o link carrega (P18, ADR 0039); só `from_link` o preenche.
     pub fn token(&self) -> Option<[u8; 16]> {
-        // STUB (testes primeiro): ainda não há token no link.
-        None
+        self.token
     }
 
     /// Como [`Self::to_link`], mas no formato v3, com o `token` dentro da parte assinada.
+    ///
+    /// Formato v3: `versão 3 | len16 certificado | n u8 | n × (len16 endereço) | token [u8; 16] |
+    /// expires_at u64 (BE) | len16 assinatura`. A assinatura cobre tudo antes dela, inclusive o byte de
+    /// versão, então um v3 não vira um v2 válido (nem o contrário) com o mesmo domínio de assinatura.
     pub fn to_link_with_token(
         &self,
         signer: &InviteSigner,
         expires_at: u64,
         token: [u8; 16],
     ) -> String {
-        // STUB (testes primeiro): ainda emite o v2, sem token.
-        let _ = token;
-        self.to_link(signer, expires_at)
+        self.signed_link(LINK_V3, Some(token), signer, expires_at)
     }
 
     /// Lê um link de convite com o relógio do sistema. Ver [`Self::from_link_at`].
@@ -122,9 +145,19 @@ impl Invite {
         let bytes = URL_SAFE_NO_PAD
             .decode(body)
             .map_err(|_| Error::InvalidInvite)?;
-        let (invite, rest) = Self::parse(&bytes, LINK_VERSION)?;
-        let signed_len = bytes.len() - rest.len() + 8;
+        // O primeiro byte escolhe o formato; qualquer outro (inclusive o v1, sem validade) é recusado.
+        let version = match bytes.first() {
+            Some(&version @ (LINK_V2 | LINK_V3)) => version,
+            _ => return Err(Error::InvalidInvite),
+        };
+        let (mut invite, rest) = Self::parse(&bytes, version)?;
         let mut tail = rest;
+        if version == LINK_V3 {
+            let token = tail.get(..16).ok_or(Error::InvalidInvite)?;
+            invite.token = Some(<[u8; 16]>::try_from(token).map_err(|_| Error::InvalidInvite)?);
+            tail = &tail[16..];
+        }
+        let signed_len = bytes.len() - tail.len() + 8;
         let expires_at = u64::from_be_bytes(
             tail.get(..8)
                 .ok_or(Error::InvalidInvite)?
@@ -195,7 +228,14 @@ impl Invite {
                 Multiaddr::try_from(take(&mut cur)?.to_vec()).map_err(|_| Error::InvalidInvite)?;
             addrs.push(addr);
         }
-        Ok((Self { certificate, addrs }, cur))
+        Ok((
+            Self {
+                certificate,
+                addrs,
+                token: None,
+            },
+            cur,
+        ))
     }
 }
 
