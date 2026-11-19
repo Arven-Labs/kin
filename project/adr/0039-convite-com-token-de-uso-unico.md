@@ -1,6 +1,6 @@
 # ADR 0039 — Convite com token de uso único e revogável (P18)
 
-- **Status**: **aceito e implementado na biblioteca** (Sessão 35, 2026-11-19, PR #242); a CLI (`--require-invite` opt-in, `/invites`, `/revoke-invite`) e os cenários de lab chegam no PR #246; o **padrão fechado** na CLI fica para um PR 3 (ver "CLI" nas consequências). Área de segurança (admissão, formato de fio, schema, parsing de entrada externa, AGENTS.md §4): auditado pelo `security-auditor` (0 críticos, 0 altos, 4 médios, 5 baixos; tabela no fim).
+- **Status**: **aceito e implementado na biblioteca** (Sessão 35, 2026-11-19, PR #242); a CLI (`--require-invite` opt-in, `/invites`, `/revoke-invite`) e os cenários de lab chegam no PR #246; a admissão por identidade (PR 3a, #248) e o **padrão fechado** na CLI (PR 3b, #251: `--open-admission`, sem `--require-invite`) estão na seção "Atualização" no fim. Área de segurança (admissão, formato de fio, schema, parsing de entrada externa, AGENTS.md §4): auditado pelo `security-auditor` (0 críticos, 0 altos, 4 médios, 5 baixos; tabela no fim).
 - **Relacionados**: ADR 0033 (link com validade assinada), ADR 0011 (decisão 5, frescor), D5 (contato por consentimento), P18, P16 (conversa de um lado só, fora daqui).
 
 ## Contexto
@@ -60,6 +60,15 @@ Alternativas descartadas: `KeyPackage` a qualquer um e barrar no `Welcome` (perd
 **Limites conhecidos (auditoria, baixos 5 e informativo):** 64 conexões com certificados autoassinados esgotam `hello_identity` e o próximo `Hello` legítimo perde a vaga em silêncio (exige 64 conexões; não mitigado); o `trust` por repasse de irmão (`on_device_list`) é transitivo como antes e agora também abre o portão por identidade. **Não validado:** cadeia v4 (`Issuer::Authority`) no caminho do `Hello` (os testes usam certificado v3; o PR 3b cobre no lab com `paired-device`).
 
 **Provas:** testes primeiro (CI, run 44526156174): 3 de 6 falharam; depois, 7 de 7 verdes. Testes da auditoria falharam antes da correção (run 44531149351: 4 falhas, 363 passando) e passam depois. Mutação de propósito (PRs descartáveis #249 e #250, fechados): `admits` aceitando qualquer identidade derrubou 11 testes e 2 cenários de lab; sem conferir o Peer ID do certificado derrubou `a_hello_certificate_of_another_peer_is_refused`.
+
+## Atualização: PR 3b, CLI com o portão fechado por padrão (PR #251, 2026-11-19)
+
+- **Padrão fechado**: `chat.set_require_invite(!open_admission)`. `--open-admission` abre mão do portão; `--require-invite` **sumiu** (flag desconhecida dá erro, com teste). A CLI imprime o modo na partida (aviso se aberto). Os cenários de NAT do lab (`setup()`) sobem o `a` com `--open-admission` porque testam transporte e o `b` disca sem link; `invite-*`, `multi-device`, `paired-device`, `revoke-device` e `history-sync` rodam com o portão **fechado**.
+- **Achado do lab** (`revoke-device`): `Chat::accept` com o peer **já conectado** (o `c` subira com `--dial`) não reapresentava o `Hello` com o token, porque `dial_peer` não faz nada com a conexão existente. Corrigido: `accept`, com o peer conectado e sem conversa, reenvia o `Hello` e, se este nó tem o maior Peer ID, também o `KeyPackage` (o de maior ID só o manda ao receber o `Hello` do outro, que já passara recusado). Teste de integração nas duas ordens de Peer ID.
+- **Cadeia v4 validada**: `paired-device` (certificado emitido pelo primário) passa pelo `Hello` com o portão fechado.
+- **Auditoria** (`security-auditor`, 0 críticos, 0 altos, 0 médios, 3 baixos): baixo 1 (falha silenciosa do portão: aviso na partida) e baixo 2 (`accept` com estado meio aceito se `key_package()` falhar: erro vira `Dropped`) corrigidos; baixo 3 (`/accept` repetido gera `KeyPackage` extra, só por ação do usuário) aceito.
+- **Falha silenciosa que continua**: estranho recusado não gera evento nenhum; só o aviso da partida diz que o portão está ligado. Um evento "peer conectou e não foi admitido" fica como melhoria.
+- **Provas**: testes e lab primeiro (CI, 2 testes de parse e 10 cenários do lab falharam); teste do `accept` falhou antes da correção; mutação de propósito no PR descartável #252.
 
 ## Auditoria (`security-auditor`, somente leitura)
 

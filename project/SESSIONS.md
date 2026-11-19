@@ -2067,4 +2067,15 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Auditoria** (`security-auditor`: 0 críticos, 0 altos, 2 médios, 4 baixos): médios 1 e 2 e baixos 3 e 4 corrigidos; baixo 5 (64 vagas de `hello_identity`) e compatibilidade (tag 4) registrados no ADR.
 - **Erros meus**: (1) o filtro do `gh run view` no 1º CI da auditoria pegou ruído e o laço de espera saiu cedo (conferi o run depois); (2) a decisão de privacidade quebrou 2 testes que discavam sem `/p2p/` (ajustados: discar sem Peer ID não identifica o device); (3) tentei acrescentar este registro com `printf >>` no Bash, e o hook barrou (o `CLAUDE.md` manda `Edit`/`Write`).
 - **Não verificado**: cadeia v4 (`open_paired`) no `Hello`; pareamento e multi-device no lab com o portão ligado (PR 3b); `warden/mobile` (consome `Envelope`/`Chat::dial`?).
-- **Próximo passo**: PR 3b (CLI padrão fechado, `--open-admission`, lab `paired-device`/`multi-device`/`revoke-device` com o portão ligado).
+- **Próximo passo**: PR 3b (CLI padrão fechado, `--open-admission`, lab `paired-device`/`multi-device`/`revoke-device` com o portão ligado). *(Feito na subseção abaixo.)*
+
+#### Convite com token: CLI com o portão fechado por padrão (P18, PR 3b, ADR 0039, #251)
+
+- **Decisões do dono**: corrigir o bug do `accept` na biblioteca neste PR (e não só ajustar o lab).
+- **Feito**: `--open-admission` (padrão fechado), `--require-invite` removida, aviso do modo na partida; lab: `setup()` dos cenários de NAT com `--open-admission`, `invite-*` sem a flag antiga; `Chat::accept` reapresenta o `Hello` (e o `KeyPackage`, se maior Peer ID) com o peer já conectado.
+- **Achado do lab**: `revoke-device` falhou com o portão fechado (`c` conectado antes do link): o token nunca era apresentado. É bug de produto (aceitar link de quem já conectou), não do lab.
+- **Provas** (CI): testes de parse e lab primeiro, 2 testes e 10 cenários falharam; teste do `accept` falhou (7 passando, 1 falhando) e passou depois; 20 de 20 checks, inclusive `paired-device`, `multi-device`, `revoke-device` com o portão fechado. Mutação de propósito no PR descartável #252.
+- **Auditoria** (`security-auditor`: 0 críticos, 0 altos, 0 médios, 3 baixos): baixos 1 e 2 corrigidos, 3 aceito.
+- **Erros meus**: errei um trecho de comentário num `Edit` (texto de `--dir`) e refiz; o `fmt --check` do CI pegaria uma linha longa que quebrei à mão antes de publicar.
+- **Não verificado**: `accept` repetido, `accept` de link v2 com peer conectado e `accept` com conversa em formação (sem teste); `warden/mobile`; teste em rede real (P33).
+- **Próximo passo**: P33 (rede real), P16 (re-handshake) ou o evento "peer não admitido".

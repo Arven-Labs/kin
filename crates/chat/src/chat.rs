@@ -1056,8 +1056,14 @@ impl Chat {
         if self.connected.contains(&peer) && !self.conversations.contains_key(&peer) {
             self.send_hello(peer);
             if self.peer_id() > peer {
-                let key_package = self.device.key_package()?;
-                self.transmit(peer, &Envelope::KeyPackage(key_package));
+                // Sem `?`: o estado do aceite já foi gravado acima, e um erro de storage aqui não pode
+                // devolver `Err` com o convite meio aceito (auditoria do PR 3b, baixo 2).
+                match self.device.key_package() {
+                    Ok(key_package) => {
+                        self.transmit(peer, &Envelope::KeyPackage(key_package));
+                    }
+                    Err(e) => self.drop_message(peer, e.into()),
+                }
             }
         }
         Ok(self.node.dial_peer(peer, invite.addrs().to_vec())?)

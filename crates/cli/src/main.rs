@@ -77,6 +77,16 @@ struct Args {
     open_admission: bool,
 }
 
+/// Em que modo de admissão o kin subiu (auditoria do PR 3b, baixo 1): o portão fechado recusa estranhos
+/// em silêncio, então o usuário precisa saber que ele está ligado, ou desligado.
+fn admission_notice(open_admission: bool) -> &'static str {
+    if open_admission {
+        "aviso: admissão aberta (--open-admission): qualquer peer que conectar abre conversa"
+    } else {
+        "admissão: fechada; abre conversa quem tem conversa, convite seu, --dial com Peer ID ou identidade aceita (--open-admission abre)"
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
     parse_from(
         std::env::args().skip(1),
@@ -328,6 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION"),
         chat.peer_id()
     );
+    println!("{}", admission_notice(args.open_admission));
     if !args.no_nostr {
         let choice = resolve_relays(&args.nostr_relays, &args.data_dir.join("relays.txt"))?;
         let origin = match choice.source {
@@ -1001,6 +1012,14 @@ mod tests {
         // convive com as outras flags, em qualquer ordem
         let args = parse(&["--no-mdns", "--open-admission", "--no-nostr"], None).unwrap();
         assert!(args.open_admission && !args.mdns && args.no_nostr);
+    }
+
+    /// O modo de admissão aparece na partida: aberto como aviso, fechado como informação.
+    #[test]
+    fn the_admission_mode_is_announced_at_startup() {
+        let open = admission_notice(true);
+        assert!(open.starts_with("aviso:") && open.contains("aberta"));
+        assert!(admission_notice(false).contains("fechada"));
     }
 
     /// `--require-invite` virou o padrão (PR 3b): a flag antiga some, e quem a passava vê um erro claro.
