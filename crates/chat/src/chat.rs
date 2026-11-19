@@ -1049,6 +1049,17 @@ impl Chat {
         if !addrs.is_empty() && has_room(&self.invite_addrs, &peer) {
             self.invite_addrs.insert(peer, addrs);
         }
+        // Já conectado e sem conversa: o `Hello` desta conexão saiu antes do link, sem o token (e o do outro
+        // lado foi recusado pelo portão), e o `dial_peer` abaixo não faz nada com a conexão existente.
+        // Reapresento o `Hello` com o token; o de maior Peer ID só manda o `KeyPackage` ao receber o `Hello`
+        // do outro, que já passou, então o mando junto (achado do lab, PR 3b).
+        if self.connected.contains(&peer) && !self.conversations.contains_key(&peer) {
+            self.send_hello(peer);
+            if self.peer_id() > peer {
+                let key_package = self.device.key_package()?;
+                self.transmit(peer, &Envelope::KeyPackage(key_package));
+            }
+        }
         Ok(self.node.dial_peer(peer, invite.addrs().to_vec())?)
     }
 
