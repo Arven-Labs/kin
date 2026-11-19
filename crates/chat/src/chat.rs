@@ -1852,7 +1852,7 @@ impl Chat {
             return Ok(());
         }
         // P16: com a conversa antiga e `peer` dizendo que a perdeu, este `KeyPackage` pode substituí-la.
-        let replacing = self.lost_state.contains(&peer) && self.conversations.contains_key(&peer);
+        let replacing = self.conversations.contains_key(&peer);
         if self.conversations.contains_key(&peer) && !replacing {
             // O `Hello` "não tenho conversa" pode ainda não ter chegado: guarda em vez de perder.
             self.hold_key_package(peer, key_package);
