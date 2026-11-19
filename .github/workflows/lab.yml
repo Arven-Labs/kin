@@ -68,6 +68,8 @@ jobs:
         scenario:
           - cone
           - symmetric
+          - cone-quic
+          - symmetric-quic
           - relay-down
           - invite
           - relay-failover
