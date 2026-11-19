@@ -5849,6 +5849,75 @@ mod tests {
         )
     }
 
+    /// Certificado válido de um device novo de `identity`.
+    fn certificate_for(identity: &StandaloneIdentity) -> DeviceCertificate {
+        let device = DeviceKey::generate();
+        identity
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1,
+            )
+            .unwrap()
+    }
+
+    /// P18 PR 3: o certificado do `Hello` só vale para o Peer ID que ele certifica. Repetir o de uma
+    /// identidade confiável numa conexão de outro peer é recusado e não grava identidade nenhuma.
+    #[tokio::test]
+    async fn a_hello_certificate_of_another_peer_is_refused() {
+        let Household {
+            mut bia, ana_key, ..
+        } = household();
+        let certificate = certificate_for(&ana_key);
+        let owner = certificate.network_peer_id();
+
+        let forged = bia.on_hello(PeerId::random(), None, Some(certificate.to_bytes()));
+        assert!(matches!(forged, Err(Error::Malformed)), "{forged:?}");
+        assert!(bia.hello_identity.is_empty());
+
+        bia.on_hello(owner, None, Some(certificate.to_bytes()))
+            .unwrap();
+        assert_eq!(bia.hello_identity.get(&owner), Some(&ana_key.id()));
+    }
+
+    /// P18 PR 3: certificado de bytes inválidos é recusado, sem pânico.
+    #[tokio::test]
+    async fn a_hello_certificate_with_garbage_bytes_is_refused() {
+        let Household { mut bia, .. } = household();
+        for bytes in [vec![], vec![0; 8], vec![0xFF; 4096]] {
+            let peer = PeerId::random();
+            let result = bia.on_hello(peer, None, Some(bytes));
+            assert!(matches!(result, Err(Error::Malformed)), "{result:?}");
+            assert!(bia.hello_identity.is_empty());
+        }
+    }
+
+    /// P18 PR 3: com o portão ligado, a identidade autenticada só admite se for a minha ou uma aceita.
+    #[tokio::test]
+    async fn the_gate_admits_an_authenticated_identity_only_if_it_is_mine_or_trusted() {
+        let Household {
+            mut bia,
+            ana_key,
+            bia_key,
+            ..
+        } = household();
+        bia.set_require_invite(true);
+        let (ana_cert, own_cert) = (certificate_for(&ana_key), certificate_for(&bia_key));
+        let (ana_peer, own_peer) = (ana_cert.network_peer_id(), own_cert.network_peer_id());
+        bia.on_hello(ana_peer, None, Some(ana_cert.to_bytes()))
+            .unwrap();
+        bia.on_hello(own_peer, None, Some(own_cert.to_bytes()))
+            .unwrap();
+
+        assert!(!bia.admits(&ana_peer).unwrap(), "desconhecida sem token");
+        assert!(bia.admits(&own_peer).unwrap(), "minha identidade");
+        bia.trust(ana_key.id()).unwrap();
+        assert!(bia.admits(&ana_peer).unwrap(), "aceita por trust");
+        bia.untrust(&ana_key.id()).unwrap();
+        assert!(!bia.admits(&ana_peer).unwrap(), "untrust fecha de novo");
+    }
+
     fn device_list_wire(raw: &mut Conversation, invites: Vec<Invite>) -> Vec<u8> {
         raw.encrypt(&Payload::DeviceList(invites).encode()).unwrap()
     }
