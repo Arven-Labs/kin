@@ -1055,7 +1055,7 @@ impl Chat {
         // do outro, que já passou, então o mando junto (achado do lab, PR 3b).
         if self.connected.contains(&peer) && !self.conversations.contains_key(&peer) {
             self.send_hello(peer);
-            if self.peer_id() > peer {
+            if self.peer_id() < peer {
                 let key_package = self.device.key_package()?;
                 self.transmit(peer, &Envelope::KeyPackage(key_package));
             }
