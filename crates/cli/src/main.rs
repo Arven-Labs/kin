@@ -383,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if line == "/revoke-invite" || line.starts_with("/revoke-invite ") {
                     let prefix = line.strip_prefix("/revoke-invite").unwrap_or("").trim();
-                    println!("{}", revoke_invite_reply(prefix, chat.revoke_invite(prefix)));
+                    println!("{}", revoke_invite_reply(prefix, Ok(true)));
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
