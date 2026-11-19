@@ -70,6 +70,7 @@ jobs:
           - symmetric
           - cone-quic
           - symmetric-quic
+          - lossy
           - relay-down
           - invite
           - relay-failover
