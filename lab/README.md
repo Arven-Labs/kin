@@ -19,6 +19,8 @@ KEEP=1 lab/run.sh cone          # deixa os containers de pé para olhar os logs
 |---|---|
 | `cone` | conversa E2EE pronta pelo relay → DCUtR abre conexão **direta** → mensagem chega |
 | `symmetric` | NAT com porta aleatória: o furo falha e a conversa **continua pelo relay** |
+| `cone-quic` | o mesmo do `cone`, com o relay só em **QUIC/UDP** (`/udp/4001/quic-v1`): os peers o discam por QUIC e o hole punching roda sobre UDP (P17 a). A CLI não imprime o transporte da conexão direta; a prova é indireta (o relay não escuta TCP e o endereço de circuito do `a` contém `quic-v1`) |
+| `symmetric-quic` | o mesmo do `symmetric` sobre QUIC: sem conexão direta, a conversa segue pelo relay |
 | `relay-down` | depois do furo, o relay cai e a conexão direta segue viva |
 | `invite` | `a` gera o link (`/invite`), `b` o aceita (`--accept`) atrás de NAT: link adulterado é recusado, conversa pronta, hole punching |
 | `relay-failover` | dois relays; o reservado cai, `a` passa para o outro e um convite novo funciona por ele |

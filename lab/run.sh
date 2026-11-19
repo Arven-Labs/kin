@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -31,6 +31,12 @@ wait_direct() { wait_log "$1" "rota com $2: direta" "${3:-45}"; }
 # "Digita" uma linha no stdin do kin do container.
 say() { compose exec -T "$1" sh -c "echo '$2' > /tmp/in"; }
 
+# Transporte do relay, que os peers também usam para chegar a ele: TCP por padrão; os cenários `*-quic`
+# trocam para QUIC/UDP (P17 a) com `use_quic` e voltam com `use_tcp`.
+use_tcp() { RELAY_PROTO="tcp/4001"; export RELAY_LISTEN="/ip4/0.0.0.0/$RELAY_PROTO"; }
+use_quic() { RELAY_PROTO="udp/4001/quic-v1"; export RELAY_LISTEN="/ip4/0.0.0.0/$RELAY_PROTO"; }
+use_tcp
+
 FAILED=0
 pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
@@ -48,11 +54,11 @@ infra() { # nat [relay2]
   cleanup
   export NAT_MODE=$nat A_ARGS="" B_ARGS=""
   compose up -d relay routera routerb "$@" >/dev/null || return 1
-  wait_log relay "relay em /ip4/203.0.113.10/tcp/4001/p2p/" 30 || { echo "relay não subiu"; return 1; }
-  RELAY_ADDR=$(first relay '/ip4/203.0.113.10/tcp/4001/p2p/[A-Za-z0-9]+')
+  wait_log relay "relay em /ip4/203.0.113.10/$RELAY_PROTO/p2p/" 30 || { echo "relay não subiu"; return 1; }
+  RELAY_ADDR=$(first relay "/ip4/203.0.113.10/$RELAY_PROTO/p2p/[A-Za-z0-9]+")
   if [ "${1:-}" = relay2 ]; then
-    wait_log relay2 "relay em /ip4/203.0.113.11/tcp/4001/p2p/" 30 || { echo "relay2 não subiu"; return 1; }
-    RELAY2_ADDR=$(first relay2 '/ip4/203.0.113.11/tcp/4001/p2p/[A-Za-z0-9]+')
+    wait_log relay2 "relay em /ip4/203.0.113.11/$RELAY_PROTO/p2p/" 30 || { echo "relay2 não subiu"; return 1; }
+    RELAY2_ADDR=$(first relay2 "/ip4/203.0.113.11/$RELAY_PROTO/p2p/[A-Za-z0-9]+")
   fi
 }
 
@@ -64,7 +70,7 @@ setup() {
   export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
   compose up -d a >/dev/null || return 1
   wait_log a "reserva aceita no relay" 30 || { echo "a não conseguiu reserva no relay"; logs a; return 1; }
-  A_CIRCUIT=$(first a '/ip4/203.0.113.10/tcp/4001/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+')
+  A_CIRCUIT=$(first a "/ip4/203.0.113.10/$RELAY_PROTO/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+")
 
   export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --dial $A_CIRCUIT"
   compose up -d b >/dev/null || return 1
@@ -102,6 +108,27 @@ scenario_symmetric() {
   fi
   check "mensagem chega pelo relay" delivered a b "oi simétrico"
   check "resposta chega pelo relay" delivered b a "volta simétrica"
+}
+
+# Mesmos cenários `cone` e `symmetric`, mas com o relay em QUIC/UDP: os peers o discam por QUIC, então
+# os endereços observados (identify) e o hole punching (DCUtR) rodam sobre UDP (P17 a). O log da CLI
+# não diz o transporte da conexão direta; a prova é indireta: o relay só escuta UDP, então o endereço
+# de circuito que o `a` anuncia (`A_CIRCUIT`) tem de conter `quic-v1`.
+quic_reserved() { case "$A_CIRCUIT" in *quic-v1*) true ;; *) false ;; esac; }
+
+scenario_cone_quic() {
+  use_quic
+  echo "== NAT cone sobre QUIC/UDP"
+  scenario_cone
+  check "reserva no relay por QUIC" quic_reserved
+  use_tcp
+}
+
+scenario_symmetric_quic() {
+  use_quic
+  echo "== NAT simétrico sobre QUIC/UDP"
+  scenario_symmetric
+  use_tcp
 }
 
 scenario_relay_down() {
@@ -669,6 +696,8 @@ run_scenario() {
   case "$1" in
     cone) scenario_cone ;;
     symmetric) scenario_symmetric ;;
+    cone-quic) scenario_cone_quic ;;
+    symmetric-quic) scenario_symmetric_quic ;;
     relay-down) scenario_relay_down ;;
     invite) scenario_invite ;;
     relay-failover) scenario_relay_failover ;;
@@ -684,7 +713,7 @@ run_scenario() {
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}
