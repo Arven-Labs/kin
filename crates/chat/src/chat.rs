@@ -1872,7 +1872,7 @@ impl Chat {
     /// `admits` devolveu `Ok(false)`: erro de banco não é recusa. Nada vai ao peer.
     fn notify_not_admitted(&mut self, peer: PeerId) {
         // `contains` antes de `admits`: um `Hello` repetido de quem já avisei não consulta o banco.
-        if self.not_admitted_notified.contains(&peer) || !matches!(self.admits(&peer), Ok(false)) {
+        if !matches!(self.admits(&peer), Ok(false)) {
             return;
         }
         if self.not_admitted_notified.len() < MAX_NOT_ADMITTED_NOTIFIED {
