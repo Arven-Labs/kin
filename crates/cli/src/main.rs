@@ -88,6 +88,14 @@ fn reset_notice(peer: &str, identity: &str) -> String {
     )
 }
 
+/// P34: o portão fechado recusou `peer`. Só local (nada vai ao peer): diz **quem** e os caminhos para admitir.
+fn not_admitted_notice(peer: &str) -> String {
+    format!(
+        "(peer {peer} conectou e não admitido: o portão está fechado; para abrir conversa mande a ele um /invite \
+         meu, use /accept com o link dele, ou --dial com o Peer ID (/p2p/<id>); --open-admission abre o portão)"
+    )
+}
+
 /// Em que modo de admissão o kin subiu (auditoria do PR 3b, baixo 1): o portão fechado recusa estranhos
 /// em silêncio, então o usuário precisa saber que ele está ligado, ou desligado.
 fn admission_notice(open_admission: bool) -> &'static str {
@@ -903,6 +911,9 @@ fn on_event(
         ChatEvent::ConversationReset { peer, identity } => {
             println!("{}", reset_notice(&peer.to_string(), &identity.to_base58()));
         }
+        ChatEvent::NotAdmitted { peer } => {
+            println!("{}", not_admitted_notice(&peer.to_string()));
+        }
         ChatEvent::Received { message, .. } => {
             let Message {
                 id, parent, text, ..
@@ -1037,6 +1048,19 @@ mod tests {
         assert!(notice.contains("IdentidadeBase58"), "{notice}");
         assert!(notice.contains("confirme por outro canal"), "{notice}");
         assert!(notice.contains("perdid"), "{notice}");
+    }
+
+    /// P34: o aviso de peer não admitido diz quem e os caminhos para admitir.
+    #[test]
+    fn the_not_admitted_notice_names_the_peer_and_the_ways_in() {
+        let notice = not_admitted_notice("12D3KooWPeer");
+        assert!(notice.contains("12D3KooWPeer"), "{notice}");
+        assert!(notice.contains("não admitido"), "{notice}");
+        assert!(notice.contains("/invite"), "{notice}");
+        assert!(notice.contains("/accept"), "{notice}");
+        assert!(notice.contains("--dial"), "{notice}");
+        // `/trust` não abre o portão para estranho (o `Hello` dele não traz certificado): fora do aviso.
+        assert!(!notice.contains("/trust"), "{notice}");
     }
 
     /// O modo de admissão aparece na partida: aberto como aviso, fechado como informação.

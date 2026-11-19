@@ -238,6 +238,7 @@ scenario_invite_single_use() {
   else
     pass "segundo uso do mesmo link não abre conversa"
   fi
+  check "a avisou que o a2 não foi admitido (P34)" wait_log a "não admitido" 10
   [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 1 ] \
     && pass "a tem uma conversa só (a do primeiro convidado)" \
     || fail "a tem mais de uma conversa"
@@ -261,6 +262,7 @@ scenario_invite_revoked() {
   else
     pass "link revogado não abre conversa"
   fi
+  check "a avisou que o b não foi admitido (P34)" wait_log a "não admitido" 10
   [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 0 ] \
     && pass "a não tem conversa nenhuma" \
     || fail "a abriu conversa com o link revogado"
@@ -388,7 +390,7 @@ contact_and_fanout() {
 
   # Fan-out: C fala com a identidade X e os dois devices recebem.
   say b "oi de C"
-  check "c -> X: a1 recebe" wait_log a "peer: oi de C" 20
+  check "c -> X: a1 recebe" wait_log a "peer: oi de C" 20 || { echo "--- log de a"; logs a | tail -40; echo "--- log de b (c)"; logs b | tail -40; }
   check "c -> X: a2 recebe" wait_log a2 "peer: oi de C" 20
 }
 

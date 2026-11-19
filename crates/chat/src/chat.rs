@@ -75,6 +75,12 @@ pub enum ChatEvent {
         /// A identidade do outro lado (a mesma da conversa antiga): quem a aplicação mostra ao usuário.
         identity: IdentityId,
     },
+    /// P34: `peer` conectou, se apresentou (`Hello`) e o portão fechado ([`Chat::set_require_invite`]) **não
+    /// o admitiu**: sem conversa, sem convite meu, sem `dial` com Peer ID, sem identidade aceita. Uma vez por
+    /// conexão. É só local: nada é dito ao peer recusado (não vira oráculo do estado dos convites).
+    NotAdmitted {
+        peer: PeerId,
+    },
     /// Mensagem recebida e decifrada.
     Received {
         peer: PeerId,
@@ -311,6 +317,9 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 /// Quantos peers podem ter um `KeyPackage` guardado ao mesmo tempo (no pior caso, 1 MiB). Maior que o dos
 /// devices conhecidos de propósito: quem enche as vagas precisa de uma conexão por vaga (auditoria, médio 2).
 const MAX_HELD_KEY_PACKAGES: usize = 64;
+/// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
+/// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
+const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
 
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 /// O Peer ID fixado num endereço discado: só vale o `/p2p/<id>` que **termina** o endereço (em circuito,
@@ -491,6 +500,9 @@ pub struct Chat {
     hello_pending: HashSet<PeerId>,
     /// Peers com quem já refiz a conversa nesta conexão: um reset por conexão (auditoria, médio 2).
     reset_done: HashSet<PeerId>,
+    /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
+    /// teto. Em memória; some com a conexão.
+    not_admitted_notified: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
     dialed: HashSet<PeerId>,
@@ -738,6 +750,7 @@ impl Chat {
             lost_state: HashSet::new(),
             hello_pending: HashSet::new(),
             reset_done: HashSet::new(),
+            not_admitted_notified: HashSet::new(),
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
@@ -1574,6 +1587,7 @@ impl Chat {
                 self.connected.remove(&peer);
                 self.hello_pending.remove(&peer);
                 self.reset_done.remove(&peer);
+                self.not_admitted_notified.remove(&peer);
                 self.retry.remove(&peer);
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
@@ -1760,6 +1774,9 @@ impl Chat {
         if let Some(token) = token {
             self.note_invite_token(peer, token)?;
         }
+        // Só aqui a recusa é definitiva para quem ainda não tem conversa: o `Hello` já trouxe o que o peer
+        // tinha a apresentar (token, certificado). Antes disso (só o `KeyPackage`), ele ainda pode se apresentar.
+        self.notify_not_admitted(peer);
         // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o token ou
         // a identidade chegou, ele é processado (e guardado de novo se ainda não for admitido).
         if (introduced || self.lost_state.contains(&peer))
@@ -1848,6 +1865,19 @@ impl Chat {
         match self.admitted.get(peer) {
             Some(token) => self.outbox.invite_token_is_live(token, now_secs()),
             None => Ok(false),
+        }
+    }
+
+    /// P34: avisa (`NotAdmitted`) que o portão recusou `peer`, uma vez por conexão e com teto. Só quando
+    /// `admits` devolveu `Ok(false)`: erro de banco não é recusa. Nada vai ao peer.
+    fn notify_not_admitted(&mut self, peer: PeerId) {
+        // `contains` antes de `admits`: um `Hello` repetido de quem já avisei não consulta o banco.
+        if self.not_admitted_notified.contains(&peer) || !matches!(self.admits(&peer), Ok(false)) {
+            return;
+        }
+        if self.not_admitted_notified.len() < MAX_NOT_ADMITTED_NOTIFIED {
+            self.not_admitted_notified.insert(peer);
+            self.queue.push_back(ChatEvent::NotAdmitted { peer });
         }
     }
 
@@ -6307,6 +6337,81 @@ mod tests {
 
     fn is_reset(event: &ChatEvent) -> bool {
         matches!(event, ChatEvent::ConversationReset { .. })
+    }
+
+    fn not_admitted(events: &[ChatEvent], peer: PeerId) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::NotAdmitted { peer: p } if *p == peer))
+            .count()
+    }
+
+    /// P34: estranho sem token com o portão ligado gera um aviso, uma vez por conexão; ao reconectar avisa de
+    /// novo. Token que não vive (nunca emitido) também.
+    #[tokio::test]
+    async fn a_refused_stranger_is_announced_once_per_connection() {
+        let mut ana = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        ana.set_require_invite(true);
+        let stranger = PeerId::random();
+
+        ana.on_hello(stranger, None, None, None).unwrap();
+        ana.on_hello(stranger, None, None, None).unwrap();
+        assert_eq!(
+            not_admitted(&events(&mut ana), stranger),
+            1,
+            "uma por conexão"
+        );
+
+        ana.handle(NodeEvent::PeerDisconnected(stranger));
+        ana.on_hello(stranger, Some([7; 16]), None, None).unwrap();
+        assert_eq!(
+            not_admitted(&events(&mut ana), stranger),
+            1,
+            "token nunca emitido, nova conexão"
+        );
+    }
+
+    /// P34: quem o portão admite (aberto, `dial` com Peer ID) não gera aviso.
+    #[tokio::test]
+    async fn an_admitted_peer_is_not_announced() {
+        let mut open = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        let peer = PeerId::random();
+        open.on_hello(peer, None, None, None).unwrap();
+        assert_eq!(not_admitted(&events(&mut open), peer), 0, "portão aberto");
+
+        let mut closed = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        closed.set_require_invite(true);
+        closed.dialed.insert(peer);
+        closed.on_hello(peer, None, None, None).unwrap();
+        assert_eq!(
+            not_admitted(&events(&mut closed), peer),
+            0,
+            "dial com Peer ID"
+        );
+    }
+
+    /// P34: o teto de peers avisados vale; acima dele, recusa sem aviso (como `hello_identity`).
+    #[tokio::test]
+    async fn the_announced_set_is_capped() {
+        let mut ana = chat(&StandaloneIdentity::generate(), &DeviceKey::generate());
+        ana.set_require_invite(true);
+        let strangers: Vec<PeerId> = (0..MAX_NOT_ADMITTED_NOTIFIED + 10)
+            .map(|_| PeerId::random())
+            .collect();
+        for peer in &strangers {
+            ana.on_hello(*peer, None, None, None).unwrap();
+        }
+        let total = events(&mut ana)
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::NotAdmitted { .. }))
+            .count();
+        assert_eq!(total, MAX_NOT_ADMITTED_NOTIFIED);
+
+        // Desconectar um peer avisado libera a vaga: o próximo recusado volta a ser avisado.
+        ana.handle(NodeEvent::PeerDisconnected(strangers[0]));
+        let late = strangers[MAX_NOT_ADMITTED_NOTIFIED + 5];
+        ana.on_hello(late, None, None, None).unwrap();
+        assert_eq!(not_admitted(&events(&mut ana), late), 1, "vaga liberada");
     }
 
     /// P18 PR 3: o certificado do `Hello` só vale para o Peer ID que ele certifica. Repetir o de uma
