@@ -358,3 +358,63 @@ async fn live_tokens_survive_a_restart() {
     let ana = a.open();
     assert_eq!(ana.invites().len(), 1, "o token sumiu ao reiniciar");
 }
+
+/// Auditoria (baixo 1): quem já é contato e apresenta o token o gasta; senão o link ficaria vivo para outro.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_that_presents_a_token_spends_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (
+        Person::new(dir.path(), "ana"),
+        Person::new(dir.path(), "bia"),
+    );
+    {
+        let (mut ana, mut bia) = (a.open(), b.open());
+        connect(&mut ana, &mut bia).await;
+    }
+
+    let (mut ana, mut bia) = (a.open(), b.open());
+    ana.set_require_invite(true);
+    let addr = listen(&mut ana).await;
+    let link = ana.invite_link(vec![addr], DEFAULT_INVITE_TTL).unwrap();
+    assert_eq!(ana.invites().len(), 1);
+
+    bia.accept(&Invite::from_link(&link).unwrap()).unwrap();
+    settle(&mut ana, &mut bia, SHORT).await;
+    assert!(
+        ana.invites().is_empty(),
+        "o contato apresentou o token e o link ficou vivo"
+    );
+}
+
+/// Auditoria (baixo 4): prefixo curto demais não revoga; maiúsculas valem.
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_prefix_needs_four_characters_and_ignores_case() {
+    let mut ana = person();
+    ana.chat.invite_link(vec![], DEFAULT_INVITE_TTL).unwrap();
+    let id = ana.chat.invites()[0].id.clone();
+
+    assert!(matches!(
+        ana.chat.revoke_invite(&id[..3]),
+        Err(Error::InvalidInvite)
+    ));
+    assert_eq!(ana.chat.invites().len(), 1, "prefixo curto não revogou");
+    assert!(ana.chat.revoke_invite(&id.to_uppercase()).unwrap());
+    assert!(ana.chat.invites().is_empty());
+}
+
+/// Auditoria (baixo 3): o token é um segredo; o `Debug` do convite não o mostra.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_debug_output_of_an_invite_hides_the_token() {
+    let ana = person();
+    let link = ana.chat.invite(vec![]).to_link_with_token(
+        &ana.device.invite_signer(),
+        now() + 3600,
+        [0xAB; 16],
+    );
+    let invite = Invite::from_link(&link).unwrap();
+    assert_eq!(invite.token(), Some([0xAB; 16]));
+
+    let shown = format!("{invite:?}");
+    assert!(shown.contains("<oculto>"), "{shown}");
+    assert!(!shown.contains("171, 171, 171"), "o token vazou: {shown}");
+}

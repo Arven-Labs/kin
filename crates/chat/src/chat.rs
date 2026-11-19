@@ -300,6 +300,9 @@ const MAX_SYNC_ENTRIES: usize = 100_000;
 
 /// Maior `KeyPackage` guardado à espera do token de convite (P18): um MLS KeyPackage real tem poucos KiB.
 const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
+/// Quantos peers podem ter um `KeyPackage` guardado ao mesmo tempo (no pior caso, 1 MiB). Maior que o dos
+/// devices conhecidos de propósito: quem enche as vagas precisa de uma conexão por vaga (auditoria, médio 2).
+const MAX_HELD_KEY_PACKAGES: usize = 64;
 
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
@@ -820,12 +823,16 @@ impl Chat {
             .collect()
     }
 
-    /// Revoga o convite vivo cujo `id` começa por `prefix`. `Ok(false)` se nenhum bate; prefixo vazio
-    /// ou que bate em mais de um é `Error::InvalidInvite` (nada é revogado por engano).
+    /// Revoga o convite vivo cujo `id` começa por `prefix` (maiúsculas valem). `Ok(false)` se nenhum bate;
+    /// prefixo com menos de 4 caracteres ou que bate em mais de um é `Error::InvalidInvite` (nada é
+    /// revogado por engano).
     pub fn revoke_invite(&mut self, prefix: &str) -> Result<bool, Error> {
-        if prefix.is_empty() {
+        // Mínimo de 4 caracteres: um prefixo curto demais revoga "o único que bate" por engano.
+        if prefix.len() < 4 {
             return Err(Error::InvalidInvite);
         }
+        let prefix = prefix.to_ascii_lowercase();
+        let prefix = prefix.as_str();
         let now = now_secs();
         let mut matches = self
             .outbox
@@ -992,10 +999,17 @@ impl Chat {
         self.expected.insert(peer, invite.identity().clone());
         // O token do link v3 vai no `Hello` a este peer (e só a ele) até a conversa ficar pronta.
         match invite.token() {
-            Some(token) if has_room(&self.hello_tokens, &peer) => {
+            Some(token) => {
+                // Cheio, sai uma entrada qualquer: quem enche isto é o usuário aceitando links, e uma
+                // aceitação nova não pode perder o token em silêncio (auditoria, médio 2).
+                if !has_room(&self.hello_tokens, &peer) {
+                    let evict = self.hello_tokens.keys().next().copied();
+                    if let Some(evict) = evict {
+                        self.hello_tokens.remove(&evict);
+                    }
+                }
                 self.hello_tokens.insert(peer, token);
             }
-            Some(_) => {}
             None => {
                 self.hello_tokens.remove(&peer);
             }
@@ -1649,14 +1663,19 @@ impl Chat {
         Ok(())
     }
 
-    /// O `Hello` de `peer` trouxe `token`: se é de um convite meu ainda vivo (e a exigência está ligada),
-    /// `peer` fica admitido até a conversa nascer, quando o token é gasto (`ready`). Token que não é meu,
+    /// O `Hello` de `peer` trouxe `token`. Se é de um convite meu ainda vivo: quem **já é contato** (já tem
+    /// conversa) gasta o token na hora, porque `ready` não vai rodar de novo para ele e o link ficaria
+    /// vivo (auditoria, baixo 1); quem não é fica admitido até a conversa nascer, quando o token é gasto
+    /// (`ready`). Vale com o portão ligado ou não: o uso único não depende dele. Token que não é meu,
     /// vencido, usado ou revogado é ignorado em silêncio (nada de estado, nada de sinal a quem sonda).
     fn note_invite_token(&mut self, peer: PeerId, token: [u8; 16]) -> Result<(), Error> {
-        if self.require_invite
-            && has_room(&self.admitted, &peer)
-            && self.outbox.invite_token_is_live(&token, now_secs())?
-        {
+        let now = now_secs();
+        if !self.outbox.invite_token_is_live(&token, now)? {
+            return Ok(());
+        }
+        if self.conversations.contains_key(&peer) {
+            self.outbox.take_invite_token(&token, now)?;
+        } else if has_room(&self.admitted, &peer) {
             self.admitted.insert(peer, token);
         }
         Ok(())
@@ -1684,9 +1703,12 @@ impl Chat {
         if self.conversations.contains_key(&peer) || self.peer_id() > peer {
             return Ok(());
         }
-        if !self.admits(&peer)? {
+        // Erro de leitura do banco conta como "não admitido" (falha fechada) e guarda igual (auditoria, baixo 2).
+        if !self.admits(&peer).unwrap_or(false) {
             // Pode ser o `Hello` com o token que ainda não chegou: guarda (com teto) em vez de perder.
-            if key_package.len() <= MAX_HELD_KEY_PACKAGE && has_room(&self.held_key_packages, &peer)
+            if key_package.len() <= MAX_HELD_KEY_PACKAGE
+                && (self.held_key_packages.contains_key(&peer)
+                    || self.held_key_packages.len() < MAX_HELD_KEY_PACKAGES)
             {
                 self.held_key_packages.insert(peer, key_package.to_vec());
             }
@@ -2444,8 +2466,12 @@ impl Chat {
         // `Hello`, para um handshake que falha no meio não queimar o link de quem convidei.
         self.hello_tokens.remove(&peer);
         self.held_key_packages.remove(&peer);
+        // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
+        // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
         if let Some(token) = self.admitted.remove(&peer) {
-            self.outbox.take_invite_token(&token, now_secs())?;
+            if let Err(e) = self.outbox.take_invite_token(&token, now_secs()) {
+                self.drop_message(peer, e);
+            }
         }
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.

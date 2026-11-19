@@ -4,13 +4,29 @@ use crate::Error;
 ///
 /// `Hello` (ambos, ao conectar) → o de maior Peer ID responde `KeyPackage` → o de menor cria a
 /// conversa e manda `Welcome` → daí em diante só `Mls`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Envelope {
     /// Com o token do convite (P18), se o link o tinha; sem ele, payload vazio.
     Hello(Option<[u8; 16]>),
     KeyPackage(Vec<u8>),
     Welcome(Vec<u8>),
     Mls(Vec<u8>),
+}
+
+/// `Debug` à mão: o token do `Hello` é um segredo até ser usado e não pode sair em log nem em mensagem
+/// de teste (auditoria, baixo 3). O resto sai como o `derive` faria.
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hello(token) => f
+                .debug_tuple("Hello")
+                .field(&token.map(|_| "<oculto>"))
+                .finish(),
+            Self::KeyPackage(bytes) => f.debug_tuple("KeyPackage").field(bytes).finish(),
+            Self::Welcome(bytes) => f.debug_tuple("Welcome").field(bytes).finish(),
+            Self::Mls(bytes) => f.debug_tuple("Mls").field(bytes).finish(),
+        }
+    }
 }
 
 impl Envelope {
@@ -63,6 +79,14 @@ mod tests {
         let without = Envelope::Hello(None).encode();
         assert_eq!(without, vec![0], "só a tag: igual ao formato antigo");
         assert_eq!(Envelope::decode(&without).unwrap(), Envelope::Hello(None));
+    }
+
+    /// Auditoria (baixo 3): o token do `Hello` é um segredo e o `Debug` não o mostra.
+    #[test]
+    fn the_debug_output_of_a_hello_hides_the_token() {
+        let shown = format!("{:?}", Envelope::Hello(Some([0xAB; 16])));
+        assert!(shown.contains("<oculto>"), "{shown}");
+        assert!(!shown.contains("171"), "o token vazou: {shown}");
     }
 
     /// Entrada externa: payload de `Hello` que não tem 0 nem 16 bytes é recusado, sem pânico.

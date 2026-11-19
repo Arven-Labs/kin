@@ -48,12 +48,24 @@ pub struct LiveInvite {
 /// [`Invite::to_link_with_token`]; a 2, sem token, ainda é lida), com validade e assinatura, em base64url
 /// sem padding, depois de `kin://invite/`. A validade só existe no link: depois de `from_link`, o `Invite`
 /// não a carrega (ADR 0033); o token (ADR 0039) fica em [`Invite::token`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Invite {
     certificate: DeviceCertificate,
     addrs: Vec<Multiaddr>,
     /// Só o link v3 traz; `new` e a `DeviceList` ficam sem.
     token: Option<[u8; 16]>,
+}
+
+/// `Debug` à mão: o token é um segredo até ser usado e não pode sair em log nem em mensagem de teste
+/// (auditoria, baixo 3).
+impl std::fmt::Debug for Invite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Invite")
+            .field("certificate", &self.certificate)
+            .field("addrs", &self.addrs)
+            .field("token", &self.token.map(|_| "<oculto>"))
+            .finish()
+    }
 }
 
 impl Invite {
