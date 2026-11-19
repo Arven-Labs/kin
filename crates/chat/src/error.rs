@@ -42,6 +42,9 @@ pub enum Error {
     /// Link de convite íntegro, mas com a validade vencida (P18, ADR 0033).
     #[error("convite vencido")]
     ExpiredInvite,
+    /// Já há convites vivos demais (P18, ADR 0039): revogue um ou espere vencer.
+    #[error("convites vivos demais")]
+    TooManyInvites,
     /// `Chat::untrust` da minha própria identidade: os meus devices são família, não contatos.
     #[error("não dá para desconfiar da própria identidade")]
     OwnIdentity,

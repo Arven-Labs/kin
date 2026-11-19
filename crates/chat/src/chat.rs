@@ -19,7 +19,7 @@ use crate::outbox::{EntryKind, Outbox, SeenKind};
 use crate::payload::{HISTORY_CHUNK_BUDGET, HistoryItem, MAX_DECODED_HISTORY, Payload};
 use crate::wire::Envelope;
 use crate::{DepositId, Mailbox, MailboxEvent};
-use crate::{Error, HistoryEntry, Invite, Message, MessageId};
+use crate::{Error, HistoryEntry, Invite, LiveInvite, Message, MessageId};
 
 /// O que o [`Chat`] avisa à aplicação.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +298,12 @@ const REVOCATION_WINDOW: Duration = Duration::from_secs(60);
 /// comprometido (chave mestra vazada) não pode encher o disco sem limite.
 const MAX_SYNC_ENTRIES: usize = 100_000;
 
+/// Maior `KeyPackage` guardado à espera do token de convite (P18): um MLS KeyPackage real tem poucos KiB.
+const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
+/// Quantos peers podem ter um `KeyPackage` guardado ao mesmo tempo (no pior caso, 1 MiB). Maior que o dos
+/// devices conhecidos de propósito: quem enche as vagas precisa de uma conexão por vaga (auditoria, médio 2).
+const MAX_HELD_KEY_PACKAGES: usize = 64;
+
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 fn has_room<V>(map: &HashMap<PeerId, V>, key: &PeerId) -> bool {
     map.contains_key(key) || map.len() < MAX_KNOWN_DEVICES
@@ -445,6 +451,17 @@ pub struct Chat {
     handshake_retries: HashMap<(PeerId, std::mem::Discriminant<Envelope>), u8>,
     /// Identidade exigida de cada peer discado por convite (`accept`), até a conversa ficar pronta.
     expected: HashMap<PeerId, IdentityId>,
+    /// Com `true`, quem não é conhecido só abre conversa se apresentar um token vivo de convite meu
+    /// (P18, ADR 0039). Padrão `false`: a biblioteca segue aberta.
+    require_invite: bool,
+    /// Token do link v3 que apresento no `Hello` a cada peer discado por `accept`, até a conversa ficar pronta.
+    hello_tokens: HashMap<PeerId, [u8; 16]>,
+    /// Peers que apresentaram, no `Hello`, um token vivo de convite meu. O token só é gasto em `ready`.
+    /// Em memória: cai com a conexão, e o `Hello` seguinte o apresenta de novo.
+    admitted: HashMap<PeerId, [u8; 16]>,
+    /// `KeyPackage` recusado só por falta de token: o `Hello` com o token e o `KeyPackage` vão por
+    /// substreams diferentes, sem ordem garantida. Guardado até o token chegar (ou a conexão cair).
+    held_key_packages: HashMap<PeerId, Vec<u8>>,
     /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
     future: HashMap<PeerId, Vec<Vec<u8>>>,
     /// Fila de saída e ids já vistos (3.2); persistente em `open`, em memória em `new`.
@@ -679,6 +696,10 @@ impl Chat {
             handshake: HashMap::new(),
             handshake_retries: HashMap::new(),
             expected: HashMap::new(),
+            require_invite: false,
+            hello_tokens: HashMap::new(),
+            admitted: HashMap::new(),
+            held_key_packages: HashMap::new(),
             future: HashMap::new(),
             outbox,
             connected: Default::default(),
@@ -772,10 +793,69 @@ impl Chat {
     /// Link de convite deste device com os endereços `addrs`, válido por `ttl` a partir de agora e
     /// assinado pela chave de rede do device (P18). `ttl` passa de [`MAX_INVITE_TTL`] menos 5 minutos
     /// vira esse teto (folga para relógios desencontrados): quem lê recusa validade além de 7 dias.
-    pub fn invite_link(&self, addrs: Vec<Multiaddr>, ttl: Duration) -> String {
+    ///
+    /// O link é o v3 e leva um **token de uso único** (16 bytes aleatórios, na parte assinada): fica no
+    /// banco até vencer, ser usado (conversa pronta) ou revogado ([`Chat::revoke_invite`]). Com
+    /// [`Chat::set_require_invite`] ligado, só quem o apresenta abre conversa. Falha com
+    /// `Error::TooManyInvites` se já há 16 convites vivos (ADR 0039).
+    pub fn invite_link(&mut self, addrs: Vec<Multiaddr>, ttl: Duration) -> Result<String, Error> {
         let ttl = ttl.min(MAX_INVITE_TTL - INVITE_CLOCK_SLACK);
-        self.invite(addrs)
-            .to_link(&self.signer, now_secs().saturating_add(ttl.as_secs()))
+        let now = now_secs();
+        let expires_at = now.saturating_add(ttl.as_secs());
+        let token: [u8; 16] = rand::random();
+        self.outbox.add_invite_token(&token, expires_at, now)?;
+        Ok(self
+            .invite(addrs)
+            .to_link_with_token(&self.signer, expires_at, token))
+    }
+
+    /// Convites emitidos por este device que ainda não foram usados nem venceram (P18, ADR 0039). Um erro
+    /// de leitura do banco aparece como lista vazia.
+    pub fn invites(&self) -> Vec<LiveInvite> {
+        self.outbox
+            .live_invite_tokens(now_secs())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(token, expires_at)| LiveInvite {
+                id: invite_id(&token),
+                expires_at,
+            })
+            .collect()
+    }
+
+    /// Revoga o convite vivo cujo `id` começa por `prefix` (maiúsculas valem). `Ok(false)` se nenhum bate;
+    /// prefixo com menos de 4 caracteres ou que bate em mais de um é `Error::InvalidInvite` (nada é
+    /// revogado por engano).
+    pub fn revoke_invite(&mut self, prefix: &str) -> Result<bool, Error> {
+        // Mínimo de 4 caracteres: um prefixo curto demais revoga "o único que bate" por engano.
+        if prefix.len() < 4 {
+            return Err(Error::InvalidInvite);
+        }
+        let prefix = prefix.to_ascii_lowercase();
+        let prefix = prefix.as_str();
+        let now = now_secs();
+        let mut matches = self
+            .outbox
+            .live_invite_tokens(now)?
+            .into_iter()
+            .filter(|(token, _)| invite_id(token).starts_with(prefix));
+        let Some((token, _)) = matches.next() else {
+            return Ok(false);
+        };
+        if matches.next().is_some() {
+            return Err(Error::InvalidInvite);
+        }
+        // Quem já apresentou o token no `Hello`, mas ainda não virou conversa, perde a vaga também.
+        self.admitted.retain(|_, admitted| *admitted != token);
+        self.outbox.take_invite_token(&token, now)
+    }
+
+    /// Com `true`, quem não é conhecido só abre conversa se apresentar um token vivo de um convite meu
+    /// (P18, ADR 0039). Conhecido é quem já tem conversa, quem eu discei por convite (`accept`) e os
+    /// devices de uma identidade confiável. Padrão `false`: a biblioteca segue aberta; o aplicativo liga
+    /// a exigência.
+    pub fn set_require_invite(&mut self, require: bool) {
+        self.require_invite = require;
     }
 
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e
@@ -917,6 +997,23 @@ impl Chat {
         }
         self.trust(invite.identity().clone())?;
         self.expected.insert(peer, invite.identity().clone());
+        // O token do link v3 vai no `Hello` a este peer (e só a ele) até a conversa ficar pronta.
+        match invite.token() {
+            Some(token) => {
+                // Cheio, sai uma entrada qualquer: quem enche isto é o usuário aceitando links, e uma
+                // aceitação nova não pode perder o token em silêncio (auditoria, médio 2).
+                if !has_room(&self.hello_tokens, &peer) {
+                    let evict = self.hello_tokens.keys().next().copied();
+                    if let Some(evict) = evict {
+                        self.hello_tokens.remove(&evict);
+                    }
+                }
+                self.hello_tokens.insert(peer, token);
+            }
+            None => {
+                self.hello_tokens.remove(&peer);
+            }
+        }
         // Guarda onde o convite diz que o peer está, para a rediscagem ter por onde começar (P32,I3).
         let addrs = dial_addrs(invite.addrs(), false);
         if !addrs.is_empty() && has_room(&self.invite_addrs, &peer) {
@@ -1400,6 +1497,9 @@ impl Chat {
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
                 self.retry.remove(&peer);
+                // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
+                self.admitted.remove(&peer);
+                self.held_key_packages.remove(&peer);
                 self.handshake_retries.retain(|(p, _), _| *p != peer);
                 self.announced.remove(&peer);
                 self.devices_announced.remove(&peer);
@@ -1533,7 +1633,7 @@ impl Chat {
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
         let result = match envelope {
-            Envelope::Hello => self.on_hello(peer),
+            Envelope::Hello(token) => self.on_hello(peer, token),
             Envelope::KeyPackage(kp) => self.on_key_package(peer, &kp),
             Envelope::Welcome(welcome) => self.on_welcome(peer, &welcome),
             Envelope::Mls(wire) => self.on_mls(peer, &wire),
@@ -1544,16 +1644,74 @@ impl Chat {
     }
 
     /// Só o de maior Peer ID responde com KeyPackage; o de menor convida (evita convite duplo).
-    fn on_hello(&mut self, peer: PeerId) -> Result<(), Error> {
+    fn on_hello(&mut self, peer: PeerId, token: Option<[u8; 16]>) -> Result<(), Error> {
+        if let Some(token) = token {
+            self.note_invite_token(peer, token)?;
+            // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o
+            // token chegou, ele é processado.
+            if let Some(key_package) = self.held_key_packages.remove(&peer) {
+                return self.on_key_package(peer, &key_package);
+            }
+        }
         if !self.conversations.contains_key(&peer) && self.peer_id() > peer {
+            if !self.admits(&peer)? {
+                return Ok(());
+            }
             let kp = self.device.key_package()?;
             self.transmit(peer, &Envelope::KeyPackage(kp));
         }
         Ok(())
     }
 
+    /// O `Hello` de `peer` trouxe `token`. Se é de um convite meu ainda vivo: quem **já é contato** (já tem
+    /// conversa) gasta o token na hora, porque `ready` não vai rodar de novo para ele e o link ficaria
+    /// vivo (auditoria, baixo 1); quem não é fica admitido até a conversa nascer, quando o token é gasto
+    /// (`ready`). Vale com o portão ligado ou não: o uso único não depende dele. Token que não é meu,
+    /// vencido, usado ou revogado é ignorado em silêncio (nada de estado, nada de sinal a quem sonda).
+    fn note_invite_token(&mut self, peer: PeerId, token: [u8; 16]) -> Result<(), Error> {
+        let now = now_secs();
+        if !self.outbox.invite_token_is_live(&token, now)? {
+            return Ok(());
+        }
+        if self.conversations.contains_key(&peer) {
+            self.outbox.take_invite_token(&token, now)?;
+        } else if has_room(&self.admitted, &peer) {
+            self.admitted.insert(peer, token);
+        }
+        Ok(())
+    }
+
+    /// `peer` pode abrir conversa comigo? Sem a exigência, sempre. Com ela, só quem já tem conversa, quem
+    /// eu discei por convite, os devices de uma identidade confiável, ou quem apresentou um token que
+    /// **ainda** está vivo (outro peer pode tê-lo gastado ou eu o ter revogado desde o `Hello`).
+    fn admits(&self, peer: &PeerId) -> Result<bool, Error> {
+        if !self.require_invite
+            || self.conversations.contains_key(peer)
+            || self.expected.contains_key(peer)
+            || self.household.contains_key(peer)
+            || self.contact_devices.contains_key(peer)
+        {
+            return Ok(true);
+        }
+        match self.admitted.get(peer) {
+            Some(token) => self.outbox.invite_token_is_live(token, now_secs()),
+            None => Ok(false),
+        }
+    }
+
     fn on_key_package(&mut self, peer: PeerId, key_package: &[u8]) -> Result<(), Error> {
         if self.conversations.contains_key(&peer) || self.peer_id() > peer {
+            return Ok(());
+        }
+        // Erro de leitura do banco conta como "não admitido" (falha fechada) e guarda igual (auditoria, baixo 2).
+        if !self.admits(&peer).unwrap_or(false) {
+            // Pode ser o `Hello` com o token que ainda não chegou: guarda (com teto) em vez de perder.
+            if key_package.len() <= MAX_HELD_KEY_PACKAGE
+                && (self.held_key_packages.contains_key(&peer)
+                    || self.held_key_packages.len() < MAX_HELD_KEY_PACKAGES)
+            {
+                self.held_key_packages.insert(peer, key_package.to_vec());
+            }
             return Ok(());
         }
         let mut conversation = Conversation::create(&self.device)?;
@@ -1580,6 +1738,11 @@ impl Chat {
 
     fn on_welcome(&mut self, peer: PeerId, welcome: &[u8]) -> Result<(), Error> {
         if self.conversations.contains_key(&peer) || self.peer_id() < peer {
+            return Ok(());
+        }
+        // Repetido aqui de propósito: o token pode ter sido gasto por outro peer ou revogado entre o
+        // `Hello` e este `Welcome` (dois convidados com o mesmo link).
+        if !self.admits(&peer)? {
             return Ok(());
         }
         let conversation = Conversation::join(
@@ -2299,6 +2462,17 @@ impl Chat {
         // O endereço da janela pré-conversa (só em memória até aqui) agora tem dono: vai para o disco.
         self.persist_peer_addrs(&peer);
         self.expected.remove(&peer);
+        // Uso único (P18, ADR 0039): a conversa nasceu, o token do convite é gasto agora, e não no
+        // `Hello`, para um handshake que falha no meio não queimar o link de quem convidei.
+        self.hello_tokens.remove(&peer);
+        self.held_key_packages.remove(&peer);
+        // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
+        // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
+        if let Some(token) = self.admitted.remove(&peer)
+            && let Err(e) = self.outbox.take_invite_token(&token, now_secs())
+        {
+            self.drop_message(peer, e);
+        }
         self.announce_if_ready(peer);
         // Conversa recém-pronta com o peer já conectado: o que estava na fila sai agora.
         self.flush(peer);
@@ -2938,7 +3112,8 @@ impl Chat {
     }
 
     fn send_hello(&mut self, peer: PeerId) {
-        self.transmit(peer, &Envelope::Hello);
+        let token = self.hello_tokens.get(&peer).copied();
+        self.transmit(peer, &Envelope::Hello(token));
     }
 
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
@@ -2972,7 +3147,7 @@ impl Chat {
         self.pending.insert(id, None);
         if matches!(
             envelope,
-            Envelope::Hello | Envelope::KeyPackage(_) | Envelope::Welcome(_)
+            Envelope::Hello(_) | Envelope::KeyPackage(_) | Envelope::Welcome(_)
         ) {
             self.handshake.insert(id, envelope.clone());
         }
@@ -2991,6 +3166,15 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Os 4 primeiros bytes do token em hexadecimal: o que a CLI lista e o que `revoke_invite` aceita. Não
+/// revela o token (sobram 96 bits).
+fn invite_id(token: &[u8; 16]) -> String {
+    token[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3808,7 +3992,7 @@ mod tests {
         let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
         let relay = MemoryRelay::default();
         let stranger = DeviceKey::generate().peer_id();
-        MemoryMailbox::new(&relay, stranger).deposit(bia.peer_id(), Envelope::Hello.encode());
+        MemoryMailbox::new(&relay, stranger).deposit(bia.peer_id(), Envelope::Hello(None).encode());
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
 
         let dropped = until(&mut bia, |e| match e {
@@ -6244,7 +6428,7 @@ mod tests {
         bia.announced.insert(ana_peer);
         bia.devices_announced.insert(ana_peer);
 
-        bia.transmit(ana_peer, &Envelope::Hello);
+        bia.transmit(ana_peer, &Envelope::Hello(None));
         let chat_id = *bia.pending.keys().next().unwrap();
         bia.pending
             .insert(chat_id, Some(MessageId::from_bytes([7; 16])));
@@ -6256,7 +6440,7 @@ mod tests {
         assert!(bia.announced.contains(&ana_peer), "mensagem de chat");
         assert!(bia.devices_announced.contains(&ana_peer));
 
-        bia.transmit(ana_peer, &Envelope::Hello);
+        bia.transmit(ana_peer, &Envelope::Hello(None));
         let control_id = *bia.pending.keys().next().unwrap();
         bia.handle(NodeEvent::SendFailed {
             peer: ana_peer,
@@ -9313,7 +9497,7 @@ mod tests {
 
         assert_eq!(r.bia.pending.len(), before, "nada foi transmitido");
         assert!(r.bia.handshake_retries.is_empty());
-        r.bia.resend_handshake(r.ana_peer, Envelope::Hello);
+        r.bia.resend_handshake(r.ana_peer, Envelope::Hello(None));
         assert!(
             !r.bia.handshake_retries.is_empty(),
             "o Hello continua saindo"

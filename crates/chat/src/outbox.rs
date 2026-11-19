@@ -23,9 +23,14 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// 5 = P24 (tabela `kin_distrusted`, a lista negra do `untrust`, também aditiva); 6 = P10a (tabela
 /// `kin_history`, o histórico das conversas, também aditiva); 7 = P10a (tabela `kin_history_cursor`, até
 /// onde já recebi do histórico de cada irmão, também aditiva); 8 = P32 a (tabela `kin_peer_addrs`, os
-/// endereços que cada contato informou, para rediscar depois de reiniciar, também aditiva). Um build
-/// antigo recusa o banco v8 (ver `migrate`): não há downgrade.
-const SCHEMA_VERSION: i64 = 8;
+/// endereços que cada contato informou, para rediscar depois de reiniciar, também aditiva); 9 = P18 (tabela
+/// `kin_invite_tokens`, os tokens de convite ainda vivos, também aditiva). Um build antigo recusa o banco
+/// v9 (ver `migrate`): não há downgrade.
+const SCHEMA_VERSION: i64 = 9;
+
+/// Teto de convites vivos por device (P18, ADR 0039): cada link emitido é uma linha, e o vencido sai
+/// sozinho, então o teto só aperta quem emite sem parar.
+pub(crate) const MAX_LIVE_INVITES: usize = 16;
 
 /// De qual memória de ids vistos se fala. Cada tipo de payload tem a sua, com teto próprio por peer:
 /// um irmão que espelha muito não pode expulsar os ids de mensagens comuns, nem um espelho com o
@@ -149,7 +154,10 @@ impl Outbox {
                  cursor INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_peer_addrs (
                  peer TEXT PRIMARY KEY,
-                 addrs TEXT NOT NULL);",
+                 addrs TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS kin_invite_tokens (
+                 token BLOB PRIMARY KEY,
+                 expires_at INTEGER NOT NULL);",
         )
         .map_err(Error::storage)?;
         Ok(Self {
@@ -505,6 +513,90 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         Ok(())
+    }
+
+    /// Grava um token de convite que vence em `expires_at` (segundos Unix). Varre os vencidos antes de
+    /// contar; com [`MAX_LIVE_INVITES`] vivos, recusa com `Error::TooManyInvites` (P18, ADR 0039).
+    pub(crate) fn add_invite_token(
+        &self,
+        token: &[u8; 16],
+        expires_at: u64,
+        now: u64,
+    ) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction().map_err(Error::storage)?;
+        tx.execute(
+            "DELETE FROM kin_invite_tokens WHERE expires_at <= ?1",
+            [now as i64],
+        )
+        .map_err(Error::storage)?;
+        let live: i64 = tx
+            .query_row("SELECT COUNT(*) FROM kin_invite_tokens", [], |row| {
+                row.get(0)
+            })
+            .map_err(Error::storage)?;
+        if usize::try_from(live).map_or(true, |live| live >= MAX_LIVE_INVITES) {
+            return Err(Error::TooManyInvites);
+        }
+        tx.execute(
+            "INSERT INTO kin_invite_tokens (token, expires_at) VALUES (?1, ?2)",
+            params![&token[..], expires_at as i64],
+        )
+        .map_err(Error::storage)?;
+        tx.commit().map_err(Error::storage)
+    }
+
+    /// Os tokens de convite ainda vivos (do mais antigo ao mais novo) com a validade de cada um. Varre os
+    /// vencidos. Linha com token de tamanho errado (banco adulterado) é ignorada.
+    pub(crate) fn live_invite_tokens(&self, now: u64) -> Result<Vec<([u8; 16], u64)>, Error> {
+        self.conn
+            .execute(
+                "DELETE FROM kin_invite_tokens WHERE expires_at <= ?1",
+                [now as i64],
+            )
+            .map_err(Error::storage)?;
+        let mut statement = self
+            .conn
+            .prepare("SELECT token, expires_at FROM kin_invite_tokens ORDER BY rowid")
+            .map_err(Error::storage)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(Error::storage)?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            let (bytes, expires_at) = row.map_err(Error::storage)?;
+            if let Ok(token) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                tokens.push((token, expires_at as u64));
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// `token` é de um convite meu que ainda não venceu nem foi usado ou revogado?
+    pub(crate) fn invite_token_is_live(&self, token: &[u8; 16], now: u64) -> Result<bool, Error> {
+        let live: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM kin_invite_tokens WHERE token = ?1 AND expires_at > ?2",
+                params![&token[..], now as i64],
+                |row| row.get(0),
+            )
+            .map_err(Error::storage)?;
+        Ok(live > 0)
+    }
+
+    /// Gasta (uso único) ou revoga o token: apaga a linha viva e diz se havia uma. A checagem e a
+    /// remoção são um comando só, então dois usos do mesmo token não passam os dois.
+    pub(crate) fn take_invite_token(&self, token: &[u8; 16], now: u64) -> Result<bool, Error> {
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM kin_invite_tokens WHERE token = ?1 AND expires_at > ?2",
+                params![&token[..], now as i64],
+            )
+            .map_err(Error::storage)?;
+        Ok(removed > 0)
     }
 
     /// Endereços gravados de `peer`; vazio se não há linha. Linha que não lê como `Multiaddr` (banco
@@ -1962,7 +2054,75 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// P18: banco v8 abre como v9, mantém o que tinha (aqui, os endereços) e ganha a tabela dos tokens.
+    #[test]
+    fn a_version_8_database_opens_as_version_9_keeps_its_data_and_gains_the_tokens_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let peer = peer();
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.set_peer_addrs(&peer, &[global_addr(1)]).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_invite_tokens; PRAGMA user_version = 8;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+        outbox.add_invite_token(&[1; 16], 200, 100).unwrap();
+
+        assert_eq!(outbox.peer_addrs(&peer).unwrap(), [global_addr(1)]);
+        assert!(outbox.invite_token_is_live(&[1; 16], 100).unwrap());
+        let version: i64 = outbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+    }
+
+    /// P18: o token vive até `expires_at` (exclusive), é gasto uma vez só e some da lista.
+    #[test]
+    fn an_invite_token_is_live_until_it_expires_and_can_be_taken_only_once() {
+        let outbox = Outbox::memory().unwrap();
+        outbox.add_invite_token(&[1; 16], 200, 100).unwrap();
+
+        assert!(outbox.invite_token_is_live(&[1; 16], 199).unwrap());
+        assert!(
+            !outbox.invite_token_is_live(&[1; 16], 200).unwrap(),
+            "no instante exato já venceu"
+        );
+        assert!(
+            !outbox.invite_token_is_live(&[2; 16], 100).unwrap(),
+            "outro token"
+        );
+
+        assert!(outbox.take_invite_token(&[1; 16], 150).unwrap());
+        assert!(
+            !outbox.take_invite_token(&[1; 16], 150).unwrap(),
+            "uso único"
+        );
+        assert!(outbox.live_invite_tokens(150).unwrap().is_empty());
+    }
+
+    /// P18: o teto de convites vivos varre os vencidos antes de contar.
+    #[test]
+    fn the_live_invite_ceiling_sweeps_expired_tokens_first() {
+        let outbox = Outbox::memory().unwrap();
+        for n in 0..MAX_LIVE_INVITES as u8 {
+            outbox.add_invite_token(&[n; 16], 200, 100).unwrap();
+        }
+        assert!(matches!(
+            outbox.add_invite_token(&[99; 16], 200, 100),
+            Err(Error::TooManyInvites)
+        ));
+
+        // No instante 200 todos venceram: cabe de novo.
+        outbox.add_invite_token(&[99; 16], 400, 200).unwrap();
+        assert_eq!(outbox.live_invite_tokens(200).unwrap(), [([99; 16], 400)]);
     }
 
     /// P32 a: ida e volta; a última gravação substitui a anterior e peer sem linha devolve vazio.
