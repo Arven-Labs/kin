@@ -228,48 +228,85 @@ async fn in_flight_messages_are_not_replayed_after_restart() {
     assert_eq!(unique, texts, "mensagem duplicada: {texts:?}");
 }
 
-/// 6. Lacuna conhecida: se um lado perde o banco, o outro continua achando que há conversa e o
-/// handshake não se refaz; o que ele envia é confirmado pela rede mas descartado pelo destino.
-/// Quando houver re-handshake (P16), este teste deve passar a exigir que a conversa se refaça.
+/// 6. P16: se um lado (`b`) perde o banco (mesma identidade e device, banco novo), o outro (`a`) o percebe
+/// pelo `Hello` ("não tenho conversa com você") e **refaz** a conversa sozinho, avisando com
+/// `ConversationReset`. Nas duas ordens de Peer ID: quem cria o grupo MLS é o de menor Peer ID.
 #[tokio::test(flavor = "multi_thread")]
-async fn peer_that_lost_its_database_is_not_rehandshaked_yet() {
-    let dir = tempfile::tempdir().unwrap();
-    let (pa, mut pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
-    let (mut a, mut b) = (pa.open(), pb.open());
-    let addr = connect(&mut a, &mut b).await;
-    drop(b);
-    timeout(
-        WAIT,
-        wait_for(&mut a, |e| {
-            matches!(e, ChatEvent::PeerDisconnected(_)).then_some(())
-        }),
-    )
-    .await
-    .expect("a não percebeu a queda");
+async fn peer_that_lost_its_database_is_rehandshaked() {
+    for a_lower in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pa, mut pb) = loop {
+            let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+            if (pa.peer_id() < pb.peer_id()) == a_lower {
+                break (pa, pb);
+            }
+        };
+        let (mut a, mut b) = (pa.open(), pb.open());
+        let addr = connect(&mut a, &mut b).await;
+        drop(b);
+        timeout(
+            WAIT,
+            wait_for(&mut a, |e| {
+                matches!(e, ChatEvent::PeerDisconnected(_)).then_some(())
+            }),
+        )
+        .await
+        .expect("a não percebeu a queda");
 
-    // Mesma identidade e device, banco novo: b não lembra de conversa nenhuma.
-    pb.db = dir.path().join("b-novo.db");
-    let mut b = pb.open();
-    assert!(!b.is_ready(&pa.peer_id()));
+        // Mesma identidade e device, banco novo: b não lembra de conversa nenhuma.
+        pb.db = dir.path().join("b-novo.db");
+        let mut b = pb.open();
+        assert!(!b.is_ready(&pa.peer_id()));
+        b.dial(addr).unwrap();
+        let (seen_a, seen_b) = connect_until_ready_within(&mut a, &mut b, WAIT).await;
+        let b_id = pb.peer_id();
+        assert!(
+            seen_a
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ConversationReset { peer } if *peer == b_id)),
+            "a não avisou a refeita (a_lower={a_lower}): {seen_a:?}"
+        );
+        assert!(
+            !seen_b
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ConversationReset { .. })),
+            "b não tinha o que refazer (a_lower={a_lower}): {seen_b:?}"
+        );
+        assert!(a.is_ready(&pb.peer_id()) && b.is_ready(&pa.peer_id()));
+
+        // E a conversa nova funciona nos dois sentidos.
+        a.send(pb.peer_id(), "depois do reset", None).unwrap();
+        let (_, message) = receive_while_driving(&mut b, &mut a).await;
+        assert_eq!(message.text, "depois do reset", "a_lower={a_lower}");
+        b.send(pa.peer_id(), "e de volta", None).unwrap();
+        let (_, message) = receive_while_driving(&mut a, &mut b).await;
+        assert_eq!(message.text, "e de volta", "a_lower={a_lower}");
+    }
+}
+
+/// P16: sem perda nenhuma, uma conversa nova (ou uma que continua) **não** gera `ConversationReset`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_or_surviving_conversation_is_never_reported_as_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    {
+        let (mut a, mut b) = (pa.open(), pb.open());
+        let addr = listen(&mut a).await;
+        b.dial(addr).unwrap();
+        let (seen_a, seen_b) = connect_until_ready_within(&mut a, &mut b, WAIT).await;
+        assert!(!has_reset(&seen_a) && !has_reset(&seen_b), "conversa nova");
+    }
+    // Os dois reabrem com os bancos de antes: a conversa continua, sem refazer.
+    let (mut a, mut b) = (pa.open(), pb.open());
+    let addr = listen(&mut a).await;
     b.dial(addr).unwrap();
     let (seen_a, seen_b) = settle(&mut a, &mut b, Duration::from_secs(3)).await;
-    // a reanuncia a conversa que tem no banco (enganosa: b não tem a sua); b nunca fica pronto.
-    assert!(
-        !seen_b
-            .iter()
-            .any(|e| matches!(e, ChatEvent::ConversationReady { .. })),
-        "o handshake se refez; atualizar este teste (P16): {seen_a:?} / {seen_b:?}"
-    );
-    assert!(a.is_ready(&pb.peer_id()) && !b.is_ready(&pa.peer_id()));
+    assert!(!has_reset(&seen_a) && !has_reset(&seen_b), "conversa que sobreviveu");
+    assert!(a.is_ready(&pb.peer_id()) && b.is_ready(&pa.peer_id()));
+}
 
-    // a ainda envia; a rede confirma, mas b não tem como decifrar e descarta.
-    let sent = a.send(pb.peer_id(), "perdida", None).unwrap();
-    let (seen_a, seen_b) = settle(&mut a, &mut b, Duration::from_secs(3)).await;
-    assert!(
-        seen_a
-            .iter()
-            .any(|e| matches!(e, ChatEvent::Delivered { message, .. } if *message == sent)),
-        "{seen_a:?}"
-    );
-    assert!(has_dropped(&seen_b), "{seen_b:?}");
+fn has_reset(events: &[ChatEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, ChatEvent::ConversationReset { .. }))
 }

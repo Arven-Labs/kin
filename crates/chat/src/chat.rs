@@ -67,6 +67,12 @@ pub enum ChatEvent {
         peer: PeerId,
         identity: IdentityId,
     },
+    /// O outro lado perdeu o estado da conversa (P16) e ela foi **refeita** com ele: o grupo antigo foi
+    /// descartado e um novo, com a mesma identidade, o substituiu. Chega antes do `ConversationReady` da
+    /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido.
+    ConversationReset {
+        peer: PeerId,
+    },
     /// Mensagem recebida e decifrada.
     Received {
         peer: PeerId,
@@ -473,6 +479,11 @@ pub struct Chat {
     /// rede é o da conexão (P18 PR 3, ADR 0039). É por ela que o portão admite a minha identidade e as
     /// aceitas por `trust`, sem token. Em memória: cai com a conexão e a conversa pronta.
     hello_identity: HashMap<PeerId, IdentityId>,
+    /// Peers que disseram no `Hello` que **não** têm a conversa que eu tenho com eles (P16): o `KeyPackage`
+    /// ou o `Welcome` deles pode, então, substituir a conversa antiga (só com a mesma identidade). Em
+    /// memória: cai com a conexão e a conversa pronta.
+    #[allow(dead_code)] // provisório: o uso entra na implementação, depois dos testes
+    lost_state: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
     dialed: HashSet<PeerId>,
@@ -717,6 +728,7 @@ impl Chat {
             hello_tokens: HashMap::new(),
             admitted: HashMap::new(),
             hello_identity: HashMap::new(),
+            lost_state: HashSet::new(),
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
@@ -6025,6 +6037,67 @@ mod tests {
                 1,
             )
             .unwrap()
+    }
+
+    /// P16: sem `lost_state`, um `KeyPackage` de quem já tem conversa continua ignorado (nenhum reset não
+    /// solicitado); com ele, o `KeyPackage` a substitui, mas **só** com a identidade da conversa antiga, e
+    /// uma recusa deixa a conversa antiga intacta.
+    #[tokio::test]
+    async fn a_peer_that_lost_its_state_replaces_the_conversation_only_with_the_same_identity() {
+        let (id_a, id_t, id_x) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package_of = |identity: &StandaloneIdentity| {
+            CryptoDevice::new(identity, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
+        assert!(ana.is_ready(&b));
+        let old = ana.conversations.get(&b).unwrap().id();
+        events(&mut ana);
+
+        // Sem `lost_state`: ignorado, a conversa é a mesma e ninguém é avisado.
+        ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
+        assert!(ana.conversations.get(&b).unwrap().id() == old);
+        assert!(events(&mut ana).is_empty());
+
+        // Com `lost_state`, identidade diferente: recusada, e a conversa antiga fica.
+        ana.lost_state.insert(b);
+        let err = ana.on_key_package(b, &key_package_of(&id_x)).unwrap_err();
+        assert!(
+            matches!(err, Error::Crypto(CryptoError::UnexpectedIdentity)),
+            "{err:?}"
+        );
+        assert!(ana.conversations.get(&b).unwrap().id() == old);
+        assert!(!events(&mut ana).iter().any(is_reset));
+
+        // Com `lost_state`, a mesma identidade: troca, avisa antes do `ConversationReady`.
+        ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
+        assert!(ana.conversations.get(&b).unwrap().id() != old);
+        let seen = events(&mut ana);
+        let reset = seen.iter().position(is_reset).expect("sem ConversationReset");
+        let ready = seen
+            .iter()
+            .position(|e| matches!(e, ChatEvent::ConversationReady { .. }))
+            .expect("sem ConversationReady");
+        assert!(reset < ready, "{seen:?}");
+        assert!(!ana.lost_state.contains(&b), "consumido pela troca");
+    }
+
+    fn is_reset(event: &ChatEvent) -> bool {
+        matches!(event, ChatEvent::ConversationReset { .. })
     }
 
     /// P18 PR 3: o certificado do `Hello` só vale para o Peer ID que ele certifica. Repetir o de uma

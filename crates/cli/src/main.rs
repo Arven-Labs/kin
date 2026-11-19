@@ -889,6 +889,9 @@ fn on_event(
             met.push((peer, identity));
             *current = Some(peer);
         }
+        ChatEvent::ConversationReset { peer } => println!(
+            "(conversa com {peer} refeita: o outro lado perdeu o estado; o que enviei sem ele perceber pode ter se perdido)"
+        ),
         ChatEvent::Received { message, .. } => {
             let Message {
                 id, parent, text, ..
