@@ -1878,9 +1878,7 @@ impl Chat {
         let invite = match conversation.invite(
             key_package,
             &Expected {
-                identity: old_identity
-                    .as_ref()
-                    .or_else(|| self.expected_identity(&peer)),
+                identity: self.expected_identity(&peer),
                 peer: Some(&peer),
             },
         ) {
