@@ -24,5 +24,13 @@ case "$NAT_MODE" in
   *) echo "NAT_MODE inválido: $NAT_MODE" >&2; exit 1 ;;
 esac
 
-echo "router pronto ($NAT_MODE): lan=$LAN_IF wan=$WAN_IF"
+# NETEM (opcional): atraso, jitter e perda na saída para a rede pública, como um enlace ruim, ex.:
+# NETEM="delay 80ms 20ms loss 3%". Cada roteador aplica na sua saída, então o caminho a↔b paga duas vezes.
+# Se o kernel do host não tiver o sch_netem, o `tc` falha e o roteador não sobe (falha visível).
+if [ -n "${NETEM:-}" ]; then
+  # shellcheck disable=SC2086  # NETEM é uma lista de argumentos do tc, de propósito sem aspas
+  tc qdisc add dev "$WAN_IF" root netem $NETEM
+fi
+
+echo "router pronto ($NAT_MODE): lan=$LAN_IF wan=$WAN_IF${NETEM:+ netem=\"$NETEM\"}"
 exec sleep infinity

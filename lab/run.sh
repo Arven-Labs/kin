@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -129,6 +129,26 @@ scenario_symmetric_quic() {
   echo "== NAT simétrico sobre QUIC/UDP"
   scenario_symmetric
   use_tcp
+}
+
+# Enlace ruim (atraso 80 ms ± 20 ms e 3% de perda em cada roteador): o NAT sintético é limpo demais, e
+# o mundo real perde pacote. Exige que a conversa feche e as mensagens cheguem; o furo direto é só
+# observado (com perda ele pode demorar ou não acontecer, e a conversa segue pelo relay).
+netem_active() { compose exec -T routera tc qdisc show 2>&1 | grep -q netem && compose exec -T routerb tc qdisc show 2>&1 | grep -q netem; }
+
+scenario_lossy() {
+  echo "== Enlace ruim (80 ms ± 20 ms, 3% de perda): a conversa fecha e as mensagens chegam"
+  export NETEM="delay 80ms 20ms loss 3%"
+  setup cone || { fail "montar o laboratório"; unset NETEM; return; }
+  check "atraso e perda ativos nos dois roteadores" netem_active
+  check "mensagem chega pelo relay" delivered a b "oi com perda"
+  if wait_direct a "$B_ID" 45 || wait_direct b "$A_ID" 5; then
+    pass "hole punching mesmo com perda"
+  else
+    echo "  INFO  sem conexão direta em 45s (aceitável com perda; a conversa segue pelo relay)"
+  fi
+  check "mensagem chega no fim" delivered b a "volta com perda"
+  unset NETEM
 }
 
 scenario_relay_down() {
@@ -696,6 +716,7 @@ run_scenario() {
   case "$1" in
     cone) scenario_cone ;;
     symmetric) scenario_symmetric ;;
+    lossy) scenario_lossy ;;
     cone-quic) scenario_cone_quic ;;
     symmetric-quic) scenario_symmetric_quic ;;
     relay-down) scenario_relay_down ;;
@@ -713,7 +734,7 @@ run_scenario() {
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}

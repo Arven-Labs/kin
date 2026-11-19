@@ -55,6 +55,7 @@ services:
       NAT_MODE: "${NAT_MODE:-cone}"
       LAN_PREFIX: "10.1.0."
       WAN_PREFIX: "203.0.113."
+      NETEM: "${NETEM:-}"
     networks:
       lana: { ipv4_address: 10.1.0.2 }
       pub: { ipv4_address: 203.0.113.2 }
@@ -65,6 +66,7 @@ services:
       NAT_MODE: "${NAT_MODE:-cone}"
       LAN_PREFIX: "10.2.0."
       WAN_PREFIX: "203.0.113."
+      NETEM: "${NETEM:-}"
     networks:
       lanb: { ipv4_address: 10.2.0.2 }
       pub: { ipv4_address: 203.0.113.3 }
