@@ -2078,4 +2078,15 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Auditoria** (`security-auditor`: 0 críticos, 0 altos, 0 médios, 3 baixos): baixos 1 e 2 corrigidos, 3 aceito.
 - **Erros meus**: errei um trecho de comentário num `Edit` (texto de `--dir`) e refiz; o `fmt --check` do CI pegaria uma linha longa que quebrei à mão antes de publicar.
 - **Não verificado**: `accept` repetido, `accept` de link v2 com peer conectado e `accept` com conversa em formação (sem teste); `warden/mobile`; teste em rede real (P33).
-- **Próximo passo**: P33 (rede real), P16 (re-handshake) ou o evento "peer não admitido".
+- **Próximo passo**: P33 (rede real), P16 (re-handshake) ou o evento "peer não admitido". *(P34 registrada no #253; P16 feita na subseção abaixo.)*
+
+#### Re-handshake quando um lado perde o banco (P16, ADR 0040, #254)
+
+- **Decisões do dono** (plan mode e durante o PR): refazer sozinho e avisar (sem `/reset`); detecção por bit no `Hello` (tag 5); a fila espera o `Hello` do peer (médio 1 da auditoria).
+- **Achado ao desenhar**: o `b` que perdeu o banco não conhece o `a` e manda `Hello` sem certificado (tag 0, regra de privacidade do ADR 0039), sem campo livre para o bit. Por isso a tag 5, e a identidade é conferida no `KeyPackage`/`Welcome`, não no `Hello`.
+- **Feito**: `Hello` tag 5 (bits token, "tenho conversa", certificado), `lost_state`, `replace_conversation` (troca só depois de verificada; a antiga volta se o `ready` falhar), `ConversationReset { peer, identity }`, `hello_pending`, `reset_done`, `reset_notice` na CLI.
+- **Provas** (CI): testes primeiro, 2 falharam (o do `two_nodes` nas duas ordens de Peer ID, e o unitário da identidade); depois da auditoria, 3 novos falharam antes da correção e passaram depois. 20 de 20 checks no `3573c24`. Mutações de propósito (PRs #255 e #256, fechados): a 1ª nem compilou (variável sem uso) e foi refeita; as duas pegas.
+- **Auditoria** (`security-auditor`: 0 críticos, 0 altos, 3 médios, 7 baixos): médios 1 a 3 corrigidos; baixos 3 (em parte), 2 (mitigado), 1/5/6/7 aceitos, 4 não corrigido (tabela no ADR 0040).
+- **Erros meus**: (1) o teste do `a_lower=false` esperava os dois `Ready`, mas o `a` reanuncia a conversa antiga, então o teste voltava cedo (troquei por `settle`); (2) segurar a fila até o `Hello` quebrou ~39 testes unitários que simulam `PeerConnected` sem `Hello` (corrigido com um helper `connect_peer` e `replace_all`, depois de eu ver só 20 das falhas por causa do `head`); (3) a 1ª mutação não compilou e não provava nada; (4) o `multi-device-plain` do Lab falhou uma vez num commit só de testes e passou na reexecução (instabilidade, causa não investigada).
+- **Não verificado**: lab com banco perdido (o `kin` guarda identidade e banco no mesmo `data-dir`, então perder o banco perde a identidade, que não é o P16); conversas divergentes sem perda (P9); `warden/mobile` (consome `ChatEvent`? variante nova exige braço no `match`); o custo real de um reset.
+- **Próximo passo**: P33 (rede real), P34 (evento "peer não admitido") ou o P9.

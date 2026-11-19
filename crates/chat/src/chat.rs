@@ -67,6 +67,14 @@ pub enum ChatEvent {
         peer: PeerId,
         identity: IdentityId,
     },
+    /// O outro lado perdeu o estado da conversa (P16) e ela foi **refeita** com ele: o grupo antigo foi
+    /// descartado e um novo, com a mesma identidade, o substituiu. Chega antes do `ConversationReady` da
+    /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido.
+    ConversationReset {
+        peer: PeerId,
+        /// A identidade do outro lado (a mesma da conversa antiga): quem a aplicação mostra ao usuário.
+        identity: IdentityId,
+    },
     /// Mensagem recebida e decifrada.
     Received {
         peer: PeerId,
@@ -473,6 +481,16 @@ pub struct Chat {
     /// rede é o da conexão (P18 PR 3, ADR 0039). É por ela que o portão admite a minha identidade e as
     /// aceitas por `trust`, sem token. Em memória: cai com a conexão e a conversa pronta.
     hello_identity: HashMap<PeerId, IdentityId>,
+    /// Peers que disseram no `Hello` que **não** têm a conversa que eu tenho com eles (P16): o `KeyPackage`
+    /// ou o `Welcome` deles pode, então, substituir a conversa antiga (só com a mesma identidade). Em
+    /// memória: cai com a conexão e a conversa pronta.
+    lost_state: HashSet<PeerId>,
+    /// Peers com conversa que acabaram de conectar e cujo `Hello` ainda não chegou (P16, auditoria, médio 1):
+    /// a fila deles espera, porque o `Hello` pode dizer que eles perderam a conversa e o que eu despejasse
+    /// no grupo antigo seria confirmado pelo transporte (`Delivered`) e descartado por eles.
+    hello_pending: HashSet<PeerId>,
+    /// Peers com quem já refiz a conversa nesta conexão: um reset por conexão (auditoria, médio 2).
+    reset_done: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
     dialed: HashSet<PeerId>,
@@ -717,6 +735,9 @@ impl Chat {
             hello_tokens: HashMap::new(),
             admitted: HashMap::new(),
             hello_identity: HashMap::new(),
+            lost_state: HashSet::new(),
+            hello_pending: HashSet::new(),
+            reset_done: HashSet::new(),
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
@@ -1377,6 +1398,10 @@ impl Chat {
     /// ([`SEND_WINDOW`]). Cada mensagem é cifrada agora, então uma nova tentativa sai com bytes
     /// diferentes; quem recebe deduplica pelo `MessageId`.
     fn send_direct(&mut self, peer: PeerId) {
+        // A fila espera o `Hello` do peer (e a troca da conversa, se ele a perdeu): ver `hello_pending`.
+        if self.hello_pending.contains(&peer) || self.lost_state.contains(&peer) {
+            return;
+        }
         let entries = match self.outbox.entries(&peer) {
             Ok(entries) => entries,
             Err(e) => return self.drop_message(peer, e),
@@ -1538,15 +1563,22 @@ impl Chat {
                 self.announce_relays(peer);
                 self.announce_devices(peer);
                 self.announce_revocations(peer);
+                // Com conversa, a fila só sai depois do `Hello` do peer (P16): ele pode ter perdido o estado.
+                if self.conversations.contains_key(&peer) {
+                    self.hello_pending.insert(peer);
+                }
                 self.send_hello(peer);
                 self.flush(peer);
             }
             NodeEvent::PeerDisconnected(peer) => {
                 self.connected.remove(&peer);
+                self.hello_pending.remove(&peer);
+                self.reset_done.remove(&peer);
                 self.retry.remove(&peer);
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
                 self.hello_identity.remove(&peer);
+                self.lost_state.remove(&peer);
                 // Discar vale para esta conexão: se não virou conversa, a permissão não fica aberta
                 // para o peer me discar depois (auditoria, baixo 3). Com conversa, `admits` já passa.
                 self.dialed.remove(&peer);
@@ -1655,6 +1687,7 @@ impl Chat {
                 if let Some(peer) = peer {
                     self.expected.remove(&peer);
                     self.dialed.remove(&peer);
+                    self.lost_state.remove(&peer);
                     self.forget_unreachable(&peer);
                     // Falha da rediscagem de fundo é do registro, não da aplicação: um evento por tentativa
                     // (até ~100 por peer e episódio, com os endereços no texto) seria ruído (auditoria S2).
@@ -1685,7 +1718,9 @@ impl Chat {
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
         let result = match envelope {
-            Envelope::Hello(token, certificate) => self.on_hello(peer, token, certificate),
+            Envelope::Hello(token, certificate, has_conversation) => {
+                self.on_hello(peer, token, certificate, has_conversation)
+            }
             Envelope::KeyPackage(kp) => self.on_key_package(peer, &kp),
             Envelope::Welcome(welcome) => self.on_welcome(peer, &welcome),
             Envelope::Mls(wire) => self.on_mls(peer, &wire),
@@ -1701,7 +1736,20 @@ impl Chat {
         peer: PeerId,
         token: Option<[u8; 16]>,
         certificate: Option<Vec<u8>>,
+        has_conversation: Option<bool>,
     ) -> Result<(), Error> {
+        // P16: `peer` diz que não tem a conversa que eu tenho com ele (perdeu o banco). Só marca: a conversa
+        // antiga continua valendo até um `KeyPackage`/`Welcome` novo, da mesma identidade, a substituir.
+        // `None` (formatos antigos do `Hello`) não diz nada.
+        if has_conversation == Some(false) && self.lost_state_candidate(&peer) {
+            self.lost_state.insert(peer);
+        }
+        // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
+        // (então ela sai pela conversa nova, depois da troca, em `ready`).
+        self.hello_pending.remove(&peer);
+        if self.conversations.contains_key(&peer) && !self.lost_state.contains(&peer) {
+            self.flush(peer);
+        }
         let mut introduced = token.is_some();
         // Um certificado inválido, ou de outro Peer ID, é recusado inteiro (nem o token vale): quem o manda
         // está forjando ou com defeito.
@@ -1714,10 +1762,14 @@ impl Chat {
         }
         // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o token ou
         // a identidade chegou, ele é processado (e guardado de novo se ainda não for admitido).
-        if introduced && let Some(key_package) = self.held_key_packages.remove(&peer) {
+        if (introduced || self.lost_state.contains(&peer))
+            && let Some(key_package) = self.held_key_packages.remove(&peer)
+        {
             return self.on_key_package(peer, &key_package);
         }
-        if !self.conversations.contains_key(&peer) && self.peer_id() > peer {
+        let needs_handshake =
+            !self.conversations.contains_key(&peer) || self.lost_state.contains(&peer);
+        if needs_handshake && self.peer_id() > peer {
             if !self.admits(&peer)? {
                 return Ok(());
             }
@@ -1725,6 +1777,23 @@ impl Chat {
             self.transmit(peer, &Envelope::KeyPackage(kp));
         }
         Ok(())
+    }
+
+    /// Posso marcar `peer` como "perdeu o estado" (P16)? Só com uma conversa **1:1** com ele (a identidade
+    /// da conversa antiga é o que o `KeyPackage` novo tem de repetir) e com vaga (teto de `held`).
+    fn lost_state_candidate(&self, peer: &PeerId) -> bool {
+        !self.reset_done.contains(peer)
+            && (self.lost_state.contains(peer) || self.lost_state.len() < MAX_HELD_KEY_PACKAGES)
+            && self.old_identity(peer).is_some()
+    }
+
+    /// A identidade da conversa 1:1 que tenho com `peer`, se há uma.
+    fn old_identity(&self, peer: &PeerId) -> Option<IdentityId> {
+        let peers = self.conversations.get(peer)?.peers().ok()?;
+        match peers.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// O `Hello` de `peer` trouxe `certificate`. Só vale se a cadeia confere (`verify`) e o Peer ID de rede
@@ -1793,26 +1862,52 @@ impl Chat {
             .or_else(|| self.hello_identity.get(peer))
     }
 
+    /// Guarda (com teto) o `KeyPackage` de `peer` até chegar o `Hello` que o torna utilizável: o `Hello` e o
+    /// `KeyPackage` vão por substreams sem ordem. Serve ao token (P18), à identidade (PR 3a) e ao "não tenho
+    /// conversa" (P16).
+    fn hold_key_package(&mut self, peer: PeerId, key_package: &[u8]) {
+        if key_package.len() <= MAX_HELD_KEY_PACKAGE
+            && (self.held_key_packages.contains_key(&peer)
+                || self.held_key_packages.len() < MAX_HELD_KEY_PACKAGES)
+        {
+            self.held_key_packages.insert(peer, key_package.to_vec());
+        }
+    }
+
     fn on_key_package(&mut self, peer: PeerId, key_package: &[u8]) -> Result<(), Error> {
-        if self.conversations.contains_key(&peer) || self.peer_id() > peer {
+        if self.peer_id() > peer {
+            return Ok(());
+        }
+        // P16: com a conversa antiga e `peer` dizendo que a perdeu, este `KeyPackage` pode substituí-la.
+        let replacing = self.lost_state.contains(&peer) && self.conversations.contains_key(&peer);
+        if self.conversations.contains_key(&peer) && !replacing {
+            // O `Hello` "não tenho conversa" pode ainda não ter chegado: guarda em vez de perder.
+            self.hold_key_package(peer, key_package);
             return Ok(());
         }
         // Erro de leitura do banco conta como "não admitido" (falha fechada) e guarda igual (auditoria, baixo 2).
         if !self.admits(&peer).unwrap_or(false) {
             // Pode ser o `Hello` com o token que ainda não chegou: guarda (com teto) em vez de perder.
-            if key_package.len() <= MAX_HELD_KEY_PACKAGE
-                && (self.held_key_packages.contains_key(&peer)
-                    || self.held_key_packages.len() < MAX_HELD_KEY_PACKAGES)
-            {
-                self.held_key_packages.insert(peer, key_package.to_vec());
-            }
+            self.hold_key_package(peer, key_package);
             return Ok(());
         }
+        // Substituir exige a identidade da conversa antiga; sem ela (a conversa mudou), nada é refeito.
+        let old_identity = if replacing {
+            let Some(identity) = self.old_identity(&peer) else {
+                self.lost_state.remove(&peer);
+                return Ok(());
+            };
+            Some(identity)
+        } else {
+            None
+        };
         let mut conversation = Conversation::create(&self.device)?;
         let invite = match conversation.invite(
             key_package,
             &Expected {
-                identity: self.expected_identity(&peer),
+                identity: old_identity
+                    .as_ref()
+                    .or_else(|| self.expected_identity(&peer)),
                 peer: Some(&peer),
             },
         ) {
@@ -1823,15 +1918,71 @@ impl Chat {
                 if let Err(delete) = conversation.delete() {
                     self.drop_message(peer, delete.into());
                 }
+                // Recusado, a conversa antiga fica intacta e a suspeita de perda acaba aqui (uma por vez).
+                self.lost_state.remove(&peer);
                 return Err(e.into());
             }
         };
         self.transmit(peer, &Envelope::Welcome(invite.welcome));
-        self.ready(peer, conversation)
+        if replacing {
+            self.replace_conversation(peer, conversation)
+        } else {
+            self.ready(peer, conversation)
+        }
+    }
+
+    /// P16: troca a conversa antiga com `peer` pela nova, **já verificada** (identidade e Peer ID da antiga,
+    /// revogação). Descarta o que valia só para o grupo antigo (anúncios, sessões de histórico, mensagens de
+    /// época futura), avisa com `ConversationReset` antes do `ConversationReady`, e só no fim apaga o grupo
+    /// antigo: se o apagamento falhar a conversa nova já funciona e o erro vira `Dropped`. A fila (`outbox`)
+    /// **não** é tocada: o que estava para sair sai pela conversa nova.
+    fn replace_conversation(
+        &mut self,
+        peer: PeerId,
+        conversation: Conversation,
+    ) -> Result<(), Error> {
+        self.lost_state.remove(&peer);
+        self.reset_done.insert(peer);
+        let identity = self.old_identity(&peer);
+        let old = self.conversations.remove(&peer);
+        self.future.remove(&peer);
+        self.announced.remove(&peer);
+        self.devices_announced.remove(&peer);
+        self.lists_acted.remove(&peer);
+        self.last_sibling_announce.remove(&peer);
+        self.revocations_checked.remove(&peer);
+        self.sibling_pending.remove(&peer);
+        self.history_requested.remove(&peer);
+        self.history_sessions.remove(&peer);
+        self.history_requests.retain(|_, p| *p != peer);
+        if let Some(identity) = identity {
+            self.queue
+                .push_back(ChatEvent::ConversationReset { peer, identity });
+        }
+        if let Err(e) = self.ready(peer, conversation) {
+            // Se a nova não entrou, a antiga volta: sem conversa nenhuma não há cura até a próxima conexão
+            // (auditoria, baixo 3). Se entrou e algo depois falhou, a nova fica.
+            if let Some(old) = old
+                && !self.conversations.contains_key(&peer)
+            {
+                self.conversations.insert(peer, old);
+            }
+            return Err(e);
+        }
+        if let Some(old) = old
+            && let Err(e) = old.delete()
+        {
+            self.drop_message(peer, e.into());
+        }
+        Ok(())
     }
 
     fn on_welcome(&mut self, peer: PeerId, welcome: &[u8]) -> Result<(), Error> {
-        if self.conversations.contains_key(&peer) || self.peer_id() < peer {
+        if self.peer_id() < peer {
+            return Ok(());
+        }
+        let replacing = self.lost_state.contains(&peer) && self.conversations.contains_key(&peer);
+        if self.conversations.contains_key(&peer) && !replacing {
             return Ok(());
         }
         // Repetido aqui de propósito: o token pode ter sido gasto por outro peer ou revogado entre o
@@ -1839,15 +1990,37 @@ impl Chat {
         if !self.admits(&peer)? {
             return Ok(());
         }
-        let conversation = Conversation::join(
+        let old_identity = if replacing {
+            let Some(identity) = self.old_identity(&peer) else {
+                self.lost_state.remove(&peer);
+                return Ok(());
+            };
+            Some(identity)
+        } else {
+            None
+        };
+        let conversation = match Conversation::join(
             &self.device,
             welcome,
             &Expected {
-                identity: self.expected_identity(&peer),
+                identity: old_identity
+                    .as_ref()
+                    .or_else(|| self.expected_identity(&peer)),
                 peer: Some(&peer),
             },
-        )?;
-        self.ready(peer, conversation)?;
+        ) {
+            Ok(conversation) => conversation,
+            Err(e) => {
+                // Recusado, a conversa antiga fica intacta e a suspeita de perda acaba aqui.
+                self.lost_state.remove(&peer);
+                return Err(e.into());
+            }
+        };
+        if replacing {
+            self.replace_conversation(peer, conversation)?;
+        } else {
+            self.ready(peer, conversation)?;
+        }
         // Quem entra por Welcome anuncia primeiro: o convidador já tem a conversa. O convidador só
         // anuncia ao receber algo do outro (ver `on_mls`), porque o Welcome e esta mensagem seguem
         // por substreams diferentes e a ordem de chegada não é garantida.
@@ -2562,6 +2735,7 @@ impl Chat {
         self.held_key_packages.remove(&peer);
         self.hello_identity.remove(&peer);
         self.dialed.remove(&peer);
+        self.lost_state.remove(&peer);
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
         if let Some(token) = self.admitted.remove(&peer)
@@ -3225,7 +3399,9 @@ impl Chat {
         let certificate = self
             .knows(&peer)
             .then(|| self.device.certificate().to_bytes());
-        self.transmit(peer, &Envelope::Hello(token, certificate));
+        // "Tenho conversa com você" (P16): é por este bit que quem tem a conversa percebe que eu a perdi.
+        let has_conversation = Some(self.conversations.contains_key(&peer));
+        self.transmit(peer, &Envelope::Hello(token, certificate, has_conversation));
     }
 
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
@@ -3335,6 +3511,15 @@ mod tests {
     fn wire(ana: &mut Conversation, text: &str) -> Vec<u8> {
         ana.encrypt(&Message::new(text.into(), None).encode())
             .unwrap()
+    }
+
+    /// Conecta `peer` como o `PeerConnected` real e, se a fila ficou segura à espera do `Hello` (P16), simula
+    /// a chegada dele: os testes de envio descrevem uma reconexão normal, em que o `Hello` chega.
+    fn connect_peer(chat: &mut Chat, peer: PeerId) {
+        chat.handle(NodeEvent::PeerConnected(peer));
+        if chat.hello_pending.remove(&peer) {
+            chat.flush(peer);
+        }
     }
 
     fn events(chat: &mut Chat) -> Vec<ChatEvent> {
@@ -3462,7 +3647,7 @@ mod tests {
             bia.send(ana_peer, text, None).unwrap();
         }
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert_eq!(in_flight(&bia), SEND_WINDOW);
         assert_eq!(bia.queued(&ana_peer), 3, "só sai da fila com o ack");
     }
@@ -3471,7 +3656,7 @@ mod tests {
     #[tokio::test]
     async fn the_send_window_limits_messages_in_flight() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         for i in 0..20 {
             bia.send(ana_peer, i.to_string(), None).unwrap();
         }
@@ -3494,7 +3679,7 @@ mod tests {
     #[tokio::test]
     async fn the_queue_drains_oldest_first_one_at_a_time() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let ids: Vec<_> = ["a", "b", "c"]
             .into_iter()
             .map(|t| bia.send(ana_peer, t, None).unwrap())
@@ -3513,7 +3698,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_send_keeps_the_message_queued() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let message = bia.send(ana_peer, "tentando", None).unwrap();
         events(&mut bia);
 
@@ -3559,7 +3744,7 @@ mod tests {
     async fn a_failed_chat_send_is_retried_only_after_the_wait() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
 
         assert_eq!(bia.retry[&ana_peer].attempts, 1);
@@ -3578,7 +3763,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
         bia.retry_cap = Duration::from_secs(86_400); // acima do dobro da base, senão o teto corta
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
         bia.flush_due_retries();
@@ -3611,7 +3796,7 @@ mod tests {
     #[tokio::test]
     async fn an_ack_resets_the_backoff() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
         bia.flush_due_retries();
@@ -3628,7 +3813,7 @@ mod tests {
     #[tokio::test]
     async fn disconnecting_clears_the_retry() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         assert!(bia.retry.contains_key(&ana_peer));
 
@@ -3640,7 +3825,7 @@ mod tests {
     #[tokio::test]
     async fn a_due_retry_does_not_send_to_a_disconnected_peer() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
         bia.connected.remove(&ana_peer);
@@ -3659,8 +3844,8 @@ mod tests {
             ana_device: (ana_peer, _),
             ..
         } = household();
-        bia.handle(NodeEvent::PeerConnected(sibling));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, sibling);
+        connect_peer(&mut bia, ana_peer);
         events(&mut bia);
         bia.send(ana_peer, "para a ana", None).unwrap();
         let to_sibling = bia.send(sibling, "para o irmão", None).unwrap();
@@ -3684,7 +3869,7 @@ mod tests {
     #[tokio::test]
     async fn queued_is_announced_on_the_first_failure_only() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let message = bia.send(ana_peer, "tentando", None).unwrap();
         events(&mut bia);
         let fail = |bia: &mut Chat| {
@@ -3715,7 +3900,7 @@ mod tests {
     async fn retries_stop_after_the_budget_and_resume_on_reconnect() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_budget = 3;
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         for _ in 0..2 {
             make_due(&mut bia, ana_peer);
@@ -3734,7 +3919,7 @@ mod tests {
         assert_eq!(bia.queued(&ana_peer), 1, "a mensagem segue na outbox");
 
         bia.handle(NodeEvent::PeerDisconnected(ana_peer));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert!(bia.retry.is_empty(), "reconectar zera a conta");
         assert_eq!(in_flight(&bia), 1, "e a fila sai de novo");
     }
@@ -3744,7 +3929,7 @@ mod tests {
     #[tokio::test]
     async fn the_clock_sleeps_again_after_the_retry_fires() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         send_and_fail(&mut bia, ana_peer, "tentando");
         make_due(&mut bia, ana_peer);
 
@@ -3776,7 +3961,7 @@ mod tests {
     #[tokio::test]
     async fn a_retry_that_finds_nothing_to_send_is_forgotten() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let first = send_and_fail(&mut bia, ana_peer, "some");
         bia.outbox.remove(&ana_peer, &first).unwrap();
         make_due(&mut bia, ana_peer);
@@ -3808,7 +3993,7 @@ mod tests {
     async fn a_failed_control_message_does_not_schedule_a_retry() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         let hello = only_pending(&bia);
 
         fail_send(&mut bia, peer, hello);
@@ -3819,7 +4004,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_after_the_peer_disconnected_schedules_nothing() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "tentando", None).unwrap();
         events(&mut bia);
         let id = first_in_flight(&bia);
@@ -3839,7 +4024,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.retry_base = Duration::from_secs(3600);
         bia.retry_cap = Duration::from_secs(86_400);
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert_eq!(bia.wake_in(), None, "sem nada agendado, espera só a rede");
 
         send_and_fail(&mut bia, ana_peer, "tentando");
@@ -4003,7 +4188,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         let relay = MemoryRelay::default();
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         bia.send(ana_peer, "direto", None).unwrap();
         assert!(relay.deposits().is_empty());
@@ -4105,7 +4290,7 @@ mod tests {
         let relay = MemoryRelay::default();
         let stranger = DeviceKey::generate().peer_id();
         MemoryMailbox::new(&relay, stranger)
-            .deposit(bia.peer_id(), Envelope::Hello(None, None).encode());
+            .deposit(bia.peer_id(), Envelope::Hello(None, None, None).encode());
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
 
         let dropped = until(&mut bia, |e| match e {
@@ -4177,7 +4362,12 @@ mod tests {
         ana.trust(id_t.id()).unwrap();
 
         // O `Hello` diz T (aceita); o `KeyPackage` traz X, desconhecida, para as mesmas chaves do device.
-        ana.on_hello(dev_b.peer_id(), None, Some(device_of(&id_t).certificate().to_bytes()))
+        ana.on_hello(
+            dev_b.peer_id(),
+            None,
+            Some(device_of(&id_t).certificate().to_bytes()),
+            None,
+        )
             .unwrap();
         let err = ana
             .on_key_package(dev_b.peer_id(), &device_of(&id_x).key_package().unwrap())
@@ -4199,7 +4389,7 @@ mod tests {
         chat.handshake.clear();
         chat.send_hello(peer);
         chat.handshake.values().find_map(|envelope| match envelope {
-            Envelope::Hello(_, certificate) => Some(certificate.clone()),
+            Envelope::Hello(_, certificate, _) => Some(certificate.clone()),
             _ => None,
         })
     }
@@ -4444,7 +4634,7 @@ mod tests {
     #[tokio::test]
     async fn turning_the_mailbox_on_does_not_deposit_for_a_connected_peer() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "direto", None).unwrap();
         let relay = MemoryRelay::default();
 
@@ -4539,7 +4729,7 @@ mod tests {
         let (mut bia, ana_peer, _relay) = bia_with_a_refused_deposit().await;
         assert!(bia.deposit_retry.contains_key(&ana_peer));
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert!(bia.deposit_retry.is_empty());
     }
 
@@ -4660,7 +4850,7 @@ mod tests {
     async fn the_age_sweep_skips_a_connected_peer() {
         let (mut bia, _ana, ana_peer, relay, _) =
             deposited_once(Some(std::time::Duration::ZERO)).await;
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.sweep_due = Some(Instant::now());
 
         bia.sweep_stale_deposits();
@@ -4765,7 +4955,7 @@ mod tests {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
         bia.sweep_rounds.insert(ana_peer, 5);
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         assert!(bia.sweep_rounds.is_empty());
     }
@@ -4774,7 +4964,7 @@ mod tests {
     #[tokio::test]
     async fn an_ack_resets_the_sweep_rounds() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "oi", None).unwrap();
         let id = first_in_flight(&bia);
         bia.sweep_rounds.insert(ana_peer, 5);
@@ -4857,7 +5047,7 @@ mod tests {
         bia.set_mailbox(MemoryMailbox::new(&relay, bia.peer_id()));
         bia.send(ana_peer, "oi", None).unwrap();
         let id = *bia.depositing.keys().next().unwrap();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         bia.handle_mailbox(MailboxEvent::DepositFailed {
             id,
@@ -4894,7 +5084,7 @@ mod tests {
     /// P32:Bia com Ana conectada e uma mensagem na fila (em voo), depois Ana cai.
     fn bia_after_ana_dropped_with_a_queue() -> (Chat, PeerId) {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.send(ana_peer, "oi", None).unwrap();
         bia.handle(NodeEvent::PeerDisconnected(ana_peer));
         (bia, ana_peer)
@@ -4916,7 +5106,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_peer_without_a_queue_is_not_redialed() {
         let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         bia.handle(NodeEvent::PeerDisconnected(ana_peer));
 
@@ -5452,7 +5642,7 @@ mod tests {
         let (mut bia, ana_peer) = bia_after_ana_dropped_with_a_queue();
         assert!(bia.redial.contains_key(&ana_peer));
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
 
         assert!(bia.redial.is_empty());
     }
@@ -6027,6 +6217,98 @@ mod tests {
             .unwrap()
     }
 
+    /// P16: sem `lost_state`, um `KeyPackage` de quem já tem conversa continua ignorado (nenhum reset não
+    /// solicitado); com ele, o `KeyPackage` a substitui, mas **só** com a identidade da conversa antiga, e
+    /// uma recusa deixa a conversa antiga intacta.
+    #[tokio::test]
+    async fn a_peer_that_lost_its_state_replaces_the_conversation_only_with_the_same_identity() {
+        let (id_a, id_t, id_x) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package_of = |identity: &StandaloneIdentity| {
+            CryptoDevice::new(identity, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
+        assert!(ana.is_ready(&b));
+        let old = ana.conversations.get(&b).unwrap().id();
+        events(&mut ana);
+
+        // Sem `lost_state`: ignorado, a conversa é a mesma e ninguém é avisado.
+        ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
+        assert!(ana.conversations.get(&b).unwrap().id() == old);
+        assert!(events(&mut ana).is_empty());
+
+        // Com `lost_state`, identidade diferente: recusada, e a conversa antiga fica.
+        ana.lost_state.insert(b);
+        let err = ana.on_key_package(b, &key_package_of(&id_x)).unwrap_err();
+        assert!(
+            matches!(err, Error::Crypto(CryptoError::UnexpectedIdentity)),
+            "{err:?}"
+        );
+        assert!(ana.conversations.get(&b).unwrap().id() == old);
+        assert!(!events(&mut ana).iter().any(is_reset));
+        assert!(!ana.lost_state.contains(&b), "a recusa consome a suspeita");
+
+        // Com `lost_state`, a mesma identidade: troca, avisa antes do `ConversationReady`.
+        ana.lost_state.insert(b);
+        ana.on_key_package(b, &key_package_of(&id_t)).unwrap();
+        assert!(ana.conversations.get(&b).unwrap().id() != old);
+        let seen = events(&mut ana);
+        let reset = seen.iter().position(is_reset).expect("sem ConversationReset");
+        let ready = seen
+            .iter()
+            .position(|e| matches!(e, ChatEvent::ConversationReady { .. }))
+            .expect("sem ConversationReady");
+        assert!(reset < ready, "{seen:?}");
+        assert!(!ana.lost_state.contains(&b), "consumido pela troca");
+    }
+
+    /// P16 (auditoria, médio 2): um reset por conexão. Depois da troca, outro `Hello` "não tenho conversa" na
+    /// mesma conexão não marca `lost_state` de novo: sem o limite, um contato repetiria o ciclo (KeyPackage,
+    /// invite, remember, delete, eventos) sem parar.
+    #[tokio::test]
+    async fn a_second_reset_in_the_same_connection_is_not_started() {
+        let (id_a, id_t) = (StandaloneIdentity::generate(), StandaloneIdentity::generate());
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package = || {
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package()).unwrap();
+        ana.lost_state.insert(b);
+        ana.on_key_package(b, &key_package()).unwrap();
+        assert!(events(&mut ana).iter().any(is_reset), "o 1º reset aconteceu");
+
+        ana.on_hello(b, None, None, Some(false)).unwrap();
+        assert!(!ana.lost_state.contains(&b), "o 2º reset na mesma conexão");
+    }
+
+    fn is_reset(event: &ChatEvent) -> bool {
+        matches!(event, ChatEvent::ConversationReset { .. })
+    }
+
     /// P18 PR 3: o certificado do `Hello` só vale para o Peer ID que ele certifica. Repetir o de uma
     /// identidade confiável numa conexão de outro peer é recusado e não grava identidade nenhuma.
     #[tokio::test]
@@ -6037,11 +6319,11 @@ mod tests {
         let certificate = certificate_for(&ana_key);
         let owner = certificate.network_peer_id();
 
-        let forged = bia.on_hello(PeerId::random(), None, Some(certificate.to_bytes()));
+        let forged = bia.on_hello(PeerId::random(), None, Some(certificate.to_bytes()), None);
         assert!(matches!(forged, Err(Error::Malformed)), "{forged:?}");
         assert!(bia.hello_identity.is_empty());
 
-        bia.on_hello(owner, None, Some(certificate.to_bytes()))
+        bia.on_hello(owner, None, Some(certificate.to_bytes()), None)
             .unwrap();
         assert_eq!(bia.hello_identity.get(&owner), Some(&ana_key.id()));
     }
@@ -6052,7 +6334,7 @@ mod tests {
         let Household { mut bia, .. } = household();
         for bytes in [vec![], vec![0; 8], vec![0xFF; 4096]] {
             let peer = PeerId::random();
-            let result = bia.on_hello(peer, None, Some(bytes));
+            let result = bia.on_hello(peer, None, Some(bytes), None);
             assert!(matches!(result, Err(Error::Malformed)), "{result:?}");
             assert!(bia.hello_identity.is_empty());
         }
@@ -6070,9 +6352,9 @@ mod tests {
         bia.set_require_invite(true);
         let (ana_cert, own_cert) = (certificate_for(&ana_key), certificate_for(&bia_key));
         let (ana_peer, own_peer) = (ana_cert.network_peer_id(), own_cert.network_peer_id());
-        bia.on_hello(ana_peer, None, Some(ana_cert.to_bytes()))
+        bia.on_hello(ana_peer, None, Some(ana_cert.to_bytes()), None)
             .unwrap();
-        bia.on_hello(own_peer, None, Some(own_cert.to_bytes()))
+        bia.on_hello(own_peer, None, Some(own_cert.to_bytes()), None)
             .unwrap();
 
         assert!(!bia.admits(&ana_peer).unwrap(), "desconhecida sem token");
@@ -6726,7 +7008,7 @@ mod tests {
         bia.announced.insert(ana_peer);
         bia.devices_announced.insert(ana_peer);
 
-        bia.transmit(ana_peer, &Envelope::Hello(None, None));
+        bia.transmit(ana_peer, &Envelope::Hello(None, None, None));
         let chat_id = *bia.pending.keys().next().unwrap();
         bia.pending
             .insert(chat_id, Some(MessageId::from_bytes([7; 16])));
@@ -6738,7 +7020,7 @@ mod tests {
         assert!(bia.announced.contains(&ana_peer), "mensagem de chat");
         assert!(bia.devices_announced.contains(&ana_peer));
 
-        bia.transmit(ana_peer, &Envelope::Hello(None, None));
+        bia.transmit(ana_peer, &Envelope::Hello(None, None, None));
         let control_id = *bia.pending.keys().next().unwrap();
         bia.handle(NodeEvent::SendFailed {
             peer: ana_peer,
@@ -6769,7 +7051,7 @@ mod tests {
     async fn a_failed_hello_is_resent_while_the_peer_is_connected_without_a_conversation() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         let first = only_pending(&bia);
 
         fail_send(&mut bia, peer, first);
@@ -6787,13 +7069,13 @@ mod tests {
             ..
         } = household();
         let gone = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(gone));
+        connect_peer(&mut bia, gone);
         let id = only_pending(&bia);
         bia.handle(NodeEvent::PeerDisconnected(gone));
         fail_send(&mut bia, gone, id);
         assert!(bia.pending.is_empty(), "peer desconectado: sem reenvio");
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         let id = only_pending(&bia);
         fail_send(&mut bia, ana_peer, id);
         assert!(bia.pending.is_empty(), "já há conversa: sem reenvio");
@@ -6804,7 +7086,7 @@ mod tests {
     async fn hello_resends_stop_at_three_per_connection_and_reset_on_reconnect() {
         let Household { mut bia, .. } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
 
         for _ in 0..3 {
             let id = only_pending(&bia);
@@ -6818,7 +7100,7 @@ mod tests {
         );
 
         bia.handle(NodeEvent::PeerDisconnected(peer));
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         let id = only_pending(&bia);
         fail_send(&mut bia, peer, id);
         only_pending(&bia);
@@ -6954,7 +7236,7 @@ mod tests {
             ..
         } = household();
         let peer = PeerId::random();
-        bia.handle(NodeEvent::PeerConnected(peer));
+        connect_peer(&mut bia, peer);
         bia.connected.insert(with_conversation);
         for _ in 0..4 {
             let id = only_pending(&bia);
@@ -7568,7 +7850,7 @@ mod tests {
             ana_device: (ana_peer, _),
             ..
         } = household();
-        bia.handle(NodeEvent::PeerConnected(sibling));
+        connect_peer(&mut bia, sibling);
         let id = bia.send_to(&ana, "oi", None).unwrap();
         events(&mut bia);
 
@@ -7586,7 +7868,7 @@ mod tests {
             "irmão não é entrega: {after_sibling:?}"
         );
 
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         bia.handle(NodeEvent::MessageDelivered {
             peer: ana_peer,
             id: first_in_flight(&bia),
@@ -7615,7 +7897,7 @@ mod tests {
         bia.outbox.corrupt_destination(&sibling, &broken);
         events(&mut bia);
 
-        bia.handle(NodeEvent::PeerConnected(sibling));
+        connect_peer(&mut bia, sibling);
 
         let all = events(&mut bia);
         assert!(
@@ -9182,7 +9464,7 @@ mod tests {
         assert!(bia.revocations_checked.contains(&sibling), "on_mls");
 
         assert!(!bia.revocations_checked.contains(&ana_peer));
-        bia.handle(NodeEvent::PeerConnected(ana_peer));
+        connect_peer(&mut bia, ana_peer);
         assert!(bia.revocations_checked.contains(&ana_peer), "PeerConnected");
     }
 
@@ -9796,7 +10078,7 @@ mod tests {
         assert_eq!(r.bia.pending.len(), before, "nada foi transmitido");
         assert!(r.bia.handshake_retries.is_empty());
         r.bia
-            .resend_handshake(r.ana_peer, Envelope::Hello(None, None));
+            .resend_handshake(r.ana_peer, Envelope::Hello(None, None, None));
         assert!(
             !r.bia.handshake_retries.is_empty(),
             "o Hello continua saindo"
