@@ -1,6 +1,6 @@
 # ADR 0039 — Convite com token de uso único e revogável (P18)
 
-- **Status**: **aceito e implementado na biblioteca** (Sessão 35, 2026-11-19, PR #242); a CLI (padrão fechado, `/invites`, `/revoke-invite`) e os cenários de lab ficam para o PR seguinte. Área de segurança (admissão, formato de fio, schema, parsing de entrada externa, AGENTS.md §4): auditado pelo `security-auditor` (0 críticos, 0 altos, 4 médios, 5 baixos; tabela no fim).
+- **Status**: **aceito e implementado na biblioteca** (Sessão 35, 2026-11-19, PR #242); a CLI (`--require-invite` opt-in, `/invites`, `/revoke-invite`) e os cenários de lab chegam no PR #246; o **padrão fechado** na CLI fica para um PR 3 (ver "CLI" nas consequências). Área de segurança (admissão, formato de fio, schema, parsing de entrada externa, AGENTS.md §4): auditado pelo `security-auditor` (0 críticos, 0 altos, 4 médios, 5 baixos; tabela no fim).
 - **Relacionados**: ADR 0033 (link com validade assinada), ADR 0011 (decisão 5, frescor), D5 (contato por consentimento), P18, P16 (conversa de um lado só, fora daqui).
 
 ## Contexto
@@ -34,7 +34,8 @@ O link de convite (ADR 0033) tem validade assinada, mas é *bearer* e multiuso: 
 - **O token é comparado por consulta SQLite**, não em tempo constante: risco desprezível (128 bits, sem oráculo, ruído de rede muito acima), aceito.
 - **O portão decide pelo Peer ID, antes de ver o certificado**: um device novo de identidade já conhecida (par recém-pareado, segundo device de um contato) que ainda não está em `household` nem `contact_devices` precisa de um token. **Não validado** com pareamento e multi-device; entra no lab do PR seguinte.
 - **Em memória**: `admitted` e `held_key_packages` caem com a conexão (`PeerDisconnected`); o `Hello` seguinte apresenta o token de novo. Não verificado se o `PeerDisconnected` do nó dispara por conexão ou só quando a última conexão do peer cai (`max_established_per_peer` é 4).
-- **Fora desta fatia**: a CLI hoje **não** liga o portão nem lista/revoga convites (cada `/invite` grava um token de 24 h; com 16 seguidos o 17º falha até algum vencer); os endereços públicos no link (P18 b); a conversa de um lado só quando o convidado recusa a identidade (P18 c, família do P16).
+- **CLI (PR #246, Sessão 35)**: `--require-invite` (**opt-in**, desligada por padrão), `/invites` e `/revoke-invite ID`. O **padrão fechado fica para um PR 3**: lendo o código, com o portão ligado `--dial` simples (`Chat::dial` não registra o peer como conhecido, então o próprio nó que disca não manda ou não aceita o `KeyPackage`) e o pareamento e o multi-device (o primário não conhece o Peer ID do device novo: `issued/` só está no disco e `household` vem de `DeviceList`, que exige conversa pronta) **não passam**. O conserto é de biblioteca: admitir por **identidade autenticada** (o certificado do `KeyPackage`/`Welcome`: minha identidade ou uma confiável passa sem token) e tratar como conhecido o peer que eu disquei; pede nova auditoria e a regressão dos cenários do lab como prova.
+- **Fora desta fatia**: os endereços públicos no link (P18 b); a conversa de um lado só quando o convidado recusa a identidade (P18 c, família do P16).
 - Quebra de API: `Chat::invite_link` agora é `&mut self` e devolve `Result`; consumidores fora deste repo (p. ex. `warden/mobile`) não foram conferidos.
 - Relógio: `now_secs()` devolve 0 se o relógio falhar (token fica vivo no banco, mas o link sai vencido); relógio que volta no tempo pode reviver um token ainda não varrido. Não explorável à distância.
 

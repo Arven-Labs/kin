@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|invite-single-use|invite-revoked|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -195,6 +195,73 @@ scenario_invite() {
   else
     fail "sem conexão direta depois do convite"
   fi
+}
+
+# `a` (com `--require-invite`) gera um convite e devolve o link em LINK e o id do convite em INVITE_ID.
+invite_setup() {
+  infra cone || { fail "montar o laboratório"; return 1; }
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --require-invite"
+  compose up -d a >/dev/null
+  wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; return 1; }
+  A_ID=$(peer_id a)
+  say a "/invite"
+  wait_log a "convite[^:]*: kin://invite/" 15 || { fail "a não gerou o convite"; logs a; return 1; }
+  LINK=$(logs a | grep -oE 'kin://invite/[A-Za-z0-9_-]+' | tail -1)
+  say a "/invites"
+  wait_log a "convite [0-9a-f]{8}: vence em" 10 || { fail "/invites não listou o convite"; logs a; return 1; }
+  INVITE_ID=$(logs a | grep -oE 'convite [0-9a-f]{8}: vence em' | tail -1 | awk '{print $2}' | tr -d ':')
+}
+
+scenario_invite_single_use() {
+  echo "== Convite de uso único: o primeiro abre a conversa, o segundo com o mesmo link não"
+  invite_setup || return
+  pass "/invites lista o convite vivo ($INVITE_ID)"
+
+  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --accept $LINK"
+  compose up -d b >/dev/null
+  if wait_log a "conversa cifrada pronta" 45 && wait_log b "conversa cifrada pronta" 45; then
+    pass "primeiro uso: conversa pronta pelo link"
+  else
+    fail "primeiro uso: conversa não ficou pronta"; logs a | tail -20; logs b | tail -20; return
+  fi
+  say a "/invites"
+  check "o token foi gasto (/invites vazio)" wait_log a "nenhum convite vivo" 10
+
+  # Segundo convidado: identidade nova, mesma LAN que `a`, o mesmo link.
+  export A2_ARGS="--data-dir /tmp --no-mdns --relay $RELAY_ADDR --accept $LINK"
+  compose up -d a2 >/dev/null
+  check "a2 alcançou o a (a recusa vem do convite, não da rede)" wait_log a2 "conectado a $A_ID" 45
+  if wait_log a2 "conversa cifrada pronta" 25; then
+    fail "segundo uso do mesmo link abriu conversa"; logs a2 | tail -20
+  else
+    pass "segundo uso do mesmo link não abre conversa"
+  fi
+  [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 1 ] \
+    && pass "a tem uma conversa só (a do primeiro convidado)" \
+    || fail "a tem mais de uma conversa"
+}
+
+scenario_invite_revoked() {
+  echo "== Convite revogado: /revoke-invite cancela o link antes do uso"
+  invite_setup || return
+  pass "/invites lista o convite vivo ($INVITE_ID)"
+
+  say a "/revoke-invite $INVITE_ID"
+  check "/revoke-invite confirma" wait_log a "convite $INVITE_ID revogado" 10
+  say a "/invites"
+  check "o convite sumiu da lista" wait_log a "nenhum convite vivo" 10
+
+  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --accept $LINK"
+  compose up -d b >/dev/null
+  check "b alcançou o a (a recusa vem do convite, não da rede)" wait_log b "conectado a $A_ID" 45
+  if wait_log b "conversa cifrada pronta" 25; then
+    fail "link revogado abriu conversa"; logs b | tail -20
+  else
+    pass "link revogado não abre conversa"
+  fi
+  [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 0 ] \
+    && pass "a não tem conversa nenhuma" \
+    || fail "a abriu conversa com o link revogado"
 }
 
 scenario_relay_failover() {
@@ -721,6 +788,8 @@ run_scenario() {
     symmetric-quic) scenario_symmetric_quic ;;
     relay-down) scenario_relay_down ;;
     invite) scenario_invite ;;
+    invite-single-use) scenario_invite_single_use ;;
+    invite-revoked) scenario_invite_revoked ;;
     relay-failover) scenario_relay_failover ;;
     multi-device) scenario_multi_device ;;
     multi-device-plain) scenario_multi_device_plain ;;
@@ -734,7 +803,7 @@ run_scenario() {
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}

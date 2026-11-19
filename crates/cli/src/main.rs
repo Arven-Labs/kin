@@ -15,6 +15,10 @@
 //! buscadas ao voltar (só com conversa já fechada). Os relays vêm de `--nostr-relay URL` (`wss://...`;
 //! `ws://` só para o próprio computador; repetível), senão de `<data-dir>/relays.txt` (uma URL por linha,
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
+//! O link do `/invite` é de **uso único** (P18, ADR 0039): `/invites` lista os vivos (id e tempo restante) e
+//! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device). Com
+//! `--require-invite`, quem não é conhecido só abre conversa se apresentar o token de um convite seu;
+//! **desligado por padrão**: ligado, `--dial` simples e o pareamento de devices ainda não passam.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -129,8 +133,7 @@ fn parse_from(
                 args.relay_limits.max_circuits = value()?.parse().map_err(|e| format!("{e}"))?;
             }
             "--no-mdns" => args.mdns = false,
-            // STUB (testes primeiro): aceita a flag, mas ainda não a guarda.
-            "--require-invite" => {}
+            "--require-invite" => args.require_invite = true,
             other => return Err(format!("argumento desconhecido: {other}")),
         }
     }
@@ -278,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--require-invite]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -481,7 +484,7 @@ fn print_invite(chat: &mut Chat) {
         Err(e) => println!("(não deu para gerar o QR: {e})"),
     }
     println!(
-        "convite (válido por {} h): {link}",
+        "convite (válido por {} h, uso único): {link}",
         DEFAULT_INVITE_TTL.as_secs() / 3600
     );
 }
@@ -496,16 +499,37 @@ fn now_secs() -> u64 {
 /// Resposta de `/invites`: um convite vivo por linha, com o `id` que `/revoke-invite` aceita e quanto
 /// falta para vencer; ou o aviso de que não há nenhum.
 fn invites_reply(invites: &[LiveInvite], now: u64) -> String {
-    // STUB (testes primeiro).
-    let _ = (invites, now);
-    String::new()
+    if invites.is_empty() {
+        return "(nenhum convite vivo)".to_string();
+    }
+    invites
+        .iter()
+        .map(|invite| {
+            let left = time_left(invite.expires_at.saturating_sub(now));
+            format!("convite {}: vence em {left}", invite.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Tempo restante em linguagem humana: `23 h 59 min`, `5 min` ou `menos de 1 min`.
+fn time_left(secs: u64) -> String {
+    match (secs / 3600, secs % 3600 / 60) {
+        (0, 0) => "menos de 1 min".to_string(),
+        (0, minutes) => format!("{minutes} min"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
 }
 
 /// Resposta de `/revoke-invite PREFIXO` a partir do resultado de `Chat::revoke_invite`.
 fn revoke_invite_reply(prefix: &str, result: Result<bool, Error>) -> String {
-    // STUB (testes primeiro).
-    let _ = (prefix, result);
-    String::new()
+    match result {
+        Ok(true) => format!("convite {prefix} revogado"),
+        Ok(false) => format!("(nenhum convite vivo começa por {prefix})"),
+        // Curto demais (mínimo de 4 caracteres) ou que bate em mais de um: a biblioteca não distingue.
+        Err(Error::InvalidInvite) => "(prefixo curto demais (mínimo de 4 caracteres) ou que bate em mais de um convite: veja os ids com /invites)".to_string(),
+        Err(e) => format!("(não deu para revogar: {e})"),
+    }
 }
 
 /// Abre um link de convite: disca o dono e exige a identidade do convite.
