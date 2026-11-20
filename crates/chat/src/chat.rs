@@ -329,6 +329,10 @@ const MAX_HELD_KEY_PACKAGES: usize = 64;
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
 const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
 
+/// Quantos pedidos de entrada (P18 d) podem esperar `approve`/`deny` ao mesmo tempo. Acima disso o peer cai
+/// no `NotAdmitted` de sempre: o teto limita a fila de decisões, não a admissão (que segue fechada).
+const MAX_PENDING_APPROVALS: usize = 16;
+
 /// Cabe `key` em `map` sem passar de [`MAX_KNOWN_DEVICES`]? Quem já está sempre cabe (atualiza).
 /// O Peer ID fixado num endereço discado: só vale o `/p2p/<id>` que **termina** o endereço (em circuito,
 /// o destino depois de `/p2p-circuit`). Circuito sem destino ou Peer ID no meio não fixam ninguém, e a
@@ -511,6 +515,15 @@ pub struct Chat {
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
     not_admitted_notified: HashSet<PeerId>,
+    /// P18 (d): com a aprovação ligada, o token vivo não basta: o convidante confirma cada entrada.
+    require_approval: bool,
+    /// Pedidos aguardando `approve`/`deny` (peer e identidade do `Hello`), com teto. Em memória; some com a
+    /// conexão.
+    pending_approval: HashMap<PeerId, IdentityId>,
+    /// Peers cujo pedido eu aprovei nesta conexão: o token deles passa pelo portão.
+    approved: HashSet<PeerId>,
+    /// Peers cujo pedido eu neguei nesta conexão: não geram outro pedido nem `NotAdmitted`.
+    denied: HashSet<PeerId>,
     /// Peers que eu disquei por `dial` com o Peer ID fixado no endereço (`/p2p/<id>`): discar é um ato meu,
     /// então o portão os admite sem token. Em memória, com teto; some quando a conversa fica pronta.
     dialed: HashSet<PeerId>,
@@ -759,6 +772,10 @@ impl Chat {
             hello_pending: HashSet::new(),
             reset_done: HashSet::new(),
             not_admitted_notified: HashSet::new(),
+            require_approval: false,
+            pending_approval: HashMap::new(),
+            approved: HashSet::new(),
+            denied: HashSet::new(),
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
@@ -930,26 +947,60 @@ impl Chat {
         self.require_invite = require;
     }
 
-    /// (stub) Com `true` (e o portão ligado), quem chega com token vivo fica pendente até `approve`.
-    #[allow(clippy::unused_self)]
-    pub fn set_require_approval(&mut self, _require: bool) {}
-
-    /// (stub) Aprova o pedido pendente de `peer`.
-    #[allow(clippy::unused_self)]
-    pub fn approve(&mut self, _peer: PeerId) -> Result<bool, Error> {
-        Ok(false)
+    /// P18 (d): com `true` (e o portão de [`Chat::set_require_invite`] ligado), quem chega com um token vivo
+    /// **não** abre conversa sozinho: vira pedido pendente (`ChatEvent::AdmissionRequested`, com a identidade
+    /// que ele apresentou) até [`Chat::approve`]; [`Chat::deny`] o dispensa. O token só é gasto quando a
+    /// conversa nasce, então um pedido pendente ou negado não queima o link. Padrão `false`.
+    pub fn set_require_approval(&mut self, require: bool) {
+        self.require_approval = require;
     }
 
-    /// (stub) Nega o pedido pendente de `peer`.
-    #[allow(clippy::unused_self)]
-    pub fn deny(&mut self, _peer: PeerId) -> bool {
-        false
+    /// Aprova o pedido pendente de `peer` e retoma o handshake: com o `KeyPackage` dele guardado (eu de menor
+    /// Peer ID) a conversa nasce agora; sendo eu o de maior Peer ID, mando o meu `KeyPackage`, que não saiu
+    /// enquanto o pedido esperava. `Ok(false)` se `peer` não tem pedido pendente ou o token dele já não vale
+    /// (gasto por outro, revogado): nada é aprovado.
+    pub fn approve(&mut self, peer: PeerId) -> Result<bool, Error> {
+        if !self.pending_approval.contains_key(&peer) {
+            return Ok(false);
+        }
+        let live = match self.admitted.get(&peer) {
+            Some(token) => self.outbox.invite_token_is_live(token, now_secs())?,
+            None => false,
+        };
+        self.pending_approval.remove(&peer);
+        if !live {
+            return Ok(false);
+        }
+        self.approved.insert(peer);
+        if let Some(key_package) = self.held_key_packages.remove(&peer) {
+            self.on_key_package(peer, &key_package)?;
+        } else if self.connected.contains(&peer)
+            && self.peer_id() > peer
+            && !self.conversations.contains_key(&peer)
+        {
+            let key_package = self.device.key_package()?;
+            self.transmit(peer, &Envelope::KeyPackage(key_package));
+        }
+        Ok(true)
     }
 
-    /// (stub) Pedidos pendentes: peer e identidade.
-    #[allow(clippy::unused_self)]
+    /// Nega o pedido pendente de `peer`: descarta o `KeyPackage` guardado e não pergunta de novo nesta conexão.
+    /// O token **segue vivo** (revogá-lo é [`Chat::revoke_invite`]). `false` se não havia pedido.
+    pub fn deny(&mut self, peer: PeerId) -> bool {
+        if self.pending_approval.remove(&peer).is_none() {
+            return false;
+        }
+        self.held_key_packages.remove(&peer);
+        self.denied.insert(peer);
+        true
+    }
+
+    /// Pedidos de entrada esperando `approve` ou `deny`: peer e identidade apresentada.
     pub fn pending_approvals(&self) -> Vec<(PeerId, IdentityId)> {
-        Vec::new()
+        self.pending_approval
+            .iter()
+            .map(|(peer, identity)| (*peer, identity.clone()))
+            .collect()
     }
 
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e
@@ -1624,6 +1675,7 @@ impl Chat {
                 self.hello_pending.remove(&peer);
                 self.reset_done.remove(&peer);
                 self.not_admitted_notified.remove(&peer);
+                self.forget_approval(&peer);
                 self.retry.remove(&peer);
                 // O token apresentado vale por conexão: o `Hello` seguinte o apresenta de novo.
                 self.admitted.remove(&peer);
@@ -1816,7 +1868,9 @@ impl Chat {
         }
         // Só aqui a recusa é definitiva para quem ainda não tem conversa: o `Hello` já trouxe o que o peer
         // tinha a apresentar (token, certificado). Antes disso (só o `KeyPackage`), ele ainda pode se apresentar.
-        self.notify_not_admitted(peer);
+        if !self.request_approval(peer) {
+            self.notify_not_admitted(peer);
+        }
         // O `KeyPackage` pode ter chegado antes deste `Hello` (substreams sem ordem): agora que o token ou
         // a identidade chegou, ele é processado (e guardado de novo se ainda não for admitido).
         if (introduced || self.lost_state.contains(&peer))
@@ -1903,9 +1957,52 @@ impl Chat {
             return Ok(true);
         }
         match self.admitted.get(peer) {
-            Some(token) => self.outbox.invite_token_is_live(token, now_secs()),
+            // Com a aprovação ligada, o token vivo só vale para quem eu aprovei (P18 d).
+            Some(token) => Ok((!self.require_approval || self.approved.contains(peer))
+                && self.outbox.invite_token_is_live(token, now_secs())?),
             None => Ok(false),
         }
+    }
+
+    /// P18 (d): `peer` apresentou um token vivo e a aprovação está ligada: vira pedido pendente e avisa
+    /// (`AdmissionRequested`, uma vez por conexão). Devolve `true` se o peer está (ou esteve, nesta conexão)
+    /// em pedido, e então o `NotAdmitted` não deve sair por cima. `false` para quem o portão admite, quem
+    /// não tem token vivo ou identidade (segue o `NotAdmitted` de sempre) e quando o teto de pendentes
+    /// acabou.
+    fn request_approval(&mut self, peer: PeerId) -> bool {
+        if !self.require_invite
+            || !self.require_approval
+            || !matches!(self.admits(&peer), Ok(false))
+        {
+            return false;
+        }
+        if self.denied.contains(&peer) || self.pending_approval.contains_key(&peer) {
+            return true;
+        }
+        let (Some(token), Some(identity)) = (
+            self.admitted.get(&peer).copied(),
+            self.hello_identity.get(&peer).cloned(),
+        ) else {
+            return false;
+        };
+        if !matches!(
+            self.outbox.invite_token_is_live(&token, now_secs()),
+            Ok(true)
+        ) || self.pending_approval.len() >= MAX_PENDING_APPROVALS
+        {
+            return false;
+        }
+        self.pending_approval.insert(peer, identity.clone());
+        self.queue
+            .push_back(ChatEvent::AdmissionRequested { peer, identity });
+        true
+    }
+
+    /// Esquece o que a aprovação guardava sobre `peer` (a conexão caiu ou a conversa nasceu).
+    fn forget_approval(&mut self, peer: &PeerId) {
+        self.pending_approval.remove(peer);
+        self.approved.remove(peer);
+        self.denied.remove(peer);
     }
 
     /// P34: avisa (`NotAdmitted`) que o portão recusou `peer`, uma vez por conexão e com teto. Só quando
@@ -2805,6 +2902,7 @@ impl Chat {
         self.held_key_packages.remove(&peer);
         self.hello_identity.remove(&peer);
         self.dialed.remove(&peer);
+        self.forget_approval(&peer);
         self.lost_state.remove(&peer);
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
