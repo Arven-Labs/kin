@@ -2131,4 +2131,13 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Achado**: o workflow `Lab` (`workflow_dispatch`) já sobe o artefato `kin` (debug, retenção de 1 dia), então dá para baixar com `gh run download -n kin` sem mudar o CI.
 - **Feito**: `project/roteiro-rede-real.md` (3 cenários, tabela de resultado em branco e critério de pronto do P33); linha no P33 do `PENDING.md`.
 - **Não verificado**: **nenhum comando do roteiro foi executado**; só conferidos por leitura contra o cabeçalho da CLI e o `lab/README.md`. O P33 continua **aberto e bloqueado**, e a Fase 4 segue condicionada a ele (ADR 0038).
-- **Próximo passo**: quando houver rede, executar o roteiro e preencher a tabela; enquanto isso, P36 ou P9.
+- **Próximo passo**: quando houver rede, executar o roteiro e preencher a tabela; enquanto isso, P36 ou P9. *(P36 na subseção abaixo.)*
+
+#### P36: reprodução da janela do P16 com a conexão antiga aberta (PR #264, só testes e docs)
+
+- **Decisão do dono** (plan mode): reproduzir primeiro, sem mudar código de produção. O desenho de correção (`hello_pending` em `PeerRoute`) ficou em aberto por risco de travar a fila para sempre.
+- **Feito**: 2 testes de integração em `two_nodes.rs` (um por ordem de Peer ID; o `b` antigo fica vivo e sem ser dirigido, um `b2` com o mesmo device e banco novo disca o `a`). Primeiro com a asserção **desejada** (refaz a conversa), depois fixando o **estado atual** (`..._not_rehandshaked_yet`). ADR 0040 (adendo) e P36 no `PENDING.md` corrigidos.
+- **Medição** (CI): com a asserção desejada, os dois falharam (o 1º run, com um loop só, parou na 1ª ordem e mascarou a outra: por isso separei). **Controles** (PRs descartáveis #265 e #266, fechados, sem o `was_pending`): `a` de maior Peer ID **passa**, `a` de menor **falha**. Conclusão: duas lacunas; a de maior é regressão do P35 (#261), a de menor é antiga (o `Hello` só sai em `PeerConnected` e `accept`).
+- **Erros meus**: (1) a revisão do #261 e eu atribuímos tudo ao gate do P35; o 1º controle (só uma ordem) já mostrou que não era; (2) o 1º teste tinha um `for` sobre as duas ordens, o que escondeu a 2ª falha; (3) rodei um `python3` só para imprimir uma mensagem, sem editar arquivo (desnecessário).
+- **Não verificado**: a causa da lacuna do `a` de menor é leitura de código (o teste só mostra o sintoma); `Delivered` falso; duração e frequência da janela; o teste só observa a ausência de `ConversationReset` em 4 s.
+- **Próximo passo**: decidir a correção (enviar `Hello` também na conexão extra, com o cuidado de não travar `hello_pending`) em plan mode, ou aceitar; o P35 deve ser reavaliado, já que a regressão do `a` de maior é dele.
