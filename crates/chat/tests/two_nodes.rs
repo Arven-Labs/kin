@@ -328,39 +328,47 @@ async fn messages_queued_for_a_peer_that_lost_its_database_still_arrive() {
 /// Esperado (desejado): o `a` percebe pelo `Hello` e refaz a conversa, como em
 /// `peer_that_lost_its_database_is_rehandshaked`.
 #[tokio::test(flavor = "multi_thread")]
-async fn peer_that_lost_its_database_with_the_old_connection_still_open_is_rehandshaked() {
-    for a_lower in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let (pa, mut pb) = loop {
-            let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
-            if (pa.peer_id() < pb.peer_id()) == a_lower {
-                break (pa, pb);
-            }
-        };
-        let (mut a, mut b_old) = (pa.open(), pb.open());
-        let addr = connect(&mut a, &mut b_old).await;
-        // `b_old` fica vivo e sem ser dirigido: para o `a`, a conexão antiga segue de pé.
+async fn old_connection_still_open_and_a_lower_is_rehandshaked() {
+    old_connection_still_open_case(true).await;
+}
 
-        pb.db = dir.path().join("b-novo.db");
-        let mut b = pb.open();
-        assert!(!b.is_ready(&pa.peer_id()));
-        b.dial(addr).unwrap();
-        let (seen_a, seen_b) = settle(&mut a, &mut b, Duration::from_secs(4)).await;
-        assert!(
-            !seen_a
-                .iter()
-                .any(|e| matches!(e, ChatEvent::PeerDisconnected(_))),
-            "a conexão antiga caiu; o teste não prova nada (a_lower={a_lower}): {seen_a:?}"
-        );
-        let b_id = pb.peer_id();
-        assert!(
-            seen_a
-                .iter()
-                .any(|e| matches!(e, ChatEvent::ConversationReset { peer, .. } if *peer == b_id)),
-            "a não refez a conversa (a_lower={a_lower})\neventos de a: {seen_a:#?}\neventos de b: {seen_b:#?}"
-        );
-        drop(b_old);
-    }
+/// P36, a outra ordem de Peer ID (um teste por ordem: uma falha não mascara a outra).
+#[tokio::test(flavor = "multi_thread")]
+async fn old_connection_still_open_and_a_higher_is_rehandshaked() {
+    old_connection_still_open_case(false).await;
+}
+
+async fn old_connection_still_open_case(a_lower: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, mut pb) = loop {
+        let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+        if (pa.peer_id() < pb.peer_id()) == a_lower {
+            break (pa, pb);
+        }
+    };
+    let (mut a, mut b_old) = (pa.open(), pb.open());
+    let addr = connect(&mut a, &mut b_old).await;
+    // `b_old` fica vivo e sem ser dirigido: para o `a`, a conexão antiga segue de pé.
+
+    pb.db = dir.path().join("b-novo.db");
+    let mut b = pb.open();
+    assert!(!b.is_ready(&pa.peer_id()));
+    b.dial(addr).unwrap();
+    let (seen_a, seen_b) = settle(&mut a, &mut b, Duration::from_secs(4)).await;
+    assert!(
+        !seen_a
+            .iter()
+            .any(|e| matches!(e, ChatEvent::PeerDisconnected(_))),
+        "a conexão antiga caiu; o teste não prova nada (a_lower={a_lower}): {seen_a:?}"
+    );
+    let b_id = pb.peer_id();
+    assert!(
+        seen_a
+            .iter()
+            .any(|e| matches!(e, ChatEvent::ConversationReset { peer, .. } if *peer == b_id)),
+        "a não refez a conversa (a_lower={a_lower})\neventos de a: {seen_a:#?}\neventos de b: {seen_b:#?}"
+    );
+    drop(b_old);
 }
 
 /// P16: sem perda nenhuma, uma conversa nova (ou uma que continua) **não** gera `ConversationReset`.
