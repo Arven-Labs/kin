@@ -6401,6 +6401,50 @@ mod tests {
         assert!(!ana.hello_pending.contains(&b));
     }
 
+    /// P36: `PeerRoute` de um peer já conectado e com conversa é uma conexão extra (o `b` reconectou com a
+    /// antiga ainda de pé): conta como abertura, então espera o `Hello` do peer. Sem conversa, ou sem a conexão
+    /// de pé, não muda nada (é a rota de uma conexão que ainda vai dar `PeerConnected`).
+    #[tokio::test]
+    async fn a_route_of_a_connected_peer_with_a_conversation_waits_for_its_hello() {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let route = NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        };
+        let mut ana = chat(&id_a, &dev_a);
+
+        // Sem conversa, mesmo conectado: nada a esperar.
+        ana.connected.insert(b);
+        ana.handle(route.clone());
+        assert!(!ana.hello_pending.contains(&b), "sem conversa");
+
+        // Com conversa, mas sem conexão de pé: a rota é de uma conexão que ainda vai dar `PeerConnected`.
+        ana.connected.remove(&b);
+        ana.on_key_package(b, &key_package).unwrap();
+        ana.handle(route.clone());
+        assert!(!ana.hello_pending.contains(&b), "sem conexão de pé");
+
+        // Com conversa e conexão de pé: conexão extra.
+        ana.connected.insert(b);
+        ana.handle(route);
+        assert!(ana.hello_pending.contains(&b), "conexão extra");
+    }
+
     fn is_reset(event: &ChatEvent) -> bool {
         matches!(event, ChatEvent::ConversationReset { .. })
     }

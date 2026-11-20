@@ -326,22 +326,23 @@ async fn messages_queued_for_a_peer_that_lost_its_database_still_arrive() {
 /// FIN, troca de NAT): no `a` é a 2ª conexão do mesmo Peer ID (só `PeerRoute`, sem `PeerConnected` nem
 /// `hello_pending`). O `b` antigo fica vivo e sem ser dirigido, então o `a` não recebe `PeerDisconnected`.
 ///
-/// **Estado atual, medido no CI (documenta a lacuna; o desejado seria o `a` refazer a conversa, como em
-/// `peer_that_lost_its_database_is_rehandshaked`). Quando o P36 for corrigido, inverta a asserção.** Os dois
-/// testes fixam que **não** há `ConversationReset`:
-/// - `a` de menor Peer ID: lacuna **antiga**. O `Hello` só é enviado em `PeerConnected` e em `accept`, então
-///   o `a` não manda `Hello` na 2ª conexão e o `b` novo (maior) nunca manda o `KeyPackage`. Falha também sem
-///   o gate do P35.
-/// - `a` de maior Peer ID: **regressão do P35**. O `Hello(false)` chega, mas sem `hello_pending` (só vem de
-///   `PeerConnected`) o `on_hello` o ignora. Sem o gate, o `a` refaz a conversa.
+/// Desejado (como em `peer_that_lost_its_database_is_rehandshaked`): o `a` refaz a conversa, com `ConversationReset`
+/// no `a` e nenhum no `b`. Antes da correção os dois testes falhavam, por motivos diferentes (PR #264):
+/// - `a` de menor Peer ID: lacuna **antiga**. O `Hello` só era enviado em `PeerConnected` e em `accept`, então
+///   o `a` não mandava `Hello` na 2ª conexão e o `b` novo (maior) nunca mandava o `KeyPackage`.
+/// - `a` de maior Peer ID: **regressão do P35**. O `Hello(false)` chegava, mas sem `hello_pending` (só vinha de
+///   `PeerConnected`) o `on_hello` o ignorava.
+///
+/// A correção trata `PeerRoute` de peer já conectado e com conversa como abertura de conexão: marca
+/// `hello_pending` e manda o `Hello`.
 #[tokio::test(flavor = "multi_thread")]
-async fn old_connection_still_open_and_a_lower_is_not_rehandshaked_yet() {
+async fn old_connection_still_open_and_a_lower_is_rehandshaked() {
     old_connection_still_open_case(true).await;
 }
 
 /// P36, a outra ordem de Peer ID (um teste por ordem: uma falha não mascara a outra). Ver o teste acima.
 #[tokio::test(flavor = "multi_thread")]
-async fn old_connection_still_open_and_a_higher_is_not_rehandshaked_yet() {
+async fn old_connection_still_open_and_a_higher_is_rehandshaked() {
     old_connection_still_open_case(false).await;
 }
 
@@ -370,10 +371,18 @@ async fn old_connection_still_open_case(a_lower: bool) {
     );
     let b_id = pb.peer_id();
     assert!(
-        !seen_a
+        seen_a
             .iter()
             .any(|e| matches!(e, ChatEvent::ConversationReset { peer, .. } if *peer == b_id)),
-        "P36 foi corrigido? a refez a conversa (a_lower={a_lower}); inverta este teste\neventos de a: {seen_a:#?}\neventos de b: {seen_b:#?}"
+        "a não refez a conversa (a_lower={a_lower})\neventos de a: {seen_a:#?}\neventos de b: {seen_b:#?}"
+    );
+    assert!(
+        !has_reset(&seen_b),
+        "b não tinha o que refazer (a_lower={a_lower}): {seen_b:?}"
+    );
+    assert!(
+        a.is_ready(&pb.peer_id()) && b.is_ready(&pa.peer_id()),
+        "a_lower={a_lower}"
     );
     drop(b_old);
 }
