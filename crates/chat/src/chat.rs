@@ -1760,7 +1760,8 @@ impl Chat {
         // nesta conexão, um `Hello` "não tenho conversa" é velho (montado antes dela, chegou depois: os
         // substreams não têm ordem) e marcar `lost_state` travaria a fila do peer até a conexão cair.
         let was_pending = self.hello_pending.remove(&peer);
-        if has_conversation == Some(false) && was_pending && self.lost_state_candidate(&peer) {
+        let _ = was_pending;
+        if has_conversation == Some(false) && self.lost_state_candidate(&peer) {
             self.lost_state.insert(peer);
         }
         // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
