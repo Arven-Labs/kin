@@ -928,6 +928,12 @@ impl Chat {
         self.invite(self.node.shareable_addresses())
     }
 
+    /// Como [`Chat::shareable_invite`], mas só com endereços de circuito de relay: o link não revela o IP
+    /// de quem o gera (P18 b). Vazio se ainda não há reserva num relay.
+    pub fn shareable_invite_via_relay(&self) -> Invite {
+        self.invite(self.node.shareable_circuit_addresses())
+    }
+
     /// Fixa os endereços que este device anuncia na lista de devices (IP fixo, port-forward, testes).
     /// Vazio (o padrão) usa os do nó, os mesmos de [`Chat::shareable_invite`].
     pub fn set_advertised_addrs(&mut self, addrs: Vec<Multiaddr>) {

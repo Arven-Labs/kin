@@ -366,6 +366,12 @@ impl Node {
         out
     }
 
+    /// Como [`Node::shareable_addresses`], mas só os de circuito de relay: o convite que sai por aqui
+    /// revela o IP do relay, não o de quem o gera (P18 b).
+    pub fn shareable_circuit_addresses(&self) -> Vec<Multiaddr> {
+        only_circuit(self.shareable_addresses())
+    }
+
     /// Envia bytes opacos a um peer já conectado. O resultado chega como `MessageDelivered` ou
     /// `SendFailed` com o mesmo [`SendId`].
     pub fn send(&mut self, peer: PeerId, data: Vec<u8>) -> SendId {
@@ -616,9 +622,11 @@ fn with_peer(addr: Multiaddr, peer: PeerId) -> Multiaddr {
 
 /// Fica só com os endereços de circuito de relay, sem loopback (P18 b: o link de convite não deve
 /// revelar o IP de quem o gera).
-#[allow(dead_code)]
 fn only_circuit(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
     addrs
+        .into_iter()
+        .filter(|addr| is_circuit(addr) && !is_loopback(addr))
+        .collect()
 }
 
 #[cfg(test)]
