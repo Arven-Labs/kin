@@ -936,6 +936,11 @@ impl Chat {
         }
         // Quem já apresentou o token no `Hello`, mas ainda não virou conversa, perde a vaga também.
         self.admitted.retain(|_, admitted| *admitted != token);
+        // O mesmo vale para os pedidos de entrada (P18 d): sem token apresentado não há o que aprovar.
+        let admitted = &self.admitted;
+        self.pending_approval
+            .retain(|peer, _| admitted.contains_key(peer));
+        self.approved.retain(|peer| admitted.contains_key(peer));
         self.outbox.take_invite_token(&token, now)
     }
 
@@ -1916,6 +1921,11 @@ impl Chat {
         if certificate.verify().is_err() || certificate.network_peer_id() != peer {
             return Err(Error::Malformed);
         }
+        // Com pedido pendente ou aprovado, a identidade que o dono viu é a que vale: um 2º `Hello` com outro
+        // certificado do mesmo Peer ID não a troca (P18 d, auditoria, baixo 1).
+        if self.pending_approval.contains_key(&peer) || self.approved.contains(&peer) {
+            return Ok(());
+        }
         if self.hello_identity.contains_key(&peer) || self.hello_identity.len() < MAX_HELD_KEY_PACKAGES {
             self.hello_identity
                 .insert(peer, certificate.identity().clone());
@@ -1935,7 +1945,11 @@ impl Chat {
         }
         if self.conversations.contains_key(&peer) {
             self.outbox.take_invite_token(&token, now)?;
-        } else if has_room(&self.admitted, &peer) {
+        } else if has_room(&self.admitted, &peer)
+            // Pedido pendente ou aprovado fica preso ao token com que foi feito (P18 d, auditoria, baixo 2).
+            && !self.pending_approval.contains_key(&peer)
+            && !self.approved.contains(&peer)
+        {
             self.admitted.insert(peer, token);
         }
         Ok(())
