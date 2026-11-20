@@ -81,6 +81,14 @@ pub enum ChatEvent {
     NotAdmitted {
         peer: PeerId,
     },
+    /// P18 (d): `peer` chegou com um token vivo de um convite meu e a aprovação
+    /// ([`Chat::set_require_approval`]) está ligada: a conversa **não** abre até [`Chat::approve`] (ou
+    /// morre em [`Chat::deny`]). `identity` é a do certificado que o peer apresentou no `Hello`. Uma vez
+    /// por conexão; só local (nada é dito ao peer).
+    AdmissionRequested {
+        peer: PeerId,
+        identity: IdentityId,
+    },
     /// Mensagem recebida e decifrada.
     Received {
         peer: PeerId,
@@ -920,6 +928,28 @@ impl Chat {
     /// a exigência.
     pub fn set_require_invite(&mut self, require: bool) {
         self.require_invite = require;
+    }
+
+    /// (stub) Com `true` (e o portão ligado), quem chega com token vivo fica pendente até `approve`.
+    #[allow(clippy::unused_self)]
+    pub fn set_require_approval(&mut self, _require: bool) {}
+
+    /// (stub) Aprova o pedido pendente de `peer`.
+    #[allow(clippy::unused_self)]
+    pub fn approve(&mut self, _peer: PeerId) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    /// (stub) Nega o pedido pendente de `peer`.
+    #[allow(clippy::unused_self)]
+    pub fn deny(&mut self, _peer: PeerId) -> bool {
+        false
+    }
+
+    /// (stub) Pedidos pendentes: peer e identidade.
+    #[allow(clippy::unused_self)]
+    pub fn pending_approvals(&self) -> Vec<(PeerId, IdentityId)> {
+        Vec::new()
     }
 
     /// Convite com os endereços que o nó considera compartilháveis (circuito de relay, externos e

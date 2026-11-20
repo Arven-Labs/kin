@@ -964,6 +964,13 @@ fn on_event(
         ChatEvent::NotAdmitted { peer } => {
             println!("{}", not_admitted_notice(&peer.to_string()));
         }
+        // A CLI ainda não liga a aprovação (PR 2 do P18 d): o evento só existe com `set_require_approval`.
+        ChatEvent::AdmissionRequested { peer, identity } => {
+            println!(
+                "(pedido de entrada de {peer}, identidade {})",
+                identity.to_base58()
+            );
+        }
         ChatEvent::Received { message, .. } => {
             let Message {
                 id, parent, text, ..
