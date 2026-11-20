@@ -614,12 +614,41 @@ fn with_peer(addr: Multiaddr, peer: PeerId) -> Multiaddr {
     }
 }
 
+/// Fica só com os endereços de circuito de relay, sem loopback (P18 b: o link de convite não deve
+/// revelar o IP de quem o gera).
+#[allow(dead_code)]
+fn only_circuit(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    addrs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn addr(s: &str) -> Multiaddr {
         s.parse().unwrap()
+    }
+
+    /// P18 b: do que o nó conhece, só o circuito de relay (não loopback) vai para o convite: o IP direto
+    /// (externo informado, escuta global, DNS) e o circuito de um relay em loopback ficam de fora.
+    #[test]
+    fn only_circuit_addresses_survive_for_the_invite_link() {
+        let me = PeerId::random();
+        let relay = PeerId::random();
+        let circuit = addr(&format!(
+            "/ip4/203.0.113.9/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{me}"
+        ));
+        let input = vec![
+            addr(&format!("/ip4/198.51.100.4/tcp/4001/p2p/{me}")),
+            circuit.clone(),
+            addr(&format!(
+                "/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{me}"
+            )),
+            addr(&format!("/dns4/casa.example.org/tcp/4001/p2p/{me}")),
+            addr(&format!("/ip6/2001:db8::1/udp/4001/quic-v1/p2p/{me}")),
+        ];
+        assert_eq!(only_circuit(input), vec![circuit]);
+        assert!(only_circuit(Vec::new()).is_empty());
     }
 
     #[test]

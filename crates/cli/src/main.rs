@@ -509,6 +509,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Quais endereços o link de `/invite` leva (P18 b).
+#[derive(Debug, PartialEq)]
+enum InviteScope {
+    /// Só circuito de relay: o link não revela o IP de quem o gera (padrão).
+    ViaRelay,
+    /// Também o IP direto (`--external-addr`, escuta global): `/invite --direct`.
+    Direct,
+}
+
+/// Lê `/invite` e `/invite --direct`. `None` se a linha não é o comando `/invite` (`/invites` não é);
+/// `Some(Err(uso))` se tem argumento que não conheço.
+#[allow(dead_code)]
+fn parse_invite(line: &str) -> Option<Result<InviteScope, String>> {
+    let _ = line;
+    None
+}
+
 /// Imprime o convite deste nó (link e QR). Sem endereço compartilhável ainda, avisa.
 fn print_invite(chat: &mut Chat) {
     let invite = chat.shareable_invite();
@@ -1040,6 +1057,31 @@ mod tests {
     }
 
     // ---- convite com token de uso único (P18, ADR 0039) ----
+
+    /// P18 b: `/invite` leva só circuito de relay; `--direct` é opt-in; outro argumento é erro de uso;
+    /// `/invites` e outros comandos não são `/invite`.
+    #[test]
+    fn invite_command_defaults_to_relay_only_and_direct_is_opt_in() {
+        assert_eq!(parse_invite("/invite"), Some(Ok(InviteScope::ViaRelay)));
+        assert_eq!(
+            parse_invite("/invite --direct"),
+            Some(Ok(InviteScope::Direct))
+        );
+        for bad in [
+            "/invite xyz",
+            "/invite --direct extra",
+            "/invite --direct --direct",
+        ] {
+            let reply = parse_invite(bad);
+            let Some(Err(usage)) = reply else {
+                panic!("{bad}: esperava erro de uso, veio {reply:?}");
+            };
+            assert!(usage.contains("--direct"), "{usage}");
+        }
+        for other in ["/invites", "/invite-x", "invite", "/accept kin://x", ""] {
+            assert_eq!(parse_invite(other), None, "{other}");
+        }
+    }
 
     fn live(id: &str, expires_at: u64) -> LiveInvite {
         LiveInvite {
