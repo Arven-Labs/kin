@@ -6335,6 +6335,66 @@ mod tests {
         assert!(!ana.lost_state.contains(&b), "o 2º reset na mesma conexão");
     }
 
+    /// P35: um `Hello` "não tenho conversa" montado antes de a conversa existir pode chegar depois dela
+    /// (substreams sem ordem). Numa conversa formada **nesta** conexão (sem `hello_pending`) ele é velho, não
+    /// prova perda de banco: marcar `lost_state` travaria a fila do peer até a conexão cair.
+    #[tokio::test]
+    async fn a_late_hello_without_conversation_does_not_mark_a_new_conversation() {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package).unwrap();
+        assert!(ana.is_ready(&b));
+        assert!(!ana.hello_pending.contains(&b), "conversa criada agora");
+
+        ana.on_hello(b, None, None, Some(false)).unwrap();
+        assert!(!ana.lost_state.contains(&b), "o Hello era velho");
+    }
+
+    /// P35 (guarda do P16): numa conversa que já existia quando a conexão abriu (`hello_pending`), o `Hello`
+    /// "não tenho conversa" continua marcando `lost_state`.
+    #[tokio::test]
+    async fn a_hello_without_conversation_still_marks_a_loaded_conversation() {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package).unwrap();
+        // Como o `PeerConnected` de uma conversa carregada do banco.
+        ana.hello_pending.insert(b);
+
+        ana.on_hello(b, None, None, Some(false)).unwrap();
+        assert!(ana.lost_state.contains(&b), "o peer perdeu o banco");
+        assert!(!ana.hello_pending.contains(&b));
+    }
+
     fn is_reset(event: &ChatEvent) -> bool {
         matches!(event, ChatEvent::ConversationReset { .. })
     }
