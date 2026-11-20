@@ -6335,6 +6335,8 @@ mod tests {
         ana.on_key_package(b, &key_package()).unwrap();
         assert!(events(&mut ana).iter().any(is_reset), "o 1º reset aconteceu");
 
+        // `hello_pending` de volta (P35: sem ele o `Hello` nem seria candidato): só o `reset_done` barra.
+        ana.hello_pending.insert(b);
         ana.on_hello(b, None, None, Some(false)).unwrap();
         assert!(!ana.lost_state.contains(&b), "o 2º reset na mesma conexão");
     }
