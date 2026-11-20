@@ -2123,4 +2123,12 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Revisão** (`adversarial-reviewer`, somente leitura): 0 críticos, 2 importantes, 4 sugestões. Importante 1 (conexão antiga meio-aberta, confirmei no `node.rs:487`) → aceito, P36; importante 2 (teste do `reset_done` vacuoso) → corrigido. Sugestões: o teste 1 não passa por `PeerConnected` nem afirma o envio destravado (**não feito**); ADR e P35 desatualizados (**feito**).
 - **Erros meus**: (1) no plano chamei a hipótese de "causa provável"; o lab 9 de 9 só prova que o mecanismo explica as falhas daquela amostra, não que seja o único; (2) não vi, até a revisão, que o teste do `reset_done` perdia o poder com a minha mudança; (3) `cargo fmt --check` já acusa 10 trechos na `main` (fora do meu diff, não mexi); (4) `gh pr close --delete-branch` apagou também a branch local da mutação, sem problema.
 - **Não verificado**: CI do commit final deste PR (teste do `reset_done` + docs), conferir no PR #261; duração e frequência da janela do P36; que não haja outra causa da instabilidade do `revoke-device` (9 execuções é amostra pequena); o teste 1 sem `PeerConnected` e sem afirmar o envio.
-- **Próximo passo**: mesclar o #261 (quem mescla é o dono); depois P33 (rede real), P36 ou P9.
+- **Próximo passo**: mesclar o #261 (quem mescla é o dono); depois P33 (rede real), P36 ou P9. *(#261 mesclado; P33 na subseção abaixo.)*
+
+#### P33: roteiro do teste em rede real (só documentação)
+
+- **Decisões do dono** (plan mode): hoje **não há** segunda rede nem VPS, então o teste não roda; o binário viria de **artefato do CI**, mas o plano aprovado deixou isso **fora** (mudança de CI, §4) e só preparou o roteiro.
+- **Achado**: o workflow `Lab` (`workflow_dispatch`) já sobe o artefato `kin` (debug, retenção de 1 dia), então dá para baixar com `gh run download -n kin` sem mudar o CI.
+- **Feito**: `project/roteiro-rede-real.md` (3 cenários, tabela de resultado em branco e critério de pronto do P33); linha no P33 do `PENDING.md`.
+- **Não verificado**: **nenhum comando do roteiro foi executado**; só conferidos por leitura contra o cabeçalho da CLI e o `lab/README.md`. O P33 continua **aberto e bloqueado**, e a Fase 4 segue condicionada a ele (ADR 0038).
+- **Próximo passo**: quando houver rede, executar o roteiro e preencher a tabela; enquanto isso, P36 ou P9.
