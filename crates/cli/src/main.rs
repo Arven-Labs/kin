@@ -292,19 +292,19 @@ fn short(id: &MessageId) -> String {
 
 /// P35: "entregue" é o ack de transporte de **um** device; sem o Peer ID não dá para saber qual (o fan-out
 /// manda uma cópia por device). O prefixo `(entregue ` fica, o lab e o dono já o conhecem.
-fn delivered_notice(_message: &str, _peer: &str) -> String {
-    String::new()
+fn delivered_notice(message: &str, peer: &str) -> String {
+    format!("(entregue {message} a {peer})")
 }
 
 /// P35: a cópia para `peer` ficou na fila. O prefixo `(na fila, sai quando o peer conectar` é procurado
 /// pelo lab (`run.sh`) e fica.
-fn queued_notice(_message: &str, _peer: &str) -> String {
-    String::new()
+fn queued_notice(message: &str, peer: &str) -> String {
+    format!("(na fila, sai quando o peer conectar: {message} para {peer})")
 }
 
 /// P35: o envio de `message` (ou do handshake) a `peer` falhou.
-fn send_failed_notice(_message: &str, _peer: &str, _reason: &str) -> String {
-    String::new()
+fn send_failed_notice(message: &str, peer: &str, reason: &str) -> String {
+    format!("(falha no envio {message} a {peer}: {reason})")
 }
 
 #[tokio::main]
