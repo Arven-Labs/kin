@@ -6645,6 +6645,107 @@ mod tests {
         }
     }
 
+    /// Certificado de `identity` para o device `device` (o Peer ID de rede é o dele).
+    fn certificate_of(identity: &StandaloneIdentity, device: &DeviceKey) -> DeviceCertificate {
+        identity
+            .authorize_device(
+                &DeviceKey::generate().public_key(),
+                &device.public_key(),
+                &device.nostr_public_key(),
+                1,
+            )
+            .unwrap()
+    }
+
+    /// Uma Bia com portão e aprovação ligados e `n` links vivos; devolve os tokens.
+    fn bia_with_links(n: usize) -> (Chat, Vec<[u8; 16]>) {
+        let mut bia = household().bia;
+        bia.set_require_invite(true);
+        bia.set_require_approval(true);
+        let tokens = (0..n)
+            .map(|_| {
+                let link = bia.invite_link(vec![], Duration::from_secs(3600)).unwrap();
+                Invite::from_link(&link).unwrap().token().unwrap()
+            })
+            .collect();
+        (bia, tokens)
+    }
+
+    /// P18 (d, auditoria, baixo 1): o pedido guarda a identidade que o dono viu. Um 2º `Hello` do mesmo Peer
+    /// ID com outro certificado válido não a troca (senão o dono aprovaria X e a conversa nasceria com Y).
+    #[tokio::test]
+    async fn a_pending_request_keeps_the_identity_it_showed() {
+        let (mut bia, tokens) = bia_with_links(1);
+        let (x, y) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let device = DeviceKey::generate();
+        let peer = device.peer_id();
+        let (cert_x, cert_y) = (certificate_of(&x, &device), certificate_of(&y, &device));
+
+        bia.on_hello(peer, Some(tokens[0]), Some(cert_x.to_bytes()), None)
+            .unwrap();
+        bia.on_hello(peer, Some(tokens[0]), Some(cert_y.to_bytes()), None)
+            .unwrap();
+
+        assert_eq!(bia.pending_approvals(), vec![(peer, x.id())]);
+        assert_eq!(bia.hello_identity.get(&peer), Some(&x.id()));
+        let asked = events(&mut bia)
+            .into_iter()
+            .filter(|e| matches!(e, ChatEvent::AdmissionRequested { .. }))
+            .count();
+        assert_eq!(asked, 1, "um pedido por conexão");
+    }
+
+    /// P18 (d, auditoria, baixo 2): a aprovação vale pelo token apresentado. Depois de `approve`, um novo
+    /// `Hello` com outro token vivo (de outro convite) não troca o token do peer: o `ready` gastaria o
+    /// errado e deixaria o aprovado vivo.
+    #[tokio::test]
+    async fn an_approved_peer_keeps_the_token_it_was_approved_with() {
+        let (mut bia, tokens) = bia_with_links(2);
+        let x = StandaloneIdentity::generate();
+        let device = DeviceKey::generate();
+        let peer = device.peer_id();
+        let cert = certificate_of(&x, &device).to_bytes();
+
+        bia.on_hello(peer, Some(tokens[0]), Some(cert.clone()), None)
+            .unwrap();
+        assert!(bia.approve(peer).unwrap());
+        bia.on_hello(peer, Some(tokens[1]), Some(cert), None)
+            .unwrap();
+
+        assert_eq!(bia.admitted.get(&peer), Some(&tokens[0]));
+    }
+
+    /// P18 (d, auditoria, médio): revogar o convite leva junto os pedidos pendentes dele. Quem recebeu um
+    /// link vazado e abriu várias conexões não deixa a fila cheia depois que o dono o revoga.
+    #[tokio::test]
+    async fn revoking_a_link_drops_its_pending_requests() {
+        let (mut bia, tokens) = bia_with_links(2);
+        let x = StandaloneIdentity::generate();
+        let (leaker, other) = (DeviceKey::generate(), DeviceKey::generate());
+        for (device, token) in [(&leaker, tokens[0]), (&other, tokens[1])] {
+            let cert = certificate_of(&x, device).to_bytes();
+            bia.on_hello(device.peer_id(), Some(token), Some(cert), None)
+                .unwrap();
+        }
+        assert_eq!(bia.pending_approvals().len(), 2);
+
+        let revoked = bia.invites().into_iter().find(|i| {
+            let prefix = i.id.clone();
+            bia.admitted
+                .get(&leaker.peer_id())
+                .is_some_and(|t| invite_id(t) == prefix)
+        });
+        let id = revoked.expect("convite do vazador").id;
+        assert!(bia.revoke_invite(&id).unwrap());
+
+        let left: Vec<PeerId> = bia.pending_approvals().iter().map(|(p, _)| *p).collect();
+        assert_eq!(left, vec![other.peer_id()]);
+        assert!(!bia.approve(leaker.peer_id()).unwrap());
+    }
+
     /// P18 PR 3: com o portão ligado, a identidade autenticada só admite se for a minha ou uma aceita.
     #[tokio::test]
     async fn the_gate_admits_an_authenticated_identity_only_if_it_is_mine_or_trusted() {
