@@ -390,7 +390,14 @@ contact_and_fanout() {
 
   # Fan-out: C fala com a identidade X e os dois devices recebem.
   say b "oi de C"
-  check "c -> X: a1 recebe" wait_log a "peer: oi de C" 20 || { echo "--- log de a"; logs a | tail -40; echo "--- log de b (c)"; logs b | tail -40; }
+  check "c -> X: a1 recebe" wait_log a "peer: oi de C" 20 || {
+    # P35: quem é quem nos logs (o "entregue"/"na fila" de c agora traz o Peer ID do device).
+    echo "--- peers: a1=${A1_ID:-?} a2=${A2_ID:-?} a3=${A3_ID:-?} c=${C_ID:-?}"
+    echo "--- log de a"; logs a | tail -40
+    echo "--- log de a2"; logs a2 | tail -25
+    echo "--- log de a3"; logs a3 2>/dev/null | tail -25
+    echo "--- log de b (c)"; logs b | tail -40
+  }
   check "c -> X: a2 recebe" wait_log a2 "peer: oi de C" 20
 }
 

@@ -290,6 +290,23 @@ fn short(id: &MessageId) -> String {
     id.to_string()[..8].to_string()
 }
 
+/// P35: "entregue" é o ack de transporte de **um** device; sem o Peer ID não dá para saber qual (o fan-out
+/// manda uma cópia por device). O prefixo `(entregue ` fica, o lab e o dono já o conhecem.
+fn delivered_notice(message: &str, peer: &str) -> String {
+    format!("(entregue {message} a {peer})")
+}
+
+/// P35: a cópia para `peer` ficou na fila. O prefixo `(na fila, sai quando o peer conectar` é procurado
+/// pelo lab (`run.sh`) e fica.
+fn queued_notice(message: &str, peer: &str) -> String {
+    format!("(na fila, sai quando o peer conectar: {message} para {peer})")
+}
+
+/// P35: o envio de `message` (ou do handshake) a `peer` falhou.
+fn send_failed_notice(message: &str, peer: &str, reason: &str) -> String {
+    format!("(falha no envio {message} a {peer}: {reason})")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `kin cold ...` (P30 fatia 1b): custódia offline da mestra, sem rede nem chat.
@@ -949,12 +966,16 @@ fn on_event(
             Ok(()) => println!("hole punching com {peer}: ok"),
             Err(e) => println!("hole punching com {peer} falhou: {e}"),
         },
-        ChatEvent::Delivered { message, .. } => println!("(entregue {})", short(&message)),
+        ChatEvent::Delivered { peer, message } => {
+            println!("{}", delivered_notice(&short(&message), &peer.to_string()));
+        }
         ChatEvent::SendFailed {
-            message, reason, ..
+            peer,
+            message,
+            reason,
         } => {
             let id = message.map_or_else(|| "handshake".into(), |m| short(&m));
-            println!("(falha no envio {id}: {reason})");
+            println!("{}", send_failed_notice(&id, &peer.to_string(), &reason));
         }
         ChatEvent::Deposited { message, .. } => {
             println!("(depositada na caixa postal: {})", short(&message));
@@ -976,8 +997,8 @@ fn on_event(
         ChatEvent::DepositFailed {
             message, reason, ..
         } => println!("(depósito recusado {}: {reason})", short(&message)),
-        ChatEvent::Queued { message, .. } => {
-            println!("(na fila, sai quando o peer conectar: {})", short(&message));
+        ChatEvent::Queued { peer, message } => {
+            println!("{}", queued_notice(&short(&message), &peer.to_string()));
         }
         ChatEvent::Stale { peer } => {
             println!("(conversa com {peer} divergiu: faltam commits que não chegaram)");
@@ -1048,6 +1069,27 @@ mod tests {
         assert!(notice.contains("IdentidadeBase58"), "{notice}");
         assert!(notice.contains("confirme por outro canal"), "{notice}");
         assert!(notice.contains("perdid"), "{notice}");
+    }
+
+    /// P35: as linhas de entrega dizem de qual device vêm e mantêm os prefixos que o lab procura.
+    #[test]
+    fn delivery_lines_name_the_peer_and_keep_the_old_prefixes() {
+        let delivered = delivered_notice("4a327655", "12D3KooWPeer");
+        assert!(delivered.starts_with("(entregue 4a327655"), "{delivered}");
+        assert!(delivered.contains("12D3KooWPeer"), "{delivered}");
+
+        let queued = queued_notice("4a327655", "12D3KooWPeer");
+        assert!(
+            queued.starts_with("(na fila, sai quando o peer conectar"),
+            "{queued}"
+        );
+        assert!(queued.contains("4a327655"), "{queued}");
+        assert!(queued.contains("12D3KooWPeer"), "{queued}");
+
+        let failed = send_failed_notice("4a327655", "12D3KooWPeer", "timeout");
+        assert!(failed.starts_with("(falha no envio 4a327655"), "{failed}");
+        assert!(failed.contains("12D3KooWPeer"), "{failed}");
+        assert!(failed.contains("timeout"), "{failed}");
     }
 
     /// P34: o aviso de peer não admitido diz quem e os caminhos para admitir.
