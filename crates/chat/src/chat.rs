@@ -1755,12 +1755,16 @@ impl Chat {
         // P16: `peer` diz que não tem a conversa que eu tenho com ele (perdeu o banco). Só marca: a conversa
         // antiga continua valendo até um `KeyPackage`/`Welcome` novo, da mesma identidade, a substituir.
         // `None` (formatos antigos do `Hello`) não diz nada.
-        if has_conversation == Some(false) && self.lost_state_candidate(&peer) {
+        //
+        // P35: só vale se a conversa já existia quando a conexão abriu (`hello_pending`). Numa conversa formada
+        // nesta conexão, um `Hello` "não tenho conversa" é velho (montado antes dela, chegou depois: os
+        // substreams não têm ordem) e marcar `lost_state` travaria a fila do peer até a conexão cair.
+        let was_pending = self.hello_pending.remove(&peer);
+        if has_conversation == Some(false) && was_pending && self.lost_state_candidate(&peer) {
             self.lost_state.insert(peer);
         }
         // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
         // (então ela sai pela conversa nova, depois da troca, em `ready`).
-        self.hello_pending.remove(&peer);
         if self.conversations.contains_key(&peer) && !self.lost_state.contains(&peer) {
             self.flush(peer);
         }
