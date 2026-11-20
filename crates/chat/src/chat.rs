@@ -3449,16 +3449,26 @@ impl Chat {
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
     /// o envio, e o peer segue conectado pela outra, então nada mais dispara o handshake. Reenvia os
     /// mesmos bytes enquanto o peer estiver conectado, no máximo [`MAX_HANDSHAKE_RETRIES`] vezes por
-    /// tipo e por conexão (o teto impede laço). `Hello` e `KeyPackage` só enquanto não há conversa:
-    /// com ela, o `Hello` é ignorado (`on_hello`) e o `KeyPackage` não serve mais. O `Welcome` é
+    /// tipo e por conexão (o teto impede laço). `Hello` e `KeyPackage` só enquanto não há conversa
+    /// (ou ela está sendo refeita, P36): com ela de pé, o `Hello` é ignorado (`on_hello`) e o
+    /// `KeyPackage` não serve mais. O `Welcome` é
     /// mandado por quem já tem a conversa (`ready`), então ali a conversa não impede o reenvio; o
     /// outro lado ignora a duplicata (`on_welcome`). Reenviar os mesmos bytes não gasta outro
     /// `KeyPackage` nem muda a época.
     fn resend_handshake(&mut self, peer: PeerId, envelope: Envelope) {
-        // `Hello` e `KeyPackage` só voltam enquanto não há conversa; o `Welcome` só se ela existe (derrubado o
-        // par, o grupo some e o convite não vale mais).
+        // `Hello` e `KeyPackage` só voltam enquanto não há conversa, ou enquanto a conversa existente ainda está sendo
+        // refeita (P36: `hello_pending`, ou `lost_state` depois do `Hello(false)`): com duas conexões ao mesmo peer o
+        // libp2p reparte os pedidos entre elas, e os que caem na conexão morta só falham no timeout. O `Welcome` só
+        // se ela existe (derrubado o par, o grupo some e o convite não vale mais).
         let is_welcome = matches!(envelope, Envelope::Welcome(_));
-        if !self.connected.contains(&peer) || is_welcome != self.conversations.contains_key(&peer) {
+        let has_conversation = self.conversations.contains_key(&peer);
+        let rehandshaking = self.hello_pending.contains(&peer) || self.lost_state.contains(&peer);
+        let allowed = if is_welcome {
+            has_conversation
+        } else {
+            !has_conversation || rehandshaking
+        };
+        if !self.connected.contains(&peer) || !allowed {
             return;
         }
         let retries = self
@@ -10306,6 +10316,48 @@ mod tests {
             !r.bia.handshake_retries.is_empty(),
             "o Hello continua saindo"
         );
+    }
+
+    /// P36: com conversa, o `Hello` que falhou só volta enquanto a conversa está sendo refeita (`hello_pending` ou
+    /// `lost_state`); numa conexão já aberta e com a conversa de pé, não.
+    #[tokio::test]
+    async fn a_hello_is_resent_with_a_conversation_only_while_it_is_being_rehandshaked() {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let mut ana = chat(&id_a, &dev_a);
+        ana.connected.insert(b);
+        ana.on_key_package(b, &key_package).unwrap();
+        ana.hello_pending.remove(&b);
+        let key = (b, std::mem::discriminant(&Envelope::Hello(None, None, None)));
+
+        ana.resend_handshake(b, Envelope::Hello(None, None, Some(true)));
+        assert!(
+            !ana.handshake_retries.contains_key(&key),
+            "conversa de pé numa conexão aberta: o Hello não volta"
+        );
+
+        ana.hello_pending.insert(b);
+        ana.resend_handshake(b, Envelope::Hello(None, None, Some(true)));
+        assert_eq!(ana.handshake_retries.get(&key), Some(&1), "hello_pending");
+
+        ana.hello_pending.remove(&b);
+        ana.lost_state.insert(b);
+        ana.resend_handshake(b, Envelope::Hello(None, None, Some(true)));
+        assert_eq!(ana.handshake_retries.get(&key), Some(&2), "lost_state");
     }
 
     /// O device revogado não volta pelo handshake: o `KeyPackage` dele é recusado e nenhuma conversa nasce.

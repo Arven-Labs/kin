@@ -362,14 +362,29 @@ async fn old_connection_still_open_case(a_lower: bool) {
     let mut b = pb.open();
     assert!(!b.is_ready(&pa.peer_id()));
     b.dial(addr).unwrap();
-    let (seen_a, seen_b) = settle(&mut a, &mut b, Duration::from_secs(4)).await;
+    let b_id = pb.peer_id();
+    let a_id = pa.peer_id();
+    // O libp2p reparte os pedidos entre as duas conexões (`request_id % nº de conexões`), então parte do handshake cai na
+    // antiga, que ninguém dirige, e só falha no timeout do pedido (10 s); o chat reenvia (P36). Espera até refazer, com teto.
+    let (mut seen_a, mut seen_b) = (Vec::new(), Vec::new());
+    let _ = timeout(Duration::from_secs(90), async {
+        loop {
+            tokio::select! {
+                e = a.next_event() => seen_a.push(e),
+                e = b.next_event() => seen_b.push(e),
+            }
+            if has_reset(&seen_a) && a.is_ready(&b_id) && b.is_ready(&a_id) {
+                break;
+            }
+        }
+    })
+    .await;
     assert!(
         !seen_a
             .iter()
             .any(|e| matches!(e, ChatEvent::PeerDisconnected(_))),
         "a conexão antiga caiu; o teste não prova nada (a_lower={a_lower}): {seen_a:?}"
     );
-    let b_id = pb.peer_id();
     assert!(
         seen_a
             .iter()
