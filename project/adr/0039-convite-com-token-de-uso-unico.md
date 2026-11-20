@@ -77,6 +77,14 @@ Alternativas descartadas: `KeyPackage` a qualquer um e barrar no `Welcome` (perd
 - **Limites aceitos** (auditoria do PR #257, baixos 2 a 4): o teto de 64 (`MAX_NOT_ADMITTED_NOTIFIED`) esgota com 64 conexões simultâneas de estranhos e então suprime o aviso, sem afetar a admissão; o set é limpo em `PeerDisconnected`, então reconexão em laço gera uma linha por ciclo; o aviso é um instantâneo e não é retratado se o peer for admitido depois.
 - **Achado corrigido**: o texto da CLI citava `/trust`, que não abre o portão para estranho (`send_hello` só manda o certificado a quem já conheço).
 
+## Atualização: P18 (b), o link não revela o IP de quem o gera (PR #270, 2026-11-20)
+
+- **Decisão do dono** (plan mode): `/invite` leva **só endereços de circuito de relay** (o link mostra o IP do relay, não o do emissor); `/invite --direct` inclui também o IP direto (`--external-addr`, escuta de IP global). Alternativa descartada: manter tudo e só avisar (não resolve o vazamento).
+- **Onde**: `Node::shareable_circuit_addresses` (filtro `only_circuit`: circuito e não loopback), `Chat::shareable_invite_via_relay`, `parse_invite` e `InviteScope` na CLI. Sem mudança de formato de fio nem de schema; `Chat::invite_link` e `shareable_invite` não mudaram (sem quebra de API).
+- **Fora**: `own_invite`/`DeviceList` (vai dentro da conversa MLS a quem já aceitei, não é link *bearer*) continua com todos os endereços.
+- **Consequência**: sem reserva em relay o `/invite` não gera link até ela existir; quem roda com `--external-addr` e sem relay precisa de `/invite --direct`. O IP direto volta a aparecer só para quem já é par (DCUtR) ou por escolha explícita.
+- **Provas**: testes primeiro (CI, run 44826514388): os 2 testes novos falharam (stubs inertes) e os demais passaram; depois da implementação, CI e `Lab` (17 cenários) verdes no commit `c6cdfd5`.
+
 ## Auditoria (`security-auditor`, somente leitura)
 
 | # | Achado | Gravidade | Destino |
