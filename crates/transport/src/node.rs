@@ -625,7 +625,7 @@ fn with_peer(addr: Multiaddr, peer: PeerId) -> Multiaddr {
 fn only_circuit(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
     addrs
         .into_iter()
-        .filter(|addr| is_circuit(addr) && !is_loopback(addr))
+        .filter(|addr| !is_loopback(addr))
         .collect()
 }
 
