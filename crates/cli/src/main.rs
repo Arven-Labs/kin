@@ -511,6 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Quais endereços o link de `/invite` leva (P18 b).
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)]
 enum InviteScope {
     /// Só circuito de relay: o link não revela o IP de quem o gera (padrão).
     ViaRelay,
