@@ -17,6 +17,8 @@
 //! `#` comenta), senão do padrão embutido. `--no-nostr` desliga a caixa postal.
 //! O link do `/invite` é de **uso único** (P18, ADR 0039): `/invites` lista os vivos (id e tempo restante) e
 //! `/revoke-invite ID` cancela um antes do uso (`/revoke` é outra coisa: revoga um device).
+//! O link leva **só endereços de circuito de relay** (P18 b): não revela o seu IP. `/invite --direct`
+//! inclui também o IP direto (`--external-addr`, escuta global).
 //! **Portão de admissão, fechado por padrão** (P18 PR 3b): quem não é conhecido só abre conversa se
 //! apresentar o token de um convite seu. Conhecido é quem já tem conversa, quem eu aceitei por link, quem
 //! eu disquei com `--dial` **com o Peer ID** (`/p2p/<id>`; sem ele ninguém é admitido) e os devices de uma
@@ -424,8 +426,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line.is_empty() {
                     continue;
                 }
-                if line == "/invite" {
-                    print_invite(&mut chat);
+                if let Some(scope) = parse_invite(line) {
+                    match scope {
+                        Ok(scope) => print_invite(&mut chat, &scope),
+                        Err(usage) => println!("({usage})"),
+                    }
                     continue;
                 }
                 if line == "/invites" {
@@ -509,12 +514,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Quais endereços o link de `/invite` leva (P18 b).
+#[derive(Debug, PartialEq)]
+enum InviteScope {
+    /// Só circuito de relay: o link não revela o IP de quem o gera (padrão).
+    ViaRelay,
+    /// Também o IP direto (`--external-addr`, escuta global): `/invite --direct`.
+    Direct,
+}
+
+/// Lê `/invite` e `/invite --direct`. `None` se a linha não é o comando `/invite` (`/invites` não é);
+/// `Some(Err(uso))` se tem argumento que não conheço.
+fn parse_invite(line: &str) -> Option<Result<InviteScope, String>> {
+    let args = line.strip_prefix("/invite")?;
+    if args.is_empty() {
+        return Some(Ok(InviteScope::ViaRelay));
+    }
+    // Só há comando se o nome acaba ali: `/invites` e `/invite-x` são outros comandos.
+    let args = args.strip_prefix(' ')?;
+    Some(match args.trim() {
+        "--direct" => Ok(InviteScope::Direct),
+        _ => Err("uso: /invite [--direct] (--direct põe o IP direto no link)".to_string()),
+    })
+}
+
 /// Imprime o convite deste nó (link e QR). Sem endereço compartilhável ainda, avisa.
-fn print_invite(chat: &mut Chat) {
-    let invite = chat.shareable_invite();
+fn print_invite(chat: &mut Chat, scope: &InviteScope) {
+    let invite = match scope {
+        InviteScope::ViaRelay => chat.shareable_invite_via_relay(),
+        InviteScope::Direct => chat.shareable_invite(),
+    };
     if invite.addrs().is_empty() {
         println!(
-            "(sem endereço compartilhável ainda: espere a reserva no relay ou use --external-addr)"
+            "(sem endereço compartilhável ainda: espere a reserva no relay; para pôr o IP direto no \
+             link use /invite --direct)"
         );
         return;
     }
@@ -1040,6 +1073,31 @@ mod tests {
     }
 
     // ---- convite com token de uso único (P18, ADR 0039) ----
+
+    /// P18 b: `/invite` leva só circuito de relay; `--direct` é opt-in; outro argumento é erro de uso;
+    /// `/invites` e outros comandos não são `/invite`.
+    #[test]
+    fn invite_command_defaults_to_relay_only_and_direct_is_opt_in() {
+        assert_eq!(parse_invite("/invite"), Some(Ok(InviteScope::ViaRelay)));
+        assert_eq!(
+            parse_invite("/invite --direct"),
+            Some(Ok(InviteScope::Direct))
+        );
+        for bad in [
+            "/invite xyz",
+            "/invite --direct extra",
+            "/invite --direct --direct",
+        ] {
+            let reply = parse_invite(bad);
+            let Some(Err(usage)) = reply else {
+                panic!("{bad}: esperava erro de uso, veio {reply:?}");
+            };
+            assert!(usage.contains("--direct"), "{usage}");
+        }
+        for other in ["/invites", "/invite-x", "invite", "/accept kin://x", ""] {
+            assert_eq!(parse_invite(other), None, "{other}");
+        }
+    }
 
     fn live(id: &str, expires_at: u64) -> LiveInvite {
         LiveInvite {

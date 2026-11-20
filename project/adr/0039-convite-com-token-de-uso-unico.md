@@ -77,6 +77,16 @@ Alternativas descartadas: `KeyPackage` a qualquer um e barrar no `Welcome` (perd
 - **Limites aceitos** (auditoria do PR #257, baixos 2 a 4): o teto de 64 (`MAX_NOT_ADMITTED_NOTIFIED`) esgota com 64 conexões simultâneas de estranhos e então suprime o aviso, sem afetar a admissão; o set é limpo em `PeerDisconnected`, então reconexão em laço gera uma linha por ciclo; o aviso é um instantâneo e não é retratado se o peer for admitido depois.
 - **Achado corrigido**: o texto da CLI citava `/trust`, que não abre o portão para estranho (`send_hello` só manda o certificado a quem já conheço).
 
+## Atualização: P18 (b), o link não revela o IP de quem o gera (PR #270, 2026-11-20)
+
+- **Decisão do dono** (plan mode): `/invite` leva **só endereços de circuito de relay** (o link mostra o IP do relay, não o do emissor); `/invite --direct` inclui também o IP direto (`--external-addr`, escuta de IP global). Alternativa descartada: manter tudo e só avisar (não resolve o vazamento).
+- **Onde**: `Node::shareable_circuit_addresses` (filtro `only_circuit`: circuito e não loopback), `Chat::shareable_invite_via_relay`, `parse_invite` e `InviteScope` na CLI. Sem mudança de formato de fio nem de schema; `Chat::invite_link` e `shareable_invite` não mudaram (sem quebra de API).
+- **Fora**: `own_invite`/`DeviceList` (vai dentro da conversa MLS a quem já aceitei, não é link *bearer*) continua com todos os endereços.
+- **Consequência**: sem reserva em relay o `/invite` não gera link até ela existir; quem roda com `--external-addr` e sem relay precisa de `/invite --direct`. O IP direto volta a aparecer só para quem já é par (DCUtR) ou por escolha explícita.
+- **Provas**: testes primeiro (CI, run 44826514388): os 2 testes novos falharam (stubs inertes) e os demais passaram; depois da implementação, CI e `Lab` (17 cenários) verdes no commit `c6cdfd5`. **Mutação de propósito** (PR descartável #271, fechado): filtro sem exigir circuito → só `only_circuit_addresses_survive_for_the_invite_link` falhou (run 44828007463).
+- **Auditoria** (`security-auditor`, somente leitura: 0 críticos, 0 altos): (1, baixo) o filtro é sintático: relay em IP privado de LAN ou em hostname `localhost` passa, e quem roda o próprio relay em casa mostra o IP dele no link; **aceito**, inerente ao circuito, documentado aqui. (2, fora do escopo, médio) `own_invite`/`DeviceList` mandam o IP direto a irmãos e a contatos confiáveis dentro da conversa MLS (`set_advertised_addrs` limita). (3, fora do escopo, médio, confiança média) o Identify do libp2p entrega `listen_addrs` e o endereço observado a todo peer conectado, inclusive estranhos: o IP direto sai por aí mesmo sem `--direct`; não verificado no código do libp2p. (4, baixo, antigo) `/invite--direct` ou com tab cai como mensagem ao peer atual. 2 e 3 ficam registrados no P18 do `PENDING.md`; 4 aceito.
+- **Não verificado**: nó real com relay e `external_addresses` (o teste usa endereços sintéticos; o `Lab` só prova que o fluxo de convite segue funcionando, não o conteúdo do link).
+
 ## Auditoria (`security-auditor`, somente leitura)
 
 | # | Achado | Gravidade | Destino |
