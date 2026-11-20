@@ -6,7 +6,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 BIN=../target/debug/kin
-[ -x "$BIN" ] || { echo "compile antes: cargo build -p kin-cli" >&2; exit 2; }
+[ -x "$BIN" ] || { echo "compile antes, no PC do dono: cargo build -p kin-cli (proibido na VM do agente, ADR 0017 do workspace)" >&2; exit 2; }
 
 # A imagem é construída uma vez aqui (vários serviços construindo a mesma tag em paralelo brigam).
 docker build -q -t kin-lab . >/dev/null || { echo "falha ao construir a imagem kin-lab" >&2; exit 2; }

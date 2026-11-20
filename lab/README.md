@@ -8,6 +8,10 @@ a (10.1.0.10) -- lana --[routera NAT]-- pub (203.0.113.0/24) --[routerb NAT]-- l
                                          relay (203.0.113.10)
 ```
 
+> **Para agentes de IA:** o `cargo build` e o laboratório abaixo são para o dono, no PC dele.
+> Na VM de desenvolvimento do agente ambos são proibidos (ADR 0017 do workspace). O laboratório
+> também roda no GitHub (`gh workflow run lab.yml --ref <branch>`; ver `.github/workflows/lab.yml`).
+
 ```bash
 cargo build -p kin-cli          # o binário é montado do host (nada de compilar Rust no container)
 lab/run.sh                      # todos os cenários
