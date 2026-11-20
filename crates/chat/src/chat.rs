@@ -1685,6 +1685,14 @@ impl Chat {
             }
             NodeEvent::PeerRoute { peer, relayed } => {
                 self.queue.push_back(ChatEvent::Route { peer, relayed });
+                // P36: o transporte só emite `PeerConnected` na 1ª conexão; uma conexão extra de um peer que
+                // já está de pé (o `b` perdeu o banco e reconectou com a antiga ainda aberta) chega só aqui.
+                // Conta como abertura: espera o `Hello` dele (que pode dizer "perdi a conversa") e manda o meu,
+                // senão o `b` novo, se for o de maior Peer ID, nunca manda o `KeyPackage`.
+                if self.connected.contains(&peer) && self.conversations.contains_key(&peer) {
+                    self.hello_pending.insert(peer);
+                    self.send_hello(peer);
+                }
             }
             NodeEvent::NatStatus(status) => self.queue.push_back(ChatEvent::Nat(status)),
             NodeEvent::RelayReserved { relay } => {
