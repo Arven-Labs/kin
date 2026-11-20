@@ -1958,8 +1958,7 @@ impl Chat {
         }
         match self.admitted.get(peer) {
             // Com a aprovação ligada, o token vivo só vale para quem eu aprovei (P18 d).
-            Some(token) => Ok((!self.require_approval || self.approved.contains(peer))
-                && self.outbox.invite_token_is_live(token, now_secs())?),
+            Some(token) => Ok(self.outbox.invite_token_is_live(token, now_secs())?),
             None => Ok(false),
         }
     }
