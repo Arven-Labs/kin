@@ -1755,12 +1755,16 @@ impl Chat {
         // P16: `peer` diz que não tem a conversa que eu tenho com ele (perdeu o banco). Só marca: a conversa
         // antiga continua valendo até um `KeyPackage`/`Welcome` novo, da mesma identidade, a substituir.
         // `None` (formatos antigos do `Hello`) não diz nada.
-        if has_conversation == Some(false) && self.lost_state_candidate(&peer) {
+        //
+        // P35: só vale se a conversa já existia quando a conexão abriu (`hello_pending`). Numa conversa formada
+        // nesta conexão, um `Hello` "não tenho conversa" é velho (montado antes dela, chegou depois: os
+        // substreams não têm ordem) e marcar `lost_state` travaria a fila do peer até a conexão cair.
+        let was_pending = self.hello_pending.remove(&peer);
+        if has_conversation == Some(false) && was_pending && self.lost_state_candidate(&peer) {
             self.lost_state.insert(peer);
         }
         // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
         // (então ela sai pela conversa nova, depois da troca, em `ready`).
-        self.hello_pending.remove(&peer);
         if self.conversations.contains_key(&peer) && !self.lost_state.contains(&peer) {
             self.flush(peer);
         }
@@ -6331,8 +6335,70 @@ mod tests {
         ana.on_key_package(b, &key_package()).unwrap();
         assert!(events(&mut ana).iter().any(is_reset), "o 1º reset aconteceu");
 
+        // `hello_pending` de volta (P35: sem ele o `Hello` nem seria candidato): só o `reset_done` barra.
+        ana.hello_pending.insert(b);
         ana.on_hello(b, None, None, Some(false)).unwrap();
         assert!(!ana.lost_state.contains(&b), "o 2º reset na mesma conexão");
+    }
+
+    /// P35: um `Hello` "não tenho conversa" montado antes de a conversa existir pode chegar depois dela
+    /// (substreams sem ordem). Numa conversa formada **nesta** conexão (sem `hello_pending`) ele é velho, não
+    /// prova perda de banco: marcar `lost_state` travaria a fila do peer até a conexão cair.
+    #[tokio::test]
+    async fn a_late_hello_without_conversation_does_not_mark_a_new_conversation() {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package).unwrap();
+        assert!(ana.is_ready(&b));
+        assert!(!ana.hello_pending.contains(&b), "conversa criada agora");
+
+        ana.on_hello(b, None, None, Some(false)).unwrap();
+        assert!(!ana.lost_state.contains(&b), "o Hello era velho");
+    }
+
+    /// P35 (guarda do P16): numa conversa que já existia quando a conexão abriu (`hello_pending`), o `Hello`
+    /// "não tenho conversa" continua marcando `lost_state`.
+    #[tokio::test]
+    async fn a_hello_without_conversation_still_marks_a_loaded_conversation() {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package).unwrap();
+        // Como o `PeerConnected` de uma conversa carregada do banco.
+        ana.hello_pending.insert(b);
+
+        ana.on_hello(b, None, None, Some(false)).unwrap();
+        assert!(ana.lost_state.contains(&b), "o peer perdeu o banco");
+        assert!(!ana.hello_pending.contains(&b));
     }
 
     fn is_reset(event: &ChatEvent) -> bool {
