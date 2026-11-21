@@ -199,6 +199,7 @@ const FUTURE_LIMIT: usize = 32;
 /// P9 (c, ADR 0041): intervalo mínimo entre duas recuperações automáticas da conversa com o mesmo peer
 /// depois de `Stale`. Dentro dele o `Stale` só avisa (quem força 32 mensagens de época futura não faz
 /// o nó refazer a conversa em laço).
+#[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
 const STALE_RECOVERY_WINDOW: Duration = Duration::from_secs(600);
 
 /// Quantas mensagens da outbox podem estar em voo (sem ack) por peer. É 1 de propósito: envios em
