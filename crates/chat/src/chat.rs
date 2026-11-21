@@ -3844,7 +3844,11 @@ mod tests {
             .unwrap();
         assert_eq!(events(&mut bia), [ChatEvent::Stale { peer: ana_peer }]);
 
-        bia.on_mls(ana_peer, &commit).unwrap();
+        // P9 (c): o `Stale` abandona a conversa; o commit que chega depois não a ressuscita nem entrega nada.
+        assert!(matches!(
+            bia.on_mls(ana_peer, &commit),
+            Err(Error::NoConversation(p)) if p == ana_peer
+        ));
         assert!(received_texts(&events(&mut bia)).is_empty());
     }
 
@@ -3890,7 +3894,10 @@ mod tests {
         assert!(!bia.admits(&ana_peer).unwrap(), "controle: sem a marca");
 
         bia.recovering.insert(ana_peer);
-        assert!(bia.admits(&ana_peer).unwrap(), "o peer em recuperação passa");
+        assert!(
+            bia.admits(&ana_peer).unwrap(),
+            "o peer em recuperação passa"
+        );
         assert!(bia.knows(&ana_peer), "e recebe o Hello com certificado");
         assert!(!bia.admits(&stranger).unwrap(), "um estranho segue barrado");
     }
