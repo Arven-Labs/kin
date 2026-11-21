@@ -2946,6 +2946,7 @@ impl Chat {
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
+        let new_identity = self.old_identity_of(&conversation);
         // Só um par v4 de outra identidade vira o trinco (no `crypto`); varrer todas as conversas a cada par
         // novo custaria O(N) por conexão de estranho (auditoria I1 da 3e-ii-b). Erro ao ler: varre.
         let may_turn_latch = match conversation.peer_certificates() {
@@ -2972,7 +2973,6 @@ impl Chat {
         self.lost_state.remove(&peer);
         // Voltou de um `Stale` (P9 c): avisa a troca antes do `ConversationReady`, como o P16 faz no outro lado.
         // Só se a conversa nova é da mesma identidade: outra identidade não é "refeita com a mesma".
-        let new_identity = self.old_identity_of(&conversation);
         if let Some((identity, _)) = self.recovering.remove(&peer)
             && new_identity.as_ref() == Some(&identity)
         {
