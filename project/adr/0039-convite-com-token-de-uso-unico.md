@@ -87,6 +87,13 @@ Alternativas descartadas: `KeyPackage` a qualquer um e barrar no `Welcome` (perd
 - **Auditoria** (`security-auditor`, somente leitura: 0 críticos, 0 altos): (1, baixo) o filtro é sintático: relay em IP privado de LAN ou em hostname `localhost` passa, e quem roda o próprio relay em casa mostra o IP dele no link; **aceito**, inerente ao circuito, documentado aqui. (2, fora do escopo, médio) `own_invite`/`DeviceList` mandam o IP direto a irmãos e a contatos confiáveis dentro da conversa MLS (`set_advertised_addrs` limita). (3, fora do escopo, médio, confiança média) o Identify do libp2p entrega `listen_addrs` e o endereço observado a todo peer conectado, inclusive estranhos: o IP direto sai por aí mesmo sem `--direct`; não verificado no código do libp2p. (4, baixo, antigo) `/invite--direct` ou com tab cai como mensagem ao peer atual. 2 e 3 ficam registrados no P18 do `PENDING.md`; 4 aceito.
 - **Não verificado**: nó real com relay e `external_addresses` (o teste usa endereços sintéticos; o `Lab` só prova que o fluxo de convite segue funcionando, não o conteúdo do link).
 
+## Atualização: P18 (c), a conversa de um lado só fica aceita (2026-11-20)
+
+- **Decisão do dono**: aceitar e fechar, sem código. Levantamento: a conversa de um lado só nasce quando o convidante tem o **menor Peer ID**, cria o grupo (`on_key_package`, que não exige identidade se nada foi fixado) e manda o `Welcome`, e o convidado recusa no `join` (`on_welcome`: identidade errada, revogado, `Welcome` inválido). Pelo **link** isso não ocorre (a assinatura prende a identidade ao Peer ID); só com um `Invite` forjado na mão ou um `Welcome` quebrado. O teste `invite_claiming_another_identity_for_the_same_peer_is_refused` (`crates/chat/tests/invite.rs`) já fixa o comportamento.
+- **Custo aceito**: o convidante vê `ConversationReady` e o transporte confirma (`Delivered`) mensagens que o outro lado descarta. O P16 não cura: a recusa consome o `lost_state` (ADR 0040).
+- **Alternativa descartada**: mensagem `Refuse` no fio (o convidado a manda ao recusar o `join`; o convidante apaga a conversa que nasceu nesta conexão e o peer nunca falou). Exige tag nova do `Envelope` (§4), testes, auditoria e cuidado com DoS, para um alcance baixo. Reabrir se aparecer um caminho real (sem forjar o objeto) que gere o estado.
+- **Não verificado**: se há outro caminho que leve o convidado a recusar o `join` com um link legítimo (por exemplo `Welcome` perdido e reenviado).
+
 ## Auditoria (`security-auditor`, somente leitura)
 
 | # | Achado | Gravidade | Destino |
