@@ -2202,11 +2202,12 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: tudo é leitura (`chat.rs`, `conversation.rs`, ADR 0040); não li o ADR 0001; o DoS por `Stale` forçado é hipótese de leitura, sem teste.
 - **Próximo passo**: se o dono quiser a recuperação por `Stale`, plan mode e ADR (cripto, §4); senão, P33. *(Recuperação por `Stale` na subseção abaixo.)*
 
-#### P9 (c): recuperação por Stale, PR #281 aberto com pendências (ADR 0041, 2026-11-21)
+#### P9 (c): recuperação por Stale, PR #281 mesclado com pendências (ADR 0041, 2026-11-21)
 
 - **Decisão do dono**: opção A (abandonar e reconectar, reaproveitando o P16), em plan mode; depois, "endurecer e seguir" quando a 1ª auditoria achou 1 alto e 4 médios.
 - **Feito** (`chat.rs`, `node.rs`, `main.rs`, `tests/disconnect.rs`): `Node::disconnect`; `recover_from_stale` com `recovering`, identidade antiga em `expected`, janela de 600 s, TTL de 24 h, só conectado, sem irmão, sem desconfiado, fora da caixa postal; `DialFailed` e `ConversationReset` ajustados. Detalhe, provas e limites no ADR 0041.
 - **Provas** (CI): testes primeiro falharam; 3 testes da reauditoria falharam antes e passaram depois; CI e `Lab` verdes no `a9317c1`.
 - **Erros meus**: a premissa do plano ("a reconexão cai no P16 sozinha") estava errada (sem redial, portão fechado barrava), só vista depois dos testes; `sed -i` e `python3` rodados no código contra a regra (sem efeito); stub sem `allow(dead_code)` e um erro de empréstimo custaram duas rodadas de CI; troquei a decisão sobre o pareado sem pedir a confirmação de volta; o log da mutação não identificou os testes que falharam; um teste foi enfraquecido (o `Reset` com mesma identidade ficou sem prova unitária).
 - **Não verificado**: ver "Pendências antes de mesclar" no ADR 0041 (mutação lida, reauditoria da correção, integração do ciclo, aviso da CLI, `disconnect` com várias conexões).
-- **Próximo passo**: fechar essas pendências e só então mesclar o #281; ou fechar o PR e marcar o ADR 0041 como descartado.
+- **Mesclado** pelo dono em 2026-11-21 (`e072153` na `main`), com `CI`, `Lab` e `CI Private Files` verdes no último commit (o `lossy` falhou uma vez e passou na 2ª tentativa; uma repetição só, sem controle, não prova instabilidade) e com as pendências abertas.
+- **Próximo passo**: fechar as pendências do ADR 0041 (mutação lida, reauditoria, integração do ciclo, aviso da CLI); ou P33, que depende do dono.
