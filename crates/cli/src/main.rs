@@ -24,6 +24,9 @@
 //! eu disquei com `--dial` **com o Peer ID** (`/p2p/<id>`; sem ele ninguém é admitido) e os devices de uma
 //! identidade minha ou aceita por `/trust`. `--open-admission` abre mão do portão. Dois devices que só se
 //! acharam por mDNS não passam sozinhos: usam `--dial` com Peer ID ou um link.
+//! `--require-approval` (P18 d, só com o portão fechado) segura quem chega com um link vivo como pedido
+//! pendente: `/allow PEER` abre a conversa e `/deny PEER` recusa **sem revogar o link** (para isso,
+//! `/revoke-invite`). PEER é o Peer ID inteiro ou um prefixo único de 12+ caracteres; sem ele, lista os pedidos e não age.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -77,6 +80,9 @@ struct Args {
     /// conhecido (conversa, convite aceito, `--dial` com Peer ID, identidade minha ou aceita) ou apresenta
     /// o token de um convite meu.
     open_admission: bool,
+    /// `--require-approval` (P18 d, ADR 0039): quem chega com um token vivo vira pedido pendente até `/allow`.
+    /// Só vale com o portão fechado: com `--open-admission` é erro de uso.
+    require_approval: bool,
 }
 
 /// O aviso de conversa refeita (P16, auditoria do PR #254, médio 3). O sinal "o outro lado perdeu o estado"
@@ -108,6 +114,78 @@ fn admission_notice(open_admission: bool) -> &'static str {
     }
 }
 
+// ---- aprovação do convidante (P18 d, ADR 0039) ----
+
+/// Menor prefixo de Peer ID aceito por `/allow` e `/deny`. Todo Peer ID ed25519 começa por `12D3KooW`
+/// (8 caracteres), então um prefixo menor que isto não distingue ninguém e abriria espaço para um
+/// Peer ID forçado a casar (auditoria do PR #278, M1).
+const MIN_REQUEST_PREFIX: usize = 12;
+
+/// Qual pedido pendente o `/allow` ou `/deny` atinge: `Ok(peer)` ou o texto a imprimir. **Sempre exige o
+/// Peer ID** (inteiro ou prefixo de pelo menos [`MIN_REQUEST_PREFIX`] caracteres que só um pedido tem):
+/// agir "no único pedido" aprovaria quem estivesse pendente na hora de digitar, e não quem o dono viu no
+/// aviso (o pedido some se a conexão cai, e outro portador do link pode ocupar o lugar). Sem pedido, sem
+/// argumento, prefixo curto, ambíguo ou desconhecido: lista os pedidos e não age.
+fn pick_request(prefix: &str, pending: &[(PeerId, IdentityId)]) -> Result<PeerId, String> {
+    if pending.is_empty() {
+        return Err("(nenhum pedido de entrada pendente)".to_string());
+    }
+    if prefix.len() >= MIN_REQUEST_PREFIX {
+        let mut matching = pending
+            .iter()
+            .filter(|(peer, _)| peer.to_string().starts_with(prefix));
+        if let (Some((peer, _)), None) = (matching.next(), matching.next()) {
+            return Ok(*peer);
+        }
+    }
+    let listing = pending
+        .iter()
+        .map(|(peer, identity)| format!("  {peer} (identidade {})", identity.to_base58()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "(pedidos de entrada pendentes; informe o Peer ID inteiro ou um prefixo único de pelo menos {MIN_REQUEST_PREFIX} caracteres)\n{listing}"
+    ))
+}
+
+/// Resposta de `/allow` a partir do resultado de `Chat::approve`.
+fn allow_reply(peer: &str, result: Result<bool, Error>) -> String {
+    match result {
+        Ok(true) => format!("{peer} aprovado: retomando a conversa"),
+        Ok(false) => format!(
+            "(sem pedido pendente de {peer}, ou o convite dele já não vale (gasto ou revogado): nada foi aprovado)"
+        ),
+        Err(e) => format!("(não deu para aprovar {peer}: {e})"),
+    }
+}
+
+/// Resposta de `/deny` a partir do resultado de `Chat::deny`. O link segue vivo: quem quer encerrá-lo usa
+/// `/revoke-invite` (decisão do dono, 2026-11-21).
+fn deny_reply(peer: &str, denied: bool) -> String {
+    if denied {
+        format!(
+            "{peer} negado: sem conversa; o link segue vivo (/revoke-invite ID o cancela, veja os ids com /invites)"
+        )
+    } else {
+        format!("(nenhum pedido pendente de {peer})")
+    }
+}
+
+/// Aviso de partida quando a aprovação está ligada.
+fn approval_notice() -> &'static str {
+    "aprovação: ligada (--require-approval); quem chegar com um convite meu espera o meu /allow ou /deny"
+}
+
+/// Aviso de um pedido de entrada novo (`ChatEvent::AdmissionRequested`): quem (peer e identidade que ele
+/// apresentou) e como responder.
+fn admission_requested_notice(peer: &str, identity: &str) -> String {
+    format!(
+        "(pedido de entrada de {peer}, identidade {identity} (apresentada pelo próprio peer, não verificada: \
+         quem tiver o link gera uma; só aprove se você espera esta pessoa agora): /allow {peer} abre a conversa, \
+         /deny {peer} recusa; o link segue vivo se você negar)"
+    )
+}
+
 fn parse_args() -> Result<Args, String> {
     parse_from(
         std::env::args().skip(1),
@@ -136,6 +214,7 @@ fn parse_from(
         relay_limits: RelayLimits::default(),
         mdns: true,
         open_admission: false,
+        require_approval: false,
     };
     let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
@@ -169,8 +248,16 @@ fn parse_from(
             }
             "--no-mdns" => args.mdns = false,
             "--open-admission" => args.open_admission = true,
+            "--require-approval" => args.require_approval = true,
             other => return Err(format!("argumento desconhecido: {other}")),
         }
+    }
+    // A biblioteca ignora a aprovação com o portão aberto; aqui seria falsa sensação de proteção.
+    if args.require_approval && args.open_admission {
+        return Err(
+            "--require-approval não vale com --open-admission (a aprovação só existe com o portão fechado)"
+                .to_string(),
+        );
     }
     if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
         args.keys.passphrase_file = env_passphrase_file
@@ -333,7 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission | --require-approval]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -358,6 +445,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
     chat.set_require_invite(!args.open_admission);
+    chat.set_require_approval(args.require_approval);
     keys::ensure_current_issuer(&identity, chat.certificate())?;
     if let Some(notice) = keys::notice_for(&identity) {
         eprintln!("{notice}");
@@ -377,6 +465,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat.peer_id()
     );
     println!("{}", admission_notice(args.open_admission));
+    if args.require_approval {
+        println!("{}", approval_notice());
+    }
     if !args.no_nostr {
         let choice = resolve_relays(&args.nostr_relays, &args.data_dir.join("relays.txt"))?;
         let origin = match choice.source {
@@ -440,6 +531,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line == "/revoke-invite" || line.starts_with("/revoke-invite ") {
                     let prefix = line.strip_prefix("/revoke-invite").unwrap_or("").trim();
                     println!("{}", revoke_invite_reply(prefix, chat.revoke_invite(prefix)));
+                    continue;
+                }
+                if line == "/allow" || line.starts_with("/allow ") {
+                    let prefix = line.strip_prefix("/allow").unwrap_or("").trim();
+                    match pick_request(prefix, &chat.pending_approvals()) {
+                        Ok(peer) => println!("{}", allow_reply(&peer.to_string(), chat.approve(peer))),
+                        Err(listing) => println!("{listing}"),
+                    }
+                    continue;
+                }
+                if line == "/deny" || line.starts_with("/deny ") {
+                    let prefix = line.strip_prefix("/deny").unwrap_or("").trim();
+                    match pick_request(prefix, &chat.pending_approvals()) {
+                        Ok(peer) => println!("{}", deny_reply(&peer.to_string(), chat.deny(peer))),
+                        Err(listing) => println!("{listing}"),
+                    }
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
@@ -964,11 +1071,11 @@ fn on_event(
         ChatEvent::NotAdmitted { peer } => {
             println!("{}", not_admitted_notice(&peer.to_string()));
         }
-        // A CLI ainda não liga a aprovação (PR 2 do P18 d): o evento só existe com `set_require_approval`.
+        // O evento só existe com `--require-approval` (`set_require_approval`).
         ChatEvent::AdmissionRequested { peer, identity } => {
             println!(
-                "(pedido de entrada de {peer}, identidade {})",
-                identity.to_base58()
+                "{}",
+                admission_requested_notice(&peer.to_string(), &identity.to_base58())
             );
         }
         ChatEvent::Received { message, .. } => {
@@ -1123,6 +1230,142 @@ mod tests {
         // convive com as outras flags, em qualquer ordem
         let args = parse(&["--no-mdns", "--open-admission", "--no-nostr"], None).unwrap();
         assert!(args.open_admission && !args.mdns && args.no_nostr);
+    }
+
+    // ---- aprovação do convidante na CLI (P18 d PR 2, ADR 0039) ----
+
+    #[test]
+    fn approval_is_off_by_default_and_require_approval_turns_it_on() {
+        assert!(!parse(&[], None).unwrap().require_approval);
+        let args = parse(&["--no-mdns", "--require-approval", "--no-nostr"], None).unwrap();
+        assert!(args.require_approval && !args.open_admission && !args.mdns);
+    }
+
+    /// A biblioteca ignora a aprovação com o portão aberto; na CLI isso seria uma falsa sensação de
+    /// proteção, então a combinação é erro de uso, em qualquer ordem.
+    #[test]
+    fn require_approval_with_open_admission_is_a_usage_error() {
+        for argv in [
+            ["--require-approval", "--open-admission"],
+            ["--open-admission", "--require-approval"],
+        ] {
+            let Err(error) = parse(&argv, None) else {
+                panic!("{argv:?}: esperava erro de uso");
+            };
+            assert!(
+                error.contains("--require-approval") && error.contains("--open-admission"),
+                "{error}"
+            );
+        }
+    }
+
+    fn request() -> (PeerId, IdentityId) {
+        (PeerId::random(), StandaloneIdentity::generate().id())
+    }
+
+    /// Sem pedido nenhum, diz isso. Com um pedido só, mas sem Peer ID (ou com prefixo curto ou que não casa),
+    /// **não age**: lista (auditoria do #278, M1 e B7: o pedido único de agora pode não ser o que o dono viu).
+    #[test]
+    fn pick_request_never_acts_without_a_real_peer_id() {
+        let Err(none) = pick_request("", &[]) else {
+            panic!("sem pedidos devia ser erro");
+        };
+        assert!(none.contains("nenhum pedido"), "{none}");
+
+        let only = request();
+        let full = only.0.to_string();
+        for prefix in ["", "1", "12D3KooW", &full[..11], "naoexiste00000"] {
+            let Err(listing) = pick_request(prefix, std::slice::from_ref(&only)) else {
+                panic!("{prefix:?}: devia listar, não agir");
+            };
+            assert!(listing.contains(&full), "{prefix:?}: {listing}");
+        }
+        assert_eq!(
+            pick_request(&full[..12], std::slice::from_ref(&only)),
+            Ok(only.0)
+        );
+    }
+
+    /// Com vários pedidos e sem prefixo que decida, nada é aprovado: a resposta lista peer e identidade.
+    #[test]
+    fn pick_request_with_several_requests_lists_them_and_does_not_act() {
+        let (a, b) = (request(), request());
+        let pending = [a.clone(), b.clone()];
+        for prefix in ["", "12D3KooW", "naoexiste"] {
+            let Err(listing) = pick_request(prefix, &pending) else {
+                panic!("{prefix:?}: devia listar, não agir");
+            };
+            for (peer, identity) in &pending {
+                assert!(listing.contains(&peer.to_string()), "{prefix:?}: {listing}");
+                assert!(
+                    listing.contains(&identity.to_base58()),
+                    "{prefix:?}: {listing}"
+                );
+            }
+        }
+    }
+
+    /// O Peer ID inteiro, ou um prefixo que só um pedido tem, escolhe o pedido.
+    #[test]
+    fn pick_request_by_full_id_or_unique_prefix() {
+        let (a, b) = (request(), request());
+        let pending = [a.clone(), b.clone()];
+        assert_eq!(pick_request(&a.0.to_string(), &pending), Ok(a.0));
+        assert_eq!(pick_request(&b.0.to_string(), &pending), Ok(b.0));
+        let unique = &b.0.to_string()[..16];
+        assert_eq!(pick_request(unique, &pending), Ok(b.0));
+    }
+
+    #[test]
+    fn allow_and_deny_replies_say_what_happened() {
+        let approved = allow_reply("12D3KooWPeer", Ok(true));
+        assert!(
+            approved.contains("12D3KooWPeer") && approved.contains("aprovado"),
+            "{approved}"
+        );
+        let stale = allow_reply("12D3KooWPeer", Ok(false));
+        assert!(stale.contains("nada foi aprovado"), "{stale}");
+        assert!(allow_reply("12D3KooWPeer", Err(Error::InvalidInvite)).contains("não deu"));
+
+        let denied = deny_reply("12D3KooWPeer", true);
+        assert!(
+            denied.contains("12D3KooWPeer") && denied.contains("negado"),
+            "{denied}"
+        );
+        // o `deny` não revoga o link (decisão do dono, 2026-11-21): a resposta diz como encerrá-lo
+        assert!(
+            denied.contains("segue vivo") && denied.contains("/revoke-invite"),
+            "{denied}"
+        );
+        assert!(deny_reply("12D3KooWPeer", false).contains("nenhum pedido"));
+    }
+
+    /// O aviso do pedido diz **quem** (peer e identidade apresentada) e os dois comandos; o `/deny` não
+    /// revoga. O prefixo "(pedido de entrada de" é o que o lab procura.
+    #[test]
+    fn the_admission_request_notice_names_who_and_the_commands() {
+        let notice = admission_requested_notice("12D3KooWPeer", "IdentidadeBase58");
+        assert!(
+            notice.starts_with("(pedido de entrada de 12D3KooWPeer"),
+            "{notice}"
+        );
+        assert!(notice.contains("IdentidadeBase58"), "{notice}");
+        assert!(
+            notice.contains("/allow") && notice.contains("/deny"),
+            "{notice}"
+        );
+        assert!(notice.contains("segue vivo"), "{notice}");
+        // a identidade é autodeclarada (auditoria do #278, M2): o aviso não a vende como "quem é"
+        assert!(notice.contains("não verificada"), "{notice}");
+    }
+
+    #[test]
+    fn the_approval_mode_is_announced_at_startup() {
+        let notice = approval_notice();
+        assert!(
+            notice.contains("--require-approval") && notice.contains("/allow"),
+            "{notice}"
+        );
     }
 
     /// Conversa refeita (P16): o aviso diz **quem** (a identidade), que o sinal não é verificável e que, se não

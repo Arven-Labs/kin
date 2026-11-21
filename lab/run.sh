@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|invite-single-use|invite-revoked|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|invite-single-use|invite-revoked|invite-approved|invite-denied|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -200,9 +200,10 @@ scenario_invite() {
 }
 
 # `a` (com o portão fechado, que é o padrão) gera um convite e devolve o link em LINK e o id em INVITE_ID.
+# `$1` (opcional): flags extras do `a`, como `--require-approval`.
 invite_setup() {
   infra cone || { fail "montar o laboratório"; return 1; }
-  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR"
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR ${1:-}"
   compose up -d a >/dev/null
   wait_log a "reserva aceita no relay" 30 || { fail "a sem reserva no relay"; logs a; return 1; }
   A_ID=$(peer_id a)
@@ -266,6 +267,59 @@ scenario_invite_revoked() {
   [ "$(logs a | grep -c 'conversa cifrada pronta')" -eq 0 ] \
     && pass "a não tem conversa nenhuma" \
     || fail "a abriu conversa com o link revogado"
+}
+
+# Aprovação do convidante (P18 d, ADR 0039): `a` sobe com `--require-approval`, `b` aceita o link e o pedido
+# de entrada espera. Deixa B_ID preenchido. Falha (return 1) se o pedido não aparece ou se a conversa abriu sozinha.
+approval_request() {
+  invite_setup "--require-approval" || return 1
+  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --accept $LINK"
+  compose up -d b >/dev/null
+  check "b alcançou o a" wait_log b "conectado a $A_ID" 45 || return 1
+  B_ID=$(peer_id b)
+  check "a mostra o pedido de entrada do b" wait_log a "pedido de entrada de $B_ID" 30 || { logs a | tail -20; return 1; }
+  if wait_log a "conversa cifrada pronta" 10; then
+    fail "a conversa abriu antes do /allow"; logs a | tail -20; return 1
+  fi
+  pass "o link sozinho não abre conversa: o pedido espera o /allow"
+}
+
+scenario_invite_approved() {
+  echo "== Aprovação do convidante: /allow abre a conversa que o link sozinho não abriu"
+  approval_request || return
+  say a "/allow $B_ID"
+  check "/allow confirma" wait_log a "$B_ID aprovado" 10
+  if wait_log a "conversa cifrada pronta" 45 && wait_log b "conversa cifrada pronta" 45; then
+    pass "depois do /allow a conversa fica pronta nos dois lados"
+  else
+    fail "a conversa não abriu depois do /allow"; logs a | tail -20; logs b | tail -20; return
+  fi
+  say a "/invites"
+  check "o token foi gasto quando a conversa nasceu (/invites vazio)" wait_log a "nenhum convite vivo" 10
+}
+
+scenario_invite_denied() {
+  echo "== Aprovação do convidante: /deny não abre conversa e não revoga o link"
+  approval_request || return
+  local live_lines="convite $INVITE_ID: vence em" before
+  before=$(logs a | grep -c "$live_lines")
+  say a "/deny $B_ID"
+  check "/deny confirma" wait_log a "$B_ID negado" 10
+  if wait_log a "conversa cifrada pronta" 25 || wait_log b "conversa cifrada pronta" 5; then
+    fail "a conversa abriu depois do /deny"; logs a | tail -20; logs b | tail -20; return
+  fi
+  pass "depois do /deny não há conversa em nenhum dos lados"
+  # Prova que o /deny dispensou o pedido (sem ele, o pedido ainda estaria pendente e o /allow o abriria).
+  say a "/allow $B_ID"
+  check "o pedido saiu da lista pendente" wait_log a "nenhum pedido de entrada pendente" 10
+  say a "/invites"
+  for _ in $(seq 20); do
+    [ "$(logs a | grep -c "$live_lines")" -gt "$before" ] && break
+    sleep 0.5
+  done
+  [ "$(logs a | grep -c "$live_lines")" -gt "$before" ] \
+    && pass "o link segue vivo depois do /deny (/invites ainda lista $INVITE_ID)" \
+    || fail "o /deny revogou o link"
 }
 
 scenario_relay_failover() {
@@ -801,6 +855,8 @@ run_scenario() {
     invite) scenario_invite ;;
     invite-single-use) scenario_invite_single_use ;;
     invite-revoked) scenario_invite_revoked ;;
+    invite-approved) scenario_invite_approved ;;
+    invite-denied) scenario_invite_denied ;;
     relay-failover) scenario_relay_failover ;;
     multi-device) scenario_multi_device ;;
     multi-device-plain) scenario_multi_device_plain ;;
@@ -814,7 +870,7 @@ run_scenario() {
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked invite-approved invite-denied relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}
