@@ -3597,7 +3597,9 @@ impl Chat {
         let now = Instant::now();
         self.stale_recovered
             .retain(|_, at| now.duration_since(*at) < STALE_RECOVERY_WINDOW);
-        if self.stale_recovered.contains_key(&peer)
+        if self
+            .sole_identity(&peer)
+            .is_none()
             || self
                 .sole_identity(&peer)
                 .is_some_and(|identity| self.is_distrusted(&identity))
