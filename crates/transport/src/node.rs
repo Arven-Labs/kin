@@ -383,6 +383,13 @@ impl Node {
         )
     }
 
+    /// Fecha **todas** as conexões com `peer` (P9 c, ADR 0041). `true` se havia conexão; os dois lados veem
+    /// `PeerDisconnected`. Stub dos testes primeiro: a implementação vem depois.
+    pub fn disconnect(&mut self, peer: PeerId) -> bool {
+        let _ = peer;
+        false
+    }
+
     /// Avança o nó até o próximo evento relevante.
     pub async fn next_event(&mut self) -> NodeEvent {
         loop {

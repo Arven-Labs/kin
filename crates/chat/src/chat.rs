@@ -196,6 +196,11 @@ struct Scan {
 /// Quantas mensagens de época futura se guardam por peer à espera do commit (P9).
 const FUTURE_LIMIT: usize = 32;
 
+/// P9 (c, ADR 0041): intervalo mínimo entre duas recuperações automáticas da conversa com o mesmo peer
+/// depois de `Stale`. Dentro dele o `Stale` só avisa (quem força 32 mensagens de época futura não faz
+/// o nó refazer a conversa em laço).
+const STALE_RECOVERY_WINDOW: Duration = Duration::from_secs(600);
+
 /// Quantas mensagens da outbox podem estar em voo (sem ack) por peer. É 1 de propósito: envios em
 /// paralelo seguem por substreams diferentes e a rede não garante qual chega primeiro, então o
 /// destinatário veria "dois" antes de "um". Um por vez garante a ordem (custo: uma ida e volta por
@@ -532,6 +537,10 @@ pub struct Chat {
     held_key_packages: HashMap<PeerId, Vec<u8>>,
     /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
     future: HashMap<PeerId, Vec<Vec<u8>>>,
+    /// P9 (c, ADR 0041): quando a conversa com o peer foi abandonada por `Stale` pela última vez. Dentro de
+    /// [`STALE_RECOVERY_WINDOW`] o `Stale` só avisa. Só em memória.
+    #[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
+    stale_recovered: HashMap<PeerId, Instant>,
     /// Fila de saída e ids já vistos (3.2); persistente em `open`, em memória em `new`.
     outbox: Outbox,
     /// Peers com ao menos uma conexão de rede aberta (`PeerConnected` até `PeerDisconnected`).
@@ -779,6 +788,7 @@ impl Chat {
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
+            stale_recovered: HashMap::new(),
             outbox,
             connected: Default::default(),
             announced: Default::default(),
@@ -3777,6 +3787,87 @@ mod tests {
 
         bia.on_mls(ana_peer, &commit).unwrap();
         assert!(received_texts(&events(&mut bia)).is_empty());
+    }
+
+    /// Estoura o teto do buffer com mensagens de época futura (o commit nunca chega): devolve o `Stale`.
+    fn force_stale(bia: &mut Chat, ana: &mut Conversation, ana_peer: PeerId) {
+        let _commit = ana.rotate_keys().unwrap();
+        for i in 0..=FUTURE_LIMIT {
+            bia.on_mls(ana_peer, &wire(ana, &i.to_string())).unwrap();
+        }
+    }
+
+    /// P9 (c, ADR 0041): no `Stale` o lado atrasado abandona a conversa (o P16 a refaz na reconexão) e
+    /// **mantém a outbox**: o que estava na fila sai pela conversa nova.
+    #[tokio::test]
+    async fn stale_drops_the_conversation_and_keeps_the_outbox() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        bia.send(ana_peer, "na fila", None).unwrap();
+        events(&mut bia);
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(
+            !bia.conversations.contains_key(&ana_peer),
+            "a conversa divergida devia ter sido abandonada"
+        );
+        assert_eq!(bia.queued(&ana_peer), 1, "a outbox não é tocada");
+        assert!(!bia.future.contains_key(&ana_peer));
+    }
+
+    /// Depois do abandono, mensagem velha do par é erro de "sem conversa", não pânico nem buffer novo.
+    #[tokio::test]
+    async fn after_the_drop_a_late_message_is_a_no_conversation_error() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        let late = wire(&mut ana, "atrasada");
+        assert!(matches!(
+            bia.on_mls(ana_peer, &late),
+            Err(Error::NoConversation(p)) if p == ana_peer
+        ));
+        assert!(!bia.future.contains_key(&ana_peer));
+    }
+
+    /// Dentro da janela, um 2º `Stale` do mesmo peer só avisa: não apaga a conversa (contra laço de recuperação).
+    #[tokio::test]
+    async fn a_second_stale_inside_the_window_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        bia.stale_recovered.insert(ana_peer, Instant::now());
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(
+            bia.conversations.contains_key(&ana_peer),
+            "dentro da janela a conversa fica"
+        );
+    }
+
+    /// Passada a janela, o `Stale` volta a recuperar.
+    #[tokio::test]
+    async fn a_stale_after_the_window_recovers_again() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        let long_ago = Instant::now()
+            .checked_sub(STALE_RECOVERY_WINDOW + Duration::from_secs(1))
+            .unwrap();
+        bia.stale_recovered.insert(ana_peer, long_ago);
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(!bia.conversations.contains_key(&ana_peer));
+    }
+
+    /// A janela é por peer: um `Stale` recente de outro peer não segura este.
+    #[tokio::test]
+    async fn the_stale_window_is_per_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        bia.stale_recovered.insert(PeerId::random(), Instant::now());
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(!bia.conversations.contains_key(&ana_peer));
     }
 
     /// P9: lixo e mensagem de outra conversa continuam sendo erro, nunca vão para o buffer.
