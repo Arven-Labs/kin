@@ -2192,4 +2192,12 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Auditoria** (`security-auditor`: 0 críticos, 0 altos, 2 médios): `/allow` sem argumento agindo no pedido único (M1) → agora exige Peer ID inteiro ou prefixo único de 12+ caracteres; identidade do pedido é autodeclarada (M2) → o aviso diz "não verificada"; o `/deny` do Lab não provava nada sozinho (B5) → `/allow` depois dele precisa dizer que não há pedido. Aceitos: a flag não persiste entre reinícios, `deny` vale só na conexão, limites do Lab. Detalhe no ADR 0039.
 - **Erros meus**: (1) a correção da auditoria (Peer ID obrigatório) foi junto com os testes no mesmo commit, sem a rodada de "falha antes" para esse comportamento; (2) acrescentei a seção do ADR 0039 com `cat >>` e heredoc, contra a regra de editar docs só com `Edit`/`Write` (o conteúdo é o mesmo que um `Edit` faria, mas o diff não passou pela sua aprovação); (3) o clone da mutação usou HTTPS sem credencial e perdi uma tentativa de push.
 - **Não verificado**: os dois caminhos de `approve` (menor e maior Peer ID) são sorteados por rodada; `warden/mobile`; `/allow` com 2 pedidos reais no Lab (só teste unitário).
-- **Próximo passo**: P9, ou o roteiro de rede real (P33, depende do dono).
+- **Próximo passo**: P9, ou o roteiro de rede real (P33, depende do dono). *(P9 conferido na subseção abaixo.)*
+
+#### P9 (c): conferência no código, só registro (2026-11-21, só docs)
+
+- **Origem**: eu citei o P9 como próximo passo **sem ter lido a linha** (erro meu, contra a regra de ler a linha inteira do `PENDING.md`); o dono perguntou o que era e pediu a conferência da (c).
+- **Achado**: a (c) diz "vai para P16", mas o P16 só trata quem declara perda de estado. Divergência sem perda não dispara nada (ADR 0040, "Conversas divergentes sem perda"), e o `Stale` (`chat.rs:3542`) só descarta o buffer e avisa. As referências eram circulares (`Stale` → P16 → P9).
+- **Decisão do dono**: só corrigir o registro. `PENDING.md` (P9 c) e ADR 0040 atualizados; os comentários do código (`chat.rs:149` e `chat.rs:3542`, "recuperar é P16") **não foram tocados** (ficam para quando houver código).
+- **Não verificado**: tudo é leitura (`chat.rs`, `conversation.rs`, ADR 0040); não li o ADR 0001; o DoS por `Stale` forçado é hipótese de leitura, sem teste.
+- **Próximo passo**: se o dono quiser a recuperação por `Stale`, plan mode e ADR (cripto, §4); senão, P33.
