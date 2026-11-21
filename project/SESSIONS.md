@@ -2156,4 +2156,22 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Auditoria** (`security-auditor`: 0 críticos, 0 altos): relay em IP privado de LAN ou quem roda o próprio relay em casa mostra esse IP no link (aceito); o IP direto continua indo na `DeviceList` (irmãos e contatos confiáveis) e no Identify do libp2p (a qualquer peer conectado; não verificado no código do libp2p): registrado no P18 do `PENDING.md`; `/invite--direct` sem espaço vira mensagem ao peer atual (antigo, aceito).
 - **Erros meus**: (1) o stub com enum sem `allow(dead_code)` derrubou o clippy antes dos testes, o que me fez perder uma rodada de CI; (2) li o `Lab` como se fosse o run do CI na 1ª leitura (`--limit 1` pegou o workflow errado); (3) escrevi "Sessão 37" no PENDING e voltei para a data ao perceber que a numeração das sessões 35/36 estava misturada; (4) `cargo fmt --check` mostra diferenças pré-existentes em `crates/chat/src/chat.rs` na `main` (não toquei: fora do escopo).
 - **Não verificado**: o conteúdo real do link com um nó real e relay (o teste usa endereços sintéticos; o `Lab` só prova que o fluxo de convite segue funcionando); `warden/mobile`; o Identify no libp2p.
-- **Próximo passo**: P18 (c), conversa de um lado só quando o convidado recusa por identidade (mesma família do P16), ou (d), confirmação do convidante; ou o P33 (depende do dono).
+- **Próximo passo**: P18 (c), conversa de um lado só quando o convidado recusa por identidade (mesma família do P16), ou (d), confirmação do convidante; ou o P33 (depende do dono). *(Feitos nas subseções abaixo: (c) aceito, (d) biblioteca.)*
+
+#### P18 (c): conversa de um lado só, aceita sem código (ADR 0039, PR #273)
+
+- **Decisão do dono** (pergunta em plan mode): aceitar e fechar. Levantamento: só nasce se o convidante é o de menor Peer ID, cria o grupo e manda o `Welcome`, e o convidado recusa o `join`; pelo link isso não ocorre (a assinatura prende identidade e Peer ID), só com `Invite` forjado na mão ou `Welcome` inválido (o teste `invite_claiming_another_identity...` já fixa).
+- **Descartado**: mensagem `Refuse` no fio (tag nova do `Envelope`, §4, DoS) e só avisar na CLI.
+- **Não verificado**: outro caminho que leve um convite legítimo a recusar o `join`.
+
+#### P18 (d): o convidante confirma quem entra, biblioteca (ADR 0039, PR #274)
+
+- **Decisão do dono**: pedido pendente com confirmação (opção C) como **segundo opt-in** (`set_require_approval`, padrão `false`); sem mudar o fio nem o schema. O ADR 0039 tinha descartado por quebrar mDNS e testes; com o portão fechado por padrão na CLI isso deixou de valer.
+- **Erro meu (premissa)**: afirmei que a identidade de quem usa o link só aparece no `KeyPackage`. Falso: quem aceitou o link está em `expected`, e o `Hello` com token já leva o certificado. Corrigido no plano antes de codar, e registrado no ADR.
+- **Feito**: `set_require_approval`, `approve`, `deny`, `pending_approvals`, `ChatEvent::AdmissionRequested`; `admits` exige `approved` para o token; o `approve` retoma o handshake nos dois papéis (menor Peer ID processa o `KeyPackage` guardado; maior manda o seu).
+- **Provas** (CI): testes primeiro, 3 de comportamento falharam e 3 guardas passaram (run 44835564573); depois CI e `Lab` verdes. Mutação de propósito (PR descartável #275, fechado): `admits` ignorando `approved` derrubou 3 testes (run 44836905982).
+- **Auditoria** (`security-auditor`, 0 críticos, 0 altos): identidade do pedido trocável por 2º `Hello` e aprovação presa ao peer e não ao token, ambos **corrigidos** com teste que falhou antes (run 44837161738); `revoke_invite` passou a limpar os pedidos do link (mitigação do teto de 16, que fica aceito); ligar a aprovação com peers já conectados não gera pedido até o próximo `Hello` (documentado).
+- **Erros meus**: o PR #274 conflitou com o #273 em `PENDING.md` (resolvido com merge, sem force push); um 1º `--log-failed` de CI sem filtro despejou ruído no contexto.
+- **Não verificado**: CLI e `Lab` da aprovação (PR 2); caminho do mailbox (o auditor não o leu); se o nó emite `PeerDisconnected` por conexão; o teto de 16 sem teste; `warden/mobile`.
+- **Em aberto (do dono)**: depois de `deny` o token segue vivo (premissa minha) ou o `deny` também revoga o link?
+- **Próximo passo**: PR 2 do (d): `--require-approval`, `/allow`, `/deny`, aviso do `AdmissionRequested` na CLI e cenários `invite-approved` e `invite-denied` no `Lab`, em plan mode.
