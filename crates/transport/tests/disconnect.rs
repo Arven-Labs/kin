@@ -58,12 +58,32 @@ async fn disconnect_closes_the_connection_and_both_sides_see_it() {
 /// Sem conexão com o peer, `disconnect` devolve `false` e não faz nada.
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnect_without_a_connection_returns_false() {
-    let (_key_a, key_b, mut a, _b) = connected_pair().await;
+    let (key_a, key_b, mut a, mut b) = connected_pair().await;
     let stranger = DeviceKey::generate().peer_id();
     assert!(!a.disconnect(stranger));
-    // pedir para fechar um desconhecido não derruba a conexão que existe
-    assert!(
-        a.disconnect(key_b.peer_id()),
-        "a conexão com o b seguia de pé"
-    );
+
+    // pedir para fechar um desconhecido não derruba a conexão que existe: o `b` ainda recebe do `a`
+    a.send(key_b.peer_id(), b"ainda de pe".to_vec());
+    let received = async {
+        loop {
+            if let NodeEvent::MessageReceived { peer, data } = b.next_event().await {
+                return (peer, data);
+            }
+        }
+    };
+    let pump_a = async {
+        loop {
+            a.next_event().await;
+        }
+    };
+    let (from, data) = timeout(WAIT, async {
+        tokio::select! {
+            got = received => got,
+            () = pump_a => unreachable!(),
+        }
+    })
+    .await
+    .expect("a conexão caiu depois do disconnect de um desconhecido");
+    assert_eq!(from, key_a.peer_id());
+    assert_eq!(data, b"ainda de pe");
 }
