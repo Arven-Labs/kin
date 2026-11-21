@@ -2175,3 +2175,11 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Não verificado**: CLI e `Lab` da aprovação (PR 2); caminho do mailbox (o auditor não o leu); se o nó emite `PeerDisconnected` por conexão; o teto de 16 sem teste; `warden/mobile`.
 - **Em aberto (do dono)**: depois de `deny` o token segue vivo (premissa minha) ou o `deny` também revoga o link?
 - **Próximo passo**: PR 2 do (d): `--require-approval`, `/allow`, `/deny`, aviso do `AdmissionRequested` na CLI e cenários `invite-approved` e `invite-denied` no `Lab`, em plan mode.
+
+#### P36: reavaliação das saídas, sem código (2026-11-21, só docs)
+
+- **Origem**: o dono pediu para retomar o P36 (aceito em 2026-11-20 depois do #267) e escolheu a saída 1 (fechar conexões antigas) em plan mode.
+- **Achado (leitura de `node.rs`, nada rodado)**: a saída 1 pode zerar as conexões na discagem simultânea, e um desempate igual nos dois lados não distingue a conexão morta da viva. Eu tinha proposto trocar por `ping` do libp2p; **erro meu**: o ping sozinho não cura, porque `PeerDisconnected` só sai com `num_established == 0` (`node.rs:507-511`) e a velha cair com a nova de pé não gera evento. Corrigi antes de qualquer código.
+- **Decisão do dono**: registrar e medir antes (duração e frequência da janela, no roteiro de rede real do P33). Registrado nas linhas do P36 e do P33 do `PENDING.md`.
+- **Não verificado**: tudo acima é leitura de código; a feature `ping` não foi avaliada conforme `padrao/dependencias-novas.md`; a duração real da janela segue não medida.
+- **Próximo passo**: executar o roteiro de rede real (depende do dono: segunda rede e VPS) acrescentando a medição do P36; ou P9, ou o PR 2 do P18 (d).
