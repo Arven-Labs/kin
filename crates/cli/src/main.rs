@@ -24,6 +24,9 @@
 //! eu disquei com `--dial` **com o Peer ID** (`/p2p/<id>`; sem ele ninguém é admitido) e os devices de uma
 //! identidade minha ou aceita por `/trust`. `--open-admission` abre mão do portão. Dois devices que só se
 //! acharam por mDNS não passam sozinhos: usam `--dial` com Peer ID ou um link.
+//! `--require-approval` (P18 d, só com o portão fechado) segura quem chega com um link vivo como pedido
+//! pendente: `/allow [peer]` abre a conversa e `/deny [peer]` recusa **sem revogar o link** (para isso,
+//! `/revoke-invite`). Sem argumento age no pedido único; com vários, lista e pede o Peer ID ou um prefixo.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -79,7 +82,6 @@ struct Args {
     open_admission: bool,
     /// `--require-approval` (P18 d, ADR 0039): quem chega com um token vivo vira pedido pendente até `/allow`.
     /// Só vale com o portão fechado: com `--open-admission` é erro de uso.
-    #[allow(dead_code)] // stub dos testes primeiro (P18 d PR 2); a implementação o lê
     require_approval: bool,
 }
 
@@ -112,37 +114,71 @@ fn admission_notice(open_admission: bool) -> &'static str {
     }
 }
 
-// ---- P18 d PR 2: stubs para os testes falharem por asserção; a implementação vem depois ----
+// ---- aprovação do convidante (P18 d, ADR 0039) ----
 
-/// Qual pedido pendente o `/allow` ou `/deny` atinge: `Ok(peer)` ou o texto a imprimir (nenhum pedido,
-/// ambíguo ou desconhecido: lista os pedidos, sem agir).
-#[allow(dead_code)]
-fn pick_request(_prefix: &str, _pending: &[(PeerId, IdentityId)]) -> Result<PeerId, String> {
-    Err(String::new())
+/// Qual pedido pendente o `/allow` ou `/deny` atinge: `Ok(peer)` ou o texto a imprimir. Sem argumento, só
+/// o pedido único é escolhido; com argumento, o Peer ID inteiro ou um prefixo que só um pedido tem. Nenhum
+/// pedido, ambiguidade ou prefixo desconhecido: lista os pedidos e não age (aprovar o peer errado abriria
+/// conversa com quem o dono não escolheu).
+fn pick_request(prefix: &str, pending: &[(PeerId, IdentityId)]) -> Result<PeerId, String> {
+    if pending.is_empty() {
+        return Err("(nenhum pedido de entrada pendente)".to_string());
+    }
+    let matching: Vec<&(PeerId, IdentityId)> = pending
+        .iter()
+        .filter(|(peer, _)| peer.to_string().starts_with(prefix))
+        .collect();
+    match (prefix.is_empty(), matching.as_slice(), pending) {
+        (false, [(peer, _)], _) => Ok(*peer),
+        (true, _, [(peer, _)]) => Ok(*peer),
+        _ => {
+            let listing = pending
+                .iter()
+                .map(|(peer, identity)| format!("  {peer} (identidade {})", identity.to_base58()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "(pedidos de entrada pendentes; escolha um pelo Peer ID inteiro ou por um prefixo único)\n{listing}"
+            ))
+        }
+    }
 }
 
 /// Resposta de `/allow` a partir do resultado de `Chat::approve`.
-#[allow(dead_code)]
-fn allow_reply(_peer: &str, _result: Result<bool, Error>) -> String {
-    String::new()
+fn allow_reply(peer: &str, result: Result<bool, Error>) -> String {
+    match result {
+        Ok(true) => format!("{peer} aprovado: retomando a conversa"),
+        Ok(false) => format!(
+            "(sem pedido pendente de {peer}, ou o convite dele já não vale (gasto ou revogado): nada foi aprovado)"
+        ),
+        Err(e) => format!("(não deu para aprovar {peer}: {e})"),
+    }
 }
 
-/// Resposta de `/deny` a partir do resultado de `Chat::deny`.
-#[allow(dead_code)]
-fn deny_reply(_peer: &str, _denied: bool) -> String {
-    String::new()
+/// Resposta de `/deny` a partir do resultado de `Chat::deny`. O link segue vivo: quem quer encerrá-lo usa
+/// `/revoke-invite` (decisão do dono, 2026-11-21).
+fn deny_reply(peer: &str, denied: bool) -> String {
+    if denied {
+        format!(
+            "{peer} negado: sem conversa; o link segue vivo (/revoke-invite ID o cancela, veja os ids com /invites)"
+        )
+    } else {
+        format!("(nenhum pedido pendente de {peer})")
+    }
 }
 
 /// Aviso de partida quando a aprovação está ligada.
-#[allow(dead_code)]
 fn approval_notice() -> &'static str {
-    ""
+    "aprovação: ligada (--require-approval); quem chegar com um convite meu espera o meu /allow ou /deny"
 }
 
-/// Aviso de um pedido de entrada novo (`ChatEvent::AdmissionRequested`).
-#[allow(dead_code)]
-fn admission_requested_notice(_peer: &str, _identity: &str) -> String {
-    String::new()
+/// Aviso de um pedido de entrada novo (`ChatEvent::AdmissionRequested`): quem (peer e identidade que ele
+/// apresentou) e como responder.
+fn admission_requested_notice(peer: &str, identity: &str) -> String {
+    format!(
+        "(pedido de entrada de {peer}, identidade {identity}: /allow {peer} abre a conversa, /deny {peer} recusa; \
+         o link segue vivo se você negar)"
+    )
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -207,8 +243,16 @@ fn parse_from(
             }
             "--no-mdns" => args.mdns = false,
             "--open-admission" => args.open_admission = true,
+            "--require-approval" => args.require_approval = true,
             other => return Err(format!("argumento desconhecido: {other}")),
         }
+    }
+    // A biblioteca ignora a aprovação com o portão aberto; aqui seria falsa sensação de proteção.
+    if args.require_approval && args.open_admission {
+        return Err(
+            "--require-approval não vale com --open-admission (a aprovação só existe com o portão fechado)"
+                .to_string(),
+        );
     }
     if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
         args.keys.passphrase_file = env_passphrase_file
@@ -371,7 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission | --require-approval]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -396,6 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Chat::open_paired(&identity.id(), &device, config, &db)?,
     };
     chat.set_require_invite(!args.open_admission);
+    chat.set_require_approval(args.require_approval);
     keys::ensure_current_issuer(&identity, chat.certificate())?;
     if let Some(notice) = keys::notice_for(&identity) {
         eprintln!("{notice}");
@@ -415,6 +460,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chat.peer_id()
     );
     println!("{}", admission_notice(args.open_admission));
+    if args.require_approval {
+        println!("{}", approval_notice());
+    }
     if !args.no_nostr {
         let choice = resolve_relays(&args.nostr_relays, &args.data_dir.join("relays.txt"))?;
         let origin = match choice.source {
@@ -478,6 +526,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line == "/revoke-invite" || line.starts_with("/revoke-invite ") {
                     let prefix = line.strip_prefix("/revoke-invite").unwrap_or("").trim();
                     println!("{}", revoke_invite_reply(prefix, chat.revoke_invite(prefix)));
+                    continue;
+                }
+                if line == "/allow" || line.starts_with("/allow ") {
+                    let prefix = line.strip_prefix("/allow").unwrap_or("").trim();
+                    match pick_request(prefix, &chat.pending_approvals()) {
+                        Ok(peer) => println!("{}", allow_reply(&peer.to_string(), chat.approve(peer))),
+                        Err(listing) => println!("{listing}"),
+                    }
+                    continue;
+                }
+                if line == "/deny" || line.starts_with("/deny ") {
+                    let prefix = line.strip_prefix("/deny").unwrap_or("").trim();
+                    match pick_request(prefix, &chat.pending_approvals()) {
+                        Ok(peer) => println!("{}", deny_reply(&peer.to_string(), chat.deny(peer))),
+                        Err(listing) => println!("{listing}"),
+                    }
                     continue;
                 }
                 if line == "/pair" || line == "/pair confirmo" {
@@ -1002,11 +1066,11 @@ fn on_event(
         ChatEvent::NotAdmitted { peer } => {
             println!("{}", not_admitted_notice(&peer.to_string()));
         }
-        // A CLI ainda não liga a aprovação (PR 2 do P18 d): o evento só existe com `set_require_approval`.
+        // O evento só existe com `--require-approval` (`set_require_approval`).
         ChatEvent::AdmissionRequested { peer, identity } => {
             println!(
-                "(pedido de entrada de {peer}, identidade {})",
-                identity.to_base58()
+                "{}",
+                admission_requested_notice(&peer.to_string(), &identity.to_base58())
             );
         }
         ChatEvent::Received { message, .. } => {
