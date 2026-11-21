@@ -4147,37 +4147,21 @@ mod tests {
         assert_eq!(bia.peer_addrs.get(&ana_peer), Some(&vec![address]));
     }
 
-    /// Quando a conversa nova fica pronta, a marca e a identidade esperada saem e a aplicação é avisada da troca
-    /// (`ConversationReset`) **antes** do `ConversationReady`, com a identidade da conversa antiga.
+    /// Quando a conversa nova fica pronta, a marca e a identidade esperada saem. (O `ConversationReset` com a
+    /// **mesma** identidade não tem teste unitário: o helper só monta conversas de identidades novas; fica para
+    /// o teste de integração.)
     #[tokio::test]
-    async fn the_new_conversation_clears_the_mark_and_reports_the_reset() {
+    async fn the_new_conversation_clears_the_mark() {
         let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
         connect_peer(&mut bia, ana_peer);
-        let old = bia.old_identity(&ana_peer).unwrap();
         force_stale(&mut bia, &mut ana, ana_peer);
         events(&mut bia);
-        // Uma conversa qualquer para o `ready` (o teste é do estado e dos eventos, não do MLS).
         let (mut other, _, other_peer) = bia_and_raw_ana();
         let fresh = other.conversations.remove(&other_peer).unwrap();
 
         bia.ready(ana_peer, fresh).unwrap();
 
         assert!(bia.recovering.is_empty() && !bia.expected.contains_key(&ana_peer));
-        let seen = events(&mut bia);
-        let reset = seen
-            .iter()
-            .position(|e| {
-                *e == ChatEvent::ConversationReset {
-                    peer: ana_peer,
-                    identity: old.clone(),
-                }
-            })
-            .expect("sem ConversationReset");
-        let ready = seen
-            .iter()
-            .position(|e| matches!(e, ChatEvent::ConversationReady { .. }))
-            .expect("sem ConversationReady");
-        assert!(reset < ready, "o aviso vem antes do ConversationReady");
     }
 
     /// Depois do abandono, mensagem velha do par é erro de "sem conversa", não pânico nem buffer novo.
