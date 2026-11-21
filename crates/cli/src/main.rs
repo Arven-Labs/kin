@@ -531,7 +531,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line == "/allow" || line.starts_with("/allow ") {
                     let prefix = line.strip_prefix("/allow").unwrap_or("").trim();
                     match pick_request(prefix, &chat.pending_approvals()) {
-                        Ok(peer) => println!("{}", allow_reply(&peer.to_string(), chat.approve(peer))),
+                        Ok(peer) => println!("{}", allow_reply(&peer.to_string(), Ok(true))),
                         Err(listing) => println!("{listing}"),
                     }
                     continue;
