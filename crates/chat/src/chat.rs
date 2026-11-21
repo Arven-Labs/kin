@@ -145,7 +145,8 @@ pub enum ChatEvent {
         reason: String,
     },
     /// Chegaram mensagens demais de uma época que este device não alcança: o commit que falta
-    /// provavelmente não virá e a conversa divergiu (recuperar é P16). O buffer foi descartado.
+    /// provavelmente não virá e a conversa divergiu. O buffer foi descartado e, fora da janela de
+    /// [`STALE_RECOVERY_WINDOW`], este lado abandonou a conversa e reconecta para o P16 refazê-la (P9 c).
     Stale {
         peer: PeerId,
     },
@@ -199,7 +200,6 @@ const FUTURE_LIMIT: usize = 32;
 /// P9 (c, ADR 0041): intervalo mínimo entre duas recuperações automáticas da conversa com o mesmo peer
 /// depois de `Stale`. Dentro dele o `Stale` só avisa (quem força 32 mensagens de época futura não faz
 /// o nó refazer a conversa em laço).
-#[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
 const STALE_RECOVERY_WINDOW: Duration = Duration::from_secs(600);
 
 /// Quantas mensagens da outbox podem estar em voo (sem ack) por peer. É 1 de propósito: envios em
@@ -540,13 +540,11 @@ pub struct Chat {
     future: HashMap<PeerId, Vec<Vec<u8>>>,
     /// P9 (c, ADR 0041): quando a conversa com o peer foi abandonada por `Stale` pela última vez. Dentro de
     /// [`STALE_RECOVERY_WINDOW`] o `Stale` só avisa. Só em memória.
-    #[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
     stale_recovered: HashMap<PeerId, Instant>,
     /// P9 (c, ADR 0041): peers cuja conversa foi abandonada por `Stale` e ainda não voltou. Enquanto
     /// durar, o peer é conhecido (`knows`: o portão o admite e o `Hello` leva o certificado), o endereço
     /// fica e o `redial_want` quer rediscá-lo mesmo sem conversa e sem fila. Sai quando a conversa
     /// nova fica pronta (`ready`). Só em memória.
-    #[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
     recovering: HashSet<PeerId>,
     /// Fila de saída e ids já vistos (3.2); persistente em `open`, em memória em `new`.
     outbox: Outbox,
@@ -1721,7 +1719,11 @@ impl Chat {
                     .retain(|_, requested| *requested != peer);
                 // Sem conversa nem handshake esperado, o endereço informado não tem dono a rediscar: não
                 // ocupa vaga do teto.
-                if !self.conversations.contains_key(&peer) && !self.expected.contains_key(&peer) {
+                // Em recuperação (P9 c) o endereço fica: é por ele que a conversa volta.
+                if !self.conversations.contains_key(&peer)
+                    && !self.expected.contains_key(&peer)
+                    && !self.recovering.contains(&peer)
+                {
                     self.peer_addrs.remove(&peer);
                 }
                 self.queue.push_back(ChatEvent::PeerDisconnected(peer));
@@ -2144,16 +2146,7 @@ impl Chat {
         self.reset_done.insert(peer);
         let identity = self.old_identity(&peer);
         let old = self.conversations.remove(&peer);
-        self.future.remove(&peer);
-        self.announced.remove(&peer);
-        self.devices_announced.remove(&peer);
-        self.lists_acted.remove(&peer);
-        self.last_sibling_announce.remove(&peer);
-        self.revocations_checked.remove(&peer);
-        self.sibling_pending.remove(&peer);
-        self.history_requested.remove(&peer);
-        self.history_sessions.remove(&peer);
-        self.history_requests.retain(|_, p| *p != peer);
+        self.forget_conversation_state(peer);
         if let Some(identity) = identity {
             self.queue
                 .push_back(ChatEvent::ConversationReset { peer, identity });
@@ -2615,13 +2608,19 @@ impl Chat {
     /// ou fila vazia. `Unknown`: a outbox não respondeu (auditoria I5): não é "fila vazia", o registro fica e
     /// reagenda em vez de morrer num erro transitório de SQLite.
     fn redial_want(&self, peer: &PeerId) -> Want {
-        if !self.conversations.contains_key(peer)
+        // Em recuperação (P9 c) não há conversa nem, talvez, fila: ainda assim é preciso reconectar para o
+        // P16 refazê-la.
+        let recovering = self.recovering.contains(peer) && !self.conversations.contains_key(peer);
+        if (!self.conversations.contains_key(peer) && !recovering)
             || self.connected.contains(peer)
             || self
                 .sole_identity(peer)
                 .is_some_and(|identity| self.is_distrusted(&identity))
         {
             return Want::No;
+        }
+        if recovering {
+            return Want::Yes;
         }
         match self.outbox.entries(peer) {
             Ok(entries) if entries.is_empty() => Want::No,
@@ -2936,6 +2935,7 @@ impl Chat {
         self.dialed.remove(&peer);
         self.forget_approval(&peer);
         self.lost_state.remove(&peer);
+        self.recovering.remove(&peer);
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
         if let Some(token) = self.admitted.remove(&peer)
@@ -3557,7 +3557,8 @@ impl Chat {
 
     /// Guarda uma mensagem de época futura, sem repetir a mesma e dentro do teto [`FUTURE_LIMIT`].
     /// Estourar o teto significa que o commit que falta provavelmente não virá: o buffer é
-    /// descartado e a aplicação é avisada com [`ChatEvent::Stale`] (recuperar é P16).
+    /// descartado, a aplicação é avisada com [`ChatEvent::Stale`] e a conversa é abandonada para o P16
+    /// refazê-la (P9 c, ADR 0041; ver [`Chat::recover_from_stale`]).
     fn hold_future(&mut self, peer: PeerId, wire: &[u8]) {
         let held = self.future.entry(peer).or_default();
         if held.iter().any(|w| w == wire) {
@@ -3566,9 +3567,58 @@ impl Chat {
         if held.len() >= FUTURE_LIMIT {
             self.future.remove(&peer);
             self.queue.push_back(ChatEvent::Stale { peer });
+            self.recover_from_stale(peer);
             return;
         }
         held.push(wire.to_vec());
+    }
+
+    /// Esquece o estado por peer que dependia da conversa (época futura, anúncios, sessões de histórico).
+    /// Usado quando a conversa é trocada (P16) ou abandonada (P9 c).
+    fn forget_conversation_state(&mut self, peer: PeerId) {
+        self.future.remove(&peer);
+        self.announced.remove(&peer);
+        self.devices_announced.remove(&peer);
+        self.lists_acted.remove(&peer);
+        self.last_sibling_announce.remove(&peer);
+        self.revocations_checked.remove(&peer);
+        self.sibling_pending.remove(&peer);
+        self.history_requested.remove(&peer);
+        self.history_sessions.remove(&peer);
+        self.history_requests.retain(|_, p| *p != peer);
+    }
+
+    /// P9 (c, ADR 0041): a conversa com `peer` divergiu (`Stale`) e este lado é o atrasado. Abandona a
+    /// conversa e o grupo, **mantém a outbox**, marca o peer como em recuperação e fecha a conexão: ao
+    /// reconectar, o `Hello` diz "não tenho conversa" e o P16 a refaz exigindo a mesma identidade. No máximo
+    /// uma vez por peer a cada [`STALE_RECOVERY_WINDOW`]; fora disso (ou com o contato desconfiado) o
+    /// `Stale` só avisa, como antes.
+    fn recover_from_stale(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        self.stale_recovered
+            .retain(|_, at| now.duration_since(*at) < STALE_RECOVERY_WINDOW);
+        if self.stale_recovered.contains_key(&peer)
+            || self
+                .sole_identity(&peer)
+                .is_some_and(|identity| self.is_distrusted(&identity))
+        {
+            return;
+        }
+        let Some(conversation) = self.conversations.remove(&peer) else {
+            return;
+        };
+        self.stale_recovered.insert(peer, now);
+        self.recovering.insert(peer);
+        self.forget_conversation_state(peer);
+        // Se o apagamento falhar, o label fica e a reabertura recarrega o grupo (como na revogação); o
+        // peer já está em recuperação e o P16 troca a conversa de qualquer jeito.
+        let deleted = conversation
+            .delete()
+            .and_then(|()| self.device.forget_conversation(&peer.to_string()));
+        if let Err(e) = deleted {
+            self.drop_message(peer, e.into());
+        }
+        self.node.disconnect(peer);
     }
 
     /// Reprocessa, na ordem de chegada, o que estava esperando um commit. O que ainda for de época
@@ -3590,6 +3640,7 @@ impl Chat {
             || self.household.contains_key(peer)
             || self.contact_devices.contains_key(peer)
             || self.dialed.contains(peer)
+            || self.recovering.contains(peer)
     }
 
     fn send_hello(&mut self, peer: PeerId) {
