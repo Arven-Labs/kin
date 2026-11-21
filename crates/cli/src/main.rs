@@ -25,8 +25,8 @@
 //! identidade minha ou aceita por `/trust`. `--open-admission` abre mão do portão. Dois devices que só se
 //! acharam por mDNS não passam sozinhos: usam `--dial` com Peer ID ou um link.
 //! `--require-approval` (P18 d, só com o portão fechado) segura quem chega com um link vivo como pedido
-//! pendente: `/allow [peer]` abre a conversa e `/deny [peer]` recusa **sem revogar o link** (para isso,
-//! `/revoke-invite`). Sem argumento age no pedido único; com vários, lista e pede o Peer ID ou um prefixo.
+//! pendente: `/allow PEER` abre a conversa e `/deny PEER` recusa **sem revogar o link** (para isso,
+//! `/revoke-invite`). PEER é o Peer ID inteiro ou um prefixo único de 12+ caracteres; sem ele, lista os pedidos e não age.
 //! `/trust [prefixo]` aceita o contato da conversa atual (ou a identidade vista que começa com o
 //! prefixo): sem isso quem convidou não processa a lista de devices dele. A escolha é gravada.
 //! `/untrust [prefixo]` desfaz: o contato deixa de receber o meu anúncio e a sua lista de devices
@@ -116,32 +116,36 @@ fn admission_notice(open_admission: bool) -> &'static str {
 
 // ---- aprovação do convidante (P18 d, ADR 0039) ----
 
-/// Qual pedido pendente o `/allow` ou `/deny` atinge: `Ok(peer)` ou o texto a imprimir. Sem argumento, só
-/// o pedido único é escolhido; com argumento, o Peer ID inteiro ou um prefixo que só um pedido tem. Nenhum
-/// pedido, ambiguidade ou prefixo desconhecido: lista os pedidos e não age (aprovar o peer errado abriria
-/// conversa com quem o dono não escolheu).
+/// Menor prefixo de Peer ID aceito por `/allow` e `/deny`. Todo Peer ID ed25519 começa por `12D3KooW`
+/// (8 caracteres), então um prefixo menor que isto não distingue ninguém e abriria espaço para um
+/// Peer ID forçado a casar (auditoria do PR #278, M1).
+const MIN_REQUEST_PREFIX: usize = 12;
+
+/// Qual pedido pendente o `/allow` ou `/deny` atinge: `Ok(peer)` ou o texto a imprimir. **Sempre exige o
+/// Peer ID** (inteiro ou prefixo de pelo menos [`MIN_REQUEST_PREFIX`] caracteres que só um pedido tem):
+/// agir "no único pedido" aprovaria quem estivesse pendente na hora de digitar, e não quem o dono viu no
+/// aviso (o pedido some se a conexão cai, e outro portador do link pode ocupar o lugar). Sem pedido, sem
+/// argumento, prefixo curto, ambíguo ou desconhecido: lista os pedidos e não age.
 fn pick_request(prefix: &str, pending: &[(PeerId, IdentityId)]) -> Result<PeerId, String> {
     if pending.is_empty() {
         return Err("(nenhum pedido de entrada pendente)".to_string());
     }
-    let matching: Vec<&(PeerId, IdentityId)> = pending
-        .iter()
-        .filter(|(peer, _)| peer.to_string().starts_with(prefix))
-        .collect();
-    match (prefix.is_empty(), matching.as_slice(), pending) {
-        (false, [(peer, _)], _) => Ok(*peer),
-        (true, _, [(peer, _)]) => Ok(*peer),
-        _ => {
-            let listing = pending
-                .iter()
-                .map(|(peer, identity)| format!("  {peer} (identidade {})", identity.to_base58()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(format!(
-                "(pedidos de entrada pendentes; escolha um pelo Peer ID inteiro ou por um prefixo único)\n{listing}"
-            ))
+    if prefix.len() >= MIN_REQUEST_PREFIX {
+        let mut matching = pending
+            .iter()
+            .filter(|(peer, _)| peer.to_string().starts_with(prefix));
+        if let (Some((peer, _)), None) = (matching.next(), matching.next()) {
+            return Ok(*peer);
         }
     }
+    let listing = pending
+        .iter()
+        .map(|(peer, identity)| format!("  {peer} (identidade {})", identity.to_base58()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "(pedidos de entrada pendentes; informe o Peer ID inteiro ou um prefixo único de pelo menos {MIN_REQUEST_PREFIX} caracteres)\n{listing}"
+    ))
 }
 
 /// Resposta de `/allow` a partir do resultado de `Chat::approve`.
@@ -176,8 +180,9 @@ fn approval_notice() -> &'static str {
 /// apresentou) e como responder.
 fn admission_requested_notice(peer: &str, identity: &str) -> String {
     format!(
-        "(pedido de entrada de {peer}, identidade {identity}: /allow {peer} abre a conversa, /deny {peer} recusa; \
-         o link segue vivo se você negar)"
+        "(pedido de entrada de {peer}, identidade {identity} (apresentada pelo próprio peer, não verificada: \
+         quem tiver o link gera uma; só aprove se você espera esta pessoa agora): /allow {peer} abre a conversa, \
+         /deny {peer} recusa; o link segue vivo se você negar)"
     )
 }
 
@@ -1258,15 +1263,27 @@ mod tests {
         (PeerId::random(), StandaloneIdentity::generate().id())
     }
 
-    /// `/allow` e `/deny` sem argumento agem no único pedido; sem pedido nenhum, dizem isso.
+    /// Sem pedido nenhum, diz isso. Com um pedido só, mas sem Peer ID (ou com prefixo curto ou que não casa),
+    /// **não age**: lista (auditoria do #278, M1 e B7: o pedido único de agora pode não ser o que o dono viu).
     #[test]
-    fn pick_request_without_argument_takes_the_only_request() {
-        let only = request();
-        assert_eq!(pick_request("", std::slice::from_ref(&only)), Ok(only.0));
+    fn pick_request_never_acts_without_a_real_peer_id() {
         let Err(none) = pick_request("", &[]) else {
             panic!("sem pedidos devia ser erro");
         };
         assert!(none.contains("nenhum pedido"), "{none}");
+
+        let only = request();
+        let full = only.0.to_string();
+        for prefix in ["", "1", "12D3KooW", &full[..11], "naoexiste00000"] {
+            let Err(listing) = pick_request(prefix, std::slice::from_ref(&only)) else {
+                panic!("{prefix:?}: devia listar, não agir");
+            };
+            assert!(listing.contains(&full), "{prefix:?}: {listing}");
+        }
+        assert_eq!(
+            pick_request(&full[..12], std::slice::from_ref(&only)),
+            Ok(only.0)
+        );
     }
 
     /// Com vários pedidos e sem prefixo que decida, nada é aprovado: a resposta lista peer e identidade.
@@ -1338,6 +1355,8 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains("segue vivo"), "{notice}");
+        // a identidade é autodeclarada (auditoria do #278, M2): o aviso não a vende como "quem é"
+        assert!(notice.contains("não verificada"), "{notice}");
     }
 
     #[test]

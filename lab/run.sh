@@ -309,6 +309,9 @@ scenario_invite_denied() {
     fail "a conversa abriu depois do /deny"; logs a | tail -20; logs b | tail -20; return
   fi
   pass "depois do /deny não há conversa em nenhum dos lados"
+  # Prova que o /deny dispensou o pedido (sem ele, o pedido ainda estaria pendente e o /allow o abriria).
+  say a "/allow $B_ID"
+  check "o pedido saiu da lista pendente" wait_log a "nenhum pedido de entrada pendente" 10
   say a "/invites"
   for _ in $(seq 20); do
     [ "$(logs a | grep -c "$live_lines")" -gt "$before" ] && break
