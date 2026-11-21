@@ -542,6 +542,12 @@ pub struct Chat {
     /// [`STALE_RECOVERY_WINDOW`] o `Stale` só avisa. Só em memória.
     #[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
     stale_recovered: HashMap<PeerId, Instant>,
+    /// P9 (c, ADR 0041): peers cuja conversa foi abandonada por `Stale` e ainda não voltou. Enquanto
+    /// durar, o peer é conhecido (`knows`: o portão o admite e o `Hello` leva o certificado), o endereço
+    /// fica e o `redial_want` quer rediscá-lo mesmo sem conversa e sem fila. Sai quando a conversa
+    /// nova fica pronta (`ready`). Só em memória.
+    #[allow(dead_code)] // stub dos testes primeiro; a implementação o lê
+    recovering: HashSet<PeerId>,
     /// Fila de saída e ids já vistos (3.2); persistente em `open`, em memória em `new`.
     outbox: Outbox,
     /// Peers com ao menos uma conexão de rede aberta (`PeerConnected` até `PeerDisconnected`).
@@ -790,6 +796,7 @@ impl Chat {
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
             stale_recovered: HashMap::new(),
+            recovering: HashSet::new(),
             outbox,
             connected: Default::default(),
             announced: Default::default(),
@@ -3815,6 +3822,77 @@ mod tests {
         );
         assert_eq!(bia.queued(&ana_peer), 1, "a outbox não é tocada");
         assert!(!bia.future.contains_key(&ana_peer));
+        assert!(
+            bia.recovering.contains(&ana_peer),
+            "o peer fica marcado como em recuperação até a conversa voltar"
+        );
+    }
+
+    /// Com o portão fechado, quem tem a conversa abandonada por `Stale` ainda é conhecido: sem isso o
+    /// `Hello` dele viraria `NotAdmitted` e a volta seria barrada. Um estranho continua barrado.
+    #[tokio::test]
+    async fn a_recovering_peer_still_passes_the_closed_gate() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.set_require_invite(true);
+        bia.conversations.remove(&ana_peer);
+        let stranger = PeerId::random();
+        assert!(!bia.admits(&ana_peer).unwrap(), "controle: sem a marca");
+
+        bia.recovering.insert(ana_peer);
+        assert!(bia.admits(&ana_peer).unwrap(), "o peer em recuperação passa");
+        assert!(bia.knows(&ana_peer), "e recebe o Hello com certificado");
+        assert!(!bia.admits(&stranger).unwrap(), "um estranho segue barrado");
+    }
+
+    /// Sem conversa e sem fila ninguém rediscaria o peer; em recuperação, sim (senão a conversa só volta se
+    /// alguém discar à mão).
+    #[tokio::test]
+    async fn a_recovering_peer_is_redialed_even_without_a_conversation_or_a_queue() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.conversations.remove(&ana_peer);
+        assert!(
+            matches!(bia.redial_want(&ana_peer), Want::No),
+            "controle: sem a marca, nada a rediscar"
+        );
+
+        bia.recovering.insert(ana_peer);
+        assert!(matches!(bia.redial_want(&ana_peer), Want::Yes));
+        bia.connected.insert(ana_peer);
+        assert!(
+            matches!(bia.redial_want(&ana_peer), Want::No),
+            "já conectado, nada a rediscar"
+        );
+    }
+
+    /// Cair a conexão (o `disconnect` do `Stale`) não apaga os endereços de quem está em recuperação.
+    #[tokio::test]
+    async fn disconnecting_keeps_the_addresses_of_a_recovering_peer() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        bia.conversations.remove(&ana_peer);
+        let address: Multiaddr = "/ip4/203.0.113.7/tcp/4001".parse().unwrap();
+        bia.peer_addrs.insert(ana_peer, vec![address.clone()]);
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        assert!(
+            !bia.peer_addrs.contains_key(&ana_peer),
+            "controle: sem a marca, os endereços saem"
+        );
+
+        bia.peer_addrs.insert(ana_peer, vec![address.clone()]);
+        bia.recovering.insert(ana_peer);
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+        assert_eq!(bia.peer_addrs.get(&ana_peer), Some(&vec![address]));
+    }
+
+    /// A marca sai quando a conversa nova fica pronta.
+    #[tokio::test]
+    async fn the_recovering_mark_ends_when_the_conversation_is_ready() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let conversation = bia.conversations.remove(&ana_peer).unwrap();
+        bia.recovering.insert(ana_peer);
+
+        bia.ready(ana_peer, conversation).unwrap();
+        assert!(!bia.recovering.contains(&ana_peer));
     }
 
     /// Depois do abandono, mensagem velha do par é erro de "sem conversa", não pânico nem buffer novo.
