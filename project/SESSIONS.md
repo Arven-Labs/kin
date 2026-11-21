@@ -2200,4 +2200,13 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Achado**: a (c) diz "vai para P16", mas o P16 só trata quem declara perda de estado. Divergência sem perda não dispara nada (ADR 0040, "Conversas divergentes sem perda"), e o `Stale` (`chat.rs:3542`) só descarta o buffer e avisa. As referências eram circulares (`Stale` → P16 → P9).
 - **Decisão do dono**: só corrigir o registro. `PENDING.md` (P9 c) e ADR 0040 atualizados; os comentários do código (`chat.rs:149` e `chat.rs:3542`, "recuperar é P16") **não foram tocados** (ficam para quando houver código).
 - **Não verificado**: tudo é leitura (`chat.rs`, `conversation.rs`, ADR 0040); não li o ADR 0001; o DoS por `Stale` forçado é hipótese de leitura, sem teste.
-- **Próximo passo**: se o dono quiser a recuperação por `Stale`, plan mode e ADR (cripto, §4); senão, P33.
+- **Próximo passo**: se o dono quiser a recuperação por `Stale`, plan mode e ADR (cripto, §4); senão, P33. *(Recuperação por `Stale` na subseção abaixo.)*
+
+#### P9 (c): recuperação por Stale, PR #281 aberto com pendências (ADR 0041, 2026-11-21)
+
+- **Decisão do dono**: opção A (abandonar e reconectar, reaproveitando o P16), em plan mode; depois, "endurecer e seguir" quando a 1ª auditoria achou 1 alto e 4 médios.
+- **Feito** (`chat.rs`, `node.rs`, `main.rs`, `tests/disconnect.rs`): `Node::disconnect`; `recover_from_stale` com `recovering`, identidade antiga em `expected`, janela de 600 s, TTL de 24 h, só conectado, sem irmão, sem desconfiado, fora da caixa postal; `DialFailed` e `ConversationReset` ajustados. Detalhe, provas e limites no ADR 0041.
+- **Provas** (CI): testes primeiro falharam; 3 testes da reauditoria falharam antes e passaram depois; CI e `Lab` verdes no `a9317c1`.
+- **Erros meus**: a premissa do plano ("a reconexão cai no P16 sozinha") estava errada (sem redial, portão fechado barrava), só vista depois dos testes; `sed -i` e `python3` rodados no código contra a regra (sem efeito); stub sem `allow(dead_code)` e um erro de empréstimo custaram duas rodadas de CI; troquei a decisão sobre o pareado sem pedir a confirmação de volta; o log da mutação não identificou os testes que falharam; um teste foi enfraquecido (o `Reset` com mesma identidade ficou sem prova unitária).
+- **Não verificado**: ver "Pendências antes de mesclar" no ADR 0041 (mutação lida, reauditoria da correção, integração do ciclo, aviso da CLI, `disconnect` com várias conexões).
+- **Próximo passo**: fechar essas pendências e só então mesclar o #281; ou fechar o PR e marcar o ADR 0041 como descartado.

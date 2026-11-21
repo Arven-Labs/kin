@@ -145,7 +145,8 @@ pub enum ChatEvent {
         reason: String,
     },
     /// Chegaram mensagens demais de uma época que este device não alcança: o commit que falta
-    /// provavelmente não virá e a conversa divergiu (recuperar é P16). O buffer foi descartado.
+    /// provavelmente não virá e a conversa divergiu. O buffer foi descartado e, fora da janela de
+    /// [`STALE_RECOVERY_WINDOW`], este lado abandonou a conversa e reconecta para o P16 refazê-la (P9 c).
     Stale {
         peer: PeerId,
     },
@@ -195,6 +196,16 @@ struct Scan {
 
 /// Quantas mensagens de época futura se guardam por peer à espera do commit (P9).
 const FUTURE_LIMIT: usize = 32;
+
+/// P9 (c, ADR 0041): intervalo mínimo entre duas recuperações automáticas da conversa com o mesmo peer
+/// depois de `Stale`. Dentro dele o `Stale` só avisa (quem força 32 mensagens de época futura não faz
+/// o nó refazer a conversa em laço).
+const STALE_RECOVERY_WINDOW: Duration = Duration::from_secs(600);
+
+/// Quanto tempo um peer fica "em recuperação" (conhecido, com o endereço guardado e rediscado) esperando a
+/// conversa voltar. Passado isso a marca e a identidade esperada saem: um peer que nunca volta não fica
+/// conhecido para sempre.
+const RECOVERING_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Quantas mensagens da outbox podem estar em voo (sem ack) por peer. É 1 de propósito: envios em
 /// paralelo seguem por substreams diferentes e a rede não garante qual chega primeiro, então o
@@ -532,6 +543,18 @@ pub struct Chat {
     held_key_packages: HashMap<PeerId, Vec<u8>>,
     /// Mensagens MLS de época futura por peer, à espera do commit que falta (P9). Só em memória.
     future: HashMap<PeerId, Vec<Vec<u8>>>,
+    /// P9 (c, ADR 0041): quando (segundos Unix) a conversa com o peer foi abandonada por `Stale` pela última
+    /// vez. Dentro de [`STALE_RECOVERY_WINDOW`] o `Stale` só avisa. Só em memória.
+    stale_recovered: HashMap<PeerId, u64>,
+    /// `true` só enquanto uma mensagem da caixa postal é processada: o `Stale` vindo dela não recupera (entrega
+    /// fora de ordem; o commit atrasado ainda salvaria a conversa).
+    from_mailbox: bool,
+    /// P9 (c, ADR 0041): peers cuja conversa foi abandonada por `Stale` e ainda não voltou, com a
+    /// **identidade da conversa antiga** e o instante do abandono. A identidade também vai para `expected`
+    /// (o portão admite o peer, o `Hello` leva o certificado, o endereço fica e o `invite`/`join` exigem
+    /// essa identidade); aqui ela serve ao `ConversationReset` e ao `redial_want`, que quer rediscar o peer
+    /// mesmo sem conversa e sem fila. Sai em `ready`, ao vencer [`RECOVERING_TTL`] ou no `untrust`. Só em memória.
+    recovering: HashMap<PeerId, (IdentityId, u64)>,
     /// Fila de saída e ids já vistos (3.2); persistente em `open`, em memória em `new`.
     outbox: Outbox,
     /// Peers com ao menos uma conexão de rede aberta (`PeerConnected` até `PeerDisconnected`).
@@ -779,6 +802,9 @@ impl Chat {
             dialed: HashSet::new(),
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
+            stale_recovered: HashMap::new(),
+            from_mailbox: false,
+            recovering: HashMap::new(),
             outbox,
             connected: Default::default(),
             announced: Default::default(),
@@ -1089,6 +1115,7 @@ impl Chat {
         self.contact_devices
             .retain(|_, invite| invite.identity() != identity);
         self.expected.retain(|_, owner| owner != identity);
+        self.recovering.retain(|_, (owner, _)| owner != identity);
         Ok(())
     }
 
@@ -1581,6 +1608,7 @@ impl Chat {
                     self.flush_sibling_pending();
                     self.flush_due_retries();
                     self.flush_due_deposits();
+                    self.expire_recovering();
                     self.flush_due_redials();
                     self.sweep_stale_deposits();
                 }
@@ -1639,7 +1667,11 @@ impl Chat {
             // Só mensagem MLS vem pela caixa postal. O handshake exige o Peer ID da conexão (P15),
             // que aqui seria apenas o que o backend afirma, então nunca entra por este caminho.
             MailboxEvent::Retrieved { from, blob } => match Envelope::decode(&blob) {
-                Ok(Envelope::Mls(wire)) => self.on_envelope(from, Envelope::Mls(wire)),
+                Ok(Envelope::Mls(wire)) => {
+                    self.from_mailbox = true;
+                    self.on_envelope(from, Envelope::Mls(wire));
+                    self.from_mailbox = false;
+                }
                 Ok(_) => self.drop_message(from, Error::Malformed),
                 Err(e) => self.drop_message(from, e),
             },
@@ -1652,6 +1684,7 @@ impl Chat {
         self.flush_sibling_pending();
         self.flush_due_retries();
         self.flush_due_deposits();
+        self.expire_recovering();
         self.flush_due_redials();
         self.sweep_stale_deposits();
         match event {
@@ -1703,6 +1736,7 @@ impl Chat {
                     .retain(|_, requested| *requested != peer);
                 // Sem conversa nem handshake esperado, o endereço informado não tem dono a rediscar: não
                 // ocupa vaga do teto.
+                // Em recuperação (P9 c) o peer está em `expected`: o endereço fica, é por ele que a conversa volta.
                 if !self.conversations.contains_key(&peer) && !self.expected.contains_key(&peer) {
                     self.peer_addrs.remove(&peer);
                 }
@@ -1792,7 +1826,10 @@ impl Chat {
             NodeEvent::DialFailed { peer, reason } => {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
-                    self.expected.remove(&peer);
+                    // Em recuperação (P9 c) a identidade fixada em `expected` fica: é ela que o handshake exige.
+                    if !self.recovering.contains_key(&peer) {
+                        self.expected.remove(&peer);
+                    }
                     self.dialed.remove(&peer);
                     self.lost_state.remove(&peer);
                     self.forget_unreachable(&peer);
@@ -1901,6 +1938,14 @@ impl Chat {
         !self.reset_done.contains(peer)
             && (self.lost_state.contains(peer) || self.lost_state.len() < MAX_HELD_KEY_PACKAGES)
             && self.old_identity(peer).is_some()
+    }
+
+    /// A identidade de uma conversa 1:1 (do outro lado), se for 1:1.
+    fn old_identity_of(&self, conversation: &Conversation) -> Option<IdentityId> {
+        match conversation.peers().ok()?.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// A identidade da conversa 1:1 que tenho com `peer`, se há uma.
@@ -2126,16 +2171,7 @@ impl Chat {
         self.reset_done.insert(peer);
         let identity = self.old_identity(&peer);
         let old = self.conversations.remove(&peer);
-        self.future.remove(&peer);
-        self.announced.remove(&peer);
-        self.devices_announced.remove(&peer);
-        self.lists_acted.remove(&peer);
-        self.last_sibling_announce.remove(&peer);
-        self.revocations_checked.remove(&peer);
-        self.sibling_pending.remove(&peer);
-        self.history_requested.remove(&peer);
-        self.history_sessions.remove(&peer);
-        self.history_requests.retain(|_, p| *p != peer);
+        self.forget_conversation_state(peer);
         if let Some(identity) = identity {
             self.queue
                 .push_back(ChatEvent::ConversationReset { peer, identity });
@@ -2597,13 +2633,29 @@ impl Chat {
     /// ou fila vazia. `Unknown`: a outbox não respondeu (auditoria I5): não é "fila vazia", o registro fica e
     /// reagenda em vez de morrer num erro transitório de SQLite.
     fn redial_want(&self, peer: &PeerId) -> Want {
-        if !self.conversations.contains_key(peer)
+        // Em recuperação (P9 c) não há conversa nem, talvez, fila: ainda assim é preciso reconectar para o
+        // P16 refazê-la. Identidade desconfiada ou marca vencida: nada a rediscar.
+        let recovering = match self.recovering.get(peer) {
+            Some((identity, since)) if !self.conversations.contains_key(peer) => {
+                if self.is_distrusted(identity)
+                    || now_secs().saturating_sub(*since) >= RECOVERING_TTL.as_secs()
+                {
+                    return Want::No;
+                }
+                true
+            }
+            _ => false,
+        };
+        if (!self.conversations.contains_key(peer) && !recovering)
             || self.connected.contains(peer)
             || self
                 .sole_identity(peer)
                 .is_some_and(|identity| self.is_distrusted(&identity))
         {
             return Want::No;
+        }
+        if recovering {
+            return Want::Yes;
         }
         match self.outbox.entries(peer) {
             Ok(entries) if entries.is_empty() => Want::No,
@@ -2894,6 +2946,7 @@ impl Chat {
     }
 
     fn ready(&mut self, peer: PeerId, conversation: Conversation) -> Result<(), Error> {
+        let new_identity = self.old_identity_of(&conversation);
         // Só um par v4 de outra identidade vira o trinco (no `crypto`); varrer todas as conversas a cada par
         // novo custaria O(N) por conexão de estranho (auditoria I1 da 3e-ii-b). Erro ao ler: varre.
         let may_turn_latch = match conversation.peer_certificates() {
@@ -2918,6 +2971,14 @@ impl Chat {
         self.dialed.remove(&peer);
         self.forget_approval(&peer);
         self.lost_state.remove(&peer);
+        // Voltou de um `Stale` (P9 c): avisa a troca antes do `ConversationReady`, como o P16 faz no outro lado.
+        // Só se a conversa nova é da mesma identidade: outra identidade não é "refeita com a mesma".
+        if let Some((identity, _)) = self.recovering.remove(&peer)
+            && new_identity.as_ref() == Some(&identity)
+        {
+            self.queue
+                .push_back(ChatEvent::ConversationReset { peer, identity });
+        }
         // Sem `?`: a conversa já existe, e um erro aqui não pode abortar o resto do `ready` (anúncio,
         // flush); o token que sobrar vivo é o único custo (auditoria, médio 1).
         if let Some(token) = self.admitted.remove(&peer)
@@ -3539,7 +3600,8 @@ impl Chat {
 
     /// Guarda uma mensagem de época futura, sem repetir a mesma e dentro do teto [`FUTURE_LIMIT`].
     /// Estourar o teto significa que o commit que falta provavelmente não virá: o buffer é
-    /// descartado e a aplicação é avisada com [`ChatEvent::Stale`] (recuperar é P16).
+    /// descartado, a aplicação é avisada com [`ChatEvent::Stale`] e a conversa é abandonada para o P16
+    /// refazê-la (P9 c, ADR 0041; ver [`Chat::recover_from_stale`]).
     fn hold_future(&mut self, peer: PeerId, wire: &[u8]) {
         let held = self.future.entry(peer).or_default();
         if held.iter().any(|w| w == wire) {
@@ -3548,9 +3610,84 @@ impl Chat {
         if held.len() >= FUTURE_LIMIT {
             self.future.remove(&peer);
             self.queue.push_back(ChatEvent::Stale { peer });
+            self.recover_from_stale(peer);
             return;
         }
         held.push(wire.to_vec());
+    }
+
+    /// Esquece o estado por peer que dependia da conversa (época futura, anúncios, sessões de histórico).
+    /// Usado quando a conversa é trocada (P16) ou abandonada (P9 c).
+    fn forget_conversation_state(&mut self, peer: PeerId) {
+        self.future.remove(&peer);
+        self.announced.remove(&peer);
+        self.devices_announced.remove(&peer);
+        self.lists_acted.remove(&peer);
+        self.last_sibling_announce.remove(&peer);
+        self.revocations_checked.remove(&peer);
+        self.sibling_pending.remove(&peer);
+        self.history_requested.remove(&peer);
+        self.history_sessions.remove(&peer);
+        self.history_requests.retain(|_, p| *p != peer);
+    }
+
+    /// P9 (c, ADR 0041): a conversa com `peer` divergiu (`Stale`) e este lado é o atrasado. Abandona a
+    /// conversa e o grupo, **mantém a outbox**, marca o peer como em recuperação e fecha a conexão: ao
+    /// reconectar, o `Hello` diz "não tenho conversa" e o P16 a refaz. A **identidade da conversa antiga** vai
+    /// para `expected`, então o `invite`/`join` a exigem (sem isso o próprio par escolheria a identidade). Só
+    /// com o peer **conectado** (a recuperação passa pelo `Hello` da conexão direta; pela caixa postal, que
+    /// entrega fora de ordem, o `Stale` só avisa), com conversa 1:1 de identidade conhecida e não
+    /// desconfiada, e que não seja um irmão (ADR 0040: irmão não se recupera). No máximo uma vez por peer a
+    /// cada [`STALE_RECOVERY_WINDOW`]; fora disso o `Stale` só avisa, como antes.
+    fn recover_from_stale(&mut self, peer: PeerId) {
+        let now = now_secs();
+        self.stale_recovered
+            .retain(|_, at| now.saturating_sub(*at) < STALE_RECOVERY_WINDOW.as_secs());
+        let Some(identity) = self.old_identity(&peer) else {
+            return;
+        };
+        if self.stale_recovered.contains_key(&peer)
+            || self.from_mailbox
+            || !self.connected.contains(&peer)
+            || self.is_sibling(&peer)
+            || self.household.contains_key(&peer)
+            || self.is_distrusted(&identity)
+        {
+            return;
+        }
+        let Some(conversation) = self.conversations.remove(&peer) else {
+            return;
+        };
+        self.stale_recovered.insert(peer, now);
+        self.recovering.insert(peer, (identity.clone(), now));
+        self.expected.insert(peer, identity);
+        self.forget_conversation_state(peer);
+        // Se o apagamento falhar, o label fica e a reabertura recarrega o grupo (como na revogação); o
+        // peer já está em recuperação e o P16 troca a conversa de qualquer jeito.
+        let deleted = conversation
+            .delete()
+            .and_then(|()| self.device.forget_conversation(&peer.to_string()));
+        if let Err(e) = deleted {
+            self.drop_message(peer, e.into());
+        }
+        self.node.disconnect(peer);
+    }
+
+    /// Vence as marcas de recuperação mais velhas que [`RECOVERING_TTL`]: o peer deixa de ser esperado.
+    fn expire_recovering(&mut self) {
+        let now = now_secs();
+        let expired: Vec<PeerId> = self
+            .recovering
+            .iter()
+            .filter(|(_, (_, since))| now.saturating_sub(*since) >= RECOVERING_TTL.as_secs())
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in expired {
+            self.recovering.remove(&peer);
+            if !self.conversations.contains_key(&peer) {
+                self.expected.remove(&peer);
+            }
+        }
     }
 
     /// Reprocessa, na ordem de chegada, o que estava esperando um commit. O que ainda for de época
@@ -3775,8 +3912,312 @@ mod tests {
             .unwrap();
         assert_eq!(events(&mut bia), [ChatEvent::Stale { peer: ana_peer }]);
 
+        // P9 (c): sem conexão direta o `Stale` só avisa, então o commit atrasado ainda é aplicado (o que o
+        // buffer descartado tinha se perdeu, a conversa não).
         bia.on_mls(ana_peer, &commit).unwrap();
         assert!(received_texts(&events(&mut bia)).is_empty());
+    }
+
+    /// Estoura o teto do buffer com mensagens de época futura (o commit nunca chega): devolve o `Stale`.
+    fn force_stale(bia: &mut Chat, ana: &mut Conversation, ana_peer: PeerId) {
+        let _commit = ana.rotate_keys().unwrap();
+        for i in 0..=FUTURE_LIMIT {
+            bia.on_mls(ana_peer, &wire(ana, &i.to_string())).unwrap();
+        }
+    }
+
+    /// P9 (c, ADR 0041): no `Stale` o lado atrasado abandona a conversa (o P16 a refaz na reconexão) e
+    /// **mantém a outbox**: o que estava na fila sai pela conversa nova.
+    #[tokio::test]
+    async fn stale_drops_the_conversation_and_keeps_the_outbox() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        bia.send(ana_peer, "na fila", None).unwrap();
+        connect_peer(&mut bia, ana_peer);
+        let old = bia.old_identity(&ana_peer).unwrap();
+        events(&mut bia);
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(
+            !bia.conversations.contains_key(&ana_peer),
+            "a conversa divergida devia ter sido abandonada"
+        );
+        assert_eq!(bia.queued(&ana_peer), 1, "a outbox não é tocada");
+        assert!(!bia.future.contains_key(&ana_peer));
+        assert_eq!(
+            bia.recovering.get(&ana_peer).map(|(identity, _)| identity),
+            Some(&old),
+            "o peer fica marcado, com a identidade da conversa antiga"
+        );
+        assert_eq!(
+            bia.expected.get(&ana_peer),
+            Some(&old),
+            "e o handshake seguinte exige essa identidade (o par não escolhe a dele)"
+        );
+    }
+
+    /// Médio 1 da reauditoria do #281: com o peer **conectado**, 33 mensagens de época futura que chegam pela
+    /// **caixa postal** (entrega fora de ordem) só avisam: o commit atrasado ainda salvaria a conversa.
+    #[tokio::test]
+    async fn stale_from_the_mailbox_with_a_connected_peer_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let _commit = ana.rotate_keys().unwrap();
+
+        for i in 0..=FUTURE_LIMIT {
+            let blob = Envelope::Mls(wire(&mut ana, &i.to_string())).encode();
+            bia.handle_mailbox(MailboxEvent::Retrieved {
+                from: ana_peer,
+                blob,
+            });
+        }
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(bia.conversations.contains_key(&ana_peer));
+        assert!(bia.recovering.is_empty());
+    }
+
+    /// Médio 2: uma discagem que falha (a rediscagem de fundo) não apaga a identidade fixada em `expected`.
+    #[tokio::test]
+    async fn a_failed_dial_keeps_the_pinned_identity_of_a_recovering_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let old = bia.old_identity(&ana_peer).unwrap();
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "sem rota".into(),
+        });
+
+        assert_eq!(bia.expected.get(&ana_peer), Some(&old));
+        assert!(bia.recovering.contains_key(&ana_peer));
+    }
+
+    /// Médio 2 (outra metade): se a conversa nova é de outra identidade, o `ConversationReset` não sai.
+    #[tokio::test]
+    async fn no_reset_is_reported_when_the_identity_changed() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        force_stale(&mut bia, &mut ana, ana_peer);
+        events(&mut bia);
+        let (mut other, _, other_peer) = bia_and_raw_ana();
+        let fresh = other.conversations.remove(&other_peer).unwrap();
+
+        bia.ready(ana_peer, fresh).unwrap();
+
+        assert!(
+            !events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ConversationReset { .. })),
+            "a identidade é outra: não é 'refeita com a mesma'"
+        );
+    }
+
+    /// Sem o peer conectado (a mensagem veio pela caixa postal, que entrega fora de ordem) o `Stale` só
+    /// avisa: o commit atrasado ainda poderia salvar a conversa, e o P16 só roda pela conexão direta.
+    #[tokio::test]
+    async fn stale_without_a_direct_connection_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(bia.conversations.contains_key(&ana_peer));
+        assert!(bia.recovering.is_empty() && bia.expected.is_empty());
+    }
+
+    /// Irmão (device da mesma identidade) não se recupera (ADR 0040): só avisa.
+    #[tokio::test]
+    async fn stale_with_a_sibling_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let invite = bia.invite(Vec::new());
+        bia.household.insert(ana_peer, invite);
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(bia.conversations.contains_key(&ana_peer));
+        assert!(bia.recovering.is_empty());
+    }
+
+    /// Contato desconfiado (`untrust`) não é recuperado: o abandono não pode religar a conversa com ele.
+    #[tokio::test]
+    async fn stale_with_a_distrusted_contact_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let identity = bia.old_identity(&ana_peer).unwrap();
+        bia.untrust(&identity).unwrap();
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(bia.conversations.contains_key(&ana_peer));
+        assert!(bia.recovering.is_empty());
+    }
+
+    /// Desconfiar do contato **depois** do abandono desfaz a recuperação: some a marca e a identidade esperada,
+    /// e nada mais é rediscado.
+    #[tokio::test]
+    async fn untrusting_a_recovering_contact_cancels_the_recovery() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let identity = bia.old_identity(&ana_peer).unwrap();
+        force_stale(&mut bia, &mut ana, ana_peer);
+        assert!(bia.recovering.contains_key(&ana_peer));
+
+        bia.untrust(&identity).unwrap();
+
+        assert!(bia.recovering.is_empty() && bia.expected.is_empty());
+        bia.connected.remove(&ana_peer);
+        assert!(matches!(bia.redial_want(&ana_peer), Want::No));
+    }
+
+    /// A marca vence: um peer que nunca volta não fica esperado (e conhecido pelo portão) para sempre.
+    #[tokio::test]
+    async fn the_recovering_mark_expires() {
+        let (mut bia, _ana, ana_peer) = bia_and_raw_ana();
+        let identity = bia.old_identity(&ana_peer).unwrap();
+        bia.conversations.remove(&ana_peer);
+        let since = now_secs() - RECOVERING_TTL.as_secs() - 1;
+        bia.recovering.insert(ana_peer, (identity.clone(), since));
+        bia.expected.insert(ana_peer, identity);
+        assert!(
+            matches!(bia.redial_want(&ana_peer), Want::No),
+            "vencida, não se redisca"
+        );
+
+        bia.expire_recovering();
+
+        assert!(bia.recovering.is_empty() && bia.expected.is_empty());
+    }
+
+    /// Com o portão fechado, quem tem a conversa abandonada por `Stale` ainda é conhecido: sem isso o
+    /// `Hello` dele viraria `NotAdmitted` e a volta seria barrada. Um estranho continua barrado.
+    #[tokio::test]
+    async fn a_recovering_peer_still_passes_the_closed_gate() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        bia.set_require_invite(true);
+        connect_peer(&mut bia, ana_peer);
+        force_stale(&mut bia, &mut ana, ana_peer);
+        assert!(bia.recovering.contains_key(&ana_peer), "pré-condição");
+        let stranger = PeerId::random();
+
+        assert!(
+            bia.admits(&ana_peer).unwrap(),
+            "o peer em recuperação passa"
+        );
+        assert!(bia.knows(&ana_peer), "e recebe o Hello com certificado");
+        assert!(!bia.admits(&stranger).unwrap(), "um estranho segue barrado");
+    }
+
+    /// Sem conversa e sem fila ninguém rediscaria o peer; em recuperação, sim (senão a conversa só volta se
+    /// alguém discar à mão). A queda que o `Stale` provoca já agenda a rediscagem.
+    #[tokio::test]
+    async fn the_disconnect_after_stale_schedules_a_redial_even_without_a_queue() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        force_stale(&mut bia, &mut ana, ana_peer);
+        assert_eq!(bia.queued(&ana_peer), 0, "pré-condição: sem fila");
+        assert!(
+            matches!(bia.redial_want(&ana_peer), Want::No),
+            "ainda conectado, nada a rediscar"
+        );
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+
+        assert!(matches!(bia.redial_want(&ana_peer), Want::Yes));
+        assert!(
+            bia.redial.contains_key(&ana_peer),
+            "a rediscagem foi agendada"
+        );
+    }
+
+    /// Cair a conexão (o `disconnect` do `Stale`) não apaga os endereços de quem está em recuperação.
+    #[tokio::test]
+    async fn disconnecting_keeps_the_addresses_of_a_recovering_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let address: Multiaddr = "/ip4/203.0.113.7/tcp/4001".parse().unwrap();
+        bia.peer_addrs.insert(ana_peer, vec![address.clone()]);
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        bia.handle(NodeEvent::PeerDisconnected(ana_peer));
+
+        assert_eq!(bia.peer_addrs.get(&ana_peer), Some(&vec![address]));
+    }
+
+    /// Quando a conversa nova fica pronta, a marca e a identidade esperada saem. (O `ConversationReset` com a
+    /// **mesma** identidade não tem teste unitário: o helper só monta conversas de identidades novas; fica para
+    /// o teste de integração.)
+    #[tokio::test]
+    async fn the_new_conversation_clears_the_mark() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        force_stale(&mut bia, &mut ana, ana_peer);
+        events(&mut bia);
+        let (mut other, _, other_peer) = bia_and_raw_ana();
+        let fresh = other.conversations.remove(&other_peer).unwrap();
+
+        bia.ready(ana_peer, fresh).unwrap();
+
+        assert!(bia.recovering.is_empty() && !bia.expected.contains_key(&ana_peer));
+    }
+
+    /// Depois do abandono, mensagem velha do par é erro de "sem conversa", não pânico nem buffer novo.
+    #[tokio::test]
+    async fn after_the_drop_a_late_message_is_a_no_conversation_error() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        let late = wire(&mut ana, "atrasada");
+        assert!(matches!(
+            bia.on_mls(ana_peer, &late),
+            Err(Error::NoConversation(p)) if p == ana_peer
+        ));
+        assert!(!bia.future.contains_key(&ana_peer));
+    }
+
+    /// Dentro da janela, um 2º `Stale` do mesmo peer só avisa: não apaga a conversa (contra laço de recuperação).
+    #[tokio::test]
+    async fn a_second_stale_inside_the_window_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        bia.stale_recovered.insert(ana_peer, now_secs());
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(
+            bia.conversations.contains_key(&ana_peer),
+            "dentro da janela a conversa fica"
+        );
+    }
+
+    /// Passada a janela, o `Stale` volta a recuperar.
+    #[tokio::test]
+    async fn a_stale_after_the_window_recovers_again() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        bia.stale_recovered
+            .insert(ana_peer, now_secs() - STALE_RECOVERY_WINDOW.as_secs() - 1);
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(!bia.conversations.contains_key(&ana_peer));
+    }
+
+    /// A janela é por peer: um `Stale` recente de outro peer não segura este.
+    #[tokio::test]
+    async fn the_stale_window_is_per_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        bia.stale_recovered.insert(PeerId::random(), now_secs());
+
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        assert!(!bia.conversations.contains_key(&ana_peer));
     }
 
     /// P9: lixo e mensagem de outra conversa continuam sendo erro, nunca vão para o buffer.

@@ -1148,7 +1148,9 @@ fn on_event(
             println!("{}", queued_notice(&short(&message), &peer.to_string()));
         }
         ChatEvent::Stale { peer } => {
-            println!("(conversa com {peer} divergiu: faltam commits que não chegaram)");
+            println!(
+                "(conversa com {peer} divergiu: faltam commits que não chegaram; a conversa foi abandonada e o kin reconecta para refazê-la com a mesma identidade; o que estava em voo pode se perder e a fila segue; no máximo uma vez a cada 10 min por contato)"
+            );
         }
         ChatEvent::PeerRelays { peer, relays } => {
             println!("(relays de {peer}: {})", relays.join(", "));
