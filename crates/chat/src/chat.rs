@@ -546,6 +546,9 @@ pub struct Chat {
     /// P9 (c, ADR 0041): quando (segundos Unix) a conversa com o peer foi abandonada por `Stale` pela última
     /// vez. Dentro de [`STALE_RECOVERY_WINDOW`] o `Stale` só avisa. Só em memória.
     stale_recovered: HashMap<PeerId, u64>,
+    /// `true` só enquanto uma mensagem da caixa postal é processada: o `Stale` vindo dela não recupera (entrega
+    /// fora de ordem; o commit atrasado ainda salvaria a conversa).
+    from_mailbox: bool,
     /// P9 (c, ADR 0041): peers cuja conversa foi abandonada por `Stale` e ainda não voltou, com a
     /// **identidade da conversa antiga** e o instante do abandono. A identidade também vai para `expected`
     /// (o portão admite o peer, o `Hello` leva o certificado, o endereço fica e o `invite`/`join` exigem
@@ -800,6 +803,7 @@ impl Chat {
             held_key_packages: HashMap::new(),
             future: HashMap::new(),
             stale_recovered: HashMap::new(),
+            from_mailbox: false,
             recovering: HashMap::new(),
             outbox,
             connected: Default::default(),
@@ -1663,7 +1667,11 @@ impl Chat {
             // Só mensagem MLS vem pela caixa postal. O handshake exige o Peer ID da conexão (P15),
             // que aqui seria apenas o que o backend afirma, então nunca entra por este caminho.
             MailboxEvent::Retrieved { from, blob } => match Envelope::decode(&blob) {
-                Ok(Envelope::Mls(wire)) => self.on_envelope(from, Envelope::Mls(wire)),
+                Ok(Envelope::Mls(wire)) => {
+                    self.from_mailbox = true;
+                    self.on_envelope(from, Envelope::Mls(wire));
+                    self.from_mailbox = false;
+                }
                 Ok(_) => self.drop_message(from, Error::Malformed),
                 Err(e) => self.drop_message(from, e),
             },
@@ -1818,7 +1826,10 @@ impl Chat {
             NodeEvent::DialFailed { peer, reason } => {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
-                    self.expected.remove(&peer);
+                    // Em recuperação (P9 c) a identidade fixada em `expected` fica: é ela que o handshake exige.
+                    if !self.recovering.contains_key(&peer) {
+                        self.expected.remove(&peer);
+                    }
                     self.dialed.remove(&peer);
                     self.lost_state.remove(&peer);
                     self.forget_unreachable(&peer);
@@ -1927,6 +1938,14 @@ impl Chat {
         !self.reset_done.contains(peer)
             && (self.lost_state.contains(peer) || self.lost_state.len() < MAX_HELD_KEY_PACKAGES)
             && self.old_identity(peer).is_some()
+    }
+
+    /// A identidade de uma conversa 1:1 (do outro lado), se for 1:1.
+    fn old_identity_of(&self, conversation: &Conversation) -> Option<IdentityId> {
+        match conversation.peers().ok()?.as_slice() {
+            [identity] => Some(identity.clone()),
+            _ => None,
+        }
     }
 
     /// A identidade da conversa 1:1 que tenho com `peer`, se há uma.
@@ -2952,7 +2971,11 @@ impl Chat {
         self.forget_approval(&peer);
         self.lost_state.remove(&peer);
         // Voltou de um `Stale` (P9 c): avisa a troca antes do `ConversationReady`, como o P16 faz no outro lado.
-        if let Some((identity, _)) = self.recovering.remove(&peer) {
+        // Só se a conversa nova é da mesma identidade: outra identidade não é "refeita com a mesma".
+        let new_identity = self.old_identity_of(&conversation);
+        if let Some((identity, _)) = self.recovering.remove(&peer)
+            && new_identity.as_ref() == Some(&identity)
+        {
             self.queue
                 .push_back(ChatEvent::ConversationReset { peer, identity });
         }
@@ -3624,7 +3647,9 @@ impl Chat {
             return;
         };
         if self.stale_recovered.contains_key(&peer)
+            || self.from_mailbox
             || !self.connected.contains(&peer)
+            || self.is_sibling(&peer)
             || self.household.contains_key(&peer)
             || self.is_distrusted(&identity)
         {
