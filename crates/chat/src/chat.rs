@@ -3932,6 +3932,64 @@ mod tests {
         );
     }
 
+    /// Médio 1 da reauditoria do #281: com o peer **conectado**, 33 mensagens de época futura que chegam pela
+    /// **caixa postal** (entrega fora de ordem) só avisam: o commit atrasado ainda salvaria a conversa.
+    #[tokio::test]
+    async fn stale_from_the_mailbox_with_a_connected_peer_only_warns() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let _commit = ana.rotate_keys().unwrap();
+
+        for i in 0..=FUTURE_LIMIT {
+            let blob = Envelope::Mls(wire(&mut ana, &i.to_string())).encode();
+            bia.handle_mailbox(MailboxEvent::Retrieved {
+                from: ana_peer,
+                blob,
+            });
+        }
+
+        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(bia.conversations.contains_key(&ana_peer));
+        assert!(bia.recovering.is_empty());
+    }
+
+    /// Médio 2: uma discagem que falha (a rediscagem de fundo) não apaga a identidade fixada em `expected`.
+    #[tokio::test]
+    async fn a_failed_dial_keeps_the_pinned_identity_of_a_recovering_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let old = bia.old_identity(&ana_peer).unwrap();
+        force_stale(&mut bia, &mut ana, ana_peer);
+
+        bia.handle(NodeEvent::DialFailed {
+            peer: Some(ana_peer),
+            reason: "sem rota".into(),
+        });
+
+        assert_eq!(bia.expected.get(&ana_peer), Some(&old));
+        assert!(bia.recovering.contains_key(&ana_peer));
+    }
+
+    /// Médio 2 (outra metade): se a conversa nova é de outra identidade, o `ConversationReset` não sai.
+    #[tokio::test]
+    async fn no_reset_is_reported_when_the_identity_changed() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        force_stale(&mut bia, &mut ana, ana_peer);
+        events(&mut bia);
+        let (mut other, _, other_peer) = bia_and_raw_ana();
+        let fresh = other.conversations.remove(&other_peer).unwrap();
+
+        bia.ready(ana_peer, fresh).unwrap();
+
+        assert!(
+            !events(&mut bia)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ConversationReset { .. })),
+            "a identidade é outra: não é 'refeita com a mesma'"
+        );
+    }
+
     /// Sem o peer conectado (a mensagem veio pela caixa postal, que entrega fora de ordem) o `Stale` só
     /// avisa: o commit atrasado ainda poderia salvar a conversa, e o P16 só roda pela conexão direta.
     #[tokio::test]
