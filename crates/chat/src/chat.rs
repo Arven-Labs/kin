@@ -338,6 +338,10 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 /// Quantos peers podem ter um `KeyPackage` guardado ao mesmo tempo (no pior caso, 1 MiB). Maior que o dos
 /// devices conhecidos de propósito: quem enche as vagas precisa de uma conexão por vaga (auditoria, médio 2).
 const MAX_HELD_KEY_PACKAGES: usize = 64;
+/// Quantas vezes por conexão um peer pode marcar `lost_state` pelo caminho do `state_id` (P36, auditoria,
+/// baixo 1): o `reset_done` só vale para a troca que dá certo, e uma tentativa que falha limpa a suspeita.
+#[allow(dead_code)] // stub do commit de testes; o próximo commit usa
+const MAX_STATE_ID_MARKS: u8 = 2;
 /// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
 const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
@@ -7413,6 +7417,29 @@ mod tests {
         ana.on_hello(b, None, None, hello_of(false, Some(ID_NEW)))
             .unwrap();
         assert!(!ana.lost_state.contains(&b));
+    }
+
+    /// P36 (auditoria, baixo 1): o `reset_done` só é gravado quando a troca **dá certo**. Um contato que manda
+    /// `Hello(false, id novo)` e depois um `KeyPackage` recusado (a tentativa falha e limpa o `lost_state`) não
+    /// pode repetir o ciclo sem fim na mesma conexão: o caminho do `state_id` marca no máximo
+    /// `MAX_STATE_ID_MARKS` vezes por conexão.
+    #[tokio::test]
+    async fn failed_resets_by_state_id_are_limited_per_connection() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        let mut marks = 0;
+        for i in 0..(MAX_STATE_ID_MARKS as usize + 3) {
+            ana.on_hello(b, None, None, hello_of(false, Some([10 + i as u8; 16])))
+                .unwrap();
+            if ana.lost_state.remove(&b) {
+                marks += 1; // a tentativa de troca falhou e consumiu a suspeita
+            }
+        }
+        assert_eq!(marks, MAX_STATE_ID_MARKS as usize);
+        // Reconectar zera o limite.
+        ana.handle(NodeEvent::PeerDisconnected(b));
+        ana.on_hello(b, None, None, hello_of(false, Some([99; 16])))
+            .unwrap();
+        assert!(ana.lost_state.contains(&b), "conexão nova, limite novo");
     }
 
     fn is_reset(event: &ChatEvent) -> bool {
