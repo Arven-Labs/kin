@@ -1480,7 +1480,7 @@ impl Chat {
         };
         let kept = self.replay.entry(peer).or_default();
         kept.push_back((message, Instant::now()));
-        while kept.len() > MAX_REPLAY {
+        while kept.len() > MAX_REPLAY + 1 {
             kept.pop_front();
         }
     }
