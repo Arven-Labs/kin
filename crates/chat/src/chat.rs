@@ -1866,7 +1866,8 @@ impl Chat {
                         self.drop_message(peer, e);
                     }
                     // Reenviada pelo reset: a aplicação já viu o `Delivered` da 1ª vez (ADR 0044).
-                    if !mirror && !self.replayed.remove(&message) {
+                    self.replayed.remove(&message);
+                    if !mirror {
                         self.queue.push_back(ChatEvent::Delivered { peer, message });
                     }
                     self.flush(peer);
