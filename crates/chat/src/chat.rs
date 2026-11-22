@@ -199,11 +199,6 @@ struct Scan {
 
 /// Quantas mensagens de época futura se guardam por peer à espera do commit (P9).
 const FUTURE_LIMIT: usize = 32;
-
-/// MEDIÇÃO TEMPORÁRIA (P9 d): conta as mensagens descartadas como `TooOld`.
-#[cfg(test)]
-static TOO_OLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// P9 (c, ADR 0041): intervalo mínimo entre duas recuperações automáticas da conversa com o mesmo peer
 /// depois de `Stale`. Dentro dele o `Stale` só avisa (quem força 32 mensagens de época futura não faz
 /// o nó refazer a conversa em laço).
@@ -3082,12 +3077,7 @@ impl Chat {
                 Ok(())
             }
             // Reentrega (at-least-once) ou velha demais: seguro ignorar.
-            Err(CryptoError::TooOld) => {
-                #[cfg(test)]
-                TOO_OLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // MEDIÇÃO TEMPORÁRIA
-                Ok(())
-            }
-            Err(CryptoError::Duplicate) => Ok(()),
+            Err(CryptoError::Duplicate | CryptoError::TooOld) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -3958,32 +3948,35 @@ mod tests {
         assert!(received_texts(&events(&mut bia)).is_empty());
     }
 
-    /// P9 (d), medição: um relay Nostr devolve o backlog por `created_at` decrescente, e o NIP-59 sorteia esse
-    /// campo (até 2 dias no passado), então a ordem de chegada não tem relação com a de envio. Aqui a ordem vem
-    /// do `created_at` de gift wraps **reais** (`nostr::wrap`); o relay em si não entra (é o modelo do NIP-01,
-    /// não um relay medido, ver P33). Para cada K (mensagens enviadas depois do commit) entrega o commit e as K
-    /// nessa ordem e mede quantas ficaram no buffer e se o `Stale` disparou sem nada ter se perdido.
-    /// Só afirma o que é determinístico (K <= `FUTURE_LIMIT` nunca estoura); o resto vai na tabela.
+    /// P9 (d), medição de 2026-11-22 (ADR 0041): um relay Nostr devolve o backlog por `created_at`
+    /// decrescente, e o NIP-59 sorteia esse campo (até 2 dias no passado), então a ordem de chegada não tem
+    /// relação com a de envio. A ordem aqui vem do `created_at` de gift wraps **reais** (`nostr::wrap`); o relay
+    /// em si não entra (é o modelo do NIP-01, não um relay medido, ver P33). Para cada K (mensagens enviadas
+    /// depois de um commit) entrega o commit e as K nessa ordem, com o peer desconectado (o `Stale` só avisa).
+    ///
+    /// Medido (30 execuções por K): K = 8 chega inteiro; K = 32 nunca dá `Stale`, mas perde em média 19 das 32,
+    /// em silêncio, porque a tolerância de fora de ordem do MLS é 10 gerações e `on_mls` ignora `TooOld`; K >=
+    /// 48 também dá `Stale` falso (teto de 32). O que a outbox reenvia depois (bytes novos, mesmo `MessageId`)
+    /// chega sempre, sem repetição.
+    ///
+    /// **Fixa o comportamento atual**: o `assert!(lost > 0)` do K = 32 é para ser invertido quando a perda por
+    /// fora de ordem for corrigida (P37).
     #[tokio::test]
-    async fn measure_future_buffer_with_the_mailbox_delivery_order() {
+    async fn out_of_order_mailbox_backlog_loses_messages_silently_but_the_resend_recovers_them() {
         const RUNS: usize = 30;
         let sender = DeviceKey::generate();
         let recipient = DeviceKey::generate().nostr_public_key();
-        let mut table = String::from("K  runs  stale  mean_held  max_held  delivered_all\n");
-        for k in [8, FUTURE_LIMIT, 48, 64, 128] {
-            let (mut stale, mut held_sum, mut held_max, mut complete) = (0, 0, 0, 0);
-            let (mut texts_sum, mut others) = (0, std::collections::BTreeMap::<String, usize>::new());
-            let (mut too_old_sum, mut recovered_sum, mut duplicates) = (0, 0, 0);
+        let mut table = String::from("K  runs  stale  mean_held  max_held  mean_lost_first_pass\n");
+        for k in [8, FUTURE_LIMIT, 64] {
+            let (mut stale, mut held_sum, mut held_max, mut lost_sum) = (0, 0, 0, 0);
             for _ in 0..RUNS {
                 let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
                 let mut blobs = vec![Envelope::Mls(ana.rotate_keys().unwrap()).encode()];
-                let messages: Vec<Message> = (0..k)
-                    .map(|i| Message::new(i.to_string(), None))
-                    .collect();
+                let messages: Vec<Message> =
+                    (0..k).map(|i| Message::new(i.to_string(), None)).collect();
                 for m in &messages {
                     blobs.push(Envelope::Mls(ana.encrypt(&m.encode()).unwrap()).encode());
                 }
-                let too_old_before = TOO_OLD.load(std::sync::atomic::Ordering::Relaxed);
                 let mut seen_ids: Vec<MessageId> = Vec::new();
                 // Posição de cada blob na entrega: `created_at` do wrap, do mais novo para o mais velho.
                 let mut order: Vec<(u64, usize)> = (0..blobs.len())
@@ -4009,12 +4002,12 @@ mod tests {
                             seen_ids.push(message.id);
                         }
                     }
-                    for e in evs.iter().filter(|e| !matches!(e, ChatEvent::Received { .. })) {
-                        let text = format!("{e:?}");
-                        *others.entry(text.chars().take(90).collect()).or_default() += 1;
-                    }
+                    assert!(
+                        !evs.iter().any(|e| matches!(e, ChatEvent::Dropped { .. })),
+                        "a perda é silenciosa: nenhum Dropped"
+                    );
                 }
-                too_old_sum += TOO_OLD.load(std::sync::atomic::Ordering::Relaxed) - too_old_before;
+                let lost = k - texts;
                 // Recuperação: a outbox do remetente reenvia, em ordem, o que não chegou (bytes novos,
                 // mesmo `MessageId`); o destinatário deduplica pelo `MessageId`.
                 let mut shown = texts;
@@ -4023,7 +4016,10 @@ mod tests {
                         continue;
                     }
                     let blob = Envelope::Mls(ana.encrypt(&m.encode()).unwrap()).encode();
-                    bia.handle_mailbox(MailboxEvent::Retrieved { from: ana_peer, blob });
+                    bia.handle_mailbox(MailboxEvent::Retrieved {
+                        from: ana_peer,
+                        blob,
+                    });
                     let evs = events(&mut bia);
                     shown += received_texts(&evs).len();
                     for e in &evs {
@@ -4032,30 +4028,32 @@ mod tests {
                         }
                     }
                 }
-                recovered_sum += seen_ids.len();
-                duplicates += shown - seen_ids.len();
-                texts_sum += texts;
-                stale += usize::from(warned);
-                held_sum += max;
-                held_max = held_max.max(max);
-                complete += usize::from(texts == k);
+                assert_eq!(seen_ids.len(), k, "K = {k}: o reenvio recupera tudo");
+                assert_eq!(shown, k, "K = {k}: nenhuma mensagem aparece duas vezes");
                 if k <= FUTURE_LIMIT {
                     assert!(!warned, "K = {k} cabe no teto e não pode dar Stale");
                 }
+                if k <= 8 {
+                    assert_eq!(lost, 0, "K = {k} cabe nas 10 gerações de tolerância");
+                }
+                stale += usize::from(warned);
+                held_sum += max;
+                held_max = held_max.max(max);
+                lost_sum += lost;
+            }
+            if k == FUTURE_LIMIT {
+                assert!(
+                    lost_sum > 0,
+                    "fixa a perda silenciosa atual (inverter na correção, P37)"
+                );
             }
             table += &format!(
-                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {complete}  texts_mean={:.1}  too_old_mean={:.1}  after_resend_mean={:.1}  duplicates={duplicates}\n",
+                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {:.1}\n",
                 held_sum as f64 / RUNS as f64,
-                texts_sum as f64 / RUNS as f64,
-                too_old_sum as f64 / RUNS as f64,
-                recovered_sum as f64 / RUNS as f64
+                lost_sum as f64 / RUNS as f64
             );
-            for (text, n) in &others {
-                table += &format!("    {n}x {text}\n");
-            }
         }
         eprintln!("{table}");
-        panic!("MEDIÇÃO TEMPORÁRIA (remover antes do merge):\n{table}");
     }
 
     /// Estoura o teto do buffer com mensagens de época futura (o commit nunca chega): devolve o `Stale`.
