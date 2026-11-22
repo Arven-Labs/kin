@@ -147,8 +147,11 @@ pub enum ChatEvent {
     /// Chegaram mensagens demais de uma época que este device não alcança: o commit que falta
     /// provavelmente não virá e a conversa divergiu. O buffer foi descartado e, fora da janela de
     /// [`STALE_RECOVERY_WINDOW`], este lado abandonou a conversa e reconecta para o P16 refazê-la (P9 c).
+    /// `recovering` diz o que este lado fez: `true` = abandonou a conversa e reconecta; `false` = só
+    /// avisou (janela, caixa postal, irmão, sem conexão) e a conversa segue como estava.
     Stale {
         peer: PeerId,
+        recovering: bool,
     },
     /// O peer anunciou onde recebe (lista já validada); os depósitos para ele passam a ir para lá.
     PeerRelays {
@@ -1287,6 +1290,19 @@ impl Chat {
     /// Há conversa E2EE pronta com o peer?
     pub fn is_ready(&self, peer: &PeerId) -> bool {
         self.conversations.contains_key(peer)
+    }
+
+    /// **Só para testes de integração** (P9 c, ADR 0041): gira a chave da conversa com `peer` e **descarta o
+    /// commit** em vez de enviá-lo. Daí em diante o que este lado cifra está numa época que o outro não
+    /// alcança, que é o que faz o `Stale` nascer. Em produção o commit sempre sai; não use fora de teste.
+    #[doc(hidden)]
+    pub fn rotate_keys_dropping_commit(&mut self, peer: PeerId) -> Result<(), Error> {
+        let conversation = self
+            .conversations
+            .get_mut(&peer)
+            .ok_or(Error::NoConversation(peer))?;
+        conversation.rotate_keys()?;
+        Ok(())
     }
 
     /// Põe `text` na outbox do peer e tenta enviar; `parent` faz a mensagem responder a outra
@@ -3609,8 +3625,8 @@ impl Chat {
         }
         if held.len() >= FUTURE_LIMIT {
             self.future.remove(&peer);
-            self.queue.push_back(ChatEvent::Stale { peer });
-            self.recover_from_stale(peer);
+            let recovering = self.recover_from_stale(peer);
+            self.queue.push_back(ChatEvent::Stale { peer, recovering });
             return;
         }
         held.push(wire.to_vec());
@@ -3638,13 +3654,14 @@ impl Chat {
     /// com o peer **conectado** (a recuperação passa pelo `Hello` da conexão direta; pela caixa postal, que
     /// entrega fora de ordem, o `Stale` só avisa), com conversa 1:1 de identidade conhecida e não
     /// desconfiada, e que não seja um irmão (ADR 0040: irmão não se recupera). No máximo uma vez por peer a
-    /// cada [`STALE_RECOVERY_WINDOW`]; fora disso o `Stale` só avisa, como antes.
-    fn recover_from_stale(&mut self, peer: PeerId) {
+    /// cada [`STALE_RECOVERY_WINDOW`]; fora disso o `Stale` só avisa, como antes. Devolve `true` se
+    /// abandonou a conversa (vira `recovering` no [`ChatEvent::Stale`]).
+    fn recover_from_stale(&mut self, peer: PeerId) -> bool {
         let now = now_secs();
         self.stale_recovered
             .retain(|_, at| now.saturating_sub(*at) < STALE_RECOVERY_WINDOW.as_secs());
         let Some(identity) = self.old_identity(&peer) else {
-            return;
+            return false;
         };
         if self.stale_recovered.contains_key(&peer)
             || self.from_mailbox
@@ -3653,10 +3670,10 @@ impl Chat {
             || self.household.contains_key(&peer)
             || self.is_distrusted(&identity)
         {
-            return;
+            return false;
         }
         let Some(conversation) = self.conversations.remove(&peer) else {
-            return;
+            return false;
         };
         self.stale_recovered.insert(peer, now);
         self.recovering.insert(peer, (identity.clone(), now));
@@ -3671,6 +3688,7 @@ impl Chat {
             self.drop_message(peer, e.into());
         }
         self.node.disconnect(peer);
+        true
     }
 
     /// Vence as marcas de recuperação mais velhas que [`RECOVERING_TTL`]: o peer deixa de ser esperado.
@@ -3910,7 +3928,14 @@ mod tests {
 
         bia.on_mls(ana_peer, &wire(&mut ana, "a gota d'água"))
             .unwrap();
-        assert_eq!(events(&mut bia), [ChatEvent::Stale { peer: ana_peer }]);
+        assert_eq!(
+            events(&mut bia),
+            [ChatEvent::Stale {
+                peer: ana_peer,
+                recovering: false
+            }],
+            "sem conexão o Stale só avisa"
+        );
 
         // P9 (c): sem conexão direta o `Stale` só avisa, então o commit atrasado ainda é aplicado (o que o
         // buffer descartado tinha se perdeu, a conversa não).
@@ -3938,7 +3963,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
-        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: true
+        }));
         assert!(
             !bia.conversations.contains_key(&ana_peer),
             "a conversa divergida devia ter sido abandonada"
@@ -3973,7 +4001,10 @@ mod tests {
             });
         }
 
-        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: false
+        }));
         assert!(bia.conversations.contains_key(&ana_peer));
         assert!(bia.recovering.is_empty());
     }
@@ -4023,7 +4054,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
-        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: false
+        }));
         assert!(bia.conversations.contains_key(&ana_peer));
         assert!(bia.recovering.is_empty() && bia.expected.is_empty());
     }
@@ -4038,6 +4072,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: false
+        }));
         assert!(bia.conversations.contains_key(&ana_peer));
         assert!(bia.recovering.is_empty());
     }
@@ -4188,7 +4226,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
-        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: false
+        }));
         assert!(
             bia.conversations.contains_key(&ana_peer),
             "dentro da janela a conversa fica"
@@ -4205,6 +4246,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: true
+        }));
         assert!(!bia.conversations.contains_key(&ana_peer));
     }
 
