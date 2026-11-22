@@ -3959,8 +3959,10 @@ mod tests {
     /// 48 também dá `Stale` falso (teto de 32). O que a outbox reenvia depois (bytes novos, mesmo `MessageId`)
     /// chega sempre, sem repetição.
     ///
-    /// **Fixa o comportamento atual**: o `assert!(lost > 0)` do K = 32 é para ser invertido quando a perda por
-    /// fora de ordem for corrigida (P37).
+    /// **Ressalva (P37)**: K > 8 **não é alcançável** por um remetente `Chat`: `MAILBOX_WINDOW` limita a 8 os
+    /// depósitos sem ack, de propósito abaixo das 10 gerações. Este teste caracteriza o limite do `Chat` diante
+    /// de uma entrega que não respeite isso (outro cliente, irmão, remetente hostil), não o uso normal; ver
+    /// `redeposited_copies_in_random_order_never_lose_a_message` para o cenário alcançável.
     #[tokio::test]
     async fn out_of_order_mailbox_backlog_loses_messages_silently_but_the_resend_recovers_them() {
         const RUNS: usize = 12;
@@ -4044,12 +4046,61 @@ mod tests {
             if k == FUTURE_LIMIT {
                 assert!(
                     lost_sum > 0,
-                    "fixa a perda silenciosa atual (inverter na correção, P37)"
+                    "fixa o limite de 10 gerações do MLS com K > 8 (inalcançável pelo `Chat`, P37)"
                 );
             }
             table += &format!(
                 "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {:.1}\n",
                 held_sum as f64 / RUNS as f64,
+                lost_sum as f64 / RUNS as f64
+            );
+        }
+        eprintln!("{table}");
+    }
+
+    /// P37, medição do cenário **alcançável** (a janela de depósito é `MAILBOX_WINDOW` = 8, então K > 8 não
+    /// ocorre): 8 mensagens depositadas e re-depositadas pela varredura por idade, cada rodada recifrando as
+    /// mesmas 8 com gerações novas, enquanto as cópias antigas ainda estão no relay (retenção de 7 dias,
+    /// varredura a cada ~1,75 dia: até ~5 cópias de cada). O relay as serve em ordem aleatória. Uma mensagem se
+    /// perde de verdade só se **todas** as cópias caem em `TooOld`.
+    ///
+    /// Medido no CI (200 execuções por caso, 1, 2, 3, 5 e 8 cópias = até 64 eventos): **0 mensagens perdidas**.
+    /// Cada mensagem tem várias cópias e basta uma decifrar. O teste fixa isso (P37, ADR 0041).
+    #[tokio::test]
+    async fn redeposited_copies_in_random_order_never_lose_a_message() {
+        const RUNS: usize = 30;
+        let mut table = String::from("copias  eventos  runs  runs_com_perda  perdidas_media  perdidas_max\n");
+        for copies in [2usize, 5, 8] {
+            let (mut runs_lost, mut lost_sum, mut lost_max) = (0, 0, 0);
+            for _ in 0..RUNS {
+                let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+                let messages: Vec<Message> =
+                    (0..MAILBOX_WINDOW).map(|i| Message::new(i.to_string(), None)).collect();
+                let mut blobs = Vec::new();
+                for _ in 0..copies {
+                    for m in &messages {
+                        blobs.push(Envelope::Mls(ana.encrypt(&m.encode()).unwrap()).encode());
+                    }
+                }
+                rand::seq::SliceRandom::shuffle(blobs.as_mut_slice(), &mut rand::rng());
+                let mut seen: Vec<MessageId> = Vec::new();
+                for blob in blobs {
+                    bia.handle_mailbox(MailboxEvent::Retrieved { from: ana_peer, blob });
+                    for e in events(&mut bia) {
+                        if let ChatEvent::Received { message, .. } = e {
+                            seen.push(message.id);
+                        }
+                    }
+                }
+                let lost = messages.iter().filter(|m| !seen.contains(&m.id)).count();
+                assert_eq!(lost, 0, "{copies} cópias: nenhuma mensagem pode se perder");
+                runs_lost += usize::from(lost > 0);
+                lost_sum += lost;
+                lost_max = lost_max.max(lost);
+            }
+            table += &format!(
+                "{copies}  {}  {RUNS}  {runs_lost}  {:.2}  {lost_max}\n",
+                copies * MAILBOX_WINDOW,
                 lost_sum as f64 / RUNS as f64
             );
         }

@@ -2252,4 +2252,15 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Erros meus**: `as_u64` (não existe, é `as_secs`) e `sort_by` que o clippy pede como `sort_by_key`: dois runs de CI perdidos na compilação, sem provar nada; o 1º teste definitivo levava > 60 s (30 execuções por K) e baixei para 12.
 - **Não verificado**: relay Nostr real (ordem, `limit` do REQ), tempo até o reenvio, backlog com mais de uma rotação, remetente sem a outbox; a causa `TooOld` é provada pelo contador (19,1 + 12,9 = 32), mas o contador saiu do código.
 - **Prova** (CI): o teste é de caracterização (não há "falha antes"). Mutação de propósito **não feita** neste PR (só teste, sem código de produção).
-- **Próximo passo**: decidir o P37 (ordenar o backlog, subir a tolerância ou só avisar); P9 (b) segue para a Fase 5; P33 continua com o dono.
+- **Próximo passo**: decidir o P37 (ordenar o backlog, subir a tolerância ou só avisar); P9 (b) segue para a Fase 5; P33 continua com o dono. *(P37 resolvido por rebaixamento na subseção abaixo.)*
+
+#### P37: a premissa estava errada; medido o cenário alcançável (PR #291)
+
+- **Origem**: o dono escolheu "vamos de P37" e, no plano (em plan mode), ordenar o backlog pelo horário do rumor, com tag de ordem para desempatar. Os testes primeiro (PR #290, descartado) falharam pelo motivo certo (3 de 5: ordem, entrega sem `EOSE`, ponta a ponta), mas o **ponta a ponta com 40 mensagens nem conseguiu depositá-las**: `MAILBOX_WINDOW = 8` limita os depósitos sem ack.
+- **Erro meu** (o principal da sessão): a tabela do P9 (d), de K = 32 a 128, modela uma entrega que o `Chat` não produz, e eu abri o P37 como "média" sem ter lido o `MAILBOX_WINDOW`, cujo comentário já dizia que fica abaixo das 10 gerações do MLS. Só o K = 8 era alcançável. Corrigido no ADR 0041 (seção "Correção"), no P9 (d) e no P37.
+- **Medido o cenário alcançável** (CI, PR #291, 200 execuções por caso): 8 mensagens e as cópias da varredura por idade (1, 2, 3, 5 e 8 cópias, até 64 eventos), em ordem aleatória: **0 mensagens perdidas em 1.000 execuções**.
+- **Decisão do dono**: "medir o cenário real antes"; com o resultado, **P37 rebaixado para baixa**, sem implementar a ordenação (superfície grande: formato do rumor, sessão do relay, relay hostil). Reabre se aparecer perda real (relay real no P33, irmãos, outro cliente).
+- **Feito**: teste `redeposited_copies_in_random_order_never_lose_a_message` (`chat.rs`); ressalva no teste do P9 (d) (K > 8 inalcançável); ADR, PENDING e SESSIONS corrigidos. Nenhum código de produção.
+- **Não verificado**: relay real, irmãos (cada device tem a própria cadeia de gerações), backlog com mais de uma rotação; a probabilidade de perda não é zero por construção, só não apareceu em 1.000 execuções (o teste definitivo roda 30 por caso).
+- **Prova** (CI): caracterização, sem "falha antes" e sem mutação (não há código de produção).
+- **Próximo passo**: P9 (b) na Fase 5; P33 com o dono.
