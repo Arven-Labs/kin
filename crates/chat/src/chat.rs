@@ -3976,7 +3976,7 @@ mod tests {
                         (event.created_at.as_secs(), i)
                     })
                     .collect();
-                order.sort_by(|a, b| b.0.cmp(&a.0));
+                order.sort_by_key(|&(created_at, _)| std::cmp::Reverse(created_at));
 
                 let (mut max, mut texts, mut warned) = (0, 0, false);
                 for (_, i) in order {
