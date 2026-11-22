@@ -433,3 +433,28 @@ async fn unreachable_relay_at_startup_falls_back_to_the_next_candidate() {
     assert_eq!(reserved, Some(peer_of(&good)));
     assert_eq!(a.relay_stats()[0].peer, peer_of(&good));
 }
+
+/// P9 (c, ADR 0041): `disconnect` também fecha uma conexão que passa por **circuito de relay**, e os dois
+/// lados (que só se enxergam pelo relay) veem a queda. É o caso do `Stale` entre peers atrás de NAT.
+#[tokio::test(flavor = "multi_thread")]
+async fn disconnect_closes_a_relayed_connection_and_both_sides_see_it() {
+    let Trio {
+        mut a,
+        mut b,
+        a_id,
+        b_id,
+    } = trio(RelayLimits::default()).await;
+
+    assert!(b.disconnect(a_id), "havia conexão por circuito para fechar");
+
+    let seen_a = until(&mut a, |e| {
+        (e == NodeEvent::PeerDisconnected(b_id)).then_some(())
+    });
+    let seen_b = until(&mut b, |e| {
+        (e == NodeEvent::PeerDisconnected(a_id)).then_some(())
+    });
+    timeout(WAIT, async { tokio::join!(seen_a, seen_b) })
+        .await
+        .expect("a queda do circuito não chegou aos dois lados");
+    assert!(!b.disconnect(a_id), "não sobrou conexão");
+}
