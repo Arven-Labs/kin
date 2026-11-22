@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -341,6 +341,13 @@ const MAX_HELD_KEY_PACKAGES: usize = 64;
 /// Quantas vezes por conexão um peer pode marcar `lost_state` pelo caminho do `state_id` (P36, auditoria,
 /// baixo 1): o `reset_done` só vale para a troca que dá certo, e uma tentativa que falha limpa a suspeita.
 const MAX_STATE_ID_MARKS: u8 = 2;
+/// Quantas mensagens com ack na janela da conexão extra se guardam por peer para o reenvio (P36, ADR 0044): o
+/// mesmo teto de [`MAILBOX_WINDOW`], que já limita o quanto fica sem confirmação.
+#[allow(dead_code)] // stub dos testes primeiro (P36, ADR 0044): sai com a implementação
+const MAX_REPLAY: usize = MAILBOX_WINDOW;
+/// Depois disto uma mensagem guardada para o reenvio vale nada (P36, ADR 0044): a janela é de segundos.
+#[allow(dead_code)] // stub dos testes primeiro (P36, ADR 0044): sai com a implementação
+const REPLAY_MAX_AGE: Duration = Duration::from_secs(120);
 /// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
 const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
@@ -535,6 +542,21 @@ pub struct Chat {
     /// Quantas vezes cada peer marcou `lost_state` pelo `state_id` nesta conexão, até [`MAX_STATE_ID_MARKS`].
     /// Em memória; zera ao desconectar.
     state_id_marks: HashMap<PeerId, u8>,
+    /// Peers cuja 1ª `PeerRoute` (a da 1ª conexão, que o `Node` emite logo depois do `PeerConnected`) ainda não
+    /// chegou (P36, ADR 0044): essa rota não é conexão extra. Em memória; some com a conexão.
+    #[allow(dead_code)] // stub dos testes primeiro
+    first_route_pending: HashSet<PeerId>,
+    /// Peers com uma conexão **extra** aberta (P36, ADR 0044): a janela em que um ack de transporte pode vir de
+    /// um `b` trocado. Em memória; some com a conexão.
+    #[allow(dead_code)] // stub dos testes primeiro
+    extra_connection: HashSet<PeerId>,
+    /// Mensagens com ack recebido **dentro** da janela (`extra_connection`), por peer, com a hora do ack (P36,
+    /// ADR 0044): se a conversa for refeita, voltam à outbox. Teto [`MAX_REPLAY`] por peer e [`REPLAY_MAX_AGE`].
+    #[allow(dead_code)] // stub dos testes primeiro
+    replay: HashMap<PeerId, VecDeque<(Message, Instant)>>,
+    /// Mensagens recolocadas na outbox pelo reenvio: o ack delas não emite `Delivered` de novo (a aplicação já viu).
+    #[allow(dead_code)] // stub dos testes primeiro
+    replayed: HashSet<MessageId>,
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
     not_admitted_notified: HashSet<PeerId>,
@@ -808,6 +830,10 @@ impl Chat {
             reset_done: HashSet::new(),
             pending_state_ids: HashMap::new(),
             state_id_marks: HashMap::new(),
+            first_route_pending: HashSet::new(),
+            extra_connection: HashSet::new(),
+            replay: HashMap::new(),
+            replayed: HashSet::new(),
             not_admitted_notified: HashSet::new(),
             require_approval: false,
             pending_approval: HashMap::new(),
@@ -7344,6 +7370,201 @@ mod tests {
         assert!(ana.is_ready(&b));
         assert!(!ana.hello_pending.contains(&b), "conversa criada agora");
         (ana, b)
+    }
+
+    /// P36 (ADR 0044): `ana` (de menor Peer ID) com conversa pronta com `b`, conectada como numa reconexão normal
+    /// (o `Hello` já chegou; a rota da 1ª conexão já passou), e um 2º `KeyPackage` de `b` (mesma identidade) para
+    /// o reset. A janela da conexão extra **não** está aberta.
+    fn ana_connected_for_replay() -> (Chat, PeerId, Vec<u8>) {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package = || {
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package()).unwrap();
+        connect_peer(&mut ana, b);
+        // O `Node` emite a rota da 1ª conexão logo depois do `PeerConnected` (`node.rs`): não é conexão extra.
+        ana.handle(NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        });
+        events(&mut ana);
+        (ana, b, key_package())
+    }
+
+    /// Manda `text`, o transporte do outro lado confirma (ack) e devolve o que a aplicação viu.
+    fn send_and_ack(ana: &mut Chat, b: PeerId, text: &str) -> Vec<ChatEvent> {
+        ana.send(b, text, None).unwrap();
+        let id = first_in_flight(ana);
+        events(ana);
+        ana.handle(NodeEvent::MessageDelivered { peer: b, id });
+        events(ana)
+    }
+
+    fn open_extra_connection(ana: &mut Chat, b: PeerId) {
+        ana.handle(NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        });
+    }
+
+    /// P36 (ADR 0044): `b` perdeu o banco: o `Hello` dele marca `lost_state` e o `KeyPackage` troca a conversa.
+    fn reset_conversation(ana: &mut Chat, b: PeerId, key_package: &[u8]) {
+        ana.lost_state.insert(b);
+        ana.on_key_package(b, key_package).unwrap();
+        assert!(events(ana).iter().any(is_reset), "o reset não aconteceu");
+    }
+
+    fn outbox_texts(ana: &Chat, b: PeerId) -> Vec<String> {
+        ana.outbox
+            .entries(&b)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    /// P36 (ADR 0044): o que recebeu ack **dentro** da janela da conexão extra pode ter ido a um `b` trocado: ao
+    /// refazer a conversa volta à outbox, com o mesmo `MessageId`, e sai de novo pela conversa nova.
+    #[tokio::test]
+    async fn a_message_acked_in_the_extra_connection_window_comes_back_after_the_reset() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "no limbo");
+        assert_eq!(ana.replay[&b].len(), 1, "o ack na janela não foi guardado");
+        assert_eq!(ana.queued(&b), 0, "o ack tirou da outbox");
+
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["no limbo"]);
+    }
+
+    /// P36 (ADR 0044): o que recebeu ack **antes** da conexão extra aparecer não é reenviado (não há como saber
+    /// se foi perdido, e reenviar história antiga repetiria o que o `b` já tem).
+    #[tokio::test]
+    async fn a_message_acked_before_the_extra_connection_is_not_replayed() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        send_and_ack(&mut ana, b, "antes");
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "dentro");
+
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["dentro"]);
+    }
+
+    /// P36 (ADR 0044): a 1ª `PeerRoute` depois do `PeerConnected` é a da própria 1ª conexão: não abre a janela.
+    /// Sem este teste, toda conexão normal guardaria tudo o que fosse confirmado.
+    #[tokio::test]
+    async fn the_route_of_the_first_connection_does_not_open_the_window() {
+        let (mut ana, b, _key_package) = ana_connected_for_replay();
+        send_and_ack(&mut ana, b, "normal");
+        assert!(
+            ana.replay.get(&b).is_none_or(|q| q.is_empty()),
+            "a rota da 1ª conexão abriu a janela"
+        );
+        // Controle: a rota seguinte (conexão extra) abre.
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "extra");
+        assert_eq!(ana.replay[&b].len(), 1);
+    }
+
+    /// P36 (ADR 0044): no máximo `MAX_REPLAY` por peer, e ficam as mais novas.
+    #[tokio::test]
+    async fn only_the_newest_messages_up_to_the_cap_are_replayed() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        let total = MAX_REPLAY + 2;
+        for i in 0..total {
+            send_and_ack(&mut ana, b, &format!("m{i}"));
+        }
+        reset_conversation(&mut ana, b, &key_package);
+        let expected: Vec<String> = (2..total).map(|i| format!("m{i}")).collect();
+        assert_eq!(outbox_texts(&ana, b), expected);
+    }
+
+    /// P36 (ADR 0044): passada a idade máxima, a mensagem guardada vale nada; a recente volta.
+    #[tokio::test]
+    async fn a_message_older_than_the_max_age_is_not_replayed() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "velha");
+        send_and_ack(&mut ana, b, "nova");
+        let old = Instant::now()
+            .checked_sub(REPLAY_MAX_AGE + Duration::from_secs(1))
+            .unwrap();
+        if let Some(queue) = ana.replay.get_mut(&b) {
+            queue.front_mut().unwrap().1 = old;
+        }
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["nova"]);
+    }
+
+    /// P36 (ADR 0044): a janela e o buffer são da conexão: `PeerDisconnected` apaga os dois, e a conexão
+    /// seguinte começa fechada (sem herdar o que foi guardado).
+    #[tokio::test]
+    async fn a_disconnect_clears_the_window_and_the_buffer() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "no limbo");
+        assert_eq!(ana.replay[&b].len(), 1, "controle: guardou");
+
+        ana.handle(NodeEvent::PeerDisconnected(b));
+        events(&mut ana);
+        assert!(!ana.replay.contains_key(&b));
+        assert!(!ana.extra_connection.contains(&b));
+
+        connect_peer(&mut ana, b);
+        ana.handle(NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        });
+        send_and_ack(&mut ana, b, "nova conexão");
+        reset_conversation(&mut ana, b, &key_package);
+        assert!(
+            outbox_texts(&ana, b).is_empty(),
+            "herdou da conexão anterior"
+        );
+    }
+
+    /// P36 (ADR 0044): decisão do dono, reenvio silencioso: o ack da mensagem reenviada tira da outbox e **não**
+    /// emite `Delivered` de novo (a aplicação já viu um).
+    #[tokio::test]
+    async fn the_ack_of_a_replayed_message_does_not_emit_delivered_again() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        let first = send_and_ack(&mut ana, b, "no limbo");
+        assert!(
+            first
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "o 1º ack emite Delivered (já visto pela aplicação)"
+        );
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["no limbo"], "controle: voltou");
+
+        let id = first_in_flight(&ana);
+        events(&mut ana);
+        ana.handle(NodeEvent::MessageDelivered { peer: b, id });
+        let seen = events(&mut ana);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "Delivered duplicado: {seen:?}"
+        );
+        assert_eq!(ana.queued(&b), 0);
     }
 
     /// P36 (ADR 0043): o `Hello` "não tenho conversa" com um `state_id` **diferente** do que o `a` gravou ao

@@ -385,6 +385,84 @@ async fn old_connection_still_open_case(a_lower: bool) {
     drop(b_old);
 }
 
+/// P36, a janela residual (ADR 0044): o `a` manda uma mensagem **logo depois** de a conexão nova do `b` (sem
+/// banco) aparecer e **antes** de processar o `Hello` dele. O ack de transporte do `b` chega, o `a` dá a
+/// mensagem por entregue e a descarta, e o chat do `b` a recusa por falta de conversa. Desejado: depois da
+/// troca da conversa o `b` a recebe (o `a` a reenvia).
+///
+/// Probabilístico antes da correção: o pedido vai para uma das duas conexões do `a` (`request_id % 2`); na
+/// antiga (sem ser dirigida) ele só expira e é reenviado depois do reset, e o teste passa por acaso. Depois da
+/// correção passa sempre.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_sent_in_the_window_before_the_reset_still_arrives_a_lower() {
+    message_in_the_window_case(true).await;
+}
+
+/// P36 (ADR 0044), a outra ordem de Peer ID.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_sent_in_the_window_before_the_reset_still_arrives_a_higher() {
+    message_in_the_window_case(false).await;
+}
+
+async fn message_in_the_window_case(a_lower: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, mut pb) = loop {
+        let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+        if (pa.peer_id() < pb.peer_id()) == a_lower {
+            break (pa, pb);
+        }
+    };
+    let (mut a, mut b_old) = (pa.open(), pb.open());
+    let addr = connect(&mut a, &mut b_old).await;
+    // Esvazia o que sobrou da 1ª conexão (a rota dela) para a espera abaixo ver só a da conexão nova.
+    settle(&mut a, &mut b_old, Duration::from_secs(1)).await;
+
+    pb.db = dir.path().join("b-novo.db");
+    let mut b = pb.open();
+    b.dial(addr).unwrap();
+    let b_id = pb.peer_id();
+    let mut seen_b = Vec::new();
+    timeout(WAIT, async {
+        loop {
+            tokio::select! {
+                e = a.next_event() => {
+                    if matches!(e, ChatEvent::Route { peer, .. } if peer == b_id) {
+                        break;
+                    }
+                }
+                e = b.next_event() => seen_b.push(e),
+            }
+        }
+    })
+    .await
+    .expect("a não viu a conexão nova");
+
+    // A conexão extra apareceu e o `Hello` do `b` ainda não foi tratado: a janela.
+    a.send(b_id, "no limbo", None).unwrap();
+    let (seen_a, seen_b_after) = settle(&mut a, &mut b, Duration::from_secs(30)).await;
+    seen_b.extend(seen_b_after);
+
+    assert!(
+        seen_a
+            .iter()
+            .any(|e| matches!(e, ChatEvent::ConversationReset { peer, .. } if *peer == b_id)),
+        "a não refez a conversa (a_lower={a_lower}): {seen_a:#?}"
+    );
+    let received: Vec<&str> = seen_b
+        .iter()
+        .filter_map(|e| match e {
+            ChatEvent::Received { message, .. } => Some(message.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        received,
+        ["no limbo"],
+        "a mensagem da janela se perdeu (a_lower={a_lower})\neventos de b: {seen_b:#?}"
+    );
+    drop(b_old);
+}
+
 /// P16: sem perda nenhuma, uma conversa nova (ou uma que continua) **não** gera `ConversationReset`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fresh_or_surviving_conversation_is_never_reported_as_reset() {
