@@ -2284,4 +2284,15 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Erros meus**: o 1º desenho fazia os cenários falharem de propósito (a asserção era "o `b` recebe"); inverti para fixar o estado atual, como os testes do P36 (`..._not_rehandshaked_yet`), para o Lab não ficar vermelho em todo PR.
 - **Não verificado**: só conexão direta; QUIC; NAT doméstico (P33); frequência real; o efeito exato da ordem dos Peer IDs (o sintoma foi o mesmo nas duas ordens, nos dois modos; o mecanismo por ordem segue por leitura); a perda da mensagem é por leitura do código, o log só mostra o `(entregue)` e o `(descartado)`.
 - **Prova** (CI): medição, sem "falha antes" e sem mutação (não há código de produção).
-- **Próximo passo**: decisão do dono sobre a prioridade do P36 e sobre reabrir uma das 3 saídas (agora com um número e uma perda de mensagem em mãos); P33 continua com o dono.
+- **Próximo passo**: decisão do dono sobre a prioridade do P36 e sobre reabrir uma das 3 saídas (agora com um número e uma perda de mensagem em mãos); P33 continua com o dono. *(Decidido na Sessão 39, abaixo.)*
+
+### 2026-11-22 — Sessão 39
+
+#### P36: ADR 0043, desenho da correção (só docs)
+
+- **Origem**: o dono escolheu "vamos de p36" e, em plan mode, **ADR de desenho + prioridade** (sem código).
+- **Feito**: ADR 0043 (proposto); P36 sobe de Baixa para **Média** no `PENDING.md`; adendo no ADR 0040.
+- **Achado**: o defeito não é só a conexão morta. O `a` nunca sabe que o `b` perdeu a conversa, porque o `Hello(false)` é ignorado pelo gate `hello_pending` (P35), que só existe na 1ª conexão. Por isso a saída 1 (fechar a conexão antiga) **não cura sozinha**; a 2 já regrediu no #267; a 3 e o `ping` não resolvem.
+- **Direção proposta** (opção 4): `state_id` aleatório no `mls.sqlite` do `b`, levado no `Hello` (bit 8 da tag 5) e comparado com o que o `a` gravou ao formar a conversa. Muda o fio e o schema (v10) e toca §4.
+- **Não verificado**: **nada foi rodado**; o desenho é por leitura de `on_hello` e `wire.rs`. Em aberto: o `state_id` por device nos irmãos, a regra para o `a` sem id gravado (build antigo), a compatibilidade do bit novo com builds antigos e a auditoria de segurança.
+- **Próximo passo**: o dono decide se aceita a opção 4 (vira tarefa de código em plan mode, com testes primeiro); P33 continua com o dono.
