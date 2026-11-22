@@ -1982,7 +1982,7 @@ impl Chat {
     fn note_state_id(&mut self, peer: PeerId, state_id: [u8; 16]) -> bool {
         if self.conversations.contains_key(&peer) {
             match self.outbox.peer_state(&peer) {
-                Ok(Some(known)) if known != state_id => {
+                Ok(Some(known)) if known == state_id => {
                     self.pending_state_ids.insert(peer, state_id);
                     return true;
                 }
