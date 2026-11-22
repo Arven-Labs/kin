@@ -33,6 +33,11 @@ struct State {
     refuse_auth: bool,
     /// Quantos `AUTH` o cliente mandou (em todas as conexões).
     auths: usize,
+    /// Como um relay hostil ou bugado: serve o armazenado mas nunca manda o `EOSE`.
+    withhold_eose: bool,
+    /// Como o NIP-01: serve o armazenado do `created_at` (do wrap) mais novo para o mais velho. O NIP-59
+    /// sorteia esse campo, então a ordem servida é aleatória em relação à de envio (P37).
+    newest_first: bool,
 }
 
 pub struct FakeRelay {
@@ -89,6 +94,16 @@ impl FakeRelay {
         let mut state = self.state.lock().unwrap();
         state.require_auth = true;
         state.refuse_auth = true;
+    }
+
+    /// Serve o armazenado mas nunca manda o `EOSE`.
+    pub fn withhold_eose(&self) {
+        self.state.lock().unwrap().withhold_eose = true;
+    }
+
+    /// Serve o armazenado por `created_at` decrescente, como um relay real (NIP-01).
+    pub fn serve_newest_first(&self) {
+        self.state.lock().unwrap().newest_first = true;
     }
 
     /// Quantos `AUTH` o relay recebeu.
@@ -239,11 +254,20 @@ async fn connection(
                             continue;
                         }
                         subs.retain(|(s, _)| *s != sub);
-                        let stored: Vec<Event> = state.lock().unwrap().events.iter().filter(|e| matches(&filter, e)).cloned().collect();
+                        let (mut stored, newest_first, withhold_eose) = {
+                            let s = state.lock().unwrap();
+                            let stored: Vec<Event> = s.events.iter().filter(|e| matches(&filter, e)).cloned().collect();
+                            (stored, s.newest_first, s.withhold_eose)
+                        };
+                        if newest_first {
+                            stored.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+                        }
                         for event in stored {
                             let _ = tx.send(Message::text(json!(["EVENT", sub, event]).to_string())).await;
                         }
-                        let _ = tx.send(Message::text(json!(["EOSE", sub]).to_string())).await;
+                        if !withhold_eose {
+                            let _ = tx.send(Message::text(json!(["EOSE", sub]).to_string())).await;
+                        }
                         subs.push((sub, filter));
                     }
                     Some("AUTH") => {

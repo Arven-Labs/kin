@@ -43,6 +43,13 @@ pub struct NostrConfig {
     /// Quantos relays precisam aceitar para o depósito contar (`Deposited`). Com menos relays que
     /// isso, vale o número de relays. Pelo menos 1.
     pub min_replicas: usize,
+    /// P37: quanto esperar o fim do armazenado (`EOSE`) de um relay antes de entregar o backlog que já
+    /// chegou, mesmo sem ele. O backlog é ordenado pelo horário de envio antes de ir para o MLS; um relay
+    /// que nunca manda `EOSE` não pode travar a entrega.
+    pub backlog_deadline: Duration,
+    /// P37: quantos eventos segurar por sessão à espera do `EOSE`. Estourou, o lote sai (a ordem só vale
+    /// dentro de cada lote) e o seguinte começa: limita a memória diante de um relay hostil.
+    pub backlog_limit: usize,
 }
 
 impl Default for NostrConfig {
@@ -56,6 +63,8 @@ impl Default for NostrConfig {
             since_window: Duration::from_secs(10 * 24 * 3600),
             ttl: Duration::from_secs(7 * 24 * 3600),
             min_replicas: 2,
+            backlog_deadline: Duration::from_secs(5),
+            backlog_limit: 2000,
         }
     }
 }

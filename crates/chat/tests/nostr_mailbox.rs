@@ -255,6 +255,119 @@ async fn a_stored_event_is_retrieved_when_the_recipient_connects() {
     );
 }
 
+// ---- ordem do backlog (P37, ADR 0041) ----
+
+/// `n` gift wraps de `from` para `to`, criados em sequência (`m0`, `m1`, ...): no mesmo segundo, então só o
+/// desempate por microssegundo do rumor distingue a ordem de envio.
+fn burst(from: &DeviceKey, to: &DeviceKey, n: usize) -> Vec<Event> {
+    (0..n)
+        .map(|i| wrap(from, &to.nostr_public_key(), format!("m{i}").as_bytes()).unwrap())
+        .collect()
+}
+
+fn with_backlog(deadline_ms: u64, limit: usize) -> NostrConfig {
+    NostrConfig {
+        backlog_deadline: Duration::from_millis(deadline_ms),
+        backlog_limit: limit,
+        ..fast()
+    }
+}
+
+/// Os próximos `n` `Retrieved`, como texto.
+async fn retrieved_texts(rx: &mut UnboundedReceiver<MailboxEvent>, n: usize) -> Vec<String> {
+    let mut texts = Vec::new();
+    for _ in 0..n {
+        match next(rx).await {
+            MailboxEvent::Retrieved { blob, .. } => texts.push(String::from_utf8(blob).unwrap()),
+            other => panic!("esperava Retrieved, veio {other:?}"),
+        }
+    }
+    texts
+}
+
+// 7a
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlog_is_retrieved_in_send_order_even_when_the_relay_serves_it_shuffled() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    let events = burst(&ana, &bia, 20);
+    // Ordem em que o relay serve (uma permutação fixa de 0..20): nada a ver com a de envio.
+    for i in [
+        13, 2, 19, 7, 0, 15, 4, 11, 18, 1, 9, 16, 5, 12, 3, 17, 8, 14, 6, 10,
+    ] {
+        relay.inject(events[i].clone());
+    }
+
+    let mut mb = NostrMailbox::with_config(&bia, &[&relay.url], with_backlog(2000, 2000)).unwrap();
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    let expected: Vec<String> = (0..20).map(|i| format!("m{i}")).collect();
+    assert_eq!(retrieved_texts(&mut rx, 20).await, expected);
+}
+
+// 7b
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_never_sends_eose_releases_the_backlog_in_order_at_the_deadline() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.withhold_eose();
+    let events = burst(&ana, &bia, 3);
+    for i in [2, 0, 1] {
+        relay.inject(events[i].clone());
+    }
+
+    let mut mb = NostrMailbox::with_config(&bia, &[&relay.url], with_backlog(800, 2000)).unwrap();
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    // Antes do prazo nada sai (está segurando para ordenar); depois do prazo sai tudo, em ordem.
+    quiet(&mut rx, 300).await;
+    assert_eq!(retrieved_texts(&mut rx, 3).await, ["m0", "m1", "m2"]);
+}
+
+// 7c
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_published_after_eose_is_not_held_back() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"guardada").unwrap());
+
+    let mut mb = NostrMailbox::with_config(&bia, &[&relay.url], with_backlog(3000, 2000)).unwrap();
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+    assert_eq!(retrieved_texts(&mut rx, 1).await, ["guardada"]);
+
+    // O armazenado acabou (EOSE): o que chega agora é ao vivo e sai sem esperar o prazo de 3 s.
+    relay.inject(wrap(&ana, &bia.nostr_public_key(), b"ao vivo").unwrap());
+    let live = timeout(Duration::from_secs(1), retrieved_texts(&mut rx, 1))
+        .await
+        .expect("o evento ao vivo foi segurado");
+    assert_eq!(live, ["ao vivo"]);
+}
+
+// 7d
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlog_larger_than_the_hold_limit_is_still_delivered_once_each() {
+    let (ana, bia) = (DeviceKey::generate(), DeviceKey::generate());
+    let relay = FakeRelay::start(Policy::Accept).await;
+    for event in burst(&ana, &bia, 10) {
+        relay.inject(event);
+    }
+
+    // Teto de 4 por lote: o backlog sai em partes, nenhuma mensagem se perde nem se repete.
+    let mut mb = NostrMailbox::with_config(&bia, &[&relay.url], with_backlog(2000, 4)).unwrap();
+    mb.learn_peer(ana.peer_id(), ana.nostr_public_key());
+    let mut rx = attach(&mut mb);
+
+    let mut got = retrieved_texts(&mut rx, 10).await;
+    got.sort();
+    let mut expected: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
+    expected.sort();
+    assert_eq!(got, expected);
+    quiet(&mut rx, 300).await;
+}
+
 // 8
 #[tokio::test(flavor = "multi_thread")]
 async fn the_same_event_from_two_relays_is_retrieved_once() {
@@ -460,6 +573,40 @@ async fn two_real_chats_exchange_a_message_through_a_relay_while_one_is_offline(
     let mut b = pb.open();
     b.set_mailbox(mailbox(&pb.device, &[&relay.url]));
     assert_eq!(until_received(&mut b).await, "pelo relay");
+}
+
+/// P37, ponta a ponta: 40 mensagens enviadas em rajada enquanto a Bia está fora ficam no relay, que as serve
+/// por `created_at` do wrap (sorteado pelo NIP-59: ordem aleatória). Sem ordenar, o MLS só tolera 10
+/// gerações de fora de ordem e a maioria chegava como `TooOld`, ignorada em silêncio (P9 d, ADR 0041).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_deposited_while_offline_arrives_complete_and_in_order_through_a_relay() {
+    const N: usize = 40;
+    let dir = tempfile::tempdir().unwrap();
+    let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
+    let relay = FakeRelay::start(Policy::Accept).await;
+    relay.serve_newest_first();
+    let (mut a, mut b) = (pa.open(), pb.open());
+    a.set_mailbox(mailbox(&pa.device, &[&relay.url]));
+    connect(&mut a, &mut b).await;
+
+    drop(b);
+    until_disconnected(&mut a).await;
+    for i in 0..N {
+        a.send(pb.peer_id(), i.to_string(), None).unwrap();
+    }
+    for _ in 0..N {
+        until_deposited(&mut a).await;
+    }
+    assert_eq!(relay.stored().len(), N);
+
+    let mut b = pb.open();
+    b.set_mailbox(mailbox(&pb.device, &[&relay.url]));
+    let mut got = Vec::new();
+    for _ in 0..N {
+        got.push(until_received(&mut b).await);
+    }
+    let expected: Vec<String> = (0..N).map(|i| i.to_string()).collect();
+    assert_eq!(got, expected);
 }
 
 // 16
