@@ -1918,7 +1918,7 @@ impl Chat {
         // "não tenho conversa" vale se traz um `state_id` **diferente** do gravado: o velho do P35 vem da mesma
         // instância que formou a conversa, então traz o mesmo.
         let was_pending = self.hello_pending.remove(&peer);
-        if has_conversation == Some(false)
+        if has_conversation.is_some()
             && (was_pending || new_instance)
             && self.lost_state_candidate(&peer)
         {
