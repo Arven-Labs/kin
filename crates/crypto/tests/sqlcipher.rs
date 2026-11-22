@@ -56,7 +56,34 @@ fn the_build_is_sqlcipher_not_plain_sqlite() {
     let version: Option<String> = conn
         .query_row("PRAGMA cipher_version", [], |row| row.get(0))
         .expect("sem `cipher_version`: o build é SQLite comum, sem SQLCipher");
-    assert!(version.is_some_and(|v| !v.is_empty()));
+    // "4.6.1 community" no SQLCipher embutido; a série 4 é a que o ADR 0045 assume (formato de arquivo v4).
+    assert!(version.is_some_and(|v| v.starts_with("4.")));
+}
+
+/// `NOTADB`: o erro que o SQLCipher dá quando a chave não decifra a página 1 (ou quando o arquivo é em claro).
+/// Casar o **código** evita que "no such table" ou "database is locked" passem por falha de chave.
+fn is_not_a_database(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::NotADatabase
+    )
+}
+
+/// Cabeçalho de um SQLite em claro. Um arquivo cifrado não começa assim (os 16 primeiros bytes são o sal).
+const PLAIN_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+#[test]
+fn a_keyed_database_does_not_start_with_the_plain_sqlite_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let keyed = dir.path().join("h-keyed.db");
+    let plain = dir.path().join("h-plain.db");
+    {
+        write_secret(&open(&keyed, Some(KEY)));
+        write_secret(&open(&plain, None));
+    }
+    assert_ne!(&fs::read(&keyed).unwrap()[..16], PLAIN_HEADER);
+    // Controle: o banco sem chave começa com o cabeçalho conhecido.
+    assert_eq!(&fs::read(&plain).unwrap()[..16], PLAIN_HEADER);
 }
 
 #[test]
@@ -106,6 +133,11 @@ fn control_a_plain_database_shows_the_text_in_its_bytes() {
     {
         let conn = open(&path, None);
         write_secret(&conn);
+        // Conexão aberta: a escrita recente está no `-wal`, e a busca por bytes também o enxerga em claro.
+        assert!(
+            contains(&wal_of(&path), SECRET),
+            "o controle não achou o texto em claro no -wal"
+        );
     }
     assert!(
         contains(&path, SECRET),
@@ -122,9 +154,14 @@ fn the_wrong_key_and_no_key_cannot_read_and_leave_the_file_untouched() {
         write_secret(&conn);
     }
     let before = fs::read(&path).unwrap();
-    for key in [Some(OTHER_KEY), None] {
+    // Sem imprimir a chave na mensagem: o padrão será copiado para as fatias 2 e 3, com chave de verdade.
+    for (i, key) in [Some(OTHER_KEY), None].into_iter().enumerate() {
         let conn = open(&path, key);
-        assert!(read_secret(&conn).is_err(), "leu com a chave {key:?}");
+        let error = read_secret(&conn).expect_err(&format!("leu com a chave de índice {i}"));
+        assert!(
+            is_not_a_database(&error),
+            "erro inesperado no índice {i}: {error}"
+        );
     }
     assert!(fs::read(&path).unwrap() == before, "o arquivo mudou");
 }
@@ -139,10 +176,8 @@ fn a_plain_database_refuses_a_key() {
         write_secret(&conn);
     }
     let conn = open(&path, Some(KEY));
-    assert!(
-        read_secret(&conn).is_err(),
-        "um banco em claro abriu com chave"
-    );
+    let error = read_secret(&conn).expect_err("um banco em claro abriu com chave");
+    assert!(is_not_a_database(&error), "erro inesperado: {error}");
 }
 
 /// De-risca a migração da fatia 3 (`--protect`): exportar um banco em claro para uma cópia cifrada.
@@ -154,11 +189,14 @@ fn export_copies_a_plain_database_into_an_encrypted_one() {
     {
         let conn = open(&plain, None);
         write_secret(&conn);
-        conn.execute_batch("INSERT INTO t (v) VALUES ('dois'), ('tres');")
+        conn.execute_batch("INSERT INTO t (v) VALUES ('dois'), ('tres'); PRAGMA user_version = 7;")
             .unwrap();
+        // `sqlcipher_export` copia tabelas, índices, views e triggers, mas **não** os pragmas: o `user_version`
+        // decide as migrações do `Outbox`, então a cópia o recebe à mão (a fatia 3 precisa fazer o mesmo).
         conn.execute_batch(&format!(
             "ATTACH DATABASE '{}' AS enc KEY \"x'{KEY}'\";
              SELECT sqlcipher_export('enc');
+             PRAGMA enc.user_version = 7;
              DETACH DATABASE enc;",
             encrypted.display()
         ))
@@ -170,6 +208,10 @@ fn export_copies_a_plain_database_into_an_encrypted_one() {
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 3);
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7, "o user_version não chegou à cópia cifrada");
     assert_eq!(
         conn.query_row("SELECT v FROM t ORDER BY rowid LIMIT 1", [], |row| {
             row.get::<_, String>(0)

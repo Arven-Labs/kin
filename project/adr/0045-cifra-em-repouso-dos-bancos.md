@@ -1,6 +1,6 @@
 # ADR 0045 — Cifra em repouso dos bancos SQLite (SQLCipher, chave aleatória selada pela senha)
 
-- **Status**: **proposto** (2026-11-22). Desenho por leitura de código e consulta ao registro; **nada implementado, nada compilado, nenhuma dependência adicionada**. Vira código só com a decisão do dono, em fatias, cada uma com plan mode, testes primeiro e auditoria.
+- **Status**: **aceito** (2026-11-22, dono); **fatia 1 implementada** (PR #308: feature ligada e provada por teste). Fatias 2 a 4 abertas, cada uma com plan mode, testes primeiro e auditoria. Ver "Implementação, fatia 1" no fim.
 - **Relacionados**: ADR 0012 (cifra em repouso de `identity.key` e `device.key`: formato selado, política contra downgrade; deixou os bancos "fora do alcance"), ADR 0008 e 0010 (histórico no motor), ADR 0037 (endereços de peer no banco), P13, P26 (b), P32 (a).
 - **Área de segurança**: **toca criptografia** (AGENTS.md §4): cifra em repouso e gestão de chave. O formato da chave selada **reusa** o do ADR 0012; a cifra dos bancos é a do SQLCipher (padrão estabelecido), sem cripto própria. Auditoria obrigatória em cada fatia de código.
 
@@ -51,7 +51,7 @@ Cobrir o dado que importa (chaves MLS e histórico); não inventar cripto (§4);
 
 ## Consequências
 - **Fecha o P13 (bancos) e o P26 (b)**: o histórico, as chaves MLS e os endereços deixam de ficar em claro em repouso.
-- **Build:** passa a exigir OpenSSL (headers e biblioteca) no CI, no lab e no PC do dono, e é um item do futuro build mobile. O `Cargo.lock` ganha `openssl-sys` (`pkg-config` e `vcpkg` já estão nele, como build-deps do `libsqlite3-sys`); o conjunto exato de transitivas só o CI mostra.
+- **Build:** passa a exigir OpenSSL (headers e biblioteca) no CI, no lab e no PC do dono, e é um item do futuro build mobile. *(Correção na fatia 1: o `Cargo.lock` **não** ganha `openssl-sys` na variante de sistema, só na `vendored`; o binário passa a ligar a `libcrypto` dinâmica. Ver "Implementação, fatia 1".)*
 - **Supply chain:** mais um C compilado (SQLCipher 4.6.1, mantido pela Zetetic) e a dependência do OpenSSL do sistema. Dados do registro (2026-11-22): `libsqlite3-sys` e `rusqlite` têm os mesmos dois donos, última release em 2026-11 (a 0.40.0 e a 0.43.0); `openssl-sys` tem três logins de dono e a última release em 2026-11-01. O kin está atrás (0.35.0 e 0.37) porque o `openmls_sqlite_storage` fixa `rusqlite 0.37`.
 - **Achado paralelo, independe desta decisão:** o **RUSTSEC-2026-0459** (2026-10-30, CVE-2026-119375: SQLite abaixo de 3.54 pode devolver memória não inicializada do cache de páginas ao abrir um banco com um `-wal` de outro tamanho de página) afeta `libsqlite3-sys < 0.39.0`, e o kin compila a 0.35.0. A exposição é local (precisa de um `-wal` gravado por quem não é confiável) e o Dependabot não mostra alerta aberto. A correção depende de uma versão do `openmls_sqlite_storage` com `rusqlite` mais novo; é item de dependências (`/dependencias kin`), não deste ADR. O SQLCipher 4.6.1 embutido seria **atualizado junto** com essa subida.
 - **Senha perdida = identidade e histórico perdidos**, sem recuperação (a 1b, mestra fria, protege a identidade, não o histórico). Backup precisa guardar `db.key` e saber a senha.
@@ -69,3 +69,22 @@ Cobrir o dado que importa (chaves MLS e histórico); não inventar cripto (§4);
 
 ## Testes que vêm primeiro (quando houver código)
 Os da fatia 1 acima; na 3, a migração com falha injetada no meio deixa o banco antigo intacto e utilizável, e a chave errada nunca apaga o original.
+
+## Implementação, fatia 1 (PR #308)
+
+Mudou só o `Cargo.toml` do workspace (`rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }`) e entrou `crates/crypto/tests/sqlcipher.rs`. Nenhuma API do `crypto`/`chat` mudou; os bancos reais **continuam em claro** até as fatias 2 a 4.
+
+### Correções ao desenho (lidas no código e medidas no CI)
+- **`Cargo.lock` não muda.** O texto acima (Consequências) dizia que o lock ganha `openssl-sys`. Errado para a variante de sistema: com `bundled-sqlcipher` o `build.rs` do `libsqlite3-sys` só liga a `libcrypto` do sistema (`rustc-link-lib=dylib=crypto`); o crate `openssl-sys` só entra com `bundled-sqlcipher-vendored-openssl`.
+- **O motor SQLite desce de versão: de 3.50.2 para 3.46.1** (medido em `libsqlite3-sys-0.35.0`: `sqlite3/sqlite3.h` x `sqlcipher/sqlite3.h`). CVEs corrigidos entre 3.47 e 3.50.2 voltam; a exposição é pequena (o kin usa SQL estático com parâmetros e não executa SQL de terceiros), mas é regressão de patch do motor. O RUSTSEC-2026-0459 (SQLite < 3.54) afeta os dois. Sobe junto com o `libsqlite3-sys` quando o `openmls_sqlite_storage` aceitar `rusqlite` mais novo (SQLCipher 4.7+); item de dependências.
+- **O binário passa a depender de `libcrypto.so.N` dinâmica.** O binário atual é autossuficiente. No CI (`ubuntu-24.04`, OpenSSL 3.0.13) e no Lab (containers `debian:stable-slim`, 22 jobs verdes) funcionou; um binário compilado no Arch (OpenSSL 4.1.0) só roda onde houver `libcrypto.so.4`. Para distribuir fora do desenvolvimento: decidir entre `-vendored-openssl` (estático) e documentar o requisito.
+- **`sqlcipher_export` não copia o `user_version`** (lido em `sqlcipher_exportFunc`, que copia tabelas, índices, views e triggers). O `Outbox` decide as migrações por `PRAGMA user_version`; a fatia 3 tem de copiá-lo à mão (`PRAGMA enc.user_version = N`), e o teste `export_copies_a_plain_database_into_an_encrypted_one` já o fixa.
+
+### Provas
+- **Testes primeiro** (run 45084116461): 5 de 7 vermelhos pelo motivo certo, lido no log (`cipher_version` sem linha, texto em claro no `-wal`, banco em claro aceita chave, `no such function: sqlcipher_export`, chave errada lê); os 2 que passam sem a feature são o controle e a reabertura.
+- **Com a feature** (run 45084667782 e Lab 45084667736, commit `33e14e0`): 7 testes verdes e a suíte inteira, com o Lab de 22 jobs verde. O SQLCipher compilou no runner com o `libssl-dev` dele.
+- **Auditoria** (`security-auditor`, sem crítico/alto): precedência de features conferida no `build.rs` (uma só `libsqlite3-sys` por causa do `links`, o SQLCipher vence o `bundled`); bancos sem `PRAGMA key` seguem SQLite comum e compatíveis. Achados aplicados: testes casam o código `NOTADB` (não só `is_err`), cabeçalho do arquivo cifrado diferente de `SQLite format 3\0` (com controle), controle em claro também no `-wal`, `cipher_version` começa com `4.`, a chave não é impressa nas mensagens, `user_version` no export. Achado deixado: o `-shm` não é inspecionado (guarda índice do WAL, não conteúdo; risco baixo).
+- **Mutações**: sem a feature (5 testes pegam); `PRAGMA kez` no helper e busca por outro texto (PRs rascunho #309 e #310, resultado no registro da Sessão 40).
+
+### Ainda não verificado
+Build no PC do dono com OpenSSL 4.1.0 (o auditor conferiu só os símbolos: todos exportados em `libcrypto.so.4`); compatibilidade de um banco real já existente com o motor 3.46.1; `cipher_provider`; custo de CPU; mobile.
