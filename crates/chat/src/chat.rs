@@ -3973,7 +3973,7 @@ mod tests {
                 let mut order: Vec<(u64, usize)> = (0..blobs.len())
                     .map(|i| {
                         let event = crate::nostr::wrap(&sender, &recipient, &[0]).unwrap();
-                        (event.created_at.as_u64(), i)
+                        (event.created_at.as_secs(), i)
                     })
                     .collect();
                 order.sort_by(|a, b| b.0.cmp(&a.0));
