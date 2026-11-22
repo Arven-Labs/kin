@@ -525,6 +525,10 @@ pub struct Chat {
     hello_pending: HashSet<PeerId>,
     /// Peers com quem já refiz a conversa nesta conexão: um reset por conexão (auditoria, médio 2).
     reset_done: HashSet<PeerId>,
+    /// `state_id` (P36, ADR 0043) que o `Hello` de um peer apresentou e que ainda **não** está gravado: o de antes
+    /// de a conversa existir, ou o do peer que acabou de provar que perdeu o banco. O `ready` o grava como a
+    /// referência da conversa nova. Em memória, com teto, e some com a conexão.
+    pending_state_ids: HashMap<PeerId, [u8; 16]>,
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
     not_admitted_notified: HashSet<PeerId>,
@@ -796,6 +800,7 @@ impl Chat {
             lost_state: HashSet::new(),
             hello_pending: HashSet::new(),
             reset_done: HashSet::new(),
+            pending_state_ids: HashMap::new(),
             not_admitted_notified: HashSet::new(),
             require_approval: false,
             pending_approval: HashMap::new(),
@@ -1727,6 +1732,7 @@ impl Chat {
                 self.connected.remove(&peer);
                 self.hello_pending.remove(&peer);
                 self.reset_done.remove(&peer);
+                self.pending_state_ids.remove(&peer);
                 self.not_admitted_notified.remove(&peer);
                 self.forget_approval(&peer);
                 self.retry.remove(&peer);
@@ -1896,11 +1902,10 @@ impl Chat {
         presence: Option<Presence>,
     ) -> Result<(), Error> {
         let has_conversation = presence.map(|p| p.has_conversation);
-        // P36 (stub): o `state_id` do peer ainda não decide nada (as duas chamadas são stubs sem efeito).
-        if let Some(state_id) = presence.and_then(|p| p.state_id) {
-            let _ = self.outbox.peer_state(&peer);
-            let _ = self.outbox.set_peer_state(&peer, state_id);
-        }
+        // P36: o `state_id` do peer difere do que gravei ao formar a conversa?
+        let new_instance = presence
+            .and_then(|p| p.state_id)
+            .is_some_and(|state_id| self.note_state_id(peer, state_id));
         // P16: `peer` diz que não tem a conversa que eu tenho com ele (perdeu o banco). Só marca: a conversa
         // antiga continua valendo até um `KeyPackage`/`Welcome` novo, da mesma identidade, a substituir.
         // `None` (formatos antigos do `Hello`) não diz nada.
@@ -1908,9 +1913,21 @@ impl Chat {
         // P35: só vale se a conversa já existia quando a conexão abriu (`hello_pending`). Numa conversa formada
         // nesta conexão, um `Hello` "não tenho conversa" é velho (montado antes dela, chegou depois: os
         // substreams não têm ordem) e marcar `lost_state` travaria a fila do peer até a conexão cair.
+        //
+        // P36 (ADR 0043): o `hello_pending` só existe na 1ª conexão. Numa 2ª (a antiga ainda de pé), o `Hello`
+        // "não tenho conversa" vale se traz um `state_id` **diferente** do gravado: o velho do P35 vem da mesma
+        // instância que formou a conversa, então traz o mesmo.
         let was_pending = self.hello_pending.remove(&peer);
-        if has_conversation == Some(false) && was_pending && self.lost_state_candidate(&peer) {
-            self.lost_state.insert(peer);
+        if has_conversation == Some(false)
+            && (was_pending || new_instance)
+            && self.lost_state_candidate(&peer)
+        {
+            let newly_marked = self.lost_state.insert(peer);
+            // Quem tem o menor Peer ID não responde com `KeyPackage` e, na 2ª conexão, não mandou `Hello` (só sai
+            // em `PeerConnected`): sem ele o `b` (maior) nunca manda o `KeyPackage`.
+            if newly_marked && new_instance && !was_pending && self.peer_id() < peer {
+                self.send_hello(peer);
+            }
         }
         // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
         // (então ela sai pela conversa nova, depois da troca, em `ready`).
@@ -1949,6 +1966,39 @@ impl Chat {
             self.transmit(peer, &Envelope::KeyPackage(kp));
         }
         Ok(())
+    }
+
+    /// P36 (ADR 0043): registra o `state_id` que o `Hello` de `peer` apresentou e diz se ele **difere** do que
+    /// gravei quando a conversa com `peer` foi formada (`true` = outra instância de estado: o banco foi trocado).
+    ///
+    /// - Com conversa e referência gravada: só compara; a referência **não** muda aqui (quem a troca é o `ready`
+    ///   da conversa nova, com o id que ficou em `pending_state_ids`).
+    /// - Com conversa e **sem** referência (conversa de antes do P36, ou linha ilegível): grava este id e devolve
+    ///   `false`. Não confia no 1º `Hello` para decidir nada, só passa a tê-lo como referência.
+    /// - Sem conversa: guarda em memória, com teto, para o `ready` gravar (o `Hello` do `b` sai antes de a
+    ///   conversa existir, e é assim que o `a` aprende a referência).
+    ///
+    /// Erro de leitura do banco vale como "sem referência": nunca marca `lost_state` por falha de disco.
+    fn note_state_id(&mut self, peer: PeerId, state_id: [u8; 16]) -> bool {
+        if self.conversations.contains_key(&peer) {
+            match self.outbox.peer_state(&peer) {
+                Ok(Some(known)) if known != state_id => {
+                    self.pending_state_ids.insert(peer, state_id);
+                    return true;
+                }
+                Ok(None) => {
+                    let _ = self.outbox.set_peer_state(&peer, state_id);
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+            return false;
+        }
+        if self.pending_state_ids.contains_key(&peer)
+            || self.pending_state_ids.len() < MAX_HELD_KEY_PACKAGES
+        {
+            self.pending_state_ids.insert(peer, state_id);
+        }
+        false
     }
 
     /// Posso marcar `peer` como "perdeu o estado" (P16)? Só com uma conversa **1:1** com ele (a identidade
@@ -2978,6 +3028,10 @@ impl Chat {
         self.device
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
+        // P36: a referência da conversa nova é o `state_id` que o peer apresentou (se apresentou).
+        if let Some(state_id) = self.pending_state_ids.remove(&peer) {
+            let _ = self.outbox.set_peer_state(&peer, state_id);
+        }
         self.teach_mailbox(peer);
         // O endereço da janela pré-conversa (só em memória até aqui) agora tem dono: vai para o disco.
         self.persist_peer_addrs(&peer);

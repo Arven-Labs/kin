@@ -29,6 +29,7 @@ pub(crate) struct Presence {
     pub(crate) state_id: Option<[u8; 16]>,
 }
 
+#[cfg(test)]
 impl Presence {
     /// Sem `state_id` (como mandava um build anterior ao P36).
     pub(crate) fn of(has_conversation: bool) -> Self {
@@ -79,14 +80,17 @@ impl Envelope {
                 out.extend_from_slice(certificate);
                 return out;
             }
-            // Tag 5: `bits u8 | [token; 16] se bit 1 | certificado (o resto) se bit 4`. Bit 1 = tem token,
-            // bit 2 = tenho conversa com você (P16), bit 4 = tem certificado.
+            // Tag 5: `bits u8 | [token; 16] se bit 1 | [state_id; 16] se bit 8 | certificado (o resto) se
+            // bit 4`. Bit 1 = tem token, bit 2 = tenho conversa com você (P16), bit 4 = tem certificado,
+            // bit 8 = tem `state_id` (P36, ADR 0043).
             Self::Hello(token, certificate, Some(presence)) => {
                 let bits = u8::from(token.is_some())
                     | u8::from(presence.has_conversation) << 1
-                    | u8::from(certificate.is_some()) << 2;
+                    | u8::from(certificate.is_some()) << 2
+                    | u8::from(presence.state_id.is_some()) << 3;
                 let mut out = vec![5, bits];
                 out.extend(token.iter().flatten());
+                out.extend(presence.state_id.iter().flatten());
                 out.extend(certificate.iter().flatten());
                 return out;
             }
@@ -131,17 +135,26 @@ impl Envelope {
                 }
                 Self::Hello(token, Some(certificate.to_vec()), None)
             }
-            // Tag 5: só os bits 1, 2 e 4 existem; o que o bit 1 e o bit 4 prometem tem de estar lá, e o
+            // Tag 5: só os bits 1, 2, 4 e 8 existem; o que os bits 1, 8 e 4 prometem tem de estar lá, e o
             // certificado prometido não pode ser vazio.
             5 => {
                 let (&bits, rest) = payload.split_first().ok_or(Error::Malformed)?;
-                if bits & !0b111 != 0 {
+                if bits & !0b1111 != 0 {
                     return Err(Error::Malformed);
                 }
                 let (token, rest) = if bits & 1 != 0 {
                     let (token, rest) = rest.split_at_checked(16).ok_or(Error::Malformed)?;
                     (
                         Some(<[u8; 16]>::try_from(token).map_err(|_| Error::Malformed)?),
+                        rest,
+                    )
+                } else {
+                    (None, rest)
+                };
+                let (state_id, rest) = if bits & 8 != 0 {
+                    let (id, rest) = rest.split_at_checked(16).ok_or(Error::Malformed)?;
+                    (
+                        Some(<[u8; 16]>::try_from(id).map_err(|_| Error::Malformed)?),
                         rest,
                     )
                 } else {
@@ -157,7 +170,11 @@ impl Envelope {
                 } else {
                     return Err(Error::Malformed);
                 };
-                Self::Hello(token, certificate, Some(Presence::of(bits & 2 != 0)))
+                let presence = Presence {
+                    has_conversation: bits & 2 != 0,
+                    state_id,
+                };
+                Self::Hello(token, certificate, Some(presence))
             }
             1 => Self::KeyPackage(payload.to_vec()),
             2 => Self::Welcome(payload.to_vec()),
