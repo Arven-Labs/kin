@@ -2263,4 +2263,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Feito**: teste `redeposited_copies_in_random_order_never_lose_a_message` (`chat.rs`); ressalva no teste do P9 (d) (K > 8 inalcançável); ADR, PENDING e SESSIONS corrigidos. Nenhum código de produção.
 - **Não verificado**: relay real, irmãos (cada device tem a própria cadeia de gerações), backlog com mais de uma rotação; a probabilidade de perda não é zero por construção, só não apareceu em 1.000 execuções (o teste definitivo roda 30 por caso).
 - **Prova** (CI): caracterização, sem "falha antes" e sem mutação (não há código de produção).
-- **Próximo passo**: P9 (b) na Fase 5; P33 com o dono.
+- **Próximo passo**: P9 (b) na Fase 5; P33 com o dono. *(P9 (b) decidido na subseção abaixo.)*
+
+#### P9 (b): grupos pequenos como fan-out de conversas 1:1 (ADR 0042)
+
+- **Origem**: o dono pediu "p9"; do P9 só sobrava o (b). Escolheu **ADR de desenho, sem código** (plan mode) e, entre 3 direções, **grupo = fan-out de conversas 1:1**.
+- **Prior art** (busca na web com termos genéricos; **drafts individuais do IETF, não adotados, textos completos não lidos**): DMLS (Kohbrok, FREEK; guarda forks, resolve pela confirmation tag; custo: chaves antigas) e Distributed-MLS (Xue et al.; *send group* por dono, sem consenso global de ordem). RFC 9750: sem DS, a lógica de entrega fica no cliente. Nenhum tem implementação no `openmls`.
+- **Decisão** (ADR 0042): cada par de membros usa a conversa 1:1 existente; a mesma `Message`/`MessageId` entra na outbox de cada membro (como o fan-out de devices do ADR 0006). Some o committer, o `Add`/`Remove` no MLS e o disputado de commits; o `Stale` fica por par (ADR 0041). Descartados: grupo MLS com committer em rodízio (traz committer offline, permissão de proposta, rejoin, e tirar o limite de 2 do `crypto`) e DMLS (protocolo quase novo, §4).
+- **Limites aceitos e registrados**: **equivocação** (sem estado de grupo, um remetente pode contar histórias diferentes a membros diferentes; mitigação prevista no P10 b: log encadeado por hash), custo N-1 por mensagem com a janela de 8 por peer (**teto de membros a medir na Fase 5**), sem ordem total, PCS por par.
+- **Feito**: ADR 0042; P9 (b) e P10 (b) atualizados no PENDING. Nenhum código, nenhum teste.
+- **Não verificado**: o custo real de N-1 depósitos; o estado atual dos drafts (conferir no datatracker); nada foi rodado.
+- **Próximo passo**: Fase 5.1 (formato de mensagem de grupo separando o identificador do grupo do transporte por par) e P10 (b); P33 com o dono.
