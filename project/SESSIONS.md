@@ -2305,4 +2305,12 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Provas** (CI): testes primeiro, run 45062869647 (compilou, clippy ok, **12 falharam** pelo motivo certo; Lab: só os 2 `stale-connection-*` vermelhos); implementação, run 45063612148 e Lab 45063612050 verdes; mutações A, B e C lidas (PRs rascunho #296 a #298, fechados), todas pegas, com os nomes no ADR; correção da auditoria: teste vermelho no run 45065311640 (1 de 415), verde depois.
 - **Erros meus**: editei o `lab/run.sh` por um script Python (o `CLAUDE.md` manda `Edit`/`Write`); percebi no mesmo passo, revertei e refiz com `Edit`. Disse no plano que a opção 4 curava as duas ordens de Peer ID; só os testes mostraram a lacuna.
 - **Não verificado**: relay real, QUIC, NAT doméstico (P33); duração da janela residual; irmãos sem teste próprio; teto de `pending_state_ids` sem teste.
-- **Próximo passo**: o dono mescla o #295; decidir se a janela residual (mensagem antes do `Hello`) merece outro ADR; P33 continua com o dono.
+- **Próximo passo**: o dono mescla o #295; decidir se a janela residual (mensagem antes do `Hello`) merece outro ADR; P33 continua com o dono. *(#295 mesclado pelo dono (`00af1d7`); o ADR da janela na subseção abaixo.)*
+
+#### P36: ADR 0044, a janela residual (só docs)
+
+- **Origem**: o dono mandou abrir o ADR da janela ("pode abrir"); plano em plan mode, só desenho.
+- **Achado**: o `Delivered` vem do ack de transporte (`Response = ()`, enviado pelo `Node` antes de o chat decifrar), e o `SEND_WINDOW = 1` escoa a fila inteira por essa janela. A opção "segurar a fila na 2ª conexão" trava no upgrade relay→direta (o `b` só manda `Hello` em `PeerConnected`).
+- **Feito**: ADR 0044 (proposto) com 4 opções; recomendada a **D**: o `a` guarda em memória as mensagens acked depois de uma conexão extra do peer e as recoloca na outbox no `ready` do reset; a **C** (ack de entrega no chat) fica como evolução. Ponteiro no P36 do `PENDING.md`.
+- **Não verificado**: **nada foi rodado**; o desenho é por leitura de `node.rs`, `codec.rs` e `chat.rs`. Em aberto: o que a aplicação vê (segundo `Delivered`?), tetos (8 mensagens, 120 s são propostas), irmãos e a ordem dos eventos no reset.
+- **Próximo passo**: o dono decide entre D, C ou A; D vira tarefa de código em plan mode, com o teste de integração que manda a mensagem **antes** do reset primeiro.
