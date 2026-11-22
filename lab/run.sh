@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Laboratório de NAT (Fase 2): sobe relay + dois roteadores com NAT + dois peers e confere o que a
-# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|invite-single-use|invite-revoked|invite-approved|invite-denied|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart]...`
+# escada de fallback faz. Uso: `cargo build -p kin-cli && lab/run.sh [cone|symmetric|cone-quic|symmetric-quic|lossy|relay-down|invite|invite-single-use|invite-revoked|invite-approved|invite-denied|relay-failover|multi-device|multi-device-plain|history-sync|paired-device|revoke-device|reconnect|reconnect-restart|stale-connection-rst|stale-connection-silent]...`
 # (sem argumentos roda todos). Limpa containers e redes ao final.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -843,6 +843,71 @@ scenario_reconnect_restart() {
   fi
 }
 
+# P36 (MEDIÇÃO, não prova de correção; o P36 segue aberto): o `b` some sem avisar (o roteador dele descarta tudo,
+# sem RST), então a conexão direta a↔b fica meio-aberta no `a`; o `b` volta com a MESMA identidade e SEM o
+# mls.sqlite (perdeu o banco) e o `a` manda uma mensagem. Mede quando a conexão antiga cai no `a`, quando a
+# conversa é refeita, se o `a` imprime `(entregue ...)` e se o `b` recebe.
+# Modos: `rst` = o mapeamento do NAT do `b` continua vivo, então o primeiro pacote do `a` na conexão antiga chega ao
+# `b` novo, que responde RST; `silent` = o `b` novo não responde RST (como um firewall que descarta), o caso
+# verdadeiramente meio-aberto. Todos os marcos saem em segundos desde o corte da rede (`MEDIDO[modo]:`).
+stale_connection() { # modo: rst | silent
+  local mode=$1
+  setup cone || { fail "montar o laboratório"; return; }
+  wait_direct a "$B_ID" 60 || { fail "sem conexão direta a↔b: não há o que medir (o hole punching varia; rode de novo)"; return; }
+  check "mensagem chega antes (rede viva)" delivered a b "antes" || return
+
+  local d0 r0 p0 e0
+  d0=$(count_log a "desconectado de $B_ID"); r0=$(count_log a "rota com $B_ID")
+  p0=$(count_log a "conversa cifrada pronta"); e0=$(count_log a "\\(entregue .* a $B_ID\\)")
+
+  # O `b` "perde o banco": mesma identidade (e Peer ID), sem o mls.sqlite (cópia do /data sem ele para um diretório novo).
+  compose exec -T b sh -c 'mkdir -p /data2 && for f in /data/*; do case "$f" in /data/mls.sqlite*) ;; *) cp -r "$f" /data2/ ;; esac; done' \
+    || { fail "copiar as chaves do b"; return; }
+  compose exec -T b sh -c "echo '--data-dir /data2 --no-mdns --relay $RELAY_ADDR --dial $A_CIRCUIT' > /tmp/kin-args"
+
+  # O `b` some sem avisar: nenhum FIN nem RST chega ao `a`.
+  compose exec -T routerb iptables -I FORWARD 1 -j DROP || { fail "cortar a rede do b"; return; }
+  local t0=$SECONDS
+  compose stop b >/dev/null
+  compose exec -T routerb iptables -D FORWARD 1
+  compose start b >/dev/null
+  # O netns do container é recriado no `start`: a regra do modo `silent` entra depois dele.
+  [ "$mode" = silent ] && compose exec -T b iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+  wait_log_n b "reserva aceita no relay" 2 30 || { fail "b não voltou à rede"; logs b | tail -20; return; }
+  local t_back=$((SECONDS - t0))
+
+  say a "no limbo"
+  # 90 s: acima dos 60 s do `idle_connection_timeout` (node.rs). Medido com 180 s em 4 rodadas (2 por modo): o `b` nunca
+  # recebeu e a conexão antiga nunca caiu; o padrão fica em 90 s para não pesar o CI (STALE_WAIT=180 repete a medição).
+  local t_disc="" t_deliv="" t_recv="" t_ready="" i wait_s=${STALE_WAIT:-90}
+  for i in $(seq "$wait_s"); do
+    [ -z "$t_disc" ] && [ "$(count_log a "desconectado de $B_ID")" -gt "$d0" ] && t_disc=$((SECONDS - t0))
+    [ -z "$t_deliv" ] && [ "$(count_log a "\\(entregue .* a $B_ID\\)")" -gt "$e0" ] && t_deliv=$((SECONDS - t0))
+    [ -z "$t_ready" ] && [ "$(count_log a "conversa cifrada pronta")" -gt "$p0" ] && t_ready=$((SECONDS - t0))
+    [ -z "$t_recv" ] && logs b | grep -q "peer: no limbo" && t_recv=$((SECONDS - t0))
+    [ -n "$t_recv" ] && break
+    sleep 1
+  done
+  local r1; r1=$(( $(count_log a "rota com $B_ID") - r0 ))
+  echo "  MEDIDO[$mode]: a=$A_ID b=$B_ID (o log não diz qual é o menor; comparar os IDs depois)"
+  echo "  MEDIDO[$mode]: b de volta à rede em ${t_back}s; a conexão antiga caiu no a em ${t_disc:-nunca (${wait_s} s)}s; conversa refeita no a em ${t_ready:-nunca (${wait_s} s)}s"
+  echo "  MEDIDO[$mode]: o a imprimiu (entregue ...) em ${t_deliv:-nunca}s; o b recebeu 'no limbo' em ${t_recv:-nunca}s; rotas novas vistas no a: $r1"
+  if [ -n "$t_deliv" ] && { [ -z "$t_recv" ] || [ "$t_deliv" -lt "$t_recv" ]; }; then
+    echo "  MEDIDO[$mode]: (entregue) ANTES de o b receber: ack de transporte falso (a janela do P36 existe)"
+  fi
+  # FIXA O ESTADO ATUAL (P36 aberto): a janela NÃO se fecha sozinha e a mensagem se perde. Quando o P36 for corrigido, esta
+  # asserção se inverte (o `b` passa a receber) e os dois cenários viram regressão de verdade.
+  check "P36 reproduzido: o b NÃO recebe 'no limbo' em ${wait_s} s (inverter na correção)" test -z "$t_recv"
+}
+scenario_stale_connection_rst() {
+  echo "== P36 (medição): conexão antiga meio-aberta, o b novo responde RST"
+  stale_connection rst
+}
+scenario_stale_connection_silent() {
+  echo "== P36 (medição): conexão antiga meio-aberta, o b novo NÃO responde RST (descarte silencioso)"
+  stale_connection silent
+}
+
 # run_scenario NOME: roda um cenário (FAILED fica 1 se algo falhou).
 run_scenario() {
   case "$1" in
@@ -865,6 +930,8 @@ run_scenario() {
     revoke-device) scenario_revoke_device ;;
     reconnect) scenario_reconnect ;;
     reconnect-restart) scenario_reconnect_restart ;;
+    stale-connection-rst) scenario_stale_connection_rst ;;
+    stale-connection-silent) scenario_stale_connection_silent ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
   esac
 }

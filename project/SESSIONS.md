@@ -2274,3 +2274,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Feito**: ADR 0042; P9 (b) e P10 (b) atualizados no PENDING. Nenhum código, nenhum teste.
 - **Não verificado**: o custo real de N-1 depósitos; o estado atual dos drafts (conferir no datatracker); nada foi rodado.
 - **Próximo passo**: Fase 5.1 (formato de mensagem de grupo separando o identificador do grupo do transporte por par) e P10 (b); P33 com o dono.
+
+#### P36: medição no laboratório de NAT (PR #293)
+
+- **Origem**: o dono pediu "vamos de p36". A linha do P36 já trazia a decisão dele (2026-11-21): não codar, medir antes, reabrir com o P33. Como o P33 segue bloqueado (sem VPS), a escolha foi **medir no laboratório de NAT** (plan mode): sem código de produção.
+- **Feito**: cenários `stale-connection-rst` e `stale-connection-silent` em `lab/run.sh` (opt-in, fora da lista padrão; entram na matriz do `Lab`, que não é check obrigatório): o `b` some (o roteador dele descarta tudo), reinicia com a mesma identidade e sem o `mls.sqlite`, volta, e o `a` manda uma mensagem. `README` do lab e matriz do `lab.yml` atualizados (CI, §4: só uma linha na matriz).
+- **Resultado** (CI, 6 rodadas: 3 por modo, com as duas ordens de Peer ID em cada; 4 com espera de 180 s e 2 com 90 s; idêntico nas 6): a conexão antiga **não caiu em 180 s** (nem em 90 s); a conversa **nunca foi refeita**; o `a` imprimiu `(entregue ...)` em 11 a 18 s enquanto o `b` imprimiu `(descartado ...: sem conversa com o peer)`: **ack falso e, por leitura do `MessageDelivered`, a mensagem se perde**. Hipótese anterior (a janela dura ~60 s, o `idle_connection_timeout`) **descartada**: o tráfego novo do `a` mantém a conexão antiga.
+- **Controle do `invite`**: no 1º run do PR o job `invite` falhou (2 asserções) e passou na repetição; o PR não toca código nem esse cenário. **Uma falha sem controle não prova instabilidade**: registrada, não investigada.
+- **Erros meus**: o 1º desenho fazia os cenários falharem de propósito (a asserção era "o `b` recebe"); inverti para fixar o estado atual, como os testes do P36 (`..._not_rehandshaked_yet`), para o Lab não ficar vermelho em todo PR.
+- **Não verificado**: só conexão direta; QUIC; NAT doméstico (P33); frequência real; o efeito exato da ordem dos Peer IDs (o sintoma foi o mesmo nas duas ordens, nos dois modos; o mecanismo por ordem segue por leitura); a perda da mensagem é por leitura do código, o log só mostra o `(entregue)` e o `(descartado)`.
+- **Prova** (CI): medição, sem "falha antes" e sem mutação (não há código de produção).
+- **Próximo passo**: decisão do dono sobre a prioridade do P36 e sobre reabrir uma das 3 saídas (agora com um número e uma perda de mensagem em mãos); P33 continua com o dono.
