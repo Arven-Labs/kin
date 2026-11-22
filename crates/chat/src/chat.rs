@@ -1804,7 +1804,6 @@ impl Chat {
                 self.state_id_marks.remove(&peer);
                 self.first_route_pending.remove(&peer);
                 self.extra_connection.remove(&peer);
-                self.replay.remove(&peer);
                 self.not_admitted_notified.remove(&peer);
                 self.forget_approval(&peer);
                 self.retry.remove(&peer);
