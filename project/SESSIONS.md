@@ -2324,4 +2324,15 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Auditoria** (`security-auditor`, sem crítico/alto): médio 1 (marca por `MessageId`, não por peer: multi-device) e médio 2 (mensagem em voo no reset continuava perdida) **corrigidos** com 2 testes novos; baixo 3 (espelho falha fechada) e 6 (limpeza, poda por idade) corrigidos; baixo 4 (ordem) e 5 (falha do `ready`) ficam como limites no ADR. O baixo 3 ficou **sem teste** (exige erro de banco injetado).
 - **Erros meus**: (1) fiz 2 testes de integração (um por ordem de Peer ID) e rodei 3 vezes no CI antes de entender que o resultado depende da paridade dos pedidos que caem na conexão antiga (sem ser dirigida); tirei os testes em vez de ajustar prazo até passar; (2) a 1ª versão da correção do médio 2 marcava o ack tardio como silencioso, o que esconderia o `Delivered` para sempre; percebi ao escrever o teste.
 - **Não verificado**: o cenário pela rede real (nem teste de integração, nem Lab novo: a janela é de milissegundos); relay real, NAT doméstico (P33); a `main` tem 19 diferenças de `cargo fmt --check` anteriores a este PR (não mexi).
-- **Próximo passo**: o dono mescla o #300; fechar os PRs de mutação #301 a #305 (`gh pr close N -R Arven-Labs/kin --delete-branch`).
+- **Próximo passo**: o dono mescla o #300; fechar os PRs de mutação #301 a #305 (`gh pr close N -R Arven-Labs/kin --delete-branch`). *(Mesclado pelo dono (`f5a1736`); os PRs de mutação #301 a #306 foram fechados com as branches apagadas.)*
+
+### 2026-11-22 — Sessão 40
+
+#### P13 / P26b: ADR 0045, cifra em repouso dos bancos (só docs)
+
+- **Origem**: depois do P36, o dono pediu o próximo item de código ("oq fazemos agora?") e escolheu o P13 ("vamos de 1"). Plan mode; duas decisões do dono: **SQLCipher** e **chave aleatória selada pela mesma senha**.
+- **Achados (leitura e registro, nada compilado)**: são 3 bancos em claro (`mls.sqlite` pelo `openmls_sqlite_storage`, `mls.outbox.db`, pareamento). O `libsqlite3-sys` já compila o SQLite (`bundled` do `openmls_sqlite_storage`) e a feature `bundled-sqlcipher` é aditiva sobre ele (SQLCipher 4.6.1, BSD-3). Cifrar no app não serve: o `Codec` do openmls usa a mesma função para chave de busca e valor.
+- **Achado paralelo**: o RUSTSEC-2026-0459 (SQLite < 3.54 devolve memória não inicializada com um `-wal` de outro tamanho de página) afeta `libsqlite3-sys < 0.39.0`; o kin usa a 0.35.0, fixada pelo `openmls_sqlite_storage` (`rusqlite ^0.37`). Exposição local; o Dependabot não mostra alerta. Fica como item de dependências, fora do ADR.
+- **Feito**: ADR 0045 (proposto) com 4 alternativas, decisão, 4 fatias futuras, consequências e "o que não sei"; ponteiro no P13 do `PENDING.md`.
+- **Não verificado**: **nada foi compilado**. Em aberto: se o SQLCipher 4.6.1 compila com o OpenSSL 4.1.0 do Arch (fallback `bundled-sqlcipher-vendored-openssl`); se o runner tem mesmo `libssl-dev`; a interação das features na árvore; custo de CPU; mobile; o conteúdo do `-shm`.
+- **Próximo passo**: o dono aceita o ADR; a fatia 1 (dependência e build no CI, com teste de "texto conhecido não aparece no arquivo") é a primeira tarefa de código, em plan mode e com auditoria (§4). `/dependencias kin` para o RUSTSEC-2026-0459.
