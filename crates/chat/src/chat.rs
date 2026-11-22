@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -69,7 +69,9 @@ pub enum ChatEvent {
     },
     /// O outro lado perdeu o estado da conversa (P16) e ela foi **refeita** com ele: o grupo antigo foi
     /// descartado e um novo, com a mesma identidade, o substituiu. Chega antes do `ConversationReady` da
-    /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido.
+    /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido, **exceto**
+    /// (ADR 0044) o que recebeu o ack com uma conexão extra do peer aberta: até 8 mensagens dos últimos 120 s são
+    /// reenviadas pela conversa nova, sem um segundo `Delivered`.
     ConversationReset {
         peer: PeerId,
         /// A identidade do outro lado (a mesma da conversa antiga): quem a aplicação mostra ao usuário.
@@ -341,6 +343,11 @@ const MAX_HELD_KEY_PACKAGES: usize = 64;
 /// Quantas vezes por conexão um peer pode marcar `lost_state` pelo caminho do `state_id` (P36, auditoria,
 /// baixo 1): o `reset_done` só vale para a troca que dá certo, e uma tentativa que falha limpa a suspeita.
 const MAX_STATE_ID_MARKS: u8 = 2;
+/// Quantas mensagens com ack na janela da conexão extra se guardam por peer para o reenvio (P36, ADR 0044): o
+/// mesmo teto de [`MAILBOX_WINDOW`], que já limita o quanto fica sem confirmação.
+const MAX_REPLAY: usize = MAILBOX_WINDOW;
+/// Depois disto uma mensagem guardada para o reenvio vale nada (P36, ADR 0044): a janela é de segundos.
+const REPLAY_MAX_AGE: Duration = Duration::from_secs(120);
 /// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
 const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
@@ -535,6 +542,20 @@ pub struct Chat {
     /// Quantas vezes cada peer marcou `lost_state` pelo `state_id` nesta conexão, até [`MAX_STATE_ID_MARKS`].
     /// Em memória; zera ao desconectar.
     state_id_marks: HashMap<PeerId, u8>,
+    /// Peers cuja 1ª `PeerRoute` (a da 1ª conexão, que o `Node` emite logo depois do `PeerConnected`) ainda não
+    /// chegou (P36, ADR 0044): essa rota não é conexão extra. Em memória; some com a conexão.
+    first_route_pending: HashSet<PeerId>,
+    /// Peers com uma conexão **extra** aberta (P36, ADR 0044): a janela em que um ack de transporte pode vir de
+    /// um `b` trocado. Em memória; some com a conexão.
+    extra_connection: HashSet<PeerId>,
+    /// Mensagens com ack recebido **dentro** da janela (`extra_connection`), por peer, com a hora do ack (P36,
+    /// ADR 0044): se a conversa for refeita, voltam à outbox. Teto [`MAX_REPLAY`] por peer e [`REPLAY_MAX_AGE`].
+    replay: HashMap<PeerId, VecDeque<(Message, Instant)>>,
+    /// Mensagens recolocadas na outbox pelo reenvio: o ack delas não emite `Delivered` de novo (a aplicação já viu).
+    replayed: HashSet<(PeerId, MessageId)>,
+    /// Mensagens que estavam em voo para o peer quando a conversa foi refeita (P36, auditoria, médio 2): o ack
+    /// delas ainda pode vir de um `b` trocado. Quando vier, voltam à outbox como as demais. Em memória.
+    late_ack: HashSet<(PeerId, MessageId)>,
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
     not_admitted_notified: HashSet<PeerId>,
@@ -808,6 +829,11 @@ impl Chat {
             reset_done: HashSet::new(),
             pending_state_ids: HashMap::new(),
             state_id_marks: HashMap::new(),
+            first_route_pending: HashSet::new(),
+            extra_connection: HashSet::new(),
+            replay: HashMap::new(),
+            replayed: HashSet::new(),
+            late_ack: HashSet::new(),
             not_admitted_notified: HashSet::new(),
             require_approval: false,
             pending_approval: HashMap::new(),
@@ -1446,6 +1472,59 @@ impl Chat {
         Ok(())
     }
 
+    /// P36 (ADR 0044): guarda a mensagem que acabou de receber ack **dentro da janela da conexão extra**, antes
+    /// de a outbox a apagar. Teto [`MAX_REPLAY`] por peer (sai a mais velha). Erro de leitura do banco: não guarda
+    /// (o reenvio é um reforço, nunca bloqueia o ack).
+    fn keep_for_replay(&mut self, peer: PeerId, id: &MessageId) {
+        let Ok(entries) = self.outbox.entries(&peer) else {
+            return;
+        };
+        let Some(message) = entries.into_iter().find(|m| m.id == *id) else {
+            return;
+        };
+        let kept = self.replay.entry(peer).or_default();
+        // Poda por idade a cada entrada: numa conexão longa com a janela aberta o buffer não guarda texto velho.
+        kept.retain(|(_, acked_at)| acked_at.elapsed() <= REPLAY_MAX_AGE);
+        kept.push_back((message, Instant::now()));
+        while kept.len() > MAX_REPLAY {
+            kept.pop_front();
+        }
+    }
+
+    /// P36 (ADR 0044): a conversa com `peer` foi refeita porque ele perdeu o banco. O que recebeu ack na janela da
+    /// conexão extra (e não passou de [`REPLAY_MAX_AGE`]) volta à outbox com o mesmo `MessageId` e sai cifrado na
+    /// conversa nova; o ack dele não emite `Delivered` de novo. A janela fecha: a conversa nova é a de agora. O que
+    /// estava **em voo** agora (cifrado na conversa antiga, sem ack) ainda pode ser confirmado por um `b` trocado:
+    /// o ack tardio dele também volta à outbox (`late_ack`).
+    fn replay_after_reset(&mut self, peer: PeerId) {
+        self.extra_connection.remove(&peer);
+        if let Some(flying) = self.in_flight.get(&peer) {
+            self.late_ack.extend(flying.iter().map(|id| (peer, *id)));
+        }
+        self.requeue_kept(peer, true);
+    }
+
+    /// Recoloca na outbox, com o mesmo `MessageId`, o que `keep_for_replay` guardou e ainda não envelheceu.
+    /// `silent`: a aplicação já viu o `Delivered` dessas mensagens, então o ack do reenvio não o emite de novo
+    /// (o ack tardio de uma mensagem que estava em voo **não** é silencioso: ela nunca foi dada por entregue).
+    fn requeue_kept(&mut self, peer: PeerId, silent: bool) {
+        let Some(kept) = self.replay.remove(&peer) else {
+            return;
+        };
+        for (message, acked_at) in kept {
+            if acked_at.elapsed() > REPLAY_MAX_AGE {
+                continue;
+            }
+            if let Err(e) = self.outbox.enqueue(&peer, &message) {
+                self.drop_message(peer, e);
+                continue;
+            }
+            if silent {
+                self.replayed.insert((peer, message.id));
+            }
+        }
+    }
+
     fn leave_flight(&mut self, peer: PeerId, message: &MessageId) {
         if let Some(flying) = self.in_flight.get_mut(&peer) {
             flying.remove(message);
@@ -1718,6 +1797,8 @@ impl Chat {
             NodeEvent::Listening(addr) => self.queue.push_back(ChatEvent::Listening(addr)),
             NodeEvent::PeerConnected(peer) => {
                 self.connected.insert(peer);
+                // A rota que o `Node` emite logo depois é a desta 1ª conexão, não uma conexão extra (P36).
+                self.first_route_pending.insert(peer);
                 // Conectado, a fila sai direto (`flush` abaixo): o novo depósito agendado não faz mais sentido.
                 self.forget_deposit_retry(&peer);
                 self.forget_redial(&peer);
@@ -1741,6 +1822,10 @@ impl Chat {
                 self.reset_done.remove(&peer);
                 self.pending_state_ids.remove(&peer);
                 self.state_id_marks.remove(&peer);
+                self.first_route_pending.remove(&peer);
+                self.extra_connection.remove(&peer);
+                self.replay.remove(&peer);
+                self.late_ack.retain(|(p, _)| *p != peer);
                 self.not_admitted_notified.remove(&peer);
                 self.forget_approval(&peer);
                 self.retry.remove(&peer);
@@ -1793,10 +1878,26 @@ impl Chat {
                     self.retry.remove(&peer);
                     // E à varredura por idade: com ack o peer está de volta, as rodadas gastas não valem mais.
                     self.sweep_rounds.remove(&peer);
+                    // P36 (ADR 0044): com uma conexão extra aberta (ou com a mensagem em voo no reset) o ack pode
+                    // vir de um `b` trocado, cujo chat ainda vai recusar a mensagem. Guarda-a antes de a linha
+                    // sumir, para o reenvio. Falha fechada: só entrada comum (um erro de leitura não vira `Plain`).
+                    let late = self.late_ack.remove(&(peer, message));
+                    let plain = matches!(
+                        self.outbox.entry_kind(&peer, &message),
+                        Ok(EntryKind::Plain)
+                    );
+                    if plain && (late || self.extra_connection.contains(&peer)) {
+                        self.keep_for_replay(peer, &message);
+                    }
                     if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
-                    if !mirror {
+                    // Ack tardio de uma mensagem que estava em voo no reset: a conversa já é a nova, volta já.
+                    if late {
+                        self.requeue_kept(peer, false);
+                    }
+                    // Reenviada pelo reset: a aplicação já viu o `Delivered` da 1ª vez (ADR 0044).
+                    if !mirror && !self.replayed.remove(&(peer, message)) && !late {
                         self.queue.push_back(ChatEvent::Delivered { peer, message });
                     }
                     self.flush(peer);
@@ -1817,6 +1918,7 @@ impl Chat {
                     // reconectar.
                     Some(message) => {
                         self.leave_flight(peer, &message);
+                        self.late_ack.remove(&(peer, message));
                         let first = !self.connected.contains(&peer) || self.schedule_retry(peer);
                         if first {
                             self.queue.push_back(ChatEvent::Queued { peer, message });
@@ -1840,6 +1942,11 @@ impl Chat {
                 }
             }
             NodeEvent::PeerRoute { peer, relayed } => {
+                // A 1ª rota depois do `PeerConnected` é a da própria conexão; as seguintes são conexões extras
+                // (hole punching, ou o peer que voltou com a antiga ainda de pé) e abrem a janela do ADR 0044.
+                if !self.first_route_pending.remove(&peer) && self.connected.contains(&peer) {
+                    self.extra_connection.insert(peer);
+                }
                 self.queue.push_back(ChatEvent::Route { peer, relayed });
             }
             NodeEvent::NatStatus(status) => self.queue.push_back(ChatEvent::Nat(status)),
@@ -2261,6 +2368,8 @@ impl Chat {
             self.queue
                 .push_back(ChatEvent::ConversationReset { peer, identity });
         }
+        // Antes do `ready`, que faz o `flush`: o que o `Delivered` da janela deu por entregue sai de novo.
+        self.replay_after_reset(peer);
         if let Err(e) = self.ready(peer, conversation) {
             // Se a nova não entrou, a antiga volta: sem conversa nenhuma não há cura até a próxima conexão
             // (auditoria, baixo 3). Se entrou e algo depois falhou, a nova fica.
@@ -3291,6 +3400,12 @@ impl Chat {
         self.history_sessions.remove(&peer);
         self.history_requests.retain(|_, p| *p != peer);
         self.in_flight.remove(&peer);
+        // P36 (ADR 0044): sem conversa nem fila, nada a reenviar; o texto guardado não fica em memória.
+        self.first_route_pending.remove(&peer);
+        self.extra_connection.remove(&peer);
+        self.replay.remove(&peer);
+        self.replayed.retain(|(p, _)| *p != peer);
+        self.late_ack.retain(|(p, _)| *p != peer);
         self.retry.remove(&peer);
         self.forget_deposit_retry(&peer);
         self.forget_redial(&peer);
@@ -7344,6 +7459,263 @@ mod tests {
         assert!(ana.is_ready(&b));
         assert!(!ana.hello_pending.contains(&b), "conversa criada agora");
         (ana, b)
+    }
+
+    /// P36 (ADR 0044): `ana` (de menor Peer ID) com conversa pronta com `b`, conectada como numa reconexão normal
+    /// (o `Hello` já chegou; a rota da 1ª conexão já passou), e um 2º `KeyPackage` de `b` (mesma identidade) para
+    /// o reset. A janela da conexão extra **não** está aberta.
+    fn ana_connected_for_replay() -> (Chat, PeerId, Vec<u8>) {
+        let (id_a, id_t) = (
+            StandaloneIdentity::generate(),
+            StandaloneIdentity::generate(),
+        );
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package = || {
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap()
+        };
+        let mut ana = chat(&id_a, &dev_a);
+        ana.on_key_package(b, &key_package()).unwrap();
+        connect_peer(&mut ana, b);
+        // O `Node` emite a rota da 1ª conexão logo depois do `PeerConnected` (`node.rs`): não é conexão extra.
+        ana.handle(NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        });
+        events(&mut ana);
+        (ana, b, key_package())
+    }
+
+    /// Manda `text`, o transporte do outro lado confirma (ack) e devolve o que a aplicação viu.
+    fn send_and_ack(ana: &mut Chat, b: PeerId, text: &str) -> Vec<ChatEvent> {
+        ana.send(b, text, None).unwrap();
+        let id = first_in_flight(ana);
+        events(ana);
+        ana.handle(NodeEvent::MessageDelivered { peer: b, id });
+        events(ana)
+    }
+
+    fn open_extra_connection(ana: &mut Chat, b: PeerId) {
+        ana.handle(NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        });
+    }
+
+    /// P36 (ADR 0044): `b` perdeu o banco: o `Hello` dele marca `lost_state` e o `KeyPackage` troca a conversa.
+    fn reset_conversation(ana: &mut Chat, b: PeerId, key_package: &[u8]) {
+        ana.lost_state.insert(b);
+        ana.on_key_package(b, key_package).unwrap();
+        assert!(events(ana).iter().any(is_reset), "o reset não aconteceu");
+    }
+
+    fn outbox_texts(ana: &Chat, b: PeerId) -> Vec<String> {
+        ana.outbox
+            .entries(&b)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    /// P36 (ADR 0044): o que recebeu ack **dentro** da janela da conexão extra pode ter ido a um `b` trocado: ao
+    /// refazer a conversa volta à outbox, com o mesmo `MessageId`, e sai de novo pela conversa nova.
+    #[tokio::test]
+    async fn a_message_acked_in_the_extra_connection_window_comes_back_after_the_reset() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "no limbo");
+        assert_eq!(ana.replay[&b].len(), 1, "o ack na janela não foi guardado");
+        assert_eq!(ana.queued(&b), 0, "o ack tirou da outbox");
+
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["no limbo"]);
+    }
+
+    /// P36 (ADR 0044): o que recebeu ack **antes** da conexão extra aparecer não é reenviado (não há como saber
+    /// se foi perdido, e reenviar história antiga repetiria o que o `b` já tem).
+    #[tokio::test]
+    async fn a_message_acked_before_the_extra_connection_is_not_replayed() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        send_and_ack(&mut ana, b, "antes");
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "dentro");
+
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["dentro"]);
+    }
+
+    /// P36 (ADR 0044): a 1ª `PeerRoute` depois do `PeerConnected` é a da própria 1ª conexão: não abre a janela.
+    /// Sem este teste, toda conexão normal guardaria tudo o que fosse confirmado.
+    #[tokio::test]
+    async fn the_route_of_the_first_connection_does_not_open_the_window() {
+        let (mut ana, b, _key_package) = ana_connected_for_replay();
+        send_and_ack(&mut ana, b, "normal");
+        assert!(
+            ana.replay.get(&b).is_none_or(|q| q.is_empty()),
+            "a rota da 1ª conexão abriu a janela"
+        );
+        // Controle: a rota seguinte (conexão extra) abre.
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "extra");
+        assert_eq!(ana.replay[&b].len(), 1);
+    }
+
+    /// P36 (ADR 0044): no máximo `MAX_REPLAY` por peer, e ficam as mais novas.
+    #[tokio::test]
+    async fn only_the_newest_messages_up_to_the_cap_are_replayed() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        let total = MAX_REPLAY + 2;
+        for i in 0..total {
+            send_and_ack(&mut ana, b, &format!("m{i}"));
+        }
+        reset_conversation(&mut ana, b, &key_package);
+        let expected: Vec<String> = (2..total).map(|i| format!("m{i}")).collect();
+        assert_eq!(outbox_texts(&ana, b), expected);
+    }
+
+    /// P36 (ADR 0044): passada a idade máxima, a mensagem guardada vale nada; a recente volta.
+    #[tokio::test]
+    async fn a_message_older_than_the_max_age_is_not_replayed() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "velha");
+        send_and_ack(&mut ana, b, "nova");
+        let old = Instant::now()
+            .checked_sub(REPLAY_MAX_AGE + Duration::from_secs(1))
+            .unwrap();
+        if let Some(queue) = ana.replay.get_mut(&b) {
+            queue.front_mut().unwrap().1 = old;
+        }
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["nova"]);
+    }
+
+    /// P36 (ADR 0044): a janela e o buffer são da conexão: `PeerDisconnected` apaga os dois, e a conexão
+    /// seguinte começa fechada (sem herdar o que foi guardado).
+    #[tokio::test]
+    async fn a_disconnect_clears_the_window_and_the_buffer() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        send_and_ack(&mut ana, b, "no limbo");
+        assert_eq!(ana.replay[&b].len(), 1, "controle: guardou");
+
+        ana.handle(NodeEvent::PeerDisconnected(b));
+        events(&mut ana);
+        assert!(!ana.replay.contains_key(&b));
+        assert!(!ana.extra_connection.contains(&b));
+
+        connect_peer(&mut ana, b);
+        ana.handle(NodeEvent::PeerRoute {
+            peer: b,
+            relayed: false,
+        });
+        send_and_ack(&mut ana, b, "nova conexão");
+        reset_conversation(&mut ana, b, &key_package);
+        assert!(
+            outbox_texts(&ana, b).is_empty(),
+            "herdou da conexão anterior"
+        );
+    }
+
+    /// P36 (ADR 0044): decisão do dono, reenvio silencioso: o ack da mensagem reenviada tira da outbox e **não**
+    /// emite `Delivered` de novo (a aplicação já viu um).
+    #[tokio::test]
+    async fn the_ack_of_a_replayed_message_does_not_emit_delivered_again() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        let first = send_and_ack(&mut ana, b, "no limbo");
+        assert!(
+            first
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "o 1º ack emite Delivered (já visto pela aplicação)"
+        );
+        reset_conversation(&mut ana, b, &key_package);
+        assert_eq!(outbox_texts(&ana, b), ["no limbo"], "controle: voltou");
+
+        let id = first_in_flight(&ana);
+        events(&mut ana);
+        ana.handle(NodeEvent::MessageDelivered { peer: b, id });
+        let seen = events(&mut ana);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "Delivered duplicado: {seen:?}"
+        );
+        assert_eq!(ana.queued(&b), 0);
+    }
+
+    /// P36 (ADR 0044, auditoria médio 2): uma mensagem **em voo** (cifrada na conversa antiga, sem ack) quando a
+    /// conversa é refeita pode ser confirmada depois por um `b` trocado. O ack tardio a recoloca na outbox, e
+    /// como a aplicação **nunca** viu `Delivered` dela, esse ack não o emite (o do reenvio emitirá).
+    #[tokio::test]
+    async fn a_message_in_flight_at_the_reset_is_replayed_when_its_late_ack_arrives() {
+        let (mut ana, b, key_package) = ana_connected_for_replay();
+        open_extra_connection(&mut ana, b);
+        ana.send(b, "em voo", None).unwrap();
+        let id = first_in_flight(&ana);
+        events(&mut ana);
+
+        reset_conversation(&mut ana, b, &key_package);
+        ana.handle(NodeEvent::MessageDelivered { peer: b, id });
+        let seen = events(&mut ana);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "o ack tardio é do b trocado, não é entrega: {seen:?}"
+        );
+        assert_eq!(
+            outbox_texts(&ana, b),
+            ["em voo"],
+            "o ack tardio perdeu a mensagem"
+        );
+
+        // O ack do reenvio, esse sim, é a entrega: a aplicação ainda não tinha visto nenhuma.
+        let again = first_in_flight(&ana);
+        ana.handle(NodeEvent::MessageDelivered { peer: b, id: again });
+        assert!(
+            events(&mut ana)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. }))
+        );
+        assert_eq!(ana.queued(&b), 0);
+    }
+
+    /// P36 (ADR 0044, auditoria médio 1): o reenvio de um device não pode engolir o `Delivered` de outro device
+    /// da mesma identidade que recebeu a mesma `MessageId`: a marca é por (peer, mensagem).
+    #[tokio::test]
+    async fn the_replay_mark_of_one_device_does_not_silence_another_devices_delivered() {
+        let (mut ana, b, _key_package) = ana_connected_for_replay();
+        let id = ana.send(b, "para dois devices", None).unwrap();
+        let other = DeviceKey::generate().peer_id();
+        ana.replayed.insert((other, id));
+        events(&mut ana);
+        ana.handle(NodeEvent::MessageDelivered {
+            peer: b,
+            id: first_in_flight(&ana),
+        });
+        assert!(
+            events(&mut ana)
+                .iter()
+                .any(|e| matches!(e, ChatEvent::Delivered { .. })),
+            "a marca do outro device engoliu o Delivered"
+        );
+        assert!(
+            ana.replayed.contains(&(other, id)),
+            "a marca do outro device se perdeu"
+        );
     }
 
     /// P36 (ADR 0043): o `Hello` "não tenho conversa" com um `state_id` **diferente** do que o `a` gravou ao
