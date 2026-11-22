@@ -2295,4 +2295,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Achado**: o defeito não é só a conexão morta. O `a` nunca sabe que o `b` perdeu a conversa, porque o `Hello(false)` é ignorado pelo gate `hello_pending` (P35), que só existe na 1ª conexão. Por isso a saída 1 (fechar a conexão antiga) **não cura sozinha**; a 2 já regrediu no #267; a 3 e o `ping` não resolvem.
 - **Direção proposta** (opção 4): `state_id` aleatório no `mls.sqlite` do `b`, levado no `Hello` (bit 8 da tag 5) e comparado com o que o `a` gravou ao formar a conversa. Muda o fio e o schema (v10) e toca §4.
 - **Não verificado**: **nada foi rodado**; o desenho é por leitura de `on_hello` e `wire.rs`. Em aberto: o `state_id` por device nos irmãos, a regra para o `a` sem id gravado (build antigo), a compatibilidade do bit novo com builds antigos e a auditoria de segurança.
-- **Próximo passo**: o dono decide se aceita a opção 4 (vira tarefa de código em plan mode, com testes primeiro); P33 continua com o dono.
+- **Próximo passo**: o dono decide se aceita a opção 4 (vira tarefa de código em plan mode, com testes primeiro); P33 continua com o dono. *(Aceita pelo dono; implementada na subseção abaixo.)*
+
+#### P36: `state_id` no `Hello` implementado (ADR 0043, PR #295)
+
+- **Origem**: o dono aceitou a opção 4 e aprovou o plano em plan mode; uma pergunta de decisão (compatibilidade com build antigo: **aceitar a quebra**) e outra com os testes na mão (janela residual: **aceitar e registrar**).
+- **Feito**: `CryptoDevice::state_id`; `Presence` no `Hello` (tag 5, bit 8); schema v10 (`kin_peer_state`); `note_state_id` e a regra no `on_hello`; o `a` de menor Peer ID manda o `Hello` ao marcar; limite de 2 marcações por `state_id` por conexão; lab `stale-connection-*` invertido.
+- **Achados**: (1) o `state_id` sozinho **não curava o `a` de menor Peer ID** (corrige o ADR 0043 como escrito: ele não manda `Hello` na 2ª conexão); (2) a mensagem mandada antes de o `a` processar o `Hello` ainda se perde (aceito); (3) a auditoria achou o `reset_done` só na troca bem-sucedida: tentativas falhas repetíveis (corrigido, teste primeiro).
+- **Provas** (CI): testes primeiro, run 45062869647 (compilou, clippy ok, **12 falharam** pelo motivo certo; Lab: só os 2 `stale-connection-*` vermelhos); implementação, run 45063612148 e Lab 45063612050 verdes; mutações A, B e C lidas (PRs rascunho #296 a #298, fechados), todas pegas, com os nomes no ADR; correção da auditoria: teste vermelho no run 45065311640 (1 de 415), verde depois.
+- **Erros meus**: editei o `lab/run.sh` por um script Python (o `CLAUDE.md` manda `Edit`/`Write`); percebi no mesmo passo, revertei e refiz com `Edit`. Disse no plano que a opção 4 curava as duas ordens de Peer ID; só os testes mostraram a lacuna.
+- **Não verificado**: relay real, QUIC, NAT doméstico (P33); duração da janela residual; irmãos sem teste próprio; teto de `pending_state_ids` sem teste.
+- **Próximo passo**: o dono mescla o #295; decidir se a janela residual (mensagem antes do `Hello`) merece outro ADR; P33 continua com o dono.
