@@ -877,8 +877,10 @@ stale_connection() { # modo: rst | silent
   local t_back=$((SECONDS - t0))
 
   say a "no limbo"
-  local t_disc="" t_deliv="" t_recv="" t_ready="" i
-  for i in $(seq 180); do
+  # 90 s: acima dos 60 s do `idle_connection_timeout` (node.rs). Medido com 180 s em 4 rodadas (2 por modo): o `b` nunca
+  # recebeu e a conexão antiga nunca caiu; o padrão fica em 90 s para não pesar o CI (STALE_WAIT=180 repete a medição).
+  local t_disc="" t_deliv="" t_recv="" t_ready="" i wait_s=${STALE_WAIT:-90}
+  for i in $(seq "$wait_s"); do
     [ -z "$t_disc" ] && [ "$(count_log a "desconectado de $B_ID")" -gt "$d0" ] && t_disc=$((SECONDS - t0))
     [ -z "$t_deliv" ] && [ "$(count_log a "\\(entregue .* a $B_ID\\)")" -gt "$e0" ] && t_deliv=$((SECONDS - t0))
     [ -z "$t_ready" ] && [ "$(count_log a "conversa cifrada pronta")" -gt "$p0" ] && t_ready=$((SECONDS - t0))
@@ -888,12 +890,14 @@ stale_connection() { # modo: rst | silent
   done
   local r1; r1=$(( $(count_log a "rota com $B_ID") - r0 ))
   echo "  MEDIDO[$mode]: a=$A_ID b=$B_ID (o log não diz qual é o menor; comparar os IDs depois)"
-  echo "  MEDIDO[$mode]: b de volta à rede em ${t_back}s; a conexão antiga caiu no a em ${t_disc:-nunca (180 s)}s; conversa refeita no a em ${t_ready:-nunca (180 s)}s"
+  echo "  MEDIDO[$mode]: b de volta à rede em ${t_back}s; a conexão antiga caiu no a em ${t_disc:-nunca (${wait_s} s)}s; conversa refeita no a em ${t_ready:-nunca (${wait_s} s)}s"
   echo "  MEDIDO[$mode]: o a imprimiu (entregue ...) em ${t_deliv:-nunca}s; o b recebeu 'no limbo' em ${t_recv:-nunca}s; rotas novas vistas no a: $r1"
   if [ -n "$t_deliv" ] && { [ -z "$t_recv" ] || [ "$t_deliv" -lt "$t_recv" ]; }; then
     echo "  MEDIDO[$mode]: (entregue) ANTES de o b receber: ack de transporte falso (a janela do P36 existe)"
   fi
-  check "o b recebe 'no limbo' em até 180 s (a janela se fecha sozinha)" test -n "$t_recv"
+  # FIXA O ESTADO ATUAL (P36 aberto): a janela NÃO se fecha sozinha e a mensagem se perde. Quando o P36 for corrigido, esta
+  # asserção se inverte (o `b` passa a receber) e os dois cenários viram regressão de verdade.
+  check "P36 reproduzido: o b NÃO recebe 'no limbo' em ${wait_s} s (inverter na correção)" test -z "$t_recv"
 }
 scenario_stale_connection_rst() {
   echo "== P36 (medição): conexão antiga meio-aberta, o b novo responde RST"
