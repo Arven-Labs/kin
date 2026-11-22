@@ -1,6 +1,6 @@
 # ADR 0044 — Mensagem perdida na janela do P36: ack de transporte não é entrega
 
-- **Status**: **proposto** (2026-11-22). Desenho por leitura de código; **nada implementado, nada rodado**. Vira código só com a decisão do dono, em plan mode, com testes primeiro.
+- **Status**: **aceito e implementado** (2026-11-22, opção D, dono escolheu "reenvio silencioso"). Ver "Implementação e correções ao desenho" no fim. Desenho original por leitura de código; a implementação foi provada no CI (testes unitários, 5 mutações pegas, Lab verde, auditoria).
 - **Relacionados**: ADR 0043 (`state_id` no `Hello`; deixou esta janela como limite aceito), ADR 0040 (re-handshake, P16), ADR 0041 (`Stale`), P19 (reenvio com espera crescente), P36, P33.
 - **Área de segurança**: **não toca** criptografia nem autenticação (não muda `crypto`, `Hello` nem o fio na opção recomendada). Reenviar é cifrar de novo, na conversa nova.
 
@@ -54,6 +54,31 @@ Por leitura, não rodei nada. A provar: (a) que `PeerRoute` de peer já conectad
 2. Unitário: mensagem acked fora da janela **não** é reenviada; acked na janela é; acima do teto, só as mais novas; passada a idade, nada; `PeerDisconnected` limpa.
 3. Lab: um cenário `stale-connection-*` em que o `a` manda "no limbo" e o `b` passa a recebê-la (hoje só se mede).
 4. Mutação lida (nome dos testes que falharam no log): remover o reenvio no `ready`; trocar o teto; abrir a janela também na 1ª conexão (deve reenviar história antiga e o teste 2 pega).
+
+## Implementação e correções ao desenho (PR #300)
+
+Só `crates/chat/src/chat.rs`; nada de fio, `Node` nem `crypto`.
+
+- **Gatilho corrigido.** O `Node` emite um `PeerRoute` também na 1ª conexão (`node.rs`, logo depois do `PeerConnected`), então "PeerRoute de peer já conectado" abriria a janela em toda conexão normal. Regra implementada: `PeerConnected` marca `first_route_pending`; a 1ª `PeerRoute` seguinte o consome; as demais abrem a janela (`extra_connection`). Teste: `the_route_of_the_first_connection_does_not_open_the_window`.
+- **Buffer** `replay` (por peer, máximo 8 = `MAX_REPLAY`, 120 s = `REPLAY_MAX_AGE`, poda por idade a cada entrada). Só entra mensagem **comum** (falha fechada: erro de leitura do banco não vira `Plain`).
+- **Reenvio** em `replace_conversation`, antes do `ready` (que faz o `flush`): `outbox.enqueue` com o mesmo `MessageId`; o ack do reenvio não emite `Delivered` (`replayed`, por **(peer, mensagem)**, auditoria médio 1: um envio para vários devices da mesma identidade tem o mesmo `MessageId`).
+- **Mensagem em voo no reset** (auditoria médio 2): cifrada na conversa antiga e sem ack quando a conversa é refeita, ela ainda pode ser confirmada por um `b` trocado. `late_ack` guarda esses ids; o ack tardio a recoloca na outbox e **não** emite `Delivered` (a aplicação nunca viu um), e o ack do reenvio emite.
+- **Limpeza:** `PeerDisconnected` e `drop_peer` apagam janela, buffer e marcas.
+- **Decisão de produto do dono:** reenvio silencioso (nenhum `Delivered` extra, nenhum campo novo no `ConversationReset`; só o comentário do evento mudou).
+
+### Provas (CI, `kin` PR #300)
+- Testes primeiro: 7 unitários falhavam pelo motivo certo (run 45076413920).
+- Implementação `e28c898`: 422 testes e Lab verdes.
+- Mutações (um PR rascunho cada, nomes lidos no log): M1 não recoloca nada (5 testes), M2 teto +1 (`only_the_newest_messages_up_to_the_cap_are_replayed`), M3 a rota da 1ª conexão abre a janela (3 testes), M4 o ack do reenvio emite `Delivered` (1 teste), M5 `PeerDisconnected` não limpa o buffer (1 teste).
+- Auditoria (`security-auditor`, só leitura): sem crítico nem alto; os 2 médios e os baixos 3 e 6 foram corrigidos no mesmo PR.
+
+### Limites que ficam (também depois da D)
+- **Sem teste de integração pela rede real.** Tentei (2 testes em `two_nodes.rs`, uma por ordem de Peer ID) e **tirei**: a conexão antiga sem ninguém dirigindo engole pedidos alternados, e a mensagem extra desloca em quais conexões os pedidos de controle caem; a conversa não era refeita em 60 s. A janela é provada por eventos injetados (determinístico) e o Lab segue medindo o resto.
+- **Ordem:** o reenviado volta no fim da outbox (`seq` novo), atrás do que o usuário mandou entre o `Hello` e o reset. `sent_at_ms` e `parent` permitem à aplicação ordenar. Preservar o `seq` exigiria API nova na `outbox`.
+- **Falha do `ready` depois do reenvio:** se o `ready` falhar, a conversa antiga é restaurada e o reenvio sairia por ela (perdido de novo). Só falha de armazenamento.
+- A janela `extra_connection` fica aberta pelo resto da conexão (upgrade relay→direta): o custo é copiar até 8 mensagens e ler a outbox do peer a cada ack, o mesmo tipo de custo do `send_direct`.
+- `Delivered` repetido depois de reiniciar o processo no meio do reenvio (a marca é em memória).
+- Reconexão para um `b` que também mudou de identidade não reenvia (o reset exige a mesma identidade).
 
 ## Consequências
 - Fecha a janela do P36 sem tocar o fio nem o transporte; mantém a C como caminho para quando houver mais perdas.
