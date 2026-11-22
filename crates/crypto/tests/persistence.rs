@@ -124,3 +124,48 @@ fn nostr() -> NostrPublicKey {
 fn key() -> PublicKey {
     DeviceKey::generate().public_key()
 }
+
+/// P36 (ADR 0043): a identidade da instância de estado sobrevive ao restart (mesmo banco, mesmo id), é
+/// estável entre chamadas e não é um valor fixo.
+#[test]
+fn the_state_id_is_stable_and_survives_a_restart() {
+    let (net, nostr) = (key(), nostr());
+    let identity = StandaloneIdentity::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("a.db");
+
+    let first = {
+        let device = CryptoDevice::open(&identity, &net, &nostr, &db, 1).unwrap();
+        let id = device.state_id().unwrap();
+        assert_eq!(device.state_id().unwrap(), id, "estável entre chamadas");
+        id
+    };
+    assert_ne!(first, [0; 16], "o id é aleatório, não um valor fixo");
+    let device = CryptoDevice::open(&identity, &net, &nostr, &db, 2).unwrap();
+    assert_eq!(device.state_id().unwrap(), first, "o mesmo banco, o mesmo id");
+}
+
+/// P36 (ADR 0043): se o banco some (o `b` perdeu o `mls.sqlite`), o id some junto: o device novo, mesmo com a
+/// mesma identidade e as mesmas chaves, tem outro. É o que o `Hello` usa para dizer "perdi o estado".
+#[test]
+fn a_new_database_gets_a_new_state_id_even_for_the_same_identity_and_keys() {
+    let (net, nostr) = (key(), nostr());
+    let identity = StandaloneIdentity::generate();
+    let dir = tempfile::tempdir().unwrap();
+
+    let old = CryptoDevice::open(&identity, &net, &nostr, &dir.path().join("old.db"), 1)
+        .unwrap()
+        .state_id()
+        .unwrap();
+    let new = CryptoDevice::open(&identity, &net, &nostr, &dir.path().join("new.db"), 1)
+        .unwrap()
+        .state_id()
+        .unwrap();
+    assert_ne!(old, new);
+    // Em memória: um id por device, nunca um valor compartilhado.
+    let (a, b) = (
+        CryptoDevice::new(&identity, &net, &nostr, 1).unwrap(),
+        CryptoDevice::new(&identity, &net, &nostr, 1).unwrap(),
+    );
+    assert_ne!(a.state_id().unwrap(), b.state_id().unwrap());
+}

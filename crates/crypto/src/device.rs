@@ -182,6 +182,14 @@ impl CryptoDevice {
         self.0.provider.remembered()
     }
 
+    /// Identidade da **instância de estado** deste device (P36, ADR 0043): um id aleatório de 16 bytes gravado
+    /// no próprio banco MLS, estável enquanto ele existir e **novo** se o banco for apagado (mesmo com a mesma
+    /// identidade e as mesmas chaves). O `Hello` o leva para o outro lado perceber "este banco não é o de
+    /// antes". Não é segredo, mas não vai a log.
+    pub fn state_id(&self) -> Result<[u8; 16], Error> {
+        self.0.provider.state_id()
+    }
+
     /// Grava um tombstone de device recebido (P30, 3c; ADR 0023): confere a assinatura e é idempotente.
     /// Devolve `true` se era novo e `false` se já estava gravado (decide o repasse, ADR 0025).
     pub fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<bool, Error> {

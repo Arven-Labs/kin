@@ -1,6 +1,6 @@
 # ADR 0043 — Conexão antiga meio-aberta: o `a` nunca sabe que o `b` perdeu a conversa (P36)
 
-- **Status**: **proposto** (2026-11-22). Desenho por leitura de código; **nada implementado, nada rodado**. A opção 4 toca handshake e autenticação (AGENTS.md §4) e muda o formato de fio: só vira código com a confirmação explícita do dono, em plan mode, com testes primeiro.
+- **Status**: **aceito e implementado** (2026-11-22, PR #295; o dono aceitou a opção 4 e aprovou o plano em plan mode). Toca handshake e formato de fio (AGENTS.md §4). Ver "Implementação e correções ao desenho" no fim.
 - **Relacionados**: ADR 0040 (re-handshake quando um lado perde o estado; adendos P35 e P36), ADR 0041 (`Stale` e `Node::disconnect`), P16, P35, P36, P33. Medição: PRs #264 (testes `..._not_rehandshaked_yet`), #267 (tentativa, fechado) e #293 (cenários `stale-connection-rst` e `-silent` do lab).
 
 ## Contexto
@@ -60,3 +60,23 @@ Por leitura de `on_hello` (`chat.rs:1891`) e de `wire.rs`. Não rodei nada. Pont
 - Custa: formato de fio novo, schema v10, auditoria de segurança e um id de instância por device.
 - Reverter depois de implementado é médio (protocolo e schema); **agora** é grátis (só este ADR).
 - O P36 sobe para **Média**: há perda de mensagem medida e a conversa não se recupera sozinha.
+
+## Implementação e correções ao desenho (2026-11-22, PR #295)
+
+**O que entrou**: `CryptoDevice::state_id` (16 bytes aleatórios em `kin_meta` do `mls.sqlite`, `provider.rs`); `Hello` tag 5 com bit 8 (`wire.rs`, tipo `Presence { has_conversation, state_id }` no lugar do `Option<bool>`, para o `state_id` só existir junto com o bit "tenho conversa"); schema v10 com `kin_peer_state` (`outbox.rs`); `note_state_id` e a regra no `on_hello` (`chat.rs`). Compatibilidade com builds antigos: **quebra aceita pelo dono** (o decoder antigo recusa o bit 8).
+
+**Correções ao que este ADR dizia (descobertas ao escrever os testes)**:
+1. **O `state_id` sozinho não curava o `a` de menor Peer ID.** Ele não responde com `KeyPackage` e, na 2ª conexão, não mandou `Hello`; sem um `Hello` dele o `b` (maior) nunca manda o `KeyPackage`. O `a` agora manda o próprio `Hello` ao marcar `lost_state` pelo `state_id` (só o de menor Peer ID, só na marcação nova).
+2. **Janela residual aceita (decisão do dono)**: uma mensagem mandada **antes** de o `a` processar o `Hello` do `b` ainda se perde (o ack de transporte já saiu). A conversa se recupera sozinha; o lab exige só a mensagem mandada **depois** da troca.
+3. A referência é o `state_id` visto **antes** de a conversa existir (`pending_state_ids` em memória, gravado no `ready`) ou, numa conversa de antes do P36, o primeiro visto (grava e não marca).
+
+**Auditoria** (`security-auditor`, só leitura, sem build): 0 críticos, 0 altos; reset continua exigindo `KeyPackage`/`Welcome` da mesma identidade. Achados:
+- **Baixo 1 (corrigido)**: o `reset_done` só é gravado na troca que dá certo, então um contato podia repetir "`Hello(false, id novo)` + `KeyPackage` recusado" sem limite. Agora no máximo 2 marcações por `state_id` por conexão (`MAX_STATE_ID_MARKS`, `state_id_marks`); teste primeiro (falhou no CI com o stub) e depois a correção.
+- **Médio 2 (aceito)**: build antigo descarta o `Hello` novo inteiro (compatibilidade); decisão do dono, sem rollout em duas fases.
+- **Baixo 3 (aceito)**: o `state_id` é um identificador estável enviado a qualquer peer, inclusive estranho (o certificado só vai a conhecido). Permite correlacionar o device se o Peer ID mudar. Mitigação possível, não feita: mandar o bit 8 só a quem tem conversa ou é conhecido (perde a referência pré-conversa).
+- **Baixo 4 (aceito)**: falsos positivos residuais (referência ausente gravada às cegas; erro de disco engolido em `set_peer_state`; duas instâncias com o mesmo Peer ID dão ping-pong de reset). O P16 ainda valida a identidade da troca.
+- **Baixo 5 (aceito)**: estranhos ocupam as 64 vagas de `pending_state_ids`; o efeito é só a referência de um contato novo não ser pré-gravada (cai no caso "sem referência").
+
+**Provas (CI)**: testes primeiro (run 45062869647: compilou, passou o clippy, 12 testes novos falharam pelos motivos certos; Lab 2 cenários `stale-connection-*` vermelhos, os outros verdes); implementação (run 45063612148 e Lab 45063612050: tudo verde, incluindo os 8 cenários que o #267 derrubou); **mutação lida** (um PR rascunho por mutação, nomes dos testes no log): A `!=` vira `==` (4 testes unitários e os 2 de integração falharam), B `Some(false)` vira `is_some()` (`only_a_hello_without_conversation_and_with_a_different_id_marks_lost_state` e `a_fresh_or_surviving_conversation_is_never_reported_as_reset`), C `<` vira `>` no envio do `Hello` (`the_lower_peer_sends_its_hello_when_it_marks_lost_state` e os 2 de integração).
+
+**Não verificado**: relay real, QUIC como conexão antiga e NAT doméstico (P33); duração real da janela residual; `state_id` por device nos irmãos (cada device é um peer, então é por construção, mas sem teste em `multi_device`); o teto de `pending_state_ids` não tem teste próprio (só leitura); a auditoria não rodou nada.

@@ -7,10 +7,14 @@ use kin_identity::{
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
 use openmls_traits::OpenMlsProvider;
+use openmls_traits::random::OpenMlsRand as _;
 use rusqlite::{OptionalExtension as _, params};
 use serde::Serialize;
 
 use crate::Error;
+
+/// Chave em `kin_meta` da identidade da instância de estado (P36).
+const STATE_ID_KEY: &str = "state_id";
 
 /// Codec do storage MLS: JSON. Simples e estável; o custo de tamanho não importa neste volume.
 #[derive(Default)]
@@ -90,6 +94,20 @@ impl Provider {
             )
             .map_err(Error::storage)?;
         Ok(())
+    }
+
+    /// Identidade da instância de estado (P36, ADR 0043): 16 bytes aleatórios gravados **neste** banco, então
+    /// somem junto com ele. Lê o gravado; se não há (banco novo, ou valor de outro tamanho, que não é nosso),
+    /// gera um novo e grava. Estável enquanto o banco existir.
+    pub(crate) fn state_id(&self) -> Result<[u8; 16], Error> {
+        if let Some(bytes) = self.meta(STATE_ID_KEY)?
+            && let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice())
+        {
+            return Ok(id);
+        }
+        let id: [u8; 16] = self.rand().random_array().map_err(Error::mls)?;
+        self.set_meta(STATE_ID_KEY, &id)?;
+        Ok(id)
     }
 
     pub(crate) fn delete_meta(&self, key: &str) -> Result<(), Error> {

@@ -24,9 +24,10 @@ pub(crate) const SEEN_LIMIT: usize = 1024;
 /// `kin_history`, o histórico das conversas, também aditiva); 7 = P10a (tabela `kin_history_cursor`, até
 /// onde já recebi do histórico de cada irmão, também aditiva); 8 = P32 a (tabela `kin_peer_addrs`, os
 /// endereços que cada contato informou, para rediscar depois de reiniciar, também aditiva); 9 = P18 (tabela
-/// `kin_invite_tokens`, os tokens de convite ainda vivos, também aditiva). Um build antigo recusa o banco
-/// v9 (ver `migrate`): não há downgrade.
-const SCHEMA_VERSION: i64 = 9;
+/// `kin_invite_tokens`, os tokens de convite ainda vivos, também aditiva); 10 = P36 (tabela
+/// `kin_peer_state`, o `state_id` que cada contato apresentou ao formar a conversa, também aditiva). Um
+/// build antigo recusa o banco v10 (ver `migrate`): não há downgrade.
+const SCHEMA_VERSION: i64 = 10;
 
 /// Teto de convites vivos por device (P18, ADR 0039): cada link emitido é uma linha, e o vencido sai
 /// sozinho, então o teto só aperta quem emite sem parar.
@@ -157,7 +158,10 @@ impl Outbox {
                  addrs TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS kin_invite_tokens (
                  token BLOB PRIMARY KEY,
-                 expires_at INTEGER NOT NULL);",
+                 expires_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS kin_peer_state (
+                 peer TEXT PRIMARY KEY,
+                 state_id BLOB NOT NULL);",
         )
         .map_err(Error::storage)?;
         Ok(Self {
@@ -476,6 +480,7 @@ impl Outbox {
             "kin_seen_mirror",
             "kin_history_cursor",
             "kin_peer_addrs",
+            "kin_peer_state",
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE peer = ?1"), [&peer])
                 .map_err(Error::storage)?;
@@ -513,6 +518,37 @@ impl Outbox {
             )
             .map_err(Error::storage)?;
         Ok(())
+    }
+
+    /// Grava o `state_id` que `peer` apresentou quando a conversa com ele foi formada (P36, ADR 0043); a
+    /// última gravação substitui a anterior. É a referência contra a qual um `Hello` futuro é comparado.
+    pub(crate) fn set_peer_state(&self, peer: &PeerId, state_id: [u8; 16]) -> Result<(), Error> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO kin_peer_state (peer, state_id) VALUES (?1, ?2)",
+                params![peer.to_string(), state_id.as_slice()],
+            )
+            .map_err(Error::storage)?;
+        Ok(())
+    }
+
+    /// O `state_id` gravado de `peer`; `None` se não há linha (conversa de antes do P36) ou se o valor gravado
+    /// não tem 16 bytes (banco adulterado: tratado como "sem referência", nunca como erro).
+    pub(crate) fn peer_state(&self, peer: &PeerId) -> Result<Option<[u8; 16]>, Error> {
+        let bytes: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT state_id FROM kin_peer_state WHERE peer = ?1",
+                [peer.to_string()],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })
+            .map_err(Error::storage)?;
+        Ok(bytes.and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok()))
     }
 
     /// Grava um token de convite que vence em `expires_at` (segundos Unix). Varre os vencidos antes de
@@ -2081,7 +2117,57 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// P36: banco v9 abre como v10, mantém o que tinha (aqui, os tokens) e ganha a tabela do `state_id`.
+    #[test]
+    fn a_version_9_database_opens_as_version_10_keeps_its_data_and_gains_the_peer_state_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let peer = peer();
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.add_invite_token(&[1; 16], 200, 100).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_peer_state; PRAGMA user_version = 9;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+        outbox.set_peer_state(&peer, [4; 16]).unwrap();
+
+        assert!(outbox.invite_token_is_live(&[1; 16], 100).unwrap());
+        assert_eq!(outbox.peer_state(&peer).unwrap(), Some([4; 16]));
+        let version: i64 = outbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+    }
+
+    /// P36: o `state_id` do peer sobrevive ao reabrir o banco, a última gravação vale, é por peer, e
+    /// esquecer o peer apaga a linha (a conversa caiu: a referência não vale mais).
+    #[test]
+    fn the_peer_state_id_is_persisted_replaced_per_peer_and_forgotten_with_the_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (one, other) = (peer(), peer());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            assert_eq!(outbox.peer_state(&one).unwrap(), None, "sem linha");
+            outbox.set_peer_state(&one, [1; 16]).unwrap();
+            outbox.set_peer_state(&one, [2; 16]).unwrap();
+            outbox.set_peer_state(&other, [3; 16]).unwrap();
+        }
+        let outbox = Outbox::open(&path).unwrap();
+        assert_eq!(outbox.peer_state(&one).unwrap(), Some([2; 16]));
+        assert_eq!(outbox.peer_state(&other).unwrap(), Some([3; 16]));
+
+        outbox.forget_peer(&one).unwrap();
+        assert_eq!(outbox.peer_state(&one).unwrap(), None);
+        assert_eq!(outbox.peer_state(&other).unwrap(), Some([3; 16]), "só o `one`");
     }
 
     /// P18: o token vive até `expires_at` (exclusive), é gasto uma vez só e some da lista.

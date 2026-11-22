@@ -10,12 +10,43 @@ pub(crate) enum Envelope {
     /// é por ele que quem recebe conhece a identidade **antes** de mandar o `KeyPackage`. Sem certificado
     /// vai o formato antigo (tag 0, só o token), que ainda é lido.
     ///
-    /// O terceiro campo (P16, tag 5) é "tenho conversa com você": `None` nos formatos antigos (tags 0 e 4),
-    /// que por isso **nunca** disparam o re-handshake; quem envia hoje sempre manda `Some`.
-    Hello(Option<[u8; 16]>, Option<Vec<u8>>, Option<bool>),
+    /// O terceiro campo (P16, tag 5) é o [`Presence`] ("tenho conversa com você" e, desde o P36, a identidade
+    /// da instância de estado): `None` nos formatos antigos (tags 0 e 4), que por isso **nunca** disparam o
+    /// re-handshake; quem envia hoje sempre manda `Some`.
+    Hello(Option<[u8; 16]>, Option<Vec<u8>>, Option<Presence>),
     KeyPackage(Vec<u8>),
     Welcome(Vec<u8>),
     Mls(Vec<u8>),
+}
+
+/// O que o `Hello` da tag 5 diz sobre o estado de quem o manda (P16 e P36, ADR 0043).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Presence {
+    /// "Tenho conversa com você" (bit 2). É por ele que quem tem a conversa percebe que o outro a perdeu.
+    pub(crate) has_conversation: bool,
+    /// Identidade da instância de estado de quem manda (bit 8): um id aleatório gravado no próprio banco MLS,
+    /// que some junto com ele. `None` num build anterior ao P36. Não é segredo, mas não sai em log.
+    pub(crate) state_id: Option<[u8; 16]>,
+}
+
+#[cfg(test)]
+impl Presence {
+    /// Sem `state_id` (como mandava um build anterior ao P36).
+    pub(crate) fn of(has_conversation: bool) -> Self {
+        Self {
+            has_conversation,
+            state_id: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Presence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Presence")
+            .field("has_conversation", &self.has_conversation)
+            .field("state_id", &self.state_id.map(|_| "<oculto>"))
+            .finish()
+    }
 }
 
 /// `Debug` à mão: o token do `Hello` é um segredo até ser usado e não pode sair em log nem em mensagem
@@ -23,11 +54,11 @@ pub(crate) enum Envelope {
 impl std::fmt::Debug for Envelope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Hello(token, certificate, has_conversation) => f
+            Self::Hello(token, certificate, presence) => f
                 .debug_tuple("Hello")
                 .field(&token.map(|_| "<oculto>"))
                 .field(&certificate.as_ref().map(Vec::len))
-                .field(has_conversation)
+                .field(presence)
                 .finish(),
             Self::KeyPackage(bytes) => f.debug_tuple("KeyPackage").field(bytes).finish(),
             Self::Welcome(bytes) => f.debug_tuple("Welcome").field(bytes).finish(),
@@ -49,14 +80,17 @@ impl Envelope {
                 out.extend_from_slice(certificate);
                 return out;
             }
-            // Tag 5: `bits u8 | [token; 16] se bit 1 | certificado (o resto) se bit 4`. Bit 1 = tem token,
-            // bit 2 = tenho conversa com você (P16), bit 4 = tem certificado.
-            Self::Hello(token, certificate, Some(has_conversation)) => {
+            // Tag 5: `bits u8 | [token; 16] se bit 1 | [state_id; 16] se bit 8 | certificado (o resto) se
+            // bit 4`. Bit 1 = tem token, bit 2 = tenho conversa com você (P16), bit 4 = tem certificado,
+            // bit 8 = tem `state_id` (P36, ADR 0043).
+            Self::Hello(token, certificate, Some(presence)) => {
                 let bits = u8::from(token.is_some())
-                    | u8::from(*has_conversation) << 1
-                    | u8::from(certificate.is_some()) << 2;
+                    | u8::from(presence.has_conversation) << 1
+                    | u8::from(certificate.is_some()) << 2
+                    | u8::from(presence.state_id.is_some()) << 3;
                 let mut out = vec![5, bits];
                 out.extend(token.iter().flatten());
+                out.extend(presence.state_id.iter().flatten());
                 out.extend(certificate.iter().flatten());
                 return out;
             }
@@ -101,17 +135,26 @@ impl Envelope {
                 }
                 Self::Hello(token, Some(certificate.to_vec()), None)
             }
-            // Tag 5: só os bits 1, 2 e 4 existem; o que o bit 1 e o bit 4 prometem tem de estar lá, e o
+            // Tag 5: só os bits 1, 2, 4 e 8 existem; o que os bits 1, 8 e 4 prometem tem de estar lá, e o
             // certificado prometido não pode ser vazio.
             5 => {
                 let (&bits, rest) = payload.split_first().ok_or(Error::Malformed)?;
-                if bits & !0b111 != 0 {
+                if bits & !0b1111 != 0 {
                     return Err(Error::Malformed);
                 }
                 let (token, rest) = if bits & 1 != 0 {
                     let (token, rest) = rest.split_at_checked(16).ok_or(Error::Malformed)?;
                     (
                         Some(<[u8; 16]>::try_from(token).map_err(|_| Error::Malformed)?),
+                        rest,
+                    )
+                } else {
+                    (None, rest)
+                };
+                let (state_id, rest) = if bits & 8 != 0 {
+                    let (id, rest) = rest.split_at_checked(16).ok_or(Error::Malformed)?;
+                    (
+                        Some(<[u8; 16]>::try_from(id).map_err(|_| Error::Malformed)?),
                         rest,
                     )
                 } else {
@@ -127,7 +170,11 @@ impl Envelope {
                 } else {
                     return Err(Error::Malformed);
                 };
-                Self::Hello(token, certificate, Some(bits & 2 != 0))
+                let presence = Presence {
+                    has_conversation: bits & 2 != 0,
+                    state_id,
+                };
+                Self::Hello(token, certificate, Some(presence))
             }
             1 => Self::KeyPackage(payload.to_vec()),
             2 => Self::Welcome(payload.to_vec()),
@@ -142,6 +189,7 @@ mod tests {
     use super::*;
 
     const TOKEN: [u8; 16] = [7; 16];
+    const STATE_ID: [u8; 16] = [9; 16];
 
     /// P18: o `Hello` de quem aceitou um link v3 leva o token; sem link, vai vazio como antes.
     #[test]
@@ -168,10 +216,16 @@ mod tests {
         for token in [Some(TOKEN), None] {
             for certificate in [Some(cert.clone()), None] {
                 for has_conversation in [true, false] {
-                    let hello = Envelope::Hello(token, certificate.clone(), Some(has_conversation));
-                    let bytes = hello.encode();
-                    assert_eq!(bytes[0], 5);
-                    assert_eq!(Envelope::decode(&bytes).unwrap(), hello, "{bytes:?}");
+                    for state_id in [Some(STATE_ID), None] {
+                        let presence = Presence {
+                            has_conversation,
+                            state_id,
+                        };
+                        let hello = Envelope::Hello(token, certificate.clone(), Some(presence));
+                        let bytes = hello.encode();
+                        assert_eq!(bytes[0], 5);
+                        assert_eq!(Envelope::decode(&bytes).unwrap(), hello, "{bytes:?}");
+                    }
                 }
             }
         }
@@ -180,8 +234,68 @@ mod tests {
     /// P16: o bit "tenho conversa" é só o bit 2: a tag 5 sem token nem certificado tem 2 bytes.
     #[test]
     fn the_conversation_bit_is_bit_two_of_tag_5() {
-        assert_eq!(Envelope::Hello(None, None, Some(false)).encode(), vec![5, 0]);
-        assert_eq!(Envelope::Hello(None, None, Some(true)).encode(), vec![5, 2]);
+        let hello = |has_conversation| Envelope::Hello(None, None, Some(Presence::of(has_conversation)));
+        assert_eq!(hello(false).encode(), vec![5, 0]);
+        assert_eq!(hello(true).encode(), vec![5, 2]);
+    }
+
+    /// P36: o `state_id` é o bit 8 da tag 5 e vai **depois do token e antes do certificado**.
+    #[test]
+    fn the_state_id_is_bit_eight_of_tag_5_between_the_token_and_the_certificate() {
+        let presence = Presence {
+            has_conversation: false,
+            state_id: Some(STATE_ID),
+        };
+        let mut only_id = vec![5, 8];
+        only_id.extend_from_slice(&STATE_ID);
+        assert_eq!(Envelope::Hello(None, None, Some(presence)).encode(), only_id);
+
+        let mut all = vec![5, 1 | 4 | 8];
+        all.extend_from_slice(&TOKEN);
+        all.extend_from_slice(&STATE_ID);
+        all.extend_from_slice(&[1, 2, 3, 4]);
+        let hello = Envelope::Hello(Some(TOKEN), Some(vec![1, 2, 3, 4]), Some(presence));
+        assert_eq!(hello.encode(), all);
+        assert_eq!(Envelope::decode(&all).unwrap(), hello);
+    }
+
+    /// P36, entrada externa: o bit 8 promete 16 bytes, e nada além do que os bits prometem.
+    #[test]
+    fn a_malformed_state_id_in_a_hello_of_tag_5_is_refused() {
+        let mut id_and_stray_byte = vec![5, 8];
+        id_and_stray_byte.extend_from_slice(&STATE_ID);
+        id_and_stray_byte.push(9);
+        let mut token_missing = vec![5, 1 | 8];
+        token_missing.extend_from_slice(&STATE_ID);
+        let cases = [
+            vec![5, 8],
+            vec![5, 8, 7, 7],
+            vec![5, 8 | 16],
+            vec![5, 0xFF],
+            id_and_stray_byte,
+            token_missing,
+        ];
+        for bytes in cases {
+            assert!(
+                matches!(Envelope::decode(&bytes), Err(Error::Malformed)),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    /// P36, entrada externa: nenhum byte de `Hello` de tag 5, qualquer que seja o tamanho (até 64 bytes) e os
+    /// bits, faz o decoder entrar em pânico; e o que decodifica volta igual ao reencodar.
+    #[test]
+    fn a_hello_of_tag_5_never_panics_and_reencodes_to_the_same_bytes() {
+        for bits in 0..=u8::MAX {
+            for len in 0..=64usize {
+                let mut bytes = vec![5, bits];
+                bytes.extend((0..len).map(|i| i as u8));
+                if let Ok(hello) = Envelope::decode(&bytes) {
+                    assert_eq!(hello.encode(), bytes, "bits={bits} len={len}");
+                }
+            }
+        }
     }
 
     /// Entrada externa: tag 5 com bit desconhecido, truncada ou com sobra é recusada, sem pânico. O que o
@@ -247,9 +361,24 @@ mod tests {
     /// Auditoria (baixo 3): o token do `Hello` é um segredo e o `Debug` não o mostra.
     #[test]
     fn the_debug_output_of_a_hello_hides_the_token() {
-        let shown = format!("{:?}", Envelope::Hello(Some([0xAB; 16]), None, Some(true)));
+        let shown = format!(
+            "{:?}",
+            Envelope::Hello(Some([0xAB; 16]), None, Some(Presence::of(true)))
+        );
         assert!(shown.contains("<oculto>"), "{shown}");
         assert!(!shown.contains("171"), "o token vazou: {shown}");
+    }
+
+    /// P36: o `state_id` não vai a log nem a mensagem de teste.
+    #[test]
+    fn the_debug_output_of_a_hello_hides_the_state_id() {
+        let presence = Presence {
+            has_conversation: true,
+            state_id: Some([0xCD; 16]),
+        };
+        let shown = format!("{:?}", Envelope::Hello(None, None, Some(presence)));
+        assert!(shown.contains("<oculto>"), "{shown}");
+        assert!(!shown.contains("205"), "o state_id vazou: {shown}");
     }
 
     /// Entrada externa: payload de `Hello` que não tem 0 nem 16 bytes é recusado, sem pânico.

@@ -843,7 +843,7 @@ scenario_reconnect_restart() {
   fi
 }
 
-# P36 (MEDIÇÃO, não prova de correção; o P36 segue aberto): o `b` some sem avisar (o roteador dele descarta tudo,
+# P36 (ADR 0043: o `Hello` leva o `state_id` da instância de estado): o `b` some sem avisar (o roteador dele descarta tudo,
 # sem RST), então a conexão direta a↔b fica meio-aberta no `a`; o `b` volta com a MESMA identidade e SEM o
 # mls.sqlite (perdeu o banco) e o `a` manda uma mensagem. Mede quando a conexão antiga cai no `a`, quando a
 # conversa é refeita, se o `a` imprime `(entregue ...)` e se o `b` recebe.
@@ -885,7 +885,7 @@ stale_connection() { # modo: rst | silent
     [ -z "$t_deliv" ] && [ "$(count_log a "\\(entregue .* a $B_ID\\)")" -gt "$e0" ] && t_deliv=$((SECONDS - t0))
     [ -z "$t_ready" ] && [ "$(count_log a "conversa cifrada pronta")" -gt "$p0" ] && t_ready=$((SECONDS - t0))
     [ -z "$t_recv" ] && logs b | grep -q "peer: no limbo" && t_recv=$((SECONDS - t0))
-    [ -n "$t_recv" ] && break
+    [ -n "$t_ready" ] && break
     sleep 1
   done
   local r1; r1=$(( $(count_log a "rota com $B_ID") - r0 ))
@@ -895,9 +895,12 @@ stale_connection() { # modo: rst | silent
   if [ -n "$t_deliv" ] && { [ -z "$t_recv" ] || [ "$t_deliv" -lt "$t_recv" ]; }; then
     echo "  MEDIDO[$mode]: (entregue) ANTES de o b receber: ack de transporte falso (a janela do P36 existe)"
   fi
-  # FIXA O ESTADO ATUAL (P36 aberto): a janela NÃO se fecha sozinha e a mensagem se perde. Quando o P36 for corrigido, esta
-  # asserção se inverte (o `b` passa a receber) e os dois cenários viram regressão de verdade.
-  check "P36 reproduzido: o b NÃO recebe 'no limbo' em ${wait_s} s (inverter na correção)" test -z "$t_recv"
+  # P36 corrigido (ADR 0043): a conversa é refeita sozinha, e uma mensagem mandada DEPOIS da troca chega. O "no limbo"
+  # (mandado antes de o `a` saber da perda) pode se perder: o ack de transporte é de antes da troca; só é medido, não exigido.
+  check "o a refez a conversa em ${wait_s} s (conversa cifrada pronta)" test -n "$t_ready"
+  [ -n "$t_ready" ] || return
+  say a "depois da troca"
+  check "o b recebe a mensagem mandada depois da troca" wait_log b "peer: depois da troca" 30
 }
 scenario_stale_connection_rst() {
   echo "== P36 (medição): conexão antiga meio-aberta, o b novo responde RST"

@@ -17,7 +17,7 @@ use crate::invite::MAX_INVITE_TTL;
 use crate::nostr::validate_peer_relays;
 use crate::outbox::{EntryKind, Outbox, SeenKind};
 use crate::payload::{HISTORY_CHUNK_BUDGET, HistoryItem, MAX_DECODED_HISTORY, Payload};
-use crate::wire::Envelope;
+use crate::wire::{Envelope, Presence};
 use crate::{DepositId, Mailbox, MailboxEvent};
 use crate::{Error, HistoryEntry, Invite, LiveInvite, Message, MessageId};
 
@@ -338,6 +338,9 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 /// Quantos peers podem ter um `KeyPackage` guardado ao mesmo tempo (no pior caso, 1 MiB). Maior que o dos
 /// devices conhecidos de propósito: quem enche as vagas precisa de uma conexão por vaga (auditoria, médio 2).
 const MAX_HELD_KEY_PACKAGES: usize = 64;
+/// Quantas vezes por conexão um peer pode marcar `lost_state` pelo caminho do `state_id` (P36, auditoria,
+/// baixo 1): o `reset_done` só vale para a troca que dá certo, e uma tentativa que falha limpa a suspeita.
+const MAX_STATE_ID_MARKS: u8 = 2;
 /// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
 const MAX_NOT_ADMITTED_NOTIFIED: usize = 64;
@@ -525,6 +528,13 @@ pub struct Chat {
     hello_pending: HashSet<PeerId>,
     /// Peers com quem já refiz a conversa nesta conexão: um reset por conexão (auditoria, médio 2).
     reset_done: HashSet<PeerId>,
+    /// `state_id` (P36, ADR 0043) que o `Hello` de um peer apresentou e que ainda **não** está gravado: o de antes
+    /// de a conversa existir, ou o do peer que acabou de provar que perdeu o banco. O `ready` o grava como a
+    /// referência da conversa nova. Em memória, com teto, e some com a conexão.
+    pending_state_ids: HashMap<PeerId, [u8; 16]>,
+    /// Quantas vezes cada peer marcou `lost_state` pelo `state_id` nesta conexão, até [`MAX_STATE_ID_MARKS`].
+    /// Em memória; zera ao desconectar.
+    state_id_marks: HashMap<PeerId, u8>,
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
     not_admitted_notified: HashSet<PeerId>,
@@ -796,6 +806,8 @@ impl Chat {
             lost_state: HashSet::new(),
             hello_pending: HashSet::new(),
             reset_done: HashSet::new(),
+            pending_state_ids: HashMap::new(),
+            state_id_marks: HashMap::new(),
             not_admitted_notified: HashSet::new(),
             require_approval: false,
             pending_approval: HashMap::new(),
@@ -1727,6 +1739,8 @@ impl Chat {
                 self.connected.remove(&peer);
                 self.hello_pending.remove(&peer);
                 self.reset_done.remove(&peer);
+                self.pending_state_ids.remove(&peer);
+                self.state_id_marks.remove(&peer);
                 self.not_admitted_notified.remove(&peer);
                 self.forget_approval(&peer);
                 self.retry.remove(&peer);
@@ -1875,8 +1889,8 @@ impl Chat {
 
     fn on_envelope(&mut self, peer: PeerId, envelope: Envelope) {
         let result = match envelope {
-            Envelope::Hello(token, certificate, has_conversation) => {
-                self.on_hello(peer, token, certificate, has_conversation)
+            Envelope::Hello(token, certificate, presence) => {
+                self.on_hello(peer, token, certificate, presence)
             }
             Envelope::KeyPackage(kp) => self.on_key_package(peer, &kp),
             Envelope::Welcome(welcome) => self.on_welcome(peer, &welcome),
@@ -1893,8 +1907,13 @@ impl Chat {
         peer: PeerId,
         token: Option<[u8; 16]>,
         certificate: Option<Vec<u8>>,
-        has_conversation: Option<bool>,
+        presence: Option<Presence>,
     ) -> Result<(), Error> {
+        let has_conversation = presence.map(|p| p.has_conversation);
+        // P36: o `state_id` do peer difere do que gravei ao formar a conversa?
+        let new_instance = presence
+            .and_then(|p| p.state_id)
+            .is_some_and(|state_id| self.note_state_id(peer, state_id));
         // P16: `peer` diz que não tem a conversa que eu tenho com ele (perdeu o banco). Só marca: a conversa
         // antiga continua valendo até um `KeyPackage`/`Welcome` novo, da mesma identidade, a substituir.
         // `None` (formatos antigos do `Hello`) não diz nada.
@@ -1902,9 +1921,29 @@ impl Chat {
         // P35: só vale se a conversa já existia quando a conexão abriu (`hello_pending`). Numa conversa formada
         // nesta conexão, um `Hello` "não tenho conversa" é velho (montado antes dela, chegou depois: os
         // substreams não têm ordem) e marcar `lost_state` travaria a fila do peer até a conexão cair.
+        //
+        // P36 (ADR 0043): o `hello_pending` só existe na 1ª conexão. Numa 2ª (a antiga ainda de pé), o `Hello`
+        // "não tenho conversa" vale se traz um `state_id` **diferente** do gravado: o velho do P35 vem da mesma
+        // instância que formou a conversa, então traz o mesmo.
         let was_pending = self.hello_pending.remove(&peer);
-        if has_conversation == Some(false) && was_pending && self.lost_state_candidate(&peer) {
-            self.lost_state.insert(peer);
+        // O caminho do `state_id` tem limite por conexão: o `reset_done` só vale para a troca que dá certo, e uma
+        // tentativa que falha limpa a suspeita (auditoria, baixo 1).
+        let by_state_id = new_instance
+            && !was_pending
+            && self.state_id_marks.get(&peer).copied().unwrap_or(0) < MAX_STATE_ID_MARKS;
+        if has_conversation == Some(false)
+            && (was_pending || by_state_id)
+            && self.lost_state_candidate(&peer)
+        {
+            let newly_marked = self.lost_state.insert(peer);
+            if by_state_id && newly_marked {
+                *self.state_id_marks.entry(peer).or_insert(0) += 1;
+                // Quem tem o menor Peer ID não responde com `KeyPackage` e, na 2ª conexão, não mandou `Hello` (só
+                // sai em `PeerConnected`): sem ele o `b` (maior) nunca manda o `KeyPackage`.
+                if self.peer_id() < peer {
+                    self.send_hello(peer);
+                }
+            }
         }
         // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
         // (então ela sai pela conversa nova, depois da troca, em `ready`).
@@ -1943,6 +1982,39 @@ impl Chat {
             self.transmit(peer, &Envelope::KeyPackage(kp));
         }
         Ok(())
+    }
+
+    /// P36 (ADR 0043): registra o `state_id` que o `Hello` de `peer` apresentou e diz se ele **difere** do que
+    /// gravei quando a conversa com `peer` foi formada (`true` = outra instância de estado: o banco foi trocado).
+    ///
+    /// - Com conversa e referência gravada: só compara; a referência **não** muda aqui (quem a troca é o `ready`
+    ///   da conversa nova, com o id que ficou em `pending_state_ids`).
+    /// - Com conversa e **sem** referência (conversa de antes do P36, ou linha ilegível): grava este id e devolve
+    ///   `false`. Não confia no 1º `Hello` para decidir nada, só passa a tê-lo como referência.
+    /// - Sem conversa: guarda em memória, com teto, para o `ready` gravar (o `Hello` do `b` sai antes de a
+    ///   conversa existir, e é assim que o `a` aprende a referência).
+    ///
+    /// Erro de leitura do banco vale como "sem referência": nunca marca `lost_state` por falha de disco.
+    fn note_state_id(&mut self, peer: PeerId, state_id: [u8; 16]) -> bool {
+        if self.conversations.contains_key(&peer) {
+            match self.outbox.peer_state(&peer) {
+                Ok(Some(known)) if known != state_id => {
+                    self.pending_state_ids.insert(peer, state_id);
+                    return true;
+                }
+                Ok(None) => {
+                    let _ = self.outbox.set_peer_state(&peer, state_id);
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+            return false;
+        }
+        if self.pending_state_ids.contains_key(&peer)
+            || self.pending_state_ids.len() < MAX_HELD_KEY_PACKAGES
+        {
+            self.pending_state_ids.insert(peer, state_id);
+        }
+        false
     }
 
     /// Posso marcar `peer` como "perdeu o estado" (P16)? Só com uma conversa **1:1** com ele (a identidade
@@ -2972,6 +3044,10 @@ impl Chat {
         self.device
             .remember(&peer.to_string(), &conversation.id())?;
         self.conversations.insert(peer, conversation);
+        // P36: a referência da conversa nova é o `state_id` que o peer apresentou (se apresentou).
+        if let Some(state_id) = self.pending_state_ids.remove(&peer) {
+            let _ = self.outbox.set_peer_state(&peer, state_id);
+        }
         self.teach_mailbox(peer);
         // O endereço da janela pré-conversa (só em memória até aqui) agora tem dono: vai para o disco.
         self.persist_peer_addrs(&peer);
@@ -3742,8 +3818,11 @@ impl Chat {
             .knows(&peer)
             .then(|| self.device.certificate().to_bytes());
         // "Tenho conversa com você" (P16): é por este bit que quem tem a conversa percebe que eu a perdi.
-        let has_conversation = Some(self.conversations.contains_key(&peer));
-        self.transmit(peer, &Envelope::Hello(token, certificate, has_conversation));
+        let presence = Presence {
+            has_conversation: self.conversations.contains_key(&peer),
+            state_id: self.device.state_id().ok(),
+        };
+        self.transmit(peer, &Envelope::Hello(token, certificate, Some(presence)));
     }
 
     /// Uma mensagem de handshake falhou (P25): com dois discos simultâneos uma das conexões cai levando
@@ -7163,7 +7242,8 @@ mod tests {
 
         // `hello_pending` de volta (P35: sem ele o `Hello` nem seria candidato): só o `reset_done` barra.
         ana.hello_pending.insert(b);
-        ana.on_hello(b, None, None, Some(false)).unwrap();
+        ana.on_hello(b, None, None, Some(Presence::of(false)))
+            .unwrap();
         assert!(!ana.lost_state.contains(&b), "o 2º reset na mesma conexão");
     }
 
@@ -7193,7 +7273,8 @@ mod tests {
         assert!(ana.is_ready(&b));
         assert!(!ana.hello_pending.contains(&b), "conversa criada agora");
 
-        ana.on_hello(b, None, None, Some(false)).unwrap();
+        ana.on_hello(b, None, None, Some(Presence::of(false)))
+            .unwrap();
         assert!(!ana.lost_state.contains(&b), "o Hello era velho");
     }
 
@@ -7222,9 +7303,155 @@ mod tests {
         // Como o `PeerConnected` de uma conversa carregada do banco.
         ana.hello_pending.insert(b);
 
-        ana.on_hello(b, None, None, Some(false)).unwrap();
+        ana.on_hello(b, None, None, Some(Presence::of(false)))
+            .unwrap();
         assert!(ana.lost_state.contains(&b), "o peer perdeu o banco");
         assert!(!ana.hello_pending.contains(&b));
+    }
+
+    const ID_OLD: [u8; 16] = [1; 16];
+    const ID_NEW: [u8; 16] = [2; 16];
+
+    fn hello_of(has_conversation: bool, state_id: Option<[u8; 16]>) -> Option<Presence> {
+        Some(Presence {
+            has_conversation,
+            state_id,
+        })
+    }
+
+    /// `ana` (de menor Peer ID que `b`) com uma conversa 1:1 formada com `b`, **sem** `hello_pending` (como numa
+    /// 2ª conexão). Se `first` é `Some`, o `Hello` de `b` com esse `state_id` chegou **antes** da conversa
+    /// (é assim que o `a` descobre a referência: o `b` ainda não tinha conversa quando o `Hello` saiu).
+    fn ana_with_conversation(first: Option<[u8; 16]>) -> (Chat, PeerId) {
+        let (id_a, id_t) = (StandaloneIdentity::generate(), StandaloneIdentity::generate());
+        let (dev_a, dev_b) = loop {
+            let keys = (DeviceKey::generate(), DeviceKey::generate());
+            if keys.0.peer_id() < keys.1.peer_id() {
+                break keys;
+            }
+        };
+        let b = dev_b.peer_id();
+        let key_package =
+            CryptoDevice::new(&id_t, &dev_b.public_key(), &dev_b.nostr_public_key(), 1)
+                .unwrap()
+                .key_package()
+                .unwrap();
+        let mut ana = chat(&id_a, &dev_a);
+        if first.is_some() {
+            ana.on_hello(b, None, None, hello_of(false, first)).unwrap();
+        }
+        ana.on_key_package(b, &key_package).unwrap();
+        assert!(ana.is_ready(&b));
+        assert!(!ana.hello_pending.contains(&b), "conversa criada agora");
+        (ana, b)
+    }
+
+    /// P36 (ADR 0043): o `Hello` "não tenho conversa" com um `state_id` **diferente** do que o `a` gravou ao
+    /// formar a conversa prova que o `b` perdeu o banco, **em qualquer conexão** (sem `hello_pending`): é o
+    /// caso da conexão antiga ainda de pé.
+    #[tokio::test]
+    async fn a_hello_with_a_different_state_id_marks_lost_state_without_hello_pending() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        ana.on_hello(b, None, None, hello_of(false, Some(ID_NEW)))
+            .unwrap();
+        assert!(ana.lost_state.contains(&b), "o b trocou de banco");
+    }
+
+    /// P36: quem tem o **menor** Peer ID não responde com `KeyPackage`, e na 2ª conexão ele não mandou `Hello`
+    /// (só sai em `PeerConnected`): sem um `Hello` dele, o `b` (maior) nunca manda o `KeyPackage`. Ao marcar
+    /// `lost_state` o `a` manda o `Hello` (era a lacuna **antiga** do P36, a de menor Peer ID).
+    #[tokio::test]
+    async fn the_lower_peer_sends_its_hello_when_it_marks_lost_state() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        ana.handshake.clear();
+        ana.on_hello(b, None, None, hello_of(false, Some(ID_NEW)))
+            .unwrap();
+        assert!(
+            ana.handshake
+                .values()
+                .any(|e| matches!(e, Envelope::Hello(..))),
+            "o a não mandou o Hello"
+        );
+    }
+
+    /// P35 (guarda de não-regressão): o `Hello` velho (montado antes de a conversa existir, mesma instância)
+    /// traz o **mesmo** `state_id` que o `a` gravou: continua ignorado, mesmo sem `hello_pending`.
+    #[tokio::test]
+    async fn a_late_hello_with_the_same_state_id_does_not_mark_lost_state() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        ana.on_hello(b, None, None, hello_of(false, Some(ID_OLD)))
+            .unwrap();
+        assert!(!ana.lost_state.contains(&b), "mesma instância, Hello velho");
+    }
+
+    /// P36: sem referência gravada (conversa de antes do P36), o `Hello` com `state_id` **grava** o id e não
+    /// marca; o seguinte, com o mesmo id, também não marca. Não confia no 1º `Hello` para decidir nada.
+    #[tokio::test]
+    async fn without_a_recorded_state_id_the_first_one_is_recorded_and_marks_nothing() {
+        let (mut ana, b) = ana_with_conversation(None);
+        assert_eq!(ana.outbox.peer_state(&b).unwrap(), None);
+        ana.on_hello(b, None, None, hello_of(false, Some(ID_OLD)))
+            .unwrap();
+        assert!(!ana.lost_state.contains(&b));
+        assert_eq!(ana.outbox.peer_state(&b).unwrap(), Some(ID_OLD));
+        ana.on_hello(b, None, None, hello_of(false, Some(ID_OLD)))
+            .unwrap();
+        assert!(!ana.lost_state.contains(&b));
+    }
+
+    /// P36: a referência é gravada em disco quando a conversa nasce (`ready`), não só na memória.
+    #[tokio::test]
+    async fn the_state_id_seen_before_the_conversation_is_persisted_when_it_is_formed() {
+        let (ana, b) = ana_with_conversation(Some(ID_OLD));
+        assert_eq!(ana.outbox.peer_state(&b).unwrap(), Some(ID_OLD));
+    }
+
+    /// P36: id diferente **com** "tenho conversa" não é perda de banco (um banco novo não tem conversa), e um
+    /// `Hello` no formato antigo (sem `state_id`) fora do `hello_pending` segue ignorado como no P35.
+    #[tokio::test]
+    async fn only_a_hello_without_conversation_and_with_a_different_id_marks_lost_state() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        ana.on_hello(b, None, None, hello_of(true, Some(ID_NEW)))
+            .unwrap();
+        assert!(!ana.lost_state.contains(&b), "tem conversa: não perdeu");
+        ana.on_hello(b, None, None, hello_of(false, None)).unwrap();
+        assert!(!ana.lost_state.contains(&b), "formato antigo, sem hello_pending");
+        ana.on_hello(b, None, None, None).unwrap();
+        assert!(!ana.lost_state.contains(&b), "tags 0 e 4 nunca disparam");
+    }
+
+    /// P36 (auditoria prevista): o limite de um reset por conexão vale também para o caminho do `state_id`: um
+    /// contato que repete `Hello` com ids novos não refaz a conversa a cada um.
+    #[tokio::test]
+    async fn a_new_state_id_does_not_start_a_second_reset_in_the_same_connection() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        ana.reset_done.insert(b);
+        ana.on_hello(b, None, None, hello_of(false, Some(ID_NEW)))
+            .unwrap();
+        assert!(!ana.lost_state.contains(&b));
+    }
+
+    /// P36 (auditoria, baixo 1): o `reset_done` só é gravado quando a troca **dá certo**. Um contato que manda
+    /// `Hello(false, id novo)` e depois um `KeyPackage` recusado (a tentativa falha e limpa o `lost_state`) não
+    /// pode repetir o ciclo sem fim na mesma conexão: o caminho do `state_id` marca no máximo
+    /// `MAX_STATE_ID_MARKS` vezes por conexão.
+    #[tokio::test]
+    async fn failed_resets_by_state_id_are_limited_per_connection() {
+        let (mut ana, b) = ana_with_conversation(Some(ID_OLD));
+        let mut marks = 0;
+        for i in 0..(MAX_STATE_ID_MARKS as usize + 3) {
+            ana.on_hello(b, None, None, hello_of(false, Some([10 + i as u8; 16])))
+                .unwrap();
+            if ana.lost_state.remove(&b) {
+                marks += 1; // a tentativa de troca falhou e consumiu a suspeita
+            }
+        }
+        assert_eq!(marks, MAX_STATE_ID_MARKS as usize);
+        // Reconectar zera o limite.
+        ana.handle(NodeEvent::PeerDisconnected(b));
+        ana.on_hello(b, None, None, hello_of(false, Some([99; 16])))
+            .unwrap();
+        assert!(ana.lost_state.contains(&b), "conexão nova, limite novo");
     }
 
     fn is_reset(event: &ChatEvent) -> bool {
