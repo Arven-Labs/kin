@@ -4056,7 +4056,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
-        assert!(events(&mut bia).contains(&ChatEvent::Stale { peer: ana_peer }));
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: false
+        }));
         assert!(bia.conversations.contains_key(&ana_peer));
         assert!(bia.recovering.is_empty() && bia.expected.is_empty());
     }
@@ -4071,6 +4074,10 @@ mod tests {
 
         force_stale(&mut bia, &mut ana, ana_peer);
 
+        assert!(events(&mut bia).contains(&ChatEvent::Stale {
+            peer: ana_peer,
+            recovering: false
+        }));
         assert!(bia.conversations.contains_key(&ana_peer));
         assert!(bia.recovering.is_empty());
     }
