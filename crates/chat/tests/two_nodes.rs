@@ -421,12 +421,14 @@ async fn message_in_the_window_case(a_lower: bool) {
     let mut b = pb.open();
     b.dial(addr).unwrap();
     let b_id = pb.peer_id();
-    let mut seen_b = Vec::new();
+    let (mut seen_b, mut before_a) = (Vec::new(), Vec::new());
     timeout(WAIT, async {
         loop {
             tokio::select! {
                 e = a.next_event() => {
-                    if matches!(e, ChatEvent::Route { peer, .. } if peer == b_id) {
+                    let route = matches!(e, ChatEvent::Route { peer, .. } if peer == b_id);
+                    before_a.push(e);
+                    if route {
                         break;
                     }
                 }
@@ -448,7 +450,7 @@ async fn message_in_the_window_case(a_lower: bool) {
         seen_a
             .iter()
             .any(|e| matches!(e, ChatEvent::ConversationReset { peer, .. } if *peer == b_id)),
-        "a não refez a conversa (a_lower={a_lower}): {seen_a:#?}"
+        "a não refez a conversa (a_lower={a_lower})\neventos de a antes da rota: {before_a:#?}\neventos de a depois: {seen_a:#?}\neventos de b: {seen_b:#?}"
     );
     let received: Vec<&str> = seen_b
         .iter()
