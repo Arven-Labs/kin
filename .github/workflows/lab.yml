@@ -85,6 +85,8 @@ jobs:
           - revoke-device
           - reconnect
           - reconnect-restart
+          - stale-connection-rst
+          - stale-connection-silent
     steps:
       - name: Checkout
         uses: actions/checkout@v7
