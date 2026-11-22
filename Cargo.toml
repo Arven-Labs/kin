@@ -38,7 +38,10 @@ openmls_rust_crypto = "=0.6.0"
 openmls_basic_credential = "=0.6.0"
 openmls_traits = "=0.6.0"
 openmls_sqlite_storage = "=0.3.0"
-rusqlite = "0.37"
+# SQLCipher embutido (P13, ADR 0045): cifra em repouso dos bancos. Aditiva sobre o `bundled` que o
+# `openmls_sqlite_storage` já liga. Exige OpenSSL (headers e biblioteca) no build; sem `PRAGMA key` o banco segue
+# SQLite comum. Se o OpenSSL do sistema não servir: `bundled-sqlcipher-vendored-openssl`.
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 serde = "1"
 serde_json = "1"
 base64 = "0.22"
