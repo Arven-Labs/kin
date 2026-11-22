@@ -515,6 +515,19 @@ impl Outbox {
         Ok(())
     }
 
+    /// Grava o `state_id` que `peer` apresentou quando a conversa com ele foi formada (P36, ADR 0043).
+    /// **Stub**: ainda não grava nada.
+    pub(crate) fn set_peer_state(&self, peer: &PeerId, state_id: [u8; 16]) -> Result<(), Error> {
+        let _ = (peer, state_id);
+        Ok(())
+    }
+
+    /// O `state_id` gravado de `peer`; `None` se não há linha (conversa de antes do P36). **Stub.**
+    pub(crate) fn peer_state(&self, peer: &PeerId) -> Result<Option<[u8; 16]>, Error> {
+        let _ = peer;
+        Ok(None)
+    }
+
     /// Grava um token de convite que vence em `expires_at` (segundos Unix). Varre os vencidos antes de
     /// contar; com [`MAX_LIVE_INVITES`] vivos, recusa com `Error::TooManyInvites` (P18, ADR 0039).
     pub(crate) fn add_invite_token(
@@ -2082,6 +2095,56 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 9);
+    }
+
+    /// P36: banco v9 abre como v10, mantém o que tinha (aqui, os tokens) e ganha a tabela do `state_id`.
+    #[test]
+    fn a_version_9_database_opens_as_version_10_keeps_its_data_and_gains_the_peer_state_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let peer = peer();
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            outbox.add_invite_token(&[1; 16], 200, 100).unwrap();
+            outbox
+                .conn
+                .execute_batch("DROP TABLE IF EXISTS kin_peer_state; PRAGMA user_version = 9;")
+                .unwrap();
+        }
+
+        let outbox = Outbox::open(&path).unwrap();
+        outbox.set_peer_state(&peer, [4; 16]).unwrap();
+
+        assert!(outbox.invite_token_is_live(&[1; 16], 100).unwrap());
+        assert_eq!(outbox.peer_state(&peer).unwrap(), Some([4; 16]));
+        let version: i64 = outbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+    }
+
+    /// P36: o `state_id` do peer sobrevive ao reabrir o banco, a última gravação vale, é por peer, e
+    /// esquecer o peer apaga a linha (a conversa caiu: a referência não vale mais).
+    #[test]
+    fn the_peer_state_id_is_persisted_replaced_per_peer_and_forgotten_with_the_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let (one, other) = (peer(), peer());
+        {
+            let outbox = Outbox::open(&path).unwrap();
+            assert_eq!(outbox.peer_state(&one).unwrap(), None, "sem linha");
+            outbox.set_peer_state(&one, [1; 16]).unwrap();
+            outbox.set_peer_state(&one, [2; 16]).unwrap();
+            outbox.set_peer_state(&other, [3; 16]).unwrap();
+        }
+        let outbox = Outbox::open(&path).unwrap();
+        assert_eq!(outbox.peer_state(&one).unwrap(), Some([2; 16]));
+        assert_eq!(outbox.peer_state(&other).unwrap(), Some([3; 16]));
+
+        outbox.forget_peer(&one).unwrap();
+        assert_eq!(outbox.peer_state(&one).unwrap(), None);
+        assert_eq!(outbox.peer_state(&other).unwrap(), Some([3; 16]), "só o `one`");
     }
 
     /// P18: o token vive até `expires_at` (exclusive), é gasto uma vez só e some da lista.

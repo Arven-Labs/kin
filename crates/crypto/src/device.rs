@@ -182,6 +182,11 @@ impl CryptoDevice {
         self.0.provider.remembered()
     }
 
+    /// Identidade da **instância de estado** deste device (P36, ADR 0043). **Stub**: ainda constante.
+    pub fn state_id(&self) -> Result<[u8; 16], Error> {
+        Ok([0; 16])
+    }
+
     /// Grava um tombstone de device recebido (P30, 3c; ADR 0023): confere a assinatura e é idempotente.
     /// Devolve `true` se era novo e `false` se já estava gravado (decide o repasse, ADR 0025).
     pub fn store_revocation(&self, revocation: &DeviceRevocation) -> Result<bool, Error> {
