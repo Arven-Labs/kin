@@ -88,6 +88,16 @@ async fn disconnect_without_a_connection_returns_false() {
     assert_eq!(data, b"ainda de pe");
 }
 
+/// Avança o nó até ele ter visto duas conexões estabelecidas com `other` (dois `PeerRoute`).
+async fn two_routes(node: &mut Node, other: PeerId) {
+    let mut seen = 0;
+    while seen < 2 {
+        if matches!(node.next_event().await, NodeEvent::PeerRoute { peer, .. } if peer == other) {
+            seen += 1;
+        }
+    }
+}
+
 /// Com **duas** conexões abertas com o mesmo peer (o que o P36 chama de conexão antiga meio-aberta), um
 /// `disconnect` fecha as duas: cada lado vê **um só** `PeerDisconnected` (o transporte só o emite quando a
 /// última cai) e um 2º `disconnect` não encontra mais nada.
@@ -108,19 +118,8 @@ async fn disconnect_closes_every_connection_with_the_peer() {
     b.dial(addr.clone()).unwrap();
     b.dial(addr).unwrap();
     // Cada conexão estabelecida vira um `PeerRoute` (a 1ª, junto do `PeerConnected`): espera 2 em cada lado.
-    let routes = |node: &mut Node, other: PeerId| {
-        let mut seen = 0;
-        async move {
-            while seen < 2 {
-                if matches!(node.next_event().await, NodeEvent::PeerRoute { peer, .. } if peer == other)
-                {
-                    seen += 1;
-                }
-            }
-        }
-    };
     timeout(WAIT, async {
-        tokio::join!(routes(&mut a, id_b), routes(&mut b, id_a))
+        tokio::join!(two_routes(&mut a, id_b), two_routes(&mut b, id_a))
     })
     .await
     .expect("as duas conexões não se estabeleceram nos dois lados");
