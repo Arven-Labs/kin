@@ -2210,4 +2210,17 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Erros meus**: a premissa do plano ("a reconexão cai no P16 sozinha") estava errada (sem redial, portão fechado barrava), só vista depois dos testes; `sed -i` e `python3` rodados no código contra a regra (sem efeito); stub sem `allow(dead_code)` e um erro de empréstimo custaram duas rodadas de CI; troquei a decisão sobre o pareado sem pedir a confirmação de volta; o log da mutação não identificou os testes que falharam; um teste foi enfraquecido (o `Reset` com mesma identidade ficou sem prova unitária).
 - **Não verificado**: ver "Pendências antes de mesclar" no ADR 0041 (mutação lida, reauditoria da correção, integração do ciclo, aviso da CLI, `disconnect` com várias conexões).
 - **Mesclado** pelo dono em 2026-11-21 (`e072153` na `main`), com `CI`, `Lab` e `CI Private Files` verdes no último commit (o `lossy` falhou uma vez e passou na 2ª tentativa; uma repetição só, sem controle, não prova instabilidade) e com as pendências abertas.
-- **Próximo passo**: fechar as pendências do ADR 0041 (mutação lida, reauditoria, integração do ciclo, aviso da CLI); ou P33, que depende do dono.
+- **Próximo passo**: fechar as pendências do ADR 0041 (mutação lida, reauditoria, integração do ciclo, aviso da CLI); ou P33, que depende do dono. *(Itens 3 e 4 na subseção abaixo.)*
+
+### 2026-11-22 — Sessão 38
+
+#### P9 (c), PR 1: aviso do Stale e ciclo completo (ADR 0041, PR #285)
+
+- **Origem**: o dono escolheu "vamos de P9" na abertura (`/projeto kin`); plano aprovado em plan mode, em 3 PRs: (3 e 4) este, (5) `disconnect`, (1 e 2) mutação lida e reauditoria.
+- **Decisões do dono**: `ChatEvent::Stale { peer, recovering }` (descartados: evento novo, só mudar o texto); gancho `#[doc(hidden)]` para forçar o `Stale` num teste de integração.
+- **Feito**: `recover_from_stale` devolve se abandonou e o evento leva isso; a CLI tem duas frases (abandonou e reconecta / só avisa); `Chat::rotate_keys_dropping_commit` (só teste); `crates/chat/tests/stale_recovery.rs` (Stale, queda, discagem, `ConversationReset` com a mesma identidade nos dois lados, mensagens nos dois sentidos).
+- **Provas** (CI): testes primeiro; o 1º run (44983768765) parou na compilação (esqueci uma asserção sem o campo), **não provou nada**; o 2º (44984019276): 2 testes unitários falharam e 395 passaram, e o `cargo test` parou ali sem rodar o de integração; depois da implementação, 397 unitários verdes; o de integração falhou duas vezes por erro **meu** no teste (sem rediscagem em loopback; `NotCommitter`) e passou no run 44985384147, com `Lab` e `CI Private Files` verdes.
+- **Achados**: (1) só o committer (menor Peer ID) gira a chave (`NotCommitter`), então o teste escolhe os papéis pela ordem dos Peer IDs; (2) a rediscagem de fundo só usa endereços públicos (`dial_addrs` filtra loopback), então no teste o lado atrasado disca à mão; **a rediscagem automática depois do `Stale` não foi exercitada com endereço real** (fica para o P33).
+- **Erros meus**: asserção esquecida no 1º commit; hipótese errada sobre o gancho (committer); 2º teste de integração descartado por ser fraco (a mensagem saía antes do `Stale`; a outbox tem teste unitário).
+- **Não verificado**: a prova do `is_sibling` com `household` vazio **não entrou** (o teste de integração não monta irmãos); o teste de integração é de caracterização (só falharia antes pelo `recovering: true`), não rodei mutação nele; `fmt --check` aponta diferenças que já existiam em `chat.rs`, `wire.rs` e `two_nodes.rs`.
+- **Próximo passo**: PR 2 (`Node::disconnect` com várias conexões e por relay) e PR 3 (mutação lida e reauditoria).
