@@ -1843,9 +1843,7 @@ impl Chat {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
                     // Em recuperação (P9 c) a identidade fixada em `expected` fica: é ela que o handshake exige.
-                    if !self.recovering.contains_key(&peer) {
-                        self.expected.remove(&peer);
-                    }
+                    self.release_expected(&peer);
                     self.dialed.remove(&peer);
                     self.lost_state.remove(&peer);
                     self.forget_unreachable(&peer);
@@ -2405,7 +2403,7 @@ impl Chat {
             // Repetir o dial é inofensivo: o libp2p ignora quando já está discando ou conectado.
             self.expected.insert(device, owner);
             if let Err(e) = self.node.dial_peer(device, addrs) {
-                self.expected.remove(&device);
+                self.release_expected(&device);
                 self.forget_unreachable(&device);
                 self.queue.push_back(ChatEvent::DialFailed {
                     peer: Some(device),
@@ -3691,6 +3689,14 @@ impl Chat {
         true
     }
 
+    /// Solta a vaga de `expected` de um dial que morreu. Em recuperação (P9 c) a identidade fixada **fica**: é
+    /// ela que o handshake seguinte exige (reauditoria do #281, achado 1).
+    fn release_expected(&mut self, peer: &PeerId) {
+        if !self.recovering.contains_key(peer) {
+            self.expected.remove(peer);
+        }
+    }
+
     /// Vence as marcas de recuperação mais velhas que [`RECOVERING_TTL`]: o peer deixa de ser esperado.
     fn expire_recovering(&mut self) {
         let now = now_secs();
@@ -4024,6 +4030,34 @@ mod tests {
 
         assert_eq!(bia.expected.get(&ana_peer), Some(&old));
         assert!(bia.recovering.contains_key(&ana_peer));
+    }
+
+    /// Reauditoria do #281, achado 1: soltar a vaga de `expected` depois de um dial que falhou (no
+    /// `on_device_list`) não apaga a identidade fixada de um peer em recuperação.
+    #[tokio::test]
+    async fn releasing_expected_keeps_the_pin_of_a_recovering_peer() {
+        let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+        connect_peer(&mut bia, ana_peer);
+        let old = bia.old_identity(&ana_peer).unwrap();
+        force_stale(&mut bia, &mut ana, ana_peer);
+        assert_eq!(bia.expected.get(&ana_peer), Some(&old), "pré-condição");
+
+        bia.release_expected(&ana_peer);
+
+        assert_eq!(bia.expected.get(&ana_peer), Some(&old));
+    }
+
+    /// Reauditoria do #281, achado 1 (guarda): fora de recuperação, soltar a vaga continua removendo.
+    #[tokio::test]
+    async fn releasing_expected_frees_the_slot_of_a_peer_not_recovering() {
+        let (mut bia, _ana, _ana_peer) = bia_and_raw_ana();
+        let stranger = PeerId::random();
+        let identity = bia.device.identity().clone();
+        bia.expected.insert(stranger, identity);
+
+        bia.release_expected(&stranger);
+
+        assert!(!bia.expected.contains_key(&stranger));
     }
 
     /// Médio 2 (outra metade): se a conversa nova é de outra identidade, o `ConversationReset` não sai.
