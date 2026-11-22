@@ -1843,9 +1843,7 @@ impl Chat {
                 // A discagem morreu: libera a vaga em `expected`. Uma lista que repetir o dial refaz.
                 if let Some(peer) = peer {
                     // Em recuperação (P9 c) a identidade fixada em `expected` fica: é ela que o handshake exige.
-                    if !self.recovering.contains_key(&peer) {
-                        self.expected.remove(&peer);
-                    }
+                    self.release_expected(&peer);
                     self.dialed.remove(&peer);
                     self.lost_state.remove(&peer);
                     self.forget_unreachable(&peer);
@@ -3691,9 +3689,12 @@ impl Chat {
         true
     }
 
-    /// STUB (testes primeiro): sempre remove, como o código fazia antes da reauditoria do P9 (c).
+    /// Solta a vaga de `expected` de um dial que morreu. Em recuperação (P9 c) a identidade fixada **fica**: é
+    /// ela que o handshake seguinte exige (reauditoria do #281, achado 1).
     fn release_expected(&mut self, peer: &PeerId) {
-        self.expected.remove(peer);
+        if !self.recovering.contains_key(peer) {
+            self.expected.remove(peer);
+        }
     }
 
     /// Vence as marcas de recuperação mais velhas que [`RECOVERING_TTL`]: o peer deixa de ser esperado.
