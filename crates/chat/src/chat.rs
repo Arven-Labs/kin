@@ -3676,7 +3676,6 @@ impl Chat {
         };
         self.stale_recovered.insert(peer, now);
         self.recovering.insert(peer, (identity.clone(), now));
-        self.expected.insert(peer, identity);
         self.forget_conversation_state(peer);
         // Se o apagamento falhar, o label fica e a reabertura recarrega o grupo (como na revogação); o
         // peer já está em recuperação e o P16 troca a conversa de qualquer jeito.
