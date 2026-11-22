@@ -1894,7 +1894,7 @@ impl Chat {
                     }
                     // Ack tardio de uma mensagem que estava em voo no reset: a conversa já é a nova, volta já.
                     if late {
-                        self.requeue_kept(peer, false);
+                        self.replay.remove(&peer);
                     }
                     // Reenviada pelo reset: a aplicação já viu o `Delivered` da 1ª vez (ADR 0044).
                     if !mirror && !self.replayed.remove(&(peer, message)) && !late {
