@@ -439,7 +439,9 @@ async fn message_in_the_window_case(a_lower: bool) {
 
     // A conexão extra apareceu e o `Hello` do `b` ainda não foi tratado: a janela.
     a.send(b_id, "no limbo", None).unwrap();
-    let (seen_a, seen_b_after) = settle(&mut a, &mut b, Duration::from_secs(30)).await;
+    // 60 s: pedidos que caem na conexão antiga (sem ser dirigida) só falham no timeout de 10 s, e a mensagem
+    // extra desloca em quais conexões os pedidos de controle caem; cada falha custa um reenvio (P25).
+    let (seen_a, seen_b_after) = settle(&mut a, &mut b, Duration::from_secs(60)).await;
     seen_b.extend(seen_b_after);
 
     assert!(
