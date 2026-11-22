@@ -3963,6 +3963,7 @@ mod tests {
         let mut table = String::from("K  runs  stale  mean_held  max_held  delivered_all\n");
         for k in [8, FUTURE_LIMIT, 48, 64, 128] {
             let (mut stale, mut held_sum, mut held_max, mut complete) = (0, 0, 0, 0);
+            let (mut texts_sum, mut others) = (0, std::collections::BTreeMap::<String, usize>::new());
             for _ in 0..RUNS {
                 let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
                 let mut blobs = vec![Envelope::Mls(ana.rotate_keys().unwrap()).encode()];
@@ -3988,7 +3989,12 @@ mod tests {
                     let evs = events(&mut bia);
                     warned |= evs.iter().any(|e| matches!(e, ChatEvent::Stale { .. }));
                     texts += received_texts(&evs).len();
+                    for e in evs.iter().filter(|e| !matches!(e, ChatEvent::Received { .. })) {
+                        let text = format!("{e:?}");
+                        *others.entry(text.chars().take(90).collect()).or_default() += 1;
+                    }
                 }
+                texts_sum += texts;
                 stale += usize::from(warned);
                 held_sum += max;
                 held_max = held_max.max(max);
@@ -3998,9 +4004,13 @@ mod tests {
                 }
             }
             table += &format!(
-                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {complete}\n",
-                held_sum as f64 / RUNS as f64
+                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {complete}  texts_mean={:.1}\n",
+                held_sum as f64 / RUNS as f64,
+                texts_sum as f64 / RUNS as f64
             );
+            for (text, n) in &others {
+                table += &format!("    {n}x {text}\n");
+            }
         }
         eprintln!("{table}");
         panic!("MEDIÇÃO TEMPORÁRIA (remover antes do merge):\n{table}");
