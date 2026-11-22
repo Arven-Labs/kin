@@ -1778,7 +1778,6 @@ impl Chat {
             NodeEvent::PeerConnected(peer) => {
                 self.connected.insert(peer);
                 // A rota que o `Node` emite logo depois é a desta 1ª conexão, não uma conexão extra (P36).
-                self.first_route_pending.insert(peer);
                 // Conectado, a fila sai direto (`flush` abaixo): o novo depósito agendado não faz mais sentido.
                 self.forget_deposit_retry(&peer);
                 self.forget_redial(&peer);
