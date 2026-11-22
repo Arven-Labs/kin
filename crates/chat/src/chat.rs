@@ -3949,6 +3949,63 @@ mod tests {
         assert!(received_texts(&events(&mut bia)).is_empty());
     }
 
+    /// P9 (d), medição: um relay Nostr devolve o backlog por `created_at` decrescente, e o NIP-59 sorteia esse
+    /// campo (até 2 dias no passado), então a ordem de chegada não tem relação com a de envio. Aqui a ordem vem
+    /// do `created_at` de gift wraps **reais** (`nostr::wrap`); o relay em si não entra (é o modelo do NIP-01,
+    /// não um relay medido, ver P33). Para cada K (mensagens enviadas depois do commit) entrega o commit e as K
+    /// nessa ordem e mede quantas ficaram no buffer e se o `Stale` disparou sem nada ter se perdido.
+    /// Só afirma o que é determinístico (K <= `FUTURE_LIMIT` nunca estoura); o resto vai na tabela.
+    #[tokio::test]
+    async fn measure_future_buffer_with_the_mailbox_delivery_order() {
+        const RUNS: usize = 30;
+        let sender = DeviceKey::generate();
+        let recipient = DeviceKey::generate().nostr_public_key();
+        let mut table = String::from("K  runs  stale  mean_held  max_held  delivered_all\n");
+        for k in [8, FUTURE_LIMIT, 48, 64, 128] {
+            let (mut stale, mut held_sum, mut held_max, mut complete) = (0, 0, 0, 0);
+            for _ in 0..RUNS {
+                let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+                let mut blobs = vec![Envelope::Mls(ana.rotate_keys().unwrap()).encode()];
+                for i in 0..k {
+                    blobs.push(Envelope::Mls(wire(&mut ana, &i.to_string())).encode());
+                }
+                // Posição de cada blob na entrega: `created_at` do wrap, do mais novo para o mais velho.
+                let mut order: Vec<(u64, usize)> = (0..blobs.len())
+                    .map(|i| {
+                        let event = crate::nostr::wrap(&sender, &recipient, &[0]).unwrap();
+                        (event.created_at.as_u64(), i)
+                    })
+                    .collect();
+                order.sort_by(|a, b| b.0.cmp(&a.0));
+
+                let (mut max, mut texts, mut warned) = (0, 0, false);
+                for (_, i) in order {
+                    bia.handle_mailbox(MailboxEvent::Retrieved {
+                        from: ana_peer,
+                        blob: blobs[i].clone(),
+                    });
+                    max = max.max(bia.future.get(&ana_peer).map_or(0, Vec::len));
+                    let evs = events(&mut bia);
+                    warned |= evs.iter().any(|e| matches!(e, ChatEvent::Stale { .. }));
+                    texts += received_texts(&evs).len();
+                }
+                stale += usize::from(warned);
+                held_sum += max;
+                held_max = held_max.max(max);
+                complete += usize::from(texts == k);
+                if k <= FUTURE_LIMIT {
+                    assert!(!warned, "K = {k} cabe no teto e não pode dar Stale");
+                }
+            }
+            table += &format!(
+                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {complete}\n",
+                held_sum as f64 / RUNS as f64
+            );
+        }
+        eprintln!("{table}");
+        panic!("MEDIÇÃO TEMPORÁRIA (remover antes do merge):\n{table}");
+    }
+
     /// Estoura o teto do buffer com mensagens de época futura (o commit nunca chega): devolve o `Stale`.
     fn force_stale(bia: &mut Chat, ana: &mut Conversation, ana_peer: PeerId) {
         let _commit = ana.rotate_keys().unwrap();
