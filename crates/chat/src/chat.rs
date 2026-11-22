@@ -4056,6 +4056,51 @@ mod tests {
         eprintln!("{table}");
     }
 
+    /// P37, medição do cenário **alcançável** (a janela de depósito é `MAILBOX_WINDOW` = 8, então K > 8 não
+    /// ocorre): 8 mensagens depositadas e re-depositadas pela varredura por idade, cada rodada recifrando as
+    /// mesmas 8 com gerações novas, enquanto as cópias antigas ainda estão no relay (retenção de 7 dias,
+    /// varredura a cada ~1,75 dia: até ~5 cópias de cada). O relay as serve em ordem aleatória. Uma mensagem se
+    /// perde de verdade só se **todas** as cópias caem em `TooOld`.
+    #[tokio::test]
+    async fn measure_redeposited_copies_in_random_order() {
+        const RUNS: usize = 200;
+        let mut table = String::from("copias  eventos  runs  runs_com_perda  perdidas_media  perdidas_max\n");
+        for copies in [1usize, 2, 3, 5, 8] {
+            let (mut runs_lost, mut lost_sum, mut lost_max) = (0, 0, 0);
+            for _ in 0..RUNS {
+                let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
+                let messages: Vec<Message> =
+                    (0..MAILBOX_WINDOW).map(|i| Message::new(i.to_string(), None)).collect();
+                let mut blobs = Vec::new();
+                for _ in 0..copies {
+                    for m in &messages {
+                        blobs.push(Envelope::Mls(ana.encrypt(&m.encode()).unwrap()).encode());
+                    }
+                }
+                rand::seq::SliceRandom::shuffle(blobs.as_mut_slice(), &mut rand::rng());
+                let mut seen: Vec<MessageId> = Vec::new();
+                for blob in blobs {
+                    bia.handle_mailbox(MailboxEvent::Retrieved { from: ana_peer, blob });
+                    for e in events(&mut bia) {
+                        if let ChatEvent::Received { message, .. } = e {
+                            seen.push(message.id);
+                        }
+                    }
+                }
+                let lost = messages.iter().filter(|m| !seen.contains(&m.id)).count();
+                runs_lost += usize::from(lost > 0);
+                lost_sum += lost;
+                lost_max = lost_max.max(lost);
+            }
+            table += &format!(
+                "{copies}  {}  {RUNS}  {runs_lost}  {:.2}  {lost_max}\n",
+                copies * MAILBOX_WINDOW,
+                lost_sum as f64 / RUNS as f64
+            );
+        }
+        panic!("MEDIÇÃO TEMPORÁRIA (remover antes do merge):\n{table}");
+    }
+
     /// Estoura o teto do buffer com mensagens de época futura (o commit nunca chega): devolve o `Stale`.
     fn force_stale(bia: &mut Chat, ana: &mut Conversation, ana_peer: PeerId) {
         let _commit = ana.rotate_keys().unwrap();
