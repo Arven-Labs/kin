@@ -1925,7 +1925,7 @@ impl Chat {
             let newly_marked = self.lost_state.insert(peer);
             // Quem tem o menor Peer ID não responde com `KeyPackage` e, na 2ª conexão, não mandou `Hello` (só sai
             // em `PeerConnected`): sem ele o `b` (maior) nunca manda o `KeyPackage`.
-            if newly_marked && new_instance && !was_pending && self.peer_id() < peer {
+            if newly_marked && new_instance && !was_pending && self.peer_id() > peer {
                 self.send_hello(peer);
             }
         }
