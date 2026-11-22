@@ -340,7 +340,6 @@ const MAX_HELD_KEY_PACKAGE: usize = 16 * 1024;
 const MAX_HELD_KEY_PACKAGES: usize = 64;
 /// Quantas vezes por conexão um peer pode marcar `lost_state` pelo caminho do `state_id` (P36, auditoria,
 /// baixo 1): o `reset_done` só vale para a troca que dá certo, e uma tentativa que falha limpa a suspeita.
-#[allow(dead_code)] // stub do commit de testes; o próximo commit usa
 const MAX_STATE_ID_MARKS: u8 = 2;
 /// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
@@ -533,6 +532,9 @@ pub struct Chat {
     /// de a conversa existir, ou o do peer que acabou de provar que perdeu o banco. O `ready` o grava como a
     /// referência da conversa nova. Em memória, com teto, e some com a conexão.
     pending_state_ids: HashMap<PeerId, [u8; 16]>,
+    /// Quantas vezes cada peer marcou `lost_state` pelo `state_id` nesta conexão, até [`MAX_STATE_ID_MARKS`].
+    /// Em memória; zera ao desconectar.
+    state_id_marks: HashMap<PeerId, u8>,
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
     not_admitted_notified: HashSet<PeerId>,
@@ -805,6 +807,7 @@ impl Chat {
             hello_pending: HashSet::new(),
             reset_done: HashSet::new(),
             pending_state_ids: HashMap::new(),
+            state_id_marks: HashMap::new(),
             not_admitted_notified: HashSet::new(),
             require_approval: false,
             pending_approval: HashMap::new(),
@@ -1737,6 +1740,7 @@ impl Chat {
                 self.hello_pending.remove(&peer);
                 self.reset_done.remove(&peer);
                 self.pending_state_ids.remove(&peer);
+                self.state_id_marks.remove(&peer);
                 self.not_admitted_notified.remove(&peer);
                 self.forget_approval(&peer);
                 self.retry.remove(&peer);
@@ -1922,15 +1926,23 @@ impl Chat {
         // "não tenho conversa" vale se traz um `state_id` **diferente** do gravado: o velho do P35 vem da mesma
         // instância que formou a conversa, então traz o mesmo.
         let was_pending = self.hello_pending.remove(&peer);
+        // O caminho do `state_id` tem limite por conexão: o `reset_done` só vale para a troca que dá certo, e uma
+        // tentativa que falha limpa a suspeita (auditoria, baixo 1).
+        let by_state_id = new_instance
+            && !was_pending
+            && self.state_id_marks.get(&peer).copied().unwrap_or(0) < MAX_STATE_ID_MARKS;
         if has_conversation == Some(false)
-            && (was_pending || new_instance)
+            && (was_pending || by_state_id)
             && self.lost_state_candidate(&peer)
         {
             let newly_marked = self.lost_state.insert(peer);
-            // Quem tem o menor Peer ID não responde com `KeyPackage` e, na 2ª conexão, não mandou `Hello` (só sai
-            // em `PeerConnected`): sem ele o `b` (maior) nunca manda o `KeyPackage`.
-            if newly_marked && new_instance && !was_pending && self.peer_id() < peer {
-                self.send_hello(peer);
+            if by_state_id && newly_marked {
+                *self.state_id_marks.entry(peer).or_insert(0) += 1;
+                // Quem tem o menor Peer ID não responde com `KeyPackage` e, na 2ª conexão, não mandou `Hello` (só
+                // sai em `PeerConnected`): sem ele o `b` (maior) nunca manda o `KeyPackage`.
+                if self.peer_id() < peer {
+                    self.send_hello(peer);
+                }
             }
         }
         // O `Hello` chegou: a fila que esperava sai, a não ser que o peer tenha dito que perdeu a conversa
