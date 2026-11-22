@@ -3665,6 +3665,7 @@ impl Chat {
         };
         if self.stale_recovered.contains_key(&peer)
             || self.from_mailbox
+            || !self.connected.contains(&peer)
             || self.is_sibling(&peer)
             || self.household.contains_key(&peer)
             || self.is_distrusted(&identity)
