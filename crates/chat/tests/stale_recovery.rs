@@ -29,7 +29,7 @@ async fn a_stale_conversation_is_rebuilt_with_the_same_identity() {
         Person::new(dir.path(), "bia"),
     );
     let (mut chat_ana, mut chat_bia) = (ana.open(), bia.open());
-    connect(&mut chat_ana, &mut chat_bia).await;
+    let addr = connect(&mut chat_ana, &mut chat_bia).await;
     let (ana_peer, bia_peer) = (ana.peer_id(), bia.peer_id());
 
     // `ana` avança de época sem que `bia` receba o commit, e manda o bastante para estourar o buffer dela.
@@ -58,8 +58,22 @@ async fn a_stale_conversation_is_rebuilt_with_the_same_identity() {
         "o lado atrasado, conectado, abandona a conversa"
     );
 
-    // Depois da queda e da reconexão, o P16 refaz a conversa; os dois lados avisam a troca com a mesma
-    // identidade da conversa antiga.
+    // A queda chega aos dois lados. Quem volta a discar é a rediscagem de fundo, mas ela só usa endereços
+    // públicos (`dial_addrs` filtra loopback), então aqui o teste faz o papel do mDNS ou do `/dial`.
+    timeout(WAIT, async {
+        tokio::select! {
+            () = wait_for(&mut chat_bia, |e| {
+                matches!(e, ChatEvent::PeerDisconnected(p) if p == ana_peer).then_some(())
+            }) => {}
+            _ = drive(&mut chat_ana) => unreachable!(),
+        }
+    })
+    .await
+    .expect("bia não viu a queda que o Stale provoca");
+    chat_bia.dial(addr).unwrap();
+
+    // Na reconexão, o P16 refaz a conversa; os dois lados avisam a troca com a mesma identidade da
+    // conversa antiga.
     let (seen_ana, seen_bia) = settle(&mut chat_ana, &mut chat_bia, Duration::from_secs(15)).await;
     let was_reset = |seen: &[ChatEvent], peer, identity| {
         seen.iter().any(|e| {
