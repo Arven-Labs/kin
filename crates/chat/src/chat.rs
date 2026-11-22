@@ -3963,7 +3963,7 @@ mod tests {
     /// fora de ordem for corrigida (P37).
     #[tokio::test]
     async fn out_of_order_mailbox_backlog_loses_messages_silently_but_the_resend_recovers_them() {
-        const RUNS: usize = 30;
+        const RUNS: usize = 12;
         let sender = DeviceKey::generate();
         let recipient = DeviceKey::generate().nostr_public_key();
         let mut table = String::from("K  runs  stale  mean_held  max_held  mean_lost_first_pass\n");

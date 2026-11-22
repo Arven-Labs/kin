@@ -2242,3 +2242,14 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Feito**: `Chat::release_expected` (só remove de `expected` se o peer não está em `recovering`), usado no `DialFailed` e no `on_device_list` (`chat.rs`, ex-linha 2408).
 - **Não verificado**: o `Err` síncrono real do `dial_peer` (ConnectionLimits, fila de adiadas cheia) **não dá para forçar em teste unitário**; o teste cobre o helper e a regra, não o ponto de chamada. O auditor não leu `stale_recovery.rs` nem os testes do #286 e não confirmou os `Err` do `swarm.dial`.
 - **Próximo passo**: fechar o P9 (c) no registro (resta o P9 (b) e (d)); ou P33, que depende do dono.
+
+#### P9 (d): teto de 32 medido com a ordem de entrega da caixa postal (PR #289)
+
+- **Origem**: o dono escolheu "vamos de P9" e, das fatias que sobravam ((b) grupos, (d) teto), a **(d)**; plano aprovado em plan mode. Depois do 1º resultado escolheu "o B depois o A" (medir a causa e a recuperação, depois registrar).
+- **Medição** (4 rodadas no CI, PR #289, o teste falhava de propósito para imprimir a tabela no log): o `created_at` de gift wraps reais (`nostr::wrap`) dá a ordem de entrega (NIP-01: do mais novo ao mais velho); K mensagens depois de um commit. Tabela completa no ADR 0041 (atualização).
+- **Achados**: (1) o limite real é a tolerância de **10 gerações** do MLS, não o teto de 32: com K = 32 chegam 12,9 de 32 e **19,1 são `TooOld` ignorados sem evento**; (2) com K >= 48 o `Stale` dispara sem ninguém ter perdido commit (10 a 25 de 30); (3) o reenvio da outbox (bytes novos, mesmo `MessageId`) recupera **tudo, sem repetir**.
+- **Feito**: teste definitivo `out_of_order_mailbox_backlog_loses_messages_silently_but_the_resend_recovers_them` (fixa o estado atual; a asserção `lost_sum > 0` é para inverter na correção); ADR 0041 e P9 (d) atualizados; **P37 novo** (decisão do dono, toca cripto, §4). Nenhum código de produção mudou (o contador `TooOld` temporário foi removido).
+- **Erros meus**: `as_u64` (não existe, é `as_secs`) e `sort_by` que o clippy pede como `sort_by_key`: dois runs de CI perdidos na compilação, sem provar nada; o 1º teste definitivo levava > 60 s (30 execuções por K) e baixei para 12.
+- **Não verificado**: relay Nostr real (ordem, `limit` do REQ), tempo até o reenvio, backlog com mais de uma rotação, remetente sem a outbox; a causa `TooOld` é provada pelo contador (19,1 + 12,9 = 32), mas o contador saiu do código.
+- **Prova** (CI): o teste é de caracterização (não há "falha antes"). Mutação de propósito **não feita** neste PR (só teste, sem código de produção).
+- **Próximo passo**: decidir o P37 (ordenar o backlog, subir a tolerância ou só avisar); P9 (b) segue para a Fase 5; P33 continua com o dono.

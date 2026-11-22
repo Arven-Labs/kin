@@ -52,6 +52,26 @@ No `Stale`, o **lado atrasado** (o que recebeu a época futura) abandona a conve
   - **Não verificado pelo auditor**: `crates/chat/tests/stale_recovery.rs` e os testes do #286 não lidos; `credential::verify` tomado como correto; backend da caixa postal (o `from` autenticado pelo selo é afirmação do ADR).
 - **Pendências (abertas na `main`; o #281 foi mesclado sem fechá-las; ver a atualização acima)**: (1) refazer a mutação **lendo quais testes falham**; (2) reauditar a correção dos 3 médios; (3) teste de integração do ciclo completo (Stale, queda, reconexão, P16 refaz, `ConversationReset` com a mesma identidade) e prova do `is_sibling` com `household` vazio; (4) o aviso da CLI (`main.rs`, `ChatEvent::Stale`) diz sempre "abandonada", falso quando só avisa: o evento precisa dizer se recuperou; (5) o `Node::disconnect` com várias conexões e por relay não foi testado.
 
+## Atualização: o teto de 32 medido com a ordem de entrega da caixa postal (P9 d, 2026-11-22)
+
+- **Modelo**: o relay Nostr devolve o backlog por `created_at` decrescente e o NIP-59 sorteia o `created_at` do gift wrap (até 2 dias atrás), então a ordem de chegada é aleatória em relação à de envio. A ordem do teste vem de gift wraps **reais** (`nostr::wrap`); o **relay não foi medido** (fica no P33).
+- **Medido** (CI, 30 execuções por K; o teste definitivo roda 12): commit seguido de K mensagens, entregues nessa ordem, peer desconectado.
+
+| K | `Stale` falso | máx. retido | entregues na 1ª passada | `TooOld` (contado) | após o reenvio |
+|---|---|---|---|---|---|
+| 8 | 0/30 | 8 | 8,0 de 8 | 0,0 | 8 de 8 |
+| 32 | 0/30 | 32 | **12,9 de 32** | 19,1 | 32 de 32 |
+| 48 | 10/30 | 32 | 10,5 de 48 | 26,5 | 48 de 48 |
+| 64 | 12/30 | 32 | 10,5 de 64 | 40,3 | 64 de 64 |
+| 128 | 25/30 | 32 | 10,4 de 128 | 65,9 | 128 de 128 |
+
+- **Achado 1 (o limite real é 10, não 32)**: `OUT_OF_ORDER_TOLERANCE = 10` (`conversation.rs:15`) e `on_mls` trata `CryptoError::TooOld` como "seguro ignorar". Na entrega embaralhada, a mensagem mais de 10 gerações atrás da maior já decifrada some **sem `Dropped`** e sem `Stale`. Com K = 32: 12,9 entregues + 19,1 `TooOld` = 32. O contador (temporário, já removido) confirma o mecanismo que eu só tinha por leitura.
+- **Achado 2 (`Stale` falso)**: com K >= 48 o teto de 32 estoura sem ninguém ter perdido commit. Com o peer conectado e a mensagem vinda da caixa postal só avisa (médio 1 da reauditoria); com o peer conectado e a 33ª pela conexão direta, abandona a conversa (limite aceito 2, acima).
+- **Achado 3 (a outbox recupera)**: o `Delivered` vem do ack do transporte, e o depósito na caixa postal só vira `Deposited`; a mensagem fica na outbox. Reenviada com bytes novos e o mesmo `MessageId`, chegou **sempre** e **sem repetição** (`mark_seen`, que só marca depois de decifrar). A mensagem perdida por `TooOld` **não é perda definitiva**, desde que a outbox do remetente a reenvie: o custo é **latência** (nova varredura ou reconexão direta), não medida.
+- **Não medido**: relay real (ordem, `limit` e `since` do REQ); o tempo até o reenvio; backlog que atravessa **mais de uma** rotação; o remetente sem a outbox (banco perdido).
+- **Decisão pendente (P37)**: ordenar o backlog (por época e geração) antes de entregar ao MLS, ou subir a tolerância. Subir `OUT_OF_ORDER_TOLERANCE` guarda mais chaves antigas (menos sigilo para a frente): toca cripto (§4), pede ADR próprio e a confirmação do dono. Esta atualização não muda código de produção.
+- **Teste**: `out_of_order_mailbox_backlog_loses_messages_silently_but_the_resend_recovers_them` (`chat.rs`) fixa o estado atual (K = 8 chega inteiro; K = 32 perde sem `Dropped` e sem `Stale`; o reenvio recupera tudo sem repetir); a asserção `lost_sum > 0` é para **inverter** na correção do P37.
+
 ## Não verificado
 
 Nada foi rodado. O comportamento do `disconnect_peer_id` (fecha todas as conexões? emite `PeerDisconnected` em ambos os lados?), o caminho da caixa postal e o caso do device pareado ficam para a etapa de testes.
