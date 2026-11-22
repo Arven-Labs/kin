@@ -69,7 +69,9 @@ pub enum ChatEvent {
     },
     /// O outro lado perdeu o estado da conversa (P16) e ela foi **refeita** com ele: o grupo antigo foi
     /// descartado e um novo, com a mesma identidade, o substituiu. Chega antes do `ConversationReady` da
-    /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido.
+    /// conversa nova. O que eu enviei e deu `Delivered` antes de eu perceber a perda ficou perdido, **exceto**
+    /// (ADR 0044) o que recebeu o ack com uma conexão extra do peer aberta: até 8 mensagens dos últimos 120 s são
+    /// reenviadas pela conversa nova, sem um segundo `Delivered`.
     ConversationReset {
         peer: PeerId,
         /// A identidade do outro lado (a mesma da conversa antiga): quem a aplicação mostra ao usuário.
@@ -343,10 +345,8 @@ const MAX_HELD_KEY_PACKAGES: usize = 64;
 const MAX_STATE_ID_MARKS: u8 = 2;
 /// Quantas mensagens com ack na janela da conexão extra se guardam por peer para o reenvio (P36, ADR 0044): o
 /// mesmo teto de [`MAILBOX_WINDOW`], que já limita o quanto fica sem confirmação.
-#[allow(dead_code)] // stub dos testes primeiro (P36, ADR 0044): sai com a implementação
 const MAX_REPLAY: usize = MAILBOX_WINDOW;
 /// Depois disto uma mensagem guardada para o reenvio vale nada (P36, ADR 0044): a janela é de segundos.
-#[allow(dead_code)] // stub dos testes primeiro (P36, ADR 0044): sai com a implementação
 const REPLAY_MAX_AGE: Duration = Duration::from_secs(120);
 /// Quantos peers recusados podem estar avisados ao mesmo tempo (P34). Acima disso, recusa sem aviso: o teto
 /// só limita a visibilidade, nunca a admissão (auditoria do PR #257, baixo 2).
@@ -544,18 +544,14 @@ pub struct Chat {
     state_id_marks: HashMap<PeerId, u8>,
     /// Peers cuja 1ª `PeerRoute` (a da 1ª conexão, que o `Node` emite logo depois do `PeerConnected`) ainda não
     /// chegou (P36, ADR 0044): essa rota não é conexão extra. Em memória; some com a conexão.
-    #[allow(dead_code)] // stub dos testes primeiro
     first_route_pending: HashSet<PeerId>,
     /// Peers com uma conexão **extra** aberta (P36, ADR 0044): a janela em que um ack de transporte pode vir de
     /// um `b` trocado. Em memória; some com a conexão.
-    #[allow(dead_code)] // stub dos testes primeiro
     extra_connection: HashSet<PeerId>,
     /// Mensagens com ack recebido **dentro** da janela (`extra_connection`), por peer, com a hora do ack (P36,
     /// ADR 0044): se a conversa for refeita, voltam à outbox. Teto [`MAX_REPLAY`] por peer e [`REPLAY_MAX_AGE`].
-    #[allow(dead_code)] // stub dos testes primeiro
     replay: HashMap<PeerId, VecDeque<(Message, Instant)>>,
     /// Mensagens recolocadas na outbox pelo reenvio: o ack delas não emite `Delivered` de novo (a aplicação já viu).
-    #[allow(dead_code)] // stub dos testes primeiro
     replayed: HashSet<MessageId>,
     /// Peers que o portão recusou e que já avisei nesta conexão (P34): um `NotAdmitted` por conexão, com
     /// teto. Em memória; some com a conexão.
@@ -1472,6 +1468,43 @@ impl Chat {
         Ok(())
     }
 
+    /// P36 (ADR 0044): guarda a mensagem que acabou de receber ack **dentro da janela da conexão extra**, antes
+    /// de a outbox a apagar. Teto [`MAX_REPLAY`] por peer (sai a mais velha). Erro de leitura do banco: não guarda
+    /// (o reenvio é um reforço, nunca bloqueia o ack).
+    fn keep_for_replay(&mut self, peer: PeerId, id: &MessageId) {
+        let Ok(entries) = self.outbox.entries(&peer) else {
+            return;
+        };
+        let Some(message) = entries.into_iter().find(|m| m.id == *id) else {
+            return;
+        };
+        let kept = self.replay.entry(peer).or_default();
+        kept.push_back((message, Instant::now()));
+        while kept.len() > MAX_REPLAY {
+            kept.pop_front();
+        }
+    }
+
+    /// P36 (ADR 0044): a conversa com `peer` foi refeita porque ele perdeu o banco. O que recebeu ack na janela da
+    /// conexão extra (e não passou de [`REPLAY_MAX_AGE`]) volta à outbox com o mesmo `MessageId` e sai cifrado na
+    /// conversa nova; o ack dele não emite `Delivered` de novo. A janela fecha: a conversa nova é a de agora.
+    fn replay_after_reset(&mut self, peer: PeerId) {
+        self.extra_connection.remove(&peer);
+        let Some(kept) = self.replay.remove(&peer) else {
+            return;
+        };
+        for (message, acked_at) in kept {
+            if acked_at.elapsed() > REPLAY_MAX_AGE {
+                continue;
+            }
+            if let Err(e) = self.outbox.enqueue(&peer, &message) {
+                self.drop_message(peer, e);
+                continue;
+            }
+            self.replayed.insert(message.id);
+        }
+    }
+
     fn leave_flight(&mut self, peer: PeerId, message: &MessageId) {
         if let Some(flying) = self.in_flight.get_mut(&peer) {
             flying.remove(message);
@@ -1744,6 +1777,8 @@ impl Chat {
             NodeEvent::Listening(addr) => self.queue.push_back(ChatEvent::Listening(addr)),
             NodeEvent::PeerConnected(peer) => {
                 self.connected.insert(peer);
+                // A rota que o `Node` emite logo depois é a desta 1ª conexão, não uma conexão extra (P36).
+                self.first_route_pending.insert(peer);
                 // Conectado, a fila sai direto (`flush` abaixo): o novo depósito agendado não faz mais sentido.
                 self.forget_deposit_retry(&peer);
                 self.forget_redial(&peer);
@@ -1767,6 +1802,9 @@ impl Chat {
                 self.reset_done.remove(&peer);
                 self.pending_state_ids.remove(&peer);
                 self.state_id_marks.remove(&peer);
+                self.first_route_pending.remove(&peer);
+                self.extra_connection.remove(&peer);
+                self.replay.remove(&peer);
                 self.not_admitted_notified.remove(&peer);
                 self.forget_approval(&peer);
                 self.retry.remove(&peer);
@@ -1819,10 +1857,16 @@ impl Chat {
                     self.retry.remove(&peer);
                     // E à varredura por idade: com ack o peer está de volta, as rodadas gastas não valem mais.
                     self.sweep_rounds.remove(&peer);
+                    // P36 (ADR 0044): com uma conexão extra aberta o ack pode vir de um `b` trocado, cujo chat
+                    // ainda vai recusar a mensagem. Guarda-a antes de a linha sumir, para o reenvio depois do reset.
+                    if !mirror && self.extra_connection.contains(&peer) {
+                        self.keep_for_replay(peer, &message);
+                    }
                     if let Err(e) = self.outbox.remove(&peer, &message) {
                         self.drop_message(peer, e);
                     }
-                    if !mirror {
+                    // Reenviada pelo reset: a aplicação já viu o `Delivered` da 1ª vez (ADR 0044).
+                    if !mirror && !self.replayed.remove(&message) {
                         self.queue.push_back(ChatEvent::Delivered { peer, message });
                     }
                     self.flush(peer);
@@ -1866,6 +1910,11 @@ impl Chat {
                 }
             }
             NodeEvent::PeerRoute { peer, relayed } => {
+                // A 1ª rota depois do `PeerConnected` é a da própria conexão; as seguintes são conexões extras
+                // (hole punching, ou o peer que voltou com a antiga ainda de pé) e abrem a janela do ADR 0044.
+                if !self.first_route_pending.remove(&peer) && self.connected.contains(&peer) {
+                    self.extra_connection.insert(peer);
+                }
                 self.queue.push_back(ChatEvent::Route { peer, relayed });
             }
             NodeEvent::NatStatus(status) => self.queue.push_back(ChatEvent::Nat(status)),
@@ -2287,6 +2336,8 @@ impl Chat {
             self.queue
                 .push_back(ChatEvent::ConversationReset { peer, identity });
         }
+        // Antes do `ready`, que faz o `flush`: o que o `Delivered` da janela deu por entregue sai de novo.
+        self.replay_after_reset(peer);
         if let Err(e) = self.ready(peer, conversation) {
             // Se a nova não entrou, a antiga volta: sem conversa nenhuma não há cura até a próxima conexão
             // (auditoria, baixo 3). Se entrou e algo depois falhou, a nova fica.
