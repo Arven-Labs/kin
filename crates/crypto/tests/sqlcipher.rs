@@ -18,7 +18,7 @@ const OTHER_KEY: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554
 fn open(path: &Path, key: Option<&str>) -> Connection {
     let conn = Connection::open(path).unwrap();
     if let Some(key) = key {
-        conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
+        conn.execute_batch(&format!("PRAGMA kez = \"x'{key}'\";"))
             .unwrap();
     }
     conn
