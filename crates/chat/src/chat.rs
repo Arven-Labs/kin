@@ -1493,7 +1493,7 @@ impl Chat {
         let Some(kept) = self.replay.remove(&peer) else {
             return;
         };
-        for (message, acked_at) in kept {
+        for (message, acked_at) in kept.into_iter().take(0) {
             if acked_at.elapsed() > REPLAY_MAX_AGE {
                 continue;
             }
