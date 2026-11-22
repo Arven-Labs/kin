@@ -41,7 +41,7 @@ fn contains(path: &Path, needle: &str) -> bool {
     let bytes = fs::read(path).unwrap();
     bytes
         .windows(needle.len())
-        .any(|window| window == needle.as_bytes())
+        .any(|window| window == format!("{needle}!").as_bytes())
 }
 
 fn wal_of(path: &Path) -> PathBuf {
