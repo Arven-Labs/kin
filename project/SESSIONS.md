@@ -2223,4 +2223,12 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Achados**: (1) só o committer (menor Peer ID) gira a chave (`NotCommitter`), então o teste escolhe os papéis pela ordem dos Peer IDs; (2) a rediscagem de fundo só usa endereços públicos (`dial_addrs` filtra loopback), então no teste o lado atrasado disca à mão; **a rediscagem automática depois do `Stale` não foi exercitada com endereço real** (fica para o P33).
 - **Erros meus**: asserção esquecida no 1º commit; hipótese errada sobre o gancho (committer); 2º teste de integração descartado por ser fraco (a mensagem saía antes do `Stale`; a outbox tem teste unitário).
 - **Não verificado**: a prova do `is_sibling` com `household` vazio **não entrou** (o teste de integração não monta irmãos); o teste de integração é de caracterização (só falharia antes pelo `recovering: true`), não rodei mutação nele; `fmt --check` aponta diferenças que já existiam em `chat.rs`, `wire.rs` e `two_nodes.rs`.
-- **Próximo passo**: PR 2 (`Node::disconnect` com várias conexões e por relay) e PR 3 (mutação lida e reauditoria).
+- **Próximo passo**: PR 2 (`Node::disconnect` com várias conexões e por relay) e PR 3 (mutação lida e reauditoria). *(PR 1 mesclado pelo dono (`d6ee7b2`); PR 2 na subseção abaixo.)*
+
+#### P9 (c), PR 2: `Node::disconnect` com várias conexões e por relay (ADR 0041, PR #286)
+
+- **Feito** (só testes do transporte): `disconnect_closes_every_connection_with_the_peer` (2 discagens ao mesmo endereço = 2 conexões; um `disconnect` fecha as duas, **uma** queda por lado, e um 2º `disconnect` devolve `false`) em `disconnect.rs`, e `disconnect_closes_a_relayed_connection_and_both_sides_see_it` (trio com relay) em `relay.rs`. Sem código de produção.
+- **Achado**: o comportamento suposto vale: `Swarm::disconnect_peer_id` fecha todas as conexões, e o transporte só emite `PeerDisconnected` quando a última cai (`num_established == 0`), nos dois lados, inclusive por circuito de relay. Isso confirma que o `Node::disconnect` do `Stale` não deixa a conexão antiga meio-aberta (a lacuna do P36 não se repete aqui).
+- **Provas** (CI): testes de caracterização, passam sem mudar código, **não há "falha antes"**. O 1º run (44985930539) parou na compilação (lifetime de um closure, erro meu); o run 44986167314 passou, com `Lab` e `CI Private Files` verdes. O `lossy` do `Lab` falhou no 1º run (44985930770) e passou no 2º, num PR que não toca código de produção: uma falha, sem controle, não prova instabilidade.
+- **Não verificado**: só loopback e o relay local; `disconnect` com a conexão antiga meio-aberta **do outro lado** (P36) segue como estava; nada de mutação nesses testes.
+- **Próximo passo**: PR 3 (mutação lida e reauditoria dos 3 médios).
