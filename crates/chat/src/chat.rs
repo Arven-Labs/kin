@@ -200,6 +200,10 @@ struct Scan {
 /// Quantas mensagens de época futura se guardam por peer à espera do commit (P9).
 const FUTURE_LIMIT: usize = 32;
 
+/// MEDIÇÃO TEMPORÁRIA (P9 d): conta as mensagens descartadas como `TooOld`.
+#[cfg(test)]
+static TOO_OLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// P9 (c, ADR 0041): intervalo mínimo entre duas recuperações automáticas da conversa com o mesmo peer
 /// depois de `Stale`. Dentro dele o `Stale` só avisa (quem força 32 mensagens de época futura não faz
 /// o nó refazer a conversa em laço).
@@ -3078,7 +3082,12 @@ impl Chat {
                 Ok(())
             }
             // Reentrega (at-least-once) ou velha demais: seguro ignorar.
-            Err(CryptoError::Duplicate | CryptoError::TooOld) => Ok(()),
+            Err(CryptoError::TooOld) => {
+                #[cfg(test)]
+                TOO_OLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed); // MEDIÇÃO TEMPORÁRIA
+                Ok(())
+            }
+            Err(CryptoError::Duplicate) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -3964,12 +3973,18 @@ mod tests {
         for k in [8, FUTURE_LIMIT, 48, 64, 128] {
             let (mut stale, mut held_sum, mut held_max, mut complete) = (0, 0, 0, 0);
             let (mut texts_sum, mut others) = (0, std::collections::BTreeMap::<String, usize>::new());
+            let (mut too_old_sum, mut recovered_sum, mut duplicates) = (0, 0, 0);
             for _ in 0..RUNS {
                 let (mut bia, mut ana, ana_peer) = bia_and_raw_ana();
                 let mut blobs = vec![Envelope::Mls(ana.rotate_keys().unwrap()).encode()];
-                for i in 0..k {
-                    blobs.push(Envelope::Mls(wire(&mut ana, &i.to_string())).encode());
+                let messages: Vec<Message> = (0..k)
+                    .map(|i| Message::new(i.to_string(), None))
+                    .collect();
+                for m in &messages {
+                    blobs.push(Envelope::Mls(ana.encrypt(&m.encode()).unwrap()).encode());
                 }
+                let too_old_before = TOO_OLD.load(std::sync::atomic::Ordering::Relaxed);
+                let mut seen_ids: Vec<MessageId> = Vec::new();
                 // Posição de cada blob na entrega: `created_at` do wrap, do mais novo para o mais velho.
                 let mut order: Vec<(u64, usize)> = (0..blobs.len())
                     .map(|i| {
@@ -3989,11 +4004,36 @@ mod tests {
                     let evs = events(&mut bia);
                     warned |= evs.iter().any(|e| matches!(e, ChatEvent::Stale { .. }));
                     texts += received_texts(&evs).len();
+                    for e in &evs {
+                        if let ChatEvent::Received { message, .. } = e {
+                            seen_ids.push(message.id);
+                        }
+                    }
                     for e in evs.iter().filter(|e| !matches!(e, ChatEvent::Received { .. })) {
                         let text = format!("{e:?}");
                         *others.entry(text.chars().take(90).collect()).or_default() += 1;
                     }
                 }
+                too_old_sum += TOO_OLD.load(std::sync::atomic::Ordering::Relaxed) - too_old_before;
+                // Recuperação: a outbox do remetente reenvia, em ordem, o que não chegou (bytes novos,
+                // mesmo `MessageId`); o destinatário deduplica pelo `MessageId`.
+                let mut shown = texts;
+                for m in &messages {
+                    if seen_ids.contains(&m.id) {
+                        continue;
+                    }
+                    let blob = Envelope::Mls(ana.encrypt(&m.encode()).unwrap()).encode();
+                    bia.handle_mailbox(MailboxEvent::Retrieved { from: ana_peer, blob });
+                    let evs = events(&mut bia);
+                    shown += received_texts(&evs).len();
+                    for e in &evs {
+                        if let ChatEvent::Received { message, .. } = e {
+                            seen_ids.push(message.id);
+                        }
+                    }
+                }
+                recovered_sum += seen_ids.len();
+                duplicates += shown - seen_ids.len();
                 texts_sum += texts;
                 stale += usize::from(warned);
                 held_sum += max;
@@ -4004,9 +4044,11 @@ mod tests {
                 }
             }
             table += &format!(
-                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {complete}  texts_mean={:.1}\n",
+                "{k}  {RUNS}  {stale}  {:.1}  {held_max}  {complete}  texts_mean={:.1}  too_old_mean={:.1}  after_resend_mean={:.1}  duplicates={duplicates}\n",
                 held_sum as f64 / RUNS as f64,
-                texts_sum as f64 / RUNS as f64
+                texts_sum as f64 / RUNS as f64,
+                too_old_sum as f64 / RUNS as f64,
+                recovered_sum as f64 / RUNS as f64
             );
             for (text, n) in &others {
                 table += &format!("    {n}x {text}\n");
