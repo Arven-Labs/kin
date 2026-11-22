@@ -3625,12 +3625,8 @@ impl Chat {
         }
         if held.len() >= FUTURE_LIMIT {
             self.future.remove(&peer);
-            // STUB (testes primeiro): o valor real vem de `recover_from_stale`.
-            self.queue.push_back(ChatEvent::Stale {
-                peer,
-                recovering: false,
-            });
-            self.recover_from_stale(peer);
+            let recovering = self.recover_from_stale(peer);
+            self.queue.push_back(ChatEvent::Stale { peer, recovering });
             return;
         }
         held.push(wire.to_vec());
@@ -3658,13 +3654,14 @@ impl Chat {
     /// com o peer **conectado** (a recuperação passa pelo `Hello` da conexão direta; pela caixa postal, que
     /// entrega fora de ordem, o `Stale` só avisa), com conversa 1:1 de identidade conhecida e não
     /// desconfiada, e que não seja um irmão (ADR 0040: irmão não se recupera). No máximo uma vez por peer a
-    /// cada [`STALE_RECOVERY_WINDOW`]; fora disso o `Stale` só avisa, como antes.
-    fn recover_from_stale(&mut self, peer: PeerId) {
+    /// cada [`STALE_RECOVERY_WINDOW`]; fora disso o `Stale` só avisa, como antes. Devolve `true` se
+    /// abandonou a conversa (vira `recovering` no [`ChatEvent::Stale`]).
+    fn recover_from_stale(&mut self, peer: PeerId) -> bool {
         let now = now_secs();
         self.stale_recovered
             .retain(|_, at| now.saturating_sub(*at) < STALE_RECOVERY_WINDOW.as_secs());
         let Some(identity) = self.old_identity(&peer) else {
-            return;
+            return false;
         };
         if self.stale_recovered.contains_key(&peer)
             || self.from_mailbox
@@ -3673,10 +3670,10 @@ impl Chat {
             || self.household.contains_key(&peer)
             || self.is_distrusted(&identity)
         {
-            return;
+            return false;
         }
         let Some(conversation) = self.conversations.remove(&peer) else {
-            return;
+            return false;
         };
         self.stale_recovered.insert(peer, now);
         self.recovering.insert(peer, (identity.clone(), now));
@@ -3691,6 +3688,7 @@ impl Chat {
             self.drop_message(peer, e.into());
         }
         self.node.disconnect(peer);
+        true
     }
 
     /// Vence as marcas de recuperação mais velhas que [`RECOVERING_TTL`]: o peer deixa de ser esperado.
