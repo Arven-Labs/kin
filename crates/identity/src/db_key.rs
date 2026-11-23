@@ -22,23 +22,32 @@ impl DbKey {
 
     /// Chave nova, 32 bytes do gerador aleatório do sistema.
     pub fn generate() -> Self {
-        unimplemented!("P13 fatia 3")
+        use secp256k1::rand::RngCore as _;
+        let mut bytes = [0u8; 32];
+        secp256k1::rand::thread_rng().fill_bytes(&mut bytes);
+        Self::from_bytes(bytes)
     }
 
     /// Grava a chave selada com a senha (formato do ADR 0012), atômico e 0600. **Falha se `path` já existe**:
     /// sobrescrever um `db.key` deixaria os bancos cifrados com a chave antiga sem como abrir.
     pub fn save_sealed(
         &self,
-        _path: &Path,
-        _passphrase: &[u8],
-        _params: KdfParams,
+        path: &Path,
+        passphrase: &[u8],
+        params: KdfParams,
     ) -> Result<(), Error> {
-        unimplemented!("P13 fatia 3")
+        crate::store::write_key_sealed_new(path, self.expose_secret(), passphrase, params)
     }
 
     /// Lê e abre um `db.key` selado. Arquivo em claro, de outro tamanho ou com senha errada é erro.
-    pub fn load_with(_path: &Path, _passphrase: &[u8]) -> Result<Self, Error> {
-        unimplemented!("P13 fatia 3")
+    pub fn load_with(path: &Path, passphrase: &[u8]) -> Result<Self, Error> {
+        let sealed = crate::store::read_limited(path)?;
+        let plain = crate::open(&sealed, passphrase)?;
+        let bytes: [u8; 32] = plain
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidSealedFile)?;
+        Ok(Self::from_bytes(bytes))
     }
 }
 

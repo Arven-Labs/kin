@@ -275,7 +275,11 @@ pub fn request(
     }
     let device = crate::keys::load_or_create_device(&dir.join("device.key"), passphrase, params)
         .map_err(|e| e.to_string())?;
-    let pending = PendingDevice::open(&dir.join("mls.sqlite"), None).map_err(|e| e.to_string())?;
+    // Com senha, o banco pendente já nasce cifrado (P13 fatia 3, ADR 0045).
+    let db_key =
+        crate::keys::open_db_key(dir, passphrase, false, params).map_err(|e| e.to_string())?;
+    let pending =
+        PendingDevice::open(&dir.join("mls.sqlite"), db_key.as_ref()).map_err(|e| e.to_string())?;
     let request = pending
         .request_at(&device, now)
         .map_err(|e| e.to_string())?;
@@ -337,7 +341,10 @@ pub fn accept(
     let certificate = certificate_from_link(certificate_link)?;
     let device =
         DeviceKey::load_with(&dir.join("device.key"), passphrase).map_err(|e| e.to_string())?;
-    let pending = PendingDevice::open(&dir.join("mls.sqlite"), None).map_err(|e| e.to_string())?;
+    let db_key = crate::keys::open_db_key(dir, passphrase, false, KdfParams::DEFAULT)
+        .map_err(|e| e.to_string())?;
+    let pending =
+        PendingDevice::open(&dir.join("mls.sqlite"), db_key.as_ref()).map_err(|e| e.to_string())?;
     // `expected` vem do `primary.id`, nunca do certificado (ADR 0016, item 4).
     pending
         .install_certificate_at(&device, &certificate, &expected, now)
@@ -983,12 +990,14 @@ mod tests {
         accept(&new, &link, Some(PASS), NOW + 120).unwrap();
 
         let device = DeviceKey::load_with(&new.join("device.key"), Some(PASS)).unwrap();
+        // Com senha o banco nasce cifrado: a chave vem do `db.key` selado pela mesma senha.
+        let db_key = kin_identity::DbKey::load_with(&new.join("db.key"), PASS).unwrap();
         let paired = CryptoDevice::open_paired(
             &identity,
             &device.public_key(),
             &device.nostr_public_key(),
             &new.join("mls.sqlite"),
-            None,
+            Some(&db_key),
         )
         .unwrap();
         assert_eq!(paired.certificate().identity(), &identity);

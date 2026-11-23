@@ -104,15 +104,23 @@ pub fn open_db(path: &Path, key: Option<&DbKey>) -> Result<Connection, Error> {
     Ok(conn)
 }
 
+/// Acrescenta `x'<64 dígitos>'` (chave bruta do SQLCipher, com zero à esquerda) a `buf`, sem `String`
+/// temporária por byte.
+fn push_raw_key(buf: &mut String, key: &DbKey) {
+    buf.push_str("x'");
+    for byte in key.expose_secret() {
+        buf.push(HEX[usize::from(byte >> 4)] as char);
+        buf.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    buf.push('\'');
+}
+
 fn apply_key(conn: &Connection, key: &DbKey) -> Result<(), Error> {
     // Um buffer só, com a capacidade exata (17 + 64 + 3): sem realloc, e é ele que é zerado ao sair.
     let mut pragma = Zeroizing::new(String::with_capacity(84));
-    pragma.push_str("PRAGMA key = \"x'");
-    for byte in key.expose_secret() {
-        pragma.push(HEX[usize::from(byte >> 4)] as char);
-        pragma.push(HEX[usize::from(byte & 0x0f)] as char);
-    }
-    pragma.push_str("'\";");
+    pragma.push_str("PRAGMA key = \"");
+    push_raw_key(&mut pragma, key);
+    pragma.push_str("\";");
     // Mensagem fixa: o erro do SQLite não é repassado, para a chave nunca ir parar numa mensagem.
     conn.execute_batch(&pragma)
         .map_err(|_| Error::Storage("PRAGMA key recusado".into()))?;
@@ -160,11 +168,165 @@ pub fn migrate_to_encrypted(path: &Path, key: &DbKey) -> Result<bool, Error> {
 /// `after_export` roda com o caminho do temporário já exportado e antes da conferência: é o ponto onde os
 /// testes injetam falha ou corrompem o temporário.
 fn migrate_inner(
-    _path: &Path,
-    _key: &DbKey,
-    _after_export: impl FnOnce(&Path) -> Result<(), Error>,
+    path: &Path,
+    key: &DbKey,
+    after_export: impl FnOnce(&Path) -> Result<(), Error>,
 ) -> Result<bool, Error> {
-    unimplemented!("P13 fatia 3")
+    if !matches!(inspect(path)?, OnDisk::Plain) {
+        return Ok(false);
+    }
+    let tmp = migration_tmp_path(path)?;
+    let result = export_and_swap(path, &tmp, key, after_export);
+    if result.is_err() {
+        remove_with_sidecars(&tmp);
+    }
+    result.map(|()| true)
+}
+
+/// Temporário no **mesmo diretório** (o `rename` só é atômico dentro do mesmo sistema de arquivos), nome único
+/// por tentativa e criado já 0600 (herdado pelo arquivo final).
+fn migration_tmp_path(path: &Path) -> Result<std::path::PathBuf, Error> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Storage("o caminho do banco não tem nome de arquivo".into()))?;
+    for _ in 0..8 {
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".{:016x}.migrating", rand_u64()));
+        let tmp = path.with_file_name(tmp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(_) => return Ok(tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::storage(e)),
+        }
+    }
+    Err(Error::Storage(
+        "sem nome livre para o banco temporário".into(),
+    ))
+}
+
+fn rand_u64() -> u64 {
+    // Só para o nome do temporário: não é segredo.
+    use std::hash::{BuildHasher as _, RandomState};
+    RandomState::new().hash_one(std::time::SystemTime::now())
+}
+
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    name.into()
+}
+
+fn remove_with_sidecars(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(sidecar(path, suffix));
+    }
+}
+
+fn export_and_swap(
+    path: &Path,
+    tmp: &Path,
+    key: &DbKey,
+    after_export: impl FnOnce(&Path) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let tmp_str = tmp
+        .to_str()
+        .ok_or_else(|| Error::Storage("caminho do banco não é UTF-8".into()))?;
+    let plain = Connection::open(path).map_err(Error::storage)?;
+    // Consolida o `-wal` no arquivo principal: o export lê pela conexão, mas o que ficar só no `-wal` não
+    // pode sobreviver ao lado do arquivo novo.
+    plain
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(Error::storage)?;
+    let version: i64 = plain
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Error::storage)?;
+
+    // O SQL leva a chave: um buffer que é zerado, e o erro do SQLite nunca é repassado.
+    let mut attach = Zeroizing::new(String::with_capacity(tmp_str.len() + 96));
+    attach.push_str("ATTACH DATABASE '");
+    attach.push_str(&tmp_str.replace('\'', "''"));
+    attach.push_str("' AS enc KEY \"");
+    push_raw_key(&mut attach, key);
+    attach.push_str("\";");
+    let refused = |_| Error::Storage("exportação para o banco cifrado recusada".into());
+    plain.execute_batch(&attach).map_err(refused)?;
+    plain
+        .query_row("SELECT sqlcipher_export('enc')", [], |_| Ok(()))
+        .map_err(refused)?;
+    // O `sqlcipher_export` não copia o `user_version`.
+    plain
+        .execute_batch(&format!("PRAGMA enc.user_version = {version};"))
+        .map_err(refused)?;
+    plain
+        .execute_batch("DETACH DATABASE enc;")
+        .map_err(refused)?;
+
+    after_export(tmp)?;
+
+    // Confere o temporário antes de trocar: abre com a chave e compara versão, tabelas e linhas.
+    let encrypted = open_db(tmp, Some(key))?;
+    let enc_version: i64 = encrypted
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Error::storage)?;
+    if enc_version != version || table_counts(&plain)? != table_counts(&encrypted)? {
+        return Err(Error::Storage(
+            "a cópia cifrada não confere com o original".into(),
+        ));
+    }
+    drop(encrypted);
+    drop(plain);
+
+    File::open(tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(Error::storage)?;
+    // O `-wal` e o `-shm` do banco em claro não podem ficar ao lado do arquivo cifrado.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match std::fs::remove_file(sidecar(path, suffix)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::storage(e)),
+        }
+    }
+    std::fs::rename(tmp, path).map_err(Error::storage)?;
+    // Persiste a entrada do diretório; falhar aqui não desfaz a troca.
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .and_then(|d| File::open(d).ok());
+    if let Some(dir) = dir {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// `(tabela, linhas)` de todas as tabelas do usuário, ordenado por nome.
+fn table_counts(conn: &Connection) -> Result<Vec<(String, i64)>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .map_err(Error::storage)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(Error::storage)?;
+    names
+        .into_iter()
+        .map(|name| {
+            let quoted = name.replace('"', "\"\"");
+            conn.query_row(&format!("SELECT count(*) FROM \"{quoted}\""), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| (name, n))
+            .map_err(Error::storage)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -167,7 +167,8 @@ pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access,
         };
     }
     match (state, opts.protect) {
-        (FilesState::New | FilesState::Sealed, true) => {
+        // Chaves já seladas aceitam `--protect`: é o caminho de cifrar os bancos (`open_db_key`).
+        (FilesState::New, true) => {
             return Err("--protect: não há chave em claro para cifrar neste --data-dir".into());
         }
         (FilesState::Plain, false) if opts.passphrase_file.is_none() => {
@@ -184,7 +185,8 @@ pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access,
     let source = match (&opts.passphrase_file, tty) {
         (Some(path), _) => Source::File(path.clone()),
         (None, true) => Source::Prompt {
-            confirm: state == FilesState::New || opts.protect,
+            // Chaves já seladas: a senha existe, não há o que confirmar.
+            confirm: state == FilesState::New || (opts.protect && state != FilesState::Sealed),
         },
         (None, false) => {
             return Err(
@@ -321,11 +323,9 @@ pub fn load(
 }
 
 /// Chave dos bancos, selada com a mesma senha das outras chaves (P13 fatia 3, ADR 0045).
-#[allow(dead_code)] // temporário: só os testes usam até a CLI chamar `open_db_key`
 pub const DB_KEY_FILE: &str = "db.key";
 
 /// Os bancos SQLite do `--data-dir`: o MLS (também o pendente do pareamento) e o `outbox` do `Chat`.
-#[allow(dead_code)] // temporário, como acima
 pub const DB_FILES: [&str; 2] = ["mls.sqlite", "mls.outbox.db"];
 
 /// Decide, cria e desbloqueia a chave dos bancos, e com `protect` migra os bancos em claro (ADR 0045).
@@ -333,14 +333,68 @@ pub const DB_FILES: [&str; 2] = ["mls.sqlite", "mls.outbox.db"];
 /// O marcador de "sem chave" é o **estado das outras chaves**, não o `db.key`: `passphrase` `Some` (chaves
 /// seladas) exige bancos cifrados, e um `db.key` ausente com banco cifrado é erro, nunca `None`. Chamar
 /// **depois** de `load`, que já validou a senha e as chaves.
-#[allow(dead_code)] // temporário, como acima
 pub fn open_db_key(
-    _dir: &Path,
-    _passphrase: Option<&[u8]>,
-    _protect: bool,
-    _params: KdfParams,
+    dir: &Path,
+    passphrase: Option<&[u8]>,
+    protect: bool,
+    params: KdfParams,
 ) -> Result<Option<kin_identity::DbKey>, Box<dyn std::error::Error>> {
-    unimplemented!("P13 fatia 3")
+    use kin_crypto::DbKind;
+
+    let key_path = dir.join(DB_KEY_FILE);
+    let mut plain = Vec::new();
+    let mut encrypted = false;
+    for name in DB_FILES {
+        match kin_crypto::db_kind(&dir.join(name))? {
+            DbKind::Plain => plain.push(name),
+            DbKind::Encrypted => encrypted = true,
+            DbKind::Absent => {}
+        }
+    }
+    let has_key = present(&key_path)?;
+
+    let Some(pass) = passphrase else {
+        // Chaves em claro (legado ou `--no-passphrase`): os bancos também ficam em claro.
+        if protect {
+            return Err("--protect exige uma senha".into());
+        }
+        if has_key {
+            return Err(format!(
+                "há {DB_KEY_FILE} neste --data-dir, mas as chaves estão em claro: informe a senha (sem --no-passphrase)"
+            )
+            .into());
+        }
+        if encrypted {
+            return Err("os bancos estão cifrados: informe a senha (sem --no-passphrase)".into());
+        }
+        return Ok(None);
+    };
+
+    // Chaves seladas exigem bancos cifrados: nunca "sem chave" por o `db.key` ter sumido.
+    if !plain.is_empty() && !protect {
+        return Err(format!(
+            "as chaves estão cifradas mas há banco em claro ({}): rode uma vez com --protect para cifrá-lo",
+            plain.join(", ")
+        )
+        .into());
+    }
+    let key = if has_key {
+        kin_identity::DbKey::load_with(&key_path, pass)?
+    } else if encrypted {
+        return Err(format!(
+            "há banco cifrado mas o {DB_KEY_FILE} não está neste --data-dir: restaure-o do backup (sem ele os bancos não abrem)"
+        )
+        .into());
+    } else {
+        // Gravado **antes** de qualquer migração: uma queda no meio nunca deixa banco cifrado sem chave.
+        let key = kin_identity::DbKey::generate();
+        key.save_sealed(&key_path, pass, params)?;
+        key
+    };
+    for name in plain {
+        kin_crypto::migrate_to_encrypted(&dir.join(name), &key)?;
+    }
+    Ok(Some(key))
 }
 
 /// Teto do `authority.cert` (o real tem ~160 bytes).

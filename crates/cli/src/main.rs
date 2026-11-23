@@ -270,8 +270,12 @@ fn parse_from(
 /// Carrega a identidade e a chave de device do diretório, criando-as na primeira execução (P13,
 /// ADR 0012). Por padrão ficam **cifradas** com uma senha (prompt, `--passphrase-file` ou
 /// `KIN_PASSPHRASE_FILE`); `--no-passphrase` grava em claro; `--protect` cifra no lugar um diretório
-/// antigo em claro.
-fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn std::error::Error>> {
+/// antigo em claro. Com senha, também cria e abre o `db.key` dos bancos; `--protect` cifra os bancos
+/// em claro (P13 fatia 3, ADR 0045).
+fn open_keys(
+    args: &Args,
+) -> Result<(keys::LocalIdentity, DeviceKey, Option<kin_identity::DbKey>), Box<dyn std::error::Error>>
+{
     let dir = &args.data_dir;
     std::fs::create_dir_all(dir)?;
     let state = keys::files_state(dir)?;
@@ -298,10 +302,16 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
     };
     if protect {
         eprintln!(
-            "aviso: o arquivo em claro antigo pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate a chave como exposta"
+            "aviso: o arquivo em claro antigo (chaves e bancos) pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate a chave e o histórico como expostos"
         );
     }
     let loaded = keys::load(
+        dir,
+        passphrase.as_ref().map(|p| p.as_slice()),
+        protect,
+        kin_identity::KdfParams::DEFAULT,
+    )?;
+    let db_key = keys::open_db_key(
         dir,
         passphrase.as_ref().map(|p| p.as_slice()),
         protect,
@@ -318,7 +328,7 @@ fn open_keys(args: &Args) -> Result<(keys::LocalIdentity, DeviceKey), Box<dyn st
             "aviso: o certificado deste device é v4; builds antigos do kin não o leem (atualize os outros devices)"
         );
     }
-    Ok(loaded)
+    Ok((loaded.0, loaded.1, db_key))
 }
 
 /// Pede a senha no terminal, sem eco; `confirm` pede de novo e exige que conferam. Normalizada em NFKC.
@@ -424,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         e
     })?;
-    let (identity, device) = open_keys(&args)?;
+    let (identity, device, db_key) = open_keys(&args)?;
     if args.serve_relay {
         return serve_relay(&args, &device).await;
     }
@@ -439,10 +449,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let db = args.data_dir.join("mls.sqlite");
     let mut chat = match identity.provider() {
-        Some(provider) => Chat::open(provider, &device, config, &db, None)?,
+        Some(provider) => Chat::open(provider, &device, config, &db, db_key.as_ref())?,
         // Device pareado (ADR 0021): sem provider; o certificado v4 já está no banco e é conferido
         // contra a identidade de `primary.id` a cada abertura.
-        None => Chat::open_paired(&identity.id(), &device, config, &db, None)?,
+        None => Chat::open_paired(&identity.id(), &device, config, &db, db_key.as_ref())?,
     };
     chat.set_require_invite(!args.open_admission);
     chat.set_require_approval(args.require_approval);
