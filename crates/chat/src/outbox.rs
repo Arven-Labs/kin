@@ -93,7 +93,7 @@ impl Outbox {
     /// Abre o banco da outbox e do histórico (texto puro): 0600, cifrado se houver `key` (P13). A política
     /// de abertura é a de `kin_crypto::open_db`, a mesma do banco MLS.
     pub(crate) fn open(path: &Path, key: Option<&DbKey>) -> Result<Self, Error> {
-        Self::init(kin_crypto::open_db(path, key)?)
+        Self::init(kin_crypto::open_db(path, key.and(None))?)
     }
 
     fn init(conn: Connection) -> Result<Self, Error> {
