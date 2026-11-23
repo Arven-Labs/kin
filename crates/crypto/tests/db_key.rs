@@ -66,6 +66,22 @@ fn wal_of(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-wal", path.display()))
 }
 
+/// Nomes e tamanhos dos arquivos do diretório, em ordem.
+fn listing(dir: &Path) -> Vec<(String, u64)> {
+    let mut files: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                e.metadata().unwrap().len(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 fn is_plain(path: &Path) -> bool {
     fs::read(path).unwrap().starts_with(PLAIN_HEADER)
 }
@@ -160,14 +176,22 @@ fn a_refused_open_leaves_the_file_untouched() {
         drop(env.open(encrypted.then(key).as_ref()).unwrap());
         let before = fs::read(&env.db).unwrap();
 
-        let refused = if encrypted {
-            env.open(Some(&other_key()))
+        let files_before = listing(env.db.parent().unwrap());
+
+        if encrypted {
+            assert!(matches!(
+                env.open(Some(&other_key())),
+                Err(Error::DbWrongKey)
+            ));
         } else {
-            env.open(Some(&key()))
-        };
-        assert!(refused.is_err());
+            assert!(matches!(env.open(Some(&key())), Err(Error::DbNotEncrypted)));
+        }
 
         assert_eq!(fs::read(&env.db).unwrap(), before, "encrypted={encrypted}");
+        // Nem um `-wal` ou `-shm` novo: a recusa não deixa rastro no diretório.
+        if !encrypted {
+            assert_eq!(listing(env.db.parent().unwrap()), files_before);
+        }
     }
 }
 
@@ -214,4 +238,149 @@ fn a_pending_device_database_follows_the_same_policy() {
         PendingDevice::open(&plain, Some(&key())),
         Err(Error::DbNotEncrypted)
     ));
+}
+
+// --- auditoria da fatia 2 -------------------------------------------------------------------------------
+
+/// A chave entra como **chave bruta** (`x'…'` de 64 dígitos), com zero à esquerda: um byte < 0x10 escrito com
+/// um dígito só faria o SQLCipher cair em passphrase (PBKDF2) sem erro, e os outros testes (que abrem e
+/// reabrem pelo mesmo caminho) não notariam. Aqui o banco é reaberto **sem** o `open_db`, com o hex escrito à
+/// mão a partir dos bytes literais.
+#[test]
+fn the_key_is_applied_as_a_raw_64_digit_key_with_leading_zeros() {
+    let mut bytes = [0xA5u8; 32];
+    bytes[0] = 0x00;
+    bytes[1] = 0x0F;
+    bytes[2] = 0x01;
+    bytes[31] = 0xFF;
+    let literal = format!("000f01{}ff", "a5".repeat(28));
+    assert_eq!(literal.len(), 64);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.sqlite");
+    {
+        let conn = kin_crypto::open_db(&path, Some(&DbKey::from_bytes(bytes))).unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (42);")
+            .unwrap();
+    }
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{literal}'\";"))
+        .unwrap();
+    let v: i64 = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 42);
+}
+
+/// O 0600 agora é do `open_db` (os três bancos passam por ele), e vale na criação e num arquivo antigo.
+#[test]
+fn the_database_is_created_0600_and_an_old_one_is_tightened() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+
+    for (name, key) in [("com-chave", Some(key())), ("sem-chave", None)] {
+        let path = dir.path().join(name);
+        let conn = kin_crypto::open_db(&path, key.as_ref()).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (v INTEGER);")
+            .unwrap();
+        assert_eq!(mode(&path), 0o600, "{name}");
+        assert_eq!(mode(&wal_of(&path)), 0o600, "{name} -wal");
+    }
+
+    let old = dir.path().join("antigo");
+    drop(kin_crypto::open_db(&old, None).unwrap());
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+    drop(kin_crypto::open_db(&old, None).unwrap());
+    assert_eq!(mode(&old), 0o600);
+}
+
+#[test]
+fn check_db_applies_the_policy_without_creating_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nao-existe");
+    assert!(kin_crypto::check_db(&missing, Some(&key())).is_ok());
+    assert!(!missing.exists());
+
+    let plain = dir.path().join("plain");
+    drop(kin_crypto::open_db(&plain, None).unwrap());
+    assert!(matches!(
+        kin_crypto::check_db(&plain, Some(&key())),
+        Err(Error::DbNotEncrypted)
+    ));
+    assert!(kin_crypto::check_db(&plain, None).is_ok());
+
+    let encrypted = dir.path().join("encrypted");
+    drop(kin_crypto::open_db(&encrypted, Some(&key())).unwrap());
+    assert!(matches!(
+        kin_crypto::check_db(&encrypted, None),
+        Err(Error::DbKeyRequired)
+    ));
+}
+
+/// Arquivos que não são um banco de verdade: nunca abrem "limpos".
+#[test]
+fn odd_files_never_open_as_a_clean_plain_database() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Um diretório no lugar do banco.
+    let folder = dir.path().join("pasta");
+    fs::create_dir(&folder).unwrap();
+    assert!(matches!(
+        kin_crypto::open_db(&folder, None),
+        Err(Error::Storage(_))
+    ));
+
+    // 15 bytes (um a menos que o cabeçalho): não é "em claro", logo exige chave.
+    let short = dir.path().join("curto");
+    fs::write(&short, &PLAIN_HEADER[..15]).unwrap();
+    assert!(matches!(
+        kin_crypto::open_db(&short, None),
+        Err(Error::DbKeyRequired)
+    ));
+
+    // Só o cabeçalho (16 bytes): é lido como em claro, então recusa a chave.
+    let header_only = dir.path().join("so-cabecalho");
+    fs::write(&header_only, PLAIN_HEADER).unwrap();
+    assert!(matches!(
+        kin_crypto::open_db(&header_only, Some(&key())),
+        Err(Error::DbNotEncrypted)
+    ));
+}
+
+/// O device pareado (`open_paired`) também leva a chave: sem este teste, trocar `key` por `None` ali passaria.
+#[test]
+fn a_paired_device_database_is_encrypted_end_to_end() {
+    use kin_identity::{AuthorityIdentity, AuthorityKey, IdentityProvider as _};
+
+    let master = StandaloneIdentity::generate();
+    let authority = AuthorityKey::generate();
+    let cert = master
+        .certify_authority(&authority.public_key(), 1_000)
+        .unwrap();
+    let primary = AuthorityIdentity::new(authority, cert).unwrap();
+    let device = DeviceKey::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("paired.sqlite");
+
+    let pending = PendingDevice::open(&db, Some(&key())).unwrap();
+    let request = pending.request(&device).unwrap();
+    let sas = request.sas_code(&primary.id());
+    let certificate = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
+    pending
+        .install_certificate(&device, &certificate, &primary.id())
+        .unwrap();
+
+    let open = |k: Option<&DbKey>| {
+        CryptoDevice::open_paired(
+            &primary.id(),
+            &device.public_key(),
+            &device.nostr_public_key(),
+            &db,
+            k,
+        )
+    };
+    assert!(open(Some(&key())).is_ok());
+    assert!(matches!(open(None), Err(Error::DbKeyRequired)));
+    assert!(matches!(open(Some(&other_key())), Err(Error::DbWrongKey)));
+    assert!(!is_plain(&db));
 }

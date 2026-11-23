@@ -147,5 +147,34 @@ async fn a_plain_outbox_next_to_an_encrypted_database_is_refused() {
         .execute_batch("CREATE TABLE x (v INTEGER);")
         .unwrap();
 
-    assert!(open(&a, Some(&k)).is_err());
+    assert!(matches!(
+        open(&a, Some(&k)),
+        Err(Error::Crypto(CryptoError::DbNotEncrypted))
+    ));
+}
+
+/// Auditoria, M1: se a outbox é recusada, o banco MLS **não** pode ter sido criado antes (em claro, ele travaria
+/// a abertura seguinte com a chave certa).
+#[test]
+fn a_refused_outbox_leaves_no_mls_database_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Person::new(dir.path(), "a");
+    let k = key();
+
+    // Só a outbox existe, cifrada; abrir sem chave é recusado e não cria o `a.db`.
+    drop(kin_crypto::open_db(&outbox_of(&a.db), Some(&k)).unwrap());
+    assert!(matches!(
+        open(&a, None),
+        Err(Error::Crypto(CryptoError::DbKeyRequired))
+    ));
+    assert!(!a.db.exists(), "o banco MLS foi criado antes da recusa");
+
+    // E o inverso: só a outbox existe, em claro; abrir com chave é recusado e não cria o `a.db`.
+    let b = Person::new(dir.path(), "b");
+    drop(kin_crypto::open_db(&outbox_of(&b.db), None).unwrap());
+    assert!(matches!(
+        open(&b, Some(&k)),
+        Err(Error::Crypto(CryptoError::DbNotEncrypted))
+    ));
+    assert!(!b.db.exists());
 }

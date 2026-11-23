@@ -725,6 +725,7 @@ impl Chat {
         db: &Path,
         key: Option<&DbKey>,
     ) -> Result<Self, Error> {
+        Self::check_databases(db, key)?;
         let device = CryptoDevice::open(
             identity,
             &device_key.public_key(),
@@ -748,6 +749,7 @@ impl Chat {
         db: &Path,
         key: Option<&DbKey>,
     ) -> Result<Self, Error> {
+        Self::check_databases(db, key)?;
         let device = CryptoDevice::open_paired(
             expected,
             &device_key.public_key(),
@@ -756,6 +758,15 @@ impl Chat {
             key,
         )?;
         Self::open_with_device(device, device_key, config, db, key)
+    }
+
+    /// Confere a política de chave dos **dois** arquivos (`db` e a outbox ao lado) antes de abrir qualquer um:
+    /// se a outbox for recusada, o banco MLS não pode já ter sido criado (e, em claro, travar a abertura
+    /// seguinte com a chave certa).
+    fn check_databases(db: &Path, key: Option<&DbKey>) -> Result<(), Error> {
+        kin_crypto::check_db(db, key)?;
+        kin_crypto::check_db(&db.with_extension("outbox.db"), key)?;
+        Ok(())
     }
 
     /// O que `open` e `open_paired` têm em comum: outbox, confiança e conversas recarregadas do banco.

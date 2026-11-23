@@ -1,6 +1,6 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use kin_identity::DbKey;
@@ -13,6 +13,10 @@ use crate::Error;
 /// cifrada, inclusive o cabeçalho).
 const PLAIN_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
+/// Dígitos hexadecimais, para montar o `PRAGMA key` sem `format!` por byte (cada um deixaria uma `String`
+/// temporária com pedaço da chave na heap).
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 /// O que o arquivo no disco é, antes de abri-lo.
 enum OnDisk {
     /// Não existe ou tem 0 bytes: o banco será criado.
@@ -24,6 +28,15 @@ enum OnDisk {
 }
 
 fn inspect(path: &Path) -> Result<OnDisk, Error> {
+    // Só arquivo comum: um FIFO bloquearia o `open` para sempre, e um diretório só falharia mais tarde.
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(Error::Storage("o caminho do banco não é um arquivo".into()));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OnDisk::New),
+        Err(e) => return Err(Error::storage(e)),
+    }
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OnDisk::New),
@@ -32,9 +45,11 @@ fn inspect(path: &Path) -> Result<OnDisk, Error> {
     let mut header = [0u8; 16];
     let mut read = 0;
     while read < header.len() {
-        match file.read(&mut header[read..]).map_err(Error::storage)? {
-            0 => break,
-            n => read += n,
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::storage(e)),
         }
     }
     Ok(match read {
@@ -44,29 +59,45 @@ fn inspect(path: &Path) -> Result<OnDisk, Error> {
     })
 }
 
-/// Abre o banco SQLite em `path`, com a política contra downgrade do ADR 0045 (P13):
+/// A política contra downgrade do ADR 0045 (P13), **sem abrir nem criar nada**:
 ///
 /// | arquivo | chave | resultado |
 /// |---|---|---|
-/// | novo ou vazio | `Some` / `None` | cria cifrado / cria em claro |
-/// | cifrado | certa | abre |
-/// | cifrado | errada | [`Error::DbWrongKey`] |
+/// | novo ou vazio | `Some` / `None` | ok (cria cifrado / em claro) |
+/// | cifrado | certa ou errada | ok aqui (a chave errada só aparece ao abrir: [`Error::DbWrongKey`]) |
 /// | cifrado | `None` | [`Error::DbKeyRequired`] |
 /// | em claro | `Some` | [`Error::DbNotEncrypted`] |
-/// | em claro | `None` | abre |
+/// | em claro | `None` | ok |
+///
+/// Quem abre **dois** bancos (o `Chat`) chama isto nos dois antes de abrir qualquer um, para uma recusa do
+/// segundo não deixar o primeiro já criado.
+pub fn check_db(path: &Path, key: Option<&DbKey>) -> Result<(), Error> {
+    match (inspect(path)?, key) {
+        (OnDisk::Plain, Some(_)) => Err(Error::DbNotEncrypted),
+        (OnDisk::Other, None) => Err(Error::DbKeyRequired),
+        _ => Ok(()),
+    }
+}
+
+/// Abre o banco SQLite em `path` com a política de [`check_db`] mais a chave errada ([`Error::DbWrongKey`]).
 ///
 /// O SQLCipher dá o mesmo erro para "chave errada" e "arquivo em claro"; por isso o cabeçalho é lido **antes**
-/// de abrir, e uma recusa nunca toca o arquivo. O `PRAGMA key` é o primeiro comando da conexão (qualquer outro
-/// antes dele lê ou grava a página 1 sem cifra). O arquivo fica 0600; `-wal` e `-shm` herdam o modo.
+/// de abrir, e uma recusa de política nunca toca o arquivo. O `PRAGMA key` é o primeiro comando da conexão
+/// (qualquer outro antes dele lê ou grava a página 1 sem cifra). O arquivo é criado já 0600 (sem janela em que
+/// outro usuário o abra); `-wal` e `-shm` herdam o modo.
 pub fn open_db(path: &Path, key: Option<&DbKey>) -> Result<Connection, Error> {
-    match (inspect(path)?, key) {
-        (OnDisk::Plain, Some(_)) => return Err(Error::DbNotEncrypted),
-        (OnDisk::Other, None) => return Err(Error::DbKeyRequired),
-        _ => {}
-    }
-    let conn = Connection::open(path).map_err(Error::storage)?;
+    check_db(path, key)?;
+    // Cria antes, com o modo certo; num arquivo que já existe isto não muda nada.
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(Error::storage)?;
+    // Arquivo antigo, criado com outro modo.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(Error::storage)?;
+    let conn = Connection::open(path).map_err(Error::storage)?;
     if let Some(key) = key {
         apply_key(&conn, key)?;
     }
@@ -74,11 +105,14 @@ pub fn open_db(path: &Path, key: Option<&DbKey>) -> Result<Connection, Error> {
 }
 
 fn apply_key(conn: &Connection, key: &DbKey) -> Result<(), Error> {
-    let mut hex = Zeroizing::new(String::with_capacity(64));
+    // Um buffer só, com a capacidade exata (17 + 64 + 3): sem realloc, e é ele que é zerado ao sair.
+    let mut pragma = Zeroizing::new(String::with_capacity(84));
+    pragma.push_str("PRAGMA key = \"x'");
     for byte in key.expose_secret() {
-        hex.push_str(&format!("{byte:02x}"));
+        pragma.push(HEX[usize::from(byte >> 4)] as char);
+        pragma.push(HEX[usize::from(byte & 0x0f)] as char);
     }
-    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
+    pragma.push_str("'\";");
     // Mensagem fixa: o erro do SQLite não é repassado, para a chave nunca ir parar numa mensagem.
     conn.execute_batch(&pragma)
         .map_err(|_| Error::Storage("PRAGMA key recusado".into()))?;

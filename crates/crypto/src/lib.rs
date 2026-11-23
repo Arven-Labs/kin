@@ -19,7 +19,7 @@ mod pending;
 mod provider;
 
 pub use conversation::{Conversation, Decrypted, Expected, Invite};
-pub use db::open_db;
+pub use db::{check_db, open_db};
 pub use device::CryptoDevice;
 pub use error::Error;
 pub use pending::{PAIR_REQUEST_TTL_SECS, PendingDevice};
