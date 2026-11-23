@@ -69,12 +69,15 @@ setup() {
 
   # Estes cenários testam NAT e transporte, não a admissão: o `b` disca o `a` sem link, então o `a` abre mão
   # do portão (P18 PR 3b). Os cenários de convite, multi-device, pareado e revogação o deixam fechado.
-  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission"
+  # SETUP_KEY_ARGS (vazio por padrão = chaves e bancos cifrados com a senha do lab): o `protect-migration` passa
+  # `--no-passphrase` para começar com tudo em claro. Não é o `KEY_ARGS` de outros cenários (o `revoke-device`
+  # o deixa preenchido para os seguintes).
+  export A_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission ${SETUP_KEY_ARGS:-}"
   compose up -d a >/dev/null || return 1
   wait_log a "reserva aceita no relay" 30 || { echo "a não conseguiu reserva no relay"; logs a; return 1; }
   A_CIRCUIT=$(first a "/ip4/203.0.113.10/$RELAY_PROTO/p2p/[A-Za-z0-9]+/p2p-circuit/p2p/[A-Za-z0-9]+")
 
-  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --dial $A_CIRCUIT"
+  export B_ARGS="--data-dir /data --no-mdns --relay $RELAY_ADDR --dial $A_CIRCUIT ${SETUP_KEY_ARGS:-}"
   compose up -d b >/dev/null || return 1
   wait_log a "conversa cifrada pronta" 40 && wait_log b "conversa cifrada pronta" 40 \
     || { echo "a conversa não ficou pronta pelo relay"; logs a; logs b; return 1; }
@@ -914,6 +917,92 @@ scenario_stale_connection_silent() {
 }
 
 # run_scenario NOME: roda um cenário (FAILED fica 1 se algo falhou).
+# ---- P13 fatia 4 (ADR 0045): bancos cifrados em repouso, olhados pelos BYTES dentro do container ----
+DB_TEXT="segredo-p13-lab"
+# Os dois bancos têm conteúdo e NÃO começam por "SQLite format 3" (o SQLCipher cifra até o cabeçalho), e o
+# `db.key` e o `identity.key` são selados (`KINK`). Só a CLI abrir não prova nada: um build sem SQLCipher abriria igual.
+db_is_encrypted() { # container
+  compose exec -T "$1" sh -c '
+    for f in /data/mls.sqlite /data/mls.outbox.db; do
+      [ -s "$f" ] || exit 1
+      [ "$(head -c15 "$f")" != "SQLite format 3" ] || exit 1
+    done
+    [ "$(head -c4 /data/db.key)" = KINK ] && [ "$(head -c4 /data/identity.key)" = KINK ]'
+}
+db_is_plain() { # container: o controle, os dois bancos em claro e sem db.key
+  compose exec -T "$1" sh -c '
+    [ "$(head -c15 /data/mls.sqlite)" = "SQLite format 3" ] && [ "$(head -c15 /data/mls.outbox.db)" = "SQLite format 3" ] \
+      && [ ! -e /data/db.key ]'
+}
+text_in_dbs() { compose exec -T "$1" sh -c "grep -qa -- '$2' /data/mls.sqlite* /data/mls.outbox.db*"; }
+text_absent_from_dbs() { ! text_in_dbs "$@"; }
+
+scenario_encrypted_db() {
+  echo "== Banco cifrado desde o início: bytes no disco, reinício e histórico (P13 fatia 4)"
+  setup cone || { fail "montar o laboratório"; return; }
+  check "mensagem chega com os bancos cifrados" delivered b a "$DB_TEXT"
+  Y=$(first a "conversa cifrada pronta com $B_ID \(identidade [A-Za-z0-9]+" | awk '{print $NF}')
+  check "a: db.key e identity.key selados e os dois bancos não são SQLite em claro" db_is_encrypted a
+  check "b: o mesmo" db_is_encrypted b
+  check "a: o texto conhecido não está nos bancos nem no -wal" text_absent_from_dbs a "$DB_TEXT"
+
+  # Reinício no mesmo /data: o estado MLS e o histórico têm de voltar do banco cifrado.
+  local n; n=$(count_log a "reserva aceita no relay")
+  compose stop a >/dev/null
+  compose start a >/dev/null
+  wait_log_n a "reserva aceita no relay" $((n + 1)) 30 \
+    || { fail "a não reabriu os bancos cifrados depois de reiniciar"; logs a | tail -20; return; }
+  say b "depois do reinicio"
+  check "a mensagem nova chega ao a reiniciado (estado MLS veio do banco cifrado)" \
+    wait_log a "peer: depois do reinicio" 90
+  say a "/history $Y 10"
+  check "/history do a reiniciado lista as duas mensagens (outbox cifrado)" \
+    wait_log a "histórico com $Y: 2 linhas" 15
+  check "a: o texto continua fora dos bancos depois do reinício" text_absent_from_dbs a "$DB_TEXT"
+}
+
+scenario_protect_migration() {
+  echo "== --protect: diretório legado em claro vira cifrado sem perder a conversa; sem db.key não abre (P13 fatia 4)"
+  SETUP_KEY_ARGS="--no-passphrase" setup cone || { fail "montar o laboratório"; return; }
+  check "mensagem chega com tudo em claro" delivered b a "$DB_TEXT"
+  Y=$(first a "conversa cifrada pronta com $B_ID \(identidade [A-Za-z0-9]+" | awk '{print $NF}')
+  # Controle: a mesma busca ACHA o texto em claro. Sem isto, "o texto sumiu" não provaria nada.
+  check "controle: o a está em claro (cabeçalho SQLite, sem db.key)" db_is_plain a
+  check "controle: o grep acha o texto nos bancos em claro" text_in_dbs a "$DB_TEXT"
+
+  # Reinicia o `a` com --protect (a senha vem do KIN_PASSPHRASE_FILE do node.sh): cifra as chaves e migra os bancos.
+  local n; n=$(count_log a "reserva aceita no relay")
+  compose exec -T a sh -c "echo '--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission --protect' > /tmp/kin-args"
+  compose stop a >/dev/null
+  compose start a >/dev/null
+  wait_log_n a "reserva aceita no relay" $((n + 1)) 30 \
+    || { fail "a não subiu com --protect"; logs a | tail -20; return; }
+  check "a: chaves e os dois bancos cifrados depois do --protect" db_is_encrypted a
+  check "a: o texto conhecido sumiu dos bancos" text_absent_from_dbs a "$DB_TEXT"
+  say b "depois do protect"
+  check "a conversa sobreviveu à migração: a mensagem nova chega ao a" wait_log a "peer: depois do protect" 90
+  say a "/history $Y 10"
+  check "/history do a mantém as mensagens de antes da migração" wait_log a "histórico com $Y: 2 linhas" 15
+
+  # Sem o db.key o banco cifrado não abre, e nunca vira "chave nova" (o requisito da auditoria da fatia 2).
+  local t; t=$(mktemp -d)
+  compose cp a:/data/db.key "$t/db.key" >/dev/null 2>&1 || { fail "copiar o db.key de a"; rm -rf "$t"; return; }
+  compose exec -T a sh -c "echo '--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission' > /tmp/kin-args; rm /data/db.key"
+  compose stop a >/dev/null
+  compose start a >/dev/null
+  check "sem o db.key o a recusa subir" wait_log a "não está neste --data-dir" 20
+  compose cp a:/data/mls.sqlite "$t/mls.sqlite" >/dev/null 2>&1
+  check "o mls.sqlite continua cifrado (não foi trocado por um novo)" \
+    test -s "$t/mls.sqlite" -a "$(head -c15 "$t/mls.sqlite")" != "SQLite format 3"
+
+  # Restaura o db.key e o a volta.
+  n=$(count_log a "reserva aceita no relay")
+  compose cp "$t/db.key" a:/data/db.key >/dev/null 2>&1 || { fail "devolver o db.key ao a"; rm -rf "$t"; return; }
+  rm -rf "$t"
+  compose start a >/dev/null
+  check "com o db.key de volta o a sobe de novo" wait_log_n a "reserva aceita no relay" $((n + 1)) 30
+}
+
 run_scenario() {
   case "$1" in
     cone) scenario_cone ;;
@@ -935,6 +1024,8 @@ run_scenario() {
     revoke-device) scenario_revoke_device ;;
     reconnect) scenario_reconnect ;;
     reconnect-restart) scenario_reconnect_restart ;;
+    encrypted-db) scenario_encrypted_db ;;
+    protect-migration) scenario_protect_migration ;;
     stale-connection-rst) scenario_stale_connection_rst ;;
     stale-connection-silent) scenario_stale_connection_silent ;;
     *) echo "cenário desconhecido: $1" >&2; exit 2 ;;
@@ -942,7 +1033,7 @@ run_scenario() {
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked invite-approved invite-denied relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked invite-approved invite-denied relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart encrypted-db protect-migration)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}
