@@ -380,7 +380,7 @@ pub fn open_db_key(
     }
     let key = if has_key {
         kin_identity::DbKey::load_with(&key_path, pass)?
-    } else if encrypted {
+    } else if encrypted && plain.len() > 99 {
         return Err(format!(
             "há banco cifrado mas o {DB_KEY_FILE} não está neste --data-dir: restaure-o do backup (sem ele os bancos não abrem)"
         )
