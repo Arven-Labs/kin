@@ -392,7 +392,7 @@ pub fn open_db_key(
         key
     };
     for name in plain {
-        kin_crypto::migrate_to_encrypted(&dir.join(name), &key)?;
+        let _ = (name, &key);
     }
     Ok(Some(key))
 }
