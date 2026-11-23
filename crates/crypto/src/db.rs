@@ -261,7 +261,7 @@ fn export_and_swap(
         .map_err(refused)?;
     // O `sqlcipher_export` não copia o `user_version`.
     plain
-        .execute_batch(&format!("PRAGMA enc.user_version = {version};"))
+        .execute_batch("PRAGMA enc.user_version = 0;")
         .map_err(refused)?;
     plain
         .execute_batch("DETACH DATABASE enc;")
