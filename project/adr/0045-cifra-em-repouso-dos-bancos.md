@@ -108,3 +108,12 @@ A API recebe a chave; **nenhum banco real é cifrado ainda** (a CLI passa `None`
 
 ### Provas da fatia 2
 CI e Lab verdes no commit `7cfdc04`. Mutações lidas no log: M1 sem a recusa de banco em claro (2 testes), M2 outbox ignora a chave (2), M3 `journal_mode` antes do `PRAGMA key` (11), M4 sem `DbKeyRequired` (3); M1 e M4 só valeram na 2ª tentativa (a 1ª reprovou no clippy, antes dos testes). Os testes acrescentados pela auditoria (hex com zero, 0600, `check_db`, pareado cifrado) **não** passaram por mutação.
+
+## Implementação, fatia 3 (PR #316)
+
+- **Marcador de "sem chave"** (decisão do dono, 2026-11-23): o estado das outras chaves. Chaves seladas (`passphrase` presente) exigem bancos cifrados; `db.key` ausente com banco cifrado é erro (nunca `None`, nunca chave nova); chaves em claro com `db.key` ou banco cifrado também é erro. Alternativa descartada: marcador no próprio `db.key` (formato novo, e o atacante o apaga junto).
+- **Migração só com `--protect`** (decisão do dono): chaves seladas e banco em claro sem `--protect` é recusado. O `db.key` (`DbKey::save_sealed`, formato do ADR 0012, nunca sobrescreve) é gravado **antes** de migrar; `migrate_to_encrypted` consolida o `-wal`, exporta para um temporário 0600 no mesmo diretório (`sqlcipher_export` + `user_version` copiado à mão), confere `user_version` e linhas por tabela, remove `-wal`/`-shm` e troca por `rename` com `fsync`. É idempotente por arquivo: queda no meio se retoma rodando `--protect` de novo.
+- **Recusas da migração**: checkpoint `busy` (outro processo com o banco aberto), `-wal` não vazio depois do fechamento e link simbólico no lugar do banco.
+- **Chamadores**: `main` (`Chat::open`/`open_paired`) e `pair request`/`accept` passam a chave; `pair` não tem `--protect`.
+- **Limites aceitos**: sem trava entre processos além do `busy`; com `db.key` presente, um banco em claro recolocado é migrado por `--protect` (rollback de estado, já possível com cópia cifrada antiga); cifrado trocado por arquivo vazio segue "novo" (B4). `lab/run.sh` copia o `db.key` nos cenários com device pareado.
+- **Provas**: testes primeiro (34 vermelhos), CI e Lab verdes; mutações M1 a M4 lidas no log (1, 2, 1 e 12 testes falham); auditoria sem crítico/alto, achados 1, 2, 3 e 5 aplicados (detalhe em `SESSIONS.md`, Sessão 42). Falta: build no PC do dono (OpenSSL 4.1.0) e o lab com reinício (fatia 4).
