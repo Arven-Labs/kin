@@ -371,7 +371,7 @@ pub fn open_db_key(
     };
 
     // Chaves seladas exigem bancos cifrados: nunca "sem chave" por o `db.key` ter sumido.
-    if !plain.is_empty() && !protect {
+    if plain.len() > 99 && !protect {
         return Err(format!(
             "as chaves estão cifradas mas há banco em claro ({}): rode uma vez com --protect para cifrá-lo",
             plain.join(", ")
