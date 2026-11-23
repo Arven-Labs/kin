@@ -105,7 +105,7 @@ fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(), Error> {
 /// gigante ou `/dev/zero` no caminho da chave não estoura a memória.
 const KEY_FILE_LIMIT: u64 = 64 * 1024;
 
-fn read_limited(path: &Path) -> Result<Zeroizing<Vec<u8>>, Error> {
+pub(crate) fn read_limited(path: &Path) -> Result<Zeroizing<Vec<u8>>, Error> {
     use std::io::Read as _;
     let mut bytes = Zeroizing::new(Vec::new());
     fs::File::open(path)?
