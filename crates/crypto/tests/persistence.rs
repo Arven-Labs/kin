@@ -21,8 +21,8 @@ fn conversation_survives_a_restart_on_both_sides() {
 
     let (id, in_flight) = {
         let (dev_ana, dev_bia) = (
-            CryptoDevice::open(&ana, &net_ana, &nostr_ana, &db_ana, 1).unwrap(),
-            CryptoDevice::open(&bia, &net_bia, &nostr_bia, &db_bia, 1).unwrap(),
+            CryptoDevice::open(&ana, &net_ana, &nostr_ana, &db_ana, 1, None).unwrap(),
+            CryptoDevice::open(&bia, &net_bia, &nostr_bia, &db_bia, 1, None).unwrap(),
         );
         let mut c_ana = Conversation::create(&dev_ana).unwrap();
         let invite = c_ana
@@ -39,8 +39,8 @@ fn conversation_survives_a_restart_on_both_sides() {
         (c_ana.id(), c_ana.encrypt(b"em voo").unwrap())
     };
 
-    let dev_ana = CryptoDevice::open(&ana, &net_ana, &nostr_ana, &db_ana, 2).unwrap();
-    let dev_bia = CryptoDevice::open(&bia, &net_bia, &nostr_bia, &db_bia, 2).unwrap();
+    let dev_ana = CryptoDevice::open(&ana, &net_ana, &nostr_ana, &db_ana, 2, None).unwrap();
+    let dev_bia = CryptoDevice::open(&bia, &net_bia, &nostr_bia, &db_bia, 2, None).unwrap();
     assert_eq!(
         dev_ana.remembered().unwrap(),
         vec![("bia".into(), id.clone())]
@@ -67,21 +67,21 @@ fn reopening_keeps_the_device_key_and_rejects_another_identity() {
     let ana = StandaloneIdentity::generate();
     let net = key();
     let nostr = nostr();
-    let first = CryptoDevice::open(&ana, &net, &nostr, &path, 1).unwrap();
+    let first = CryptoDevice::open(&ana, &net, &nostr, &path, 1, None).unwrap();
     // O KeyPackage carrega a chave do device: recarregar não pode trocá-la.
     let kp_before = Conversation::create(&first).unwrap().id();
     drop(first);
-    let second = CryptoDevice::open(&ana, &net, &nostr, &path, 99).unwrap();
+    let second = CryptoDevice::open(&ana, &net, &nostr, &path, 99, None).unwrap();
     assert!(Conversation::load(&second, &kp_before).unwrap().is_some());
 
     let other = StandaloneIdentity::generate();
     assert!(matches!(
-        CryptoDevice::open(&other, &net, &nostr, &path, 1),
+        CryptoDevice::open(&other, &net, &nostr, &path, 1, None),
         Err(Error::IdentityMismatch)
     ));
     // P15: o certificado salvo cobre a chave de rede antiga; outra chave de rede não serve.
     assert!(matches!(
-        CryptoDevice::open(&ana, &key(), &nostr, &path, 1),
+        CryptoDevice::open(&ana, &key(), &nostr, &path, 1, None),
         Err(Error::DeviceMismatch)
     ));
     assert!(
@@ -99,20 +99,20 @@ fn the_nostr_key_is_certified_and_reopening_with_another_one_is_rejected() {
     let device = DeviceKey::generate();
     let (net, nostr) = (device.public_key(), device.nostr_public_key());
 
-    let first = CryptoDevice::open(&ana, &net, &nostr, &path, 1).unwrap();
+    let first = CryptoDevice::open(&ana, &net, &nostr, &path, 1, None).unwrap();
     assert_eq!(first.certificate().nostr_key, nostr);
     first.certificate().verify().unwrap();
     drop(first);
 
     // Mesma chave: reabre, e o certificado salvo continua cobrindo a chave Nostr.
-    let again = CryptoDevice::open(&ana, &net, &nostr, &path, 99).unwrap();
+    let again = CryptoDevice::open(&ana, &net, &nostr, &path, 99, None).unwrap();
     assert_eq!(again.certificate().nostr_key, nostr);
     drop(again);
 
     // ADR 0004: outra chave Nostr não é a que o certificado salvo cobre.
     let other = DeviceKey::generate().nostr_public_key();
     assert!(matches!(
-        CryptoDevice::open(&ana, &net, &other, &path, 1),
+        CryptoDevice::open(&ana, &net, &other, &path, 1, None),
         Err(Error::DeviceMismatch)
     ));
 }
@@ -135,13 +135,13 @@ fn the_state_id_is_stable_and_survives_a_restart() {
     let db = dir.path().join("a.db");
 
     let first = {
-        let device = CryptoDevice::open(&identity, &net, &nostr, &db, 1).unwrap();
+        let device = CryptoDevice::open(&identity, &net, &nostr, &db, 1, None).unwrap();
         let id = device.state_id().unwrap();
         assert_eq!(device.state_id().unwrap(), id, "estável entre chamadas");
         id
     };
     assert_ne!(first, [0; 16], "o id é aleatório, não um valor fixo");
-    let device = CryptoDevice::open(&identity, &net, &nostr, &db, 2).unwrap();
+    let device = CryptoDevice::open(&identity, &net, &nostr, &db, 2, None).unwrap();
     assert_eq!(device.state_id().unwrap(), first, "o mesmo banco, o mesmo id");
 }
 
@@ -153,11 +153,11 @@ fn a_new_database_gets_a_new_state_id_even_for_the_same_identity_and_keys() {
     let identity = StandaloneIdentity::generate();
     let dir = tempfile::tempdir().unwrap();
 
-    let old = CryptoDevice::open(&identity, &net, &nostr, &dir.path().join("old.db"), 1)
+    let old = CryptoDevice::open(&identity, &net, &nostr, &dir.path().join("old.db"), 1, None)
         .unwrap()
         .state_id()
         .unwrap();
-    let new = CryptoDevice::open(&identity, &net, &nostr, &dir.path().join("new.db"), 1)
+    let new = CryptoDevice::open(&identity, &net, &nostr, &dir.path().join("new.db"), 1, None)
         .unwrap()
         .state_id()
         .unwrap();

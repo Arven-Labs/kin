@@ -275,7 +275,7 @@ pub fn request(
     }
     let device = crate::keys::load_or_create_device(&dir.join("device.key"), passphrase, params)
         .map_err(|e| e.to_string())?;
-    let pending = PendingDevice::open(&dir.join("mls.sqlite")).map_err(|e| e.to_string())?;
+    let pending = PendingDevice::open(&dir.join("mls.sqlite"), None).map_err(|e| e.to_string())?;
     let request = pending
         .request_at(&device, now)
         .map_err(|e| e.to_string())?;
@@ -337,7 +337,7 @@ pub fn accept(
     let certificate = certificate_from_link(certificate_link)?;
     let device =
         DeviceKey::load_with(&dir.join("device.key"), passphrase).map_err(|e| e.to_string())?;
-    let pending = PendingDevice::open(&dir.join("mls.sqlite")).map_err(|e| e.to_string())?;
+    let pending = PendingDevice::open(&dir.join("mls.sqlite"), None).map_err(|e| e.to_string())?;
     // `expected` vem do `primary.id`, nunca do certificado (ADR 0016, item 4).
     pending
         .install_certificate_at(&device, &certificate, &expected, now)
@@ -988,6 +988,7 @@ mod tests {
             &device.public_key(),
             &device.nostr_public_key(),
             &new.join("mls.sqlite"),
+            None,
         )
         .unwrap();
         assert_eq!(paired.certificate().identity(), &identity);

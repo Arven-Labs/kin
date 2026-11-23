@@ -43,6 +43,7 @@ impl Person {
                 ..Default::default()
             },
             &self.db,
+            None,
         )
         .unwrap()
     }
@@ -82,7 +83,7 @@ fn has_dropped(events: &[ChatEvent]) -> bool {
 async fn chats_find_each_other_via_mdns_and_talk() {
     let dir = tempfile::tempdir().unwrap();
     let (pa, pb) = (Person::new(dir.path(), "a"), Person::new(dir.path(), "b"));
-    let mk = |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db).unwrap();
+    let mk = |p: &Person| Chat::open(&p.identity, &p.device, NodeConfig::default(), &p.db, None).unwrap();
     let (mut a, mut b) = (mk(&pa), mk(&pb));
     a.listen().unwrap();
     b.listen().unwrap();

@@ -26,6 +26,7 @@ fn store_tombstone_while_closed(a: &Person, b: &Person, certificate: &DeviceCert
         &b.device.nostr_public_key(),
         &b.db,
         1,
+        None,
     )
     .unwrap();
     let revocation = a.identity.revoke_device(certificate, 2).unwrap();
@@ -120,6 +121,7 @@ async fn reopening_fails_when_the_revoked_device_cannot_be_dropped() {
             ..Default::default()
         },
         &b.db,
+        None,
     );
 
     assert!(result.is_err(), "abriu com o revogado ainda vivo");
@@ -148,6 +150,7 @@ async fn reopening_fails_when_the_revocation_store_cannot_be_read() {
             ..Default::default()
         },
         &b.db,
+        None,
     );
 
     assert!(result.is_err(), "abriu com o store ilegível");

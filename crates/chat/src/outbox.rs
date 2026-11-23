@@ -7,7 +7,7 @@
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use kin_identity::{IdentityId, PublicKey};
+use kin_identity::{DbKey, IdentityId, PublicKey};
 use kin_transport::{Multiaddr, PeerId};
 use rusqlite::{Connection, params};
 
@@ -90,13 +90,10 @@ impl Outbox {
         Self::init(Connection::open_in_memory().map_err(Error::storage)?)
     }
 
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let conn = Connection::open(path).map_err(Error::storage)?;
-        // Tem texto em claro: só o dono lê. O -wal e o -shm herdam o modo.
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(Error::storage)?;
-        Self::init(conn)
+    /// Abre o banco da outbox e do histórico (texto puro): 0600, cifrado se houver `key` (P13). A política
+    /// de abertura é a de `kin_crypto::open_db`, a mesma do banco MLS.
+    pub(crate) fn open(path: &Path, key: Option<&DbKey>) -> Result<Self, Error> {
+        Self::init(kin_crypto::open_db(path, key)?)
     }
 
     fn init(conn: Connection) -> Result<Self, Error> {
@@ -1251,7 +1248,7 @@ mod tests {
             .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(
             outbox.entries(&old).unwrap(),
@@ -1274,11 +1271,11 @@ mod tests {
         let path = dir.path().join("o.db");
         let peer = peer();
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             deposited(&outbox, &peer, "x", 100);
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(outbox.entries(&peer).unwrap().len(), 1);
         assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
@@ -1290,14 +1287,14 @@ mod tests {
     fn a_database_from_a_newer_schema_is_refused_and_left_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("o.db");
-        drop(Outbox::open(&path).unwrap());
+        drop(Outbox::open(&path, None).unwrap());
         let future = SCHEMA_VERSION + 1;
         Connection::open(&path)
             .unwrap()
             .execute_batch(&format!("PRAGMA user_version = {future};"))
             .unwrap();
 
-        let result = Outbox::open(&path);
+        let result = Outbox::open(&path, None);
 
         assert!(matches!(result, Err(Error::Storage(_))), "recusa");
         let version: i64 = Connection::open(&path)
@@ -1380,11 +1377,11 @@ mod tests {
         let path = dir.path().join("o.db");
         let (sibling, message, bia) = (peer(), Message::new("oi".into(), None), identity());
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.enqueue_mirror(&sibling, &message, &bia).unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(
             outbox.entry_kind(&sibling, &message.id).unwrap(),
@@ -1425,7 +1422,7 @@ mod tests {
             .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(
             outbox.entries(&old).unwrap(),
@@ -1465,7 +1462,7 @@ mod tests {
         }
         let (sibling, message) = (peer(), Message::new("x".into(), None));
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         outbox
             .enqueue_mirror(&sibling, &message, &identity())
             .unwrap();
@@ -1483,7 +1480,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let peer = peer();
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             deposited(&outbox, &peer, "antes", 100);
             outbox
                 .conn
@@ -1491,7 +1488,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(time_rows(&outbox), 0);
         assert_eq!(outbox.expire_deposits(&peer, 1000).unwrap(), 0);
@@ -1509,14 +1506,14 @@ mod tests {
         let path = dir.path().join("o.db");
         let (ana, bia) = (identity(), identity());
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             assert!(outbox.trusted_identities().unwrap().is_empty());
             outbox.add_trusted(&ana).unwrap();
             outbox.add_trusted(&bia).unwrap();
             outbox.add_trusted(&ana).unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         let mut got = outbox.trusted_identities().unwrap();
         got.sort_by_key(IdentityId::to_base58);
@@ -1531,14 +1528,14 @@ mod tests {
         let path = dir.path().join("o.db");
         let (ana, bia) = (identity(), identity());
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             assert!(outbox.distrusted_identities().unwrap().is_empty());
             outbox.add_distrusted(&ana).unwrap();
             outbox.add_distrusted(&bia).unwrap();
             outbox.add_distrusted(&ana).unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         let mut got = outbox.distrusted_identities().unwrap();
         let mut want = vec![ana, bia];
@@ -1571,7 +1568,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let ana = identity();
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.add_trusted(&ana).unwrap();
             outbox
                 .conn
@@ -1579,7 +1576,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert!(outbox.distrusted_identities().unwrap().is_empty());
         assert_eq!(outbox.trusted_identities().unwrap(), vec![ana]);
@@ -1592,7 +1589,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let peer = peer();
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             deposited(&outbox, &peer, "antes", 100);
             outbox
                 .conn
@@ -1600,7 +1597,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert!(outbox.trusted_identities().unwrap().is_empty());
         assert_eq!(outbox.deposited_count(&peer).unwrap(), 1);
@@ -1642,7 +1639,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let (peer, id) = (peer(), Message::new("vista".into(), None).id);
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             assert!(outbox.mark_seen(&peer, &id, SeenKind::Message).unwrap());
             outbox
                 .conn
@@ -1650,7 +1647,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(outbox.seen_count(&peer, SeenKind::Mirror).unwrap(), 0);
         assert!(
@@ -1857,11 +1854,11 @@ mod tests {
             Message::new("fica".into(), Some(MessageId::from_bytes([9; 16]))),
         );
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.record_history(&ana, true, &message).unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         let history = outbox.history(&ana, None, 10).unwrap();
         assert_eq!(history.len(), 1);
@@ -1874,7 +1871,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let (ana, bia) = (identity(), identity());
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.add_trusted(&bia).unwrap();
             outbox
                 .conn
@@ -1882,7 +1879,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         let message = Message::new("depois da migração".into(), None);
         assert!(outbox.record_history(&ana, false, &message).unwrap());
 
@@ -2024,14 +2021,14 @@ mod tests {
         let path = dir.path().join("o.db");
         let (one, two, unknown) = (peer(), peer(), peer());
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             assert_eq!(outbox.history_cursor(&one).unwrap(), 0, "padrão");
             outbox.set_history_cursor(&one, 5).unwrap();
             outbox.set_history_cursor(&two, 9).unwrap();
             outbox.set_history_cursor(&one, 7).unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
 
         assert_eq!(outbox.history_cursor(&one).unwrap(), 7, "a última grava");
         assert_eq!(outbox.history_cursor(&two).unwrap(), 9);
@@ -2045,7 +2042,7 @@ mod tests {
         let (ana, peer) = (identity(), peer());
         let message = Message::new("antes".into(), None);
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.record_history(&ana, true, &message).unwrap();
             outbox
                 .conn
@@ -2053,7 +2050,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         outbox.set_history_cursor(&peer, 3).unwrap();
 
         assert_eq!(outbox.history(&ana, None, 10).unwrap()[0].message, message);
@@ -2073,7 +2070,7 @@ mod tests {
         let (ana, peer) = (identity(), peer());
         let message = Message::new("antes".into(), None);
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.record_history(&ana, true, &message).unwrap();
             outbox
                 .conn
@@ -2081,7 +2078,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         outbox.set_peer_addrs(&peer, &[global_addr(1)]).unwrap();
 
         assert_eq!(outbox.history(&ana, None, 10).unwrap()[0].message, message);
@@ -2100,7 +2097,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let peer = peer();
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.set_peer_addrs(&peer, &[global_addr(1)]).unwrap();
             outbox
                 .conn
@@ -2108,7 +2105,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         outbox.add_invite_token(&[1; 16], 200, 100).unwrap();
 
         assert_eq!(outbox.peer_addrs(&peer).unwrap(), [global_addr(1)]);
@@ -2127,7 +2124,7 @@ mod tests {
         let path = dir.path().join("o.db");
         let peer = peer();
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             outbox.add_invite_token(&[1; 16], 200, 100).unwrap();
             outbox
                 .conn
@@ -2135,7 +2132,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         outbox.set_peer_state(&peer, [4; 16]).unwrap();
 
         assert!(outbox.invite_token_is_live(&[1; 16], 100).unwrap());
@@ -2155,13 +2152,13 @@ mod tests {
         let path = dir.path().join("o.db");
         let (one, other) = (peer(), peer());
         {
-            let outbox = Outbox::open(&path).unwrap();
+            let outbox = Outbox::open(&path, None).unwrap();
             assert_eq!(outbox.peer_state(&one).unwrap(), None, "sem linha");
             outbox.set_peer_state(&one, [1; 16]).unwrap();
             outbox.set_peer_state(&one, [2; 16]).unwrap();
             outbox.set_peer_state(&other, [3; 16]).unwrap();
         }
-        let outbox = Outbox::open(&path).unwrap();
+        let outbox = Outbox::open(&path, None).unwrap();
         assert_eq!(outbox.peer_state(&one).unwrap(), Some([2; 16]));
         assert_eq!(outbox.peer_state(&other).unwrap(), Some([3; 16]));
 

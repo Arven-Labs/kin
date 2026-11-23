@@ -4,6 +4,7 @@
 //! da identidade não assina bytes livres, só formatos com domínio (S1, ADR 0013). Quem está por trás (keypair local, TruthID) é detalhe do provedor.
 
 mod authority;
+mod db_key;
 mod device;
 mod error;
 mod pairing;
@@ -14,6 +15,7 @@ mod standalone;
 mod store;
 
 pub use authority::{AuthorityCertificate, AuthorityIdentity, AuthorityKey};
+pub use db_key::DbKey;
 pub use device::{
     DeviceCertificate, DeviceKey, InviteSigner, Issuer, NostrPublicKey, ed25519_bytes,
     public_key_from_ed25519,

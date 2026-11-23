@@ -163,6 +163,7 @@ async fn conversation_survives_restart_without_new_handshake() {
                 ..Default::default()
             },
             db,
+            None,
         )
         .unwrap()
     };

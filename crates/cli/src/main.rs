@@ -439,10 +439,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let db = args.data_dir.join("mls.sqlite");
     let mut chat = match identity.provider() {
-        Some(provider) => Chat::open(provider, &device, config, &db)?,
+        Some(provider) => Chat::open(provider, &device, config, &db, None)?,
         // Device pareado (ADR 0021): sem provider; o certificado v4 já está no banco e é conferido
         // contra a identidade de `primary.id` a cada abertura.
-        None => Chat::open_paired(&identity.id(), &device, config, &db)?,
+        None => Chat::open_paired(&identity.id(), &device, config, &db, None)?,
     };
     chat.set_require_invite(!args.open_admission);
     chat.set_require_approval(args.require_approval);

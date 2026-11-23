@@ -88,3 +88,23 @@ Mudou só o `Cargo.toml` do workspace (`rusqlite = { version = "0.37", features 
 
 ### Ainda não verificado
 Build no PC do dono com OpenSSL 4.1.0 (o auditor conferiu só os símbolos: todos exportados em `libcrypto.so.4`); compatibilidade de um banco real já existente com o motor 3.46.1; `cipher_provider`; custo de CPU; mobile.
+
+## Implementação, fatia 2 (PR #311)
+
+A API recebe a chave; **nenhum banco real é cifrado ainda** (a CLI passa `None` até a fatia 3).
+
+- `identity::DbKey`: 32 bytes em `Zeroizing`, `Debug` redigido, sem `Display`/`Clone`/`Serialize`.
+- `crypto::check_db(path, Option<&DbKey>)` e `open_db(...)`: a política está no código, em uma função só para os três bancos. Lê os 16 primeiros bytes **antes** de abrir (o SQLCipher dá `NOTADB` igual para "chave errada" e "arquivo em claro"): em claro + chave = `DbNotEncrypted`, cifrado + `None` = `DbKeyRequired`, chave errada = `DbWrongKey` (vem da primeira leitura). Uma recusa de política não toca o arquivo. Arquivo ausente ou de 0 bytes conta como novo; só arquivo comum é aceito.
+- `PRAGMA key` é o primeiro comando de toda conexão; a chave entra como chave bruta (`x'<64 dígitos>'`, com zero à esquerda: um dígito só faria o SQLCipher cair em PBKDF2 sem erro; teste fixa). O arquivo nasce 0600.
+- `Chat::open` e `open_paired` conferem a política dos **dois** arquivos (`db` e `db.outbox.db`) antes de abrir qualquer um, para a recusa do segundo não deixar o primeiro criado.
+- Assinaturas: `Provider::open`, `PendingDevice::open`, `CryptoDevice::open`/`open_paired`, `Outbox::open`, `Chat::open`/`open_paired`, todas com `Option<&DbKey>` como último parâmetro. Dependência nova no `crypto`: `zeroize` (já fixada no workspace).
+
+### Limites aceitos e requisitos da fatia 3 (auditoria)
+- **Cifrado trocado por arquivo vazio (ou apagado) vira "novo"**: o app cria estado novo, sem erro (reset silencioso de histórico e chaves MLS; não é perda de confidencialidade). Detectar exigiria um marcador fora do banco, por exemplo no `db.key`. Já valia para "arquivo ausente".
+- **A CLI decide `None`**: a política só protege se "sem chave" vier de um sinal que o atacante não controle. Se a fatia 3 usar "não achei o `db.key`", quem apaga o `db.key` e troca o banco por um em claro refaz o downgrade. A fatia 3 precisa de um marcador (por exemplo, o `identity.key` selado implica bancos cifrados).
+- `Provider::open(None, Some(chave))` (memória) ignora a chave: não há o que cifrar. Ninguém chama assim em produção.
+- Resíduos de chave na heap fora do alcance do kin (cópia do SQL no `rusqlite`, estado interno do SQLCipher); a chave fica em memória enquanto o app roda (como já dito nas consequências).
+- Não coberto: `-shm`; arquivos de 1 a 4095 bytes com chave (comportamento do SQLCipher não lido).
+
+### Provas da fatia 2
+CI e Lab verdes no commit `7cfdc04`. Mutações lidas no log: M1 sem a recusa de banco em claro (2 testes), M2 outbox ignora a chave (2), M3 `journal_mode` antes do `PRAGMA key` (11), M4 sem `DbKeyRequired` (3); M1 e M4 só valeram na 2ª tentativa (a 1ª reprovou no clippy, antes dos testes). Os testes acrescentados pela auditoria (hex com zero, 0600, `check_db`, pareado cifrado) **não** passaram por mutação.
