@@ -117,3 +117,7 @@ CI e Lab verdes no commit `7cfdc04`. Mutações lidas no log: M1 sem a recusa de
 - **Chamadores**: `main` (`Chat::open`/`open_paired`) e `pair request`/`accept` passam a chave; `pair` não tem `--protect`.
 - **Limites aceitos**: sem trava entre processos além do `busy`; com `db.key` presente, um banco em claro recolocado é migrado por `--protect` (rollback de estado, já possível com cópia cifrada antiga); cifrado trocado por arquivo vazio segue "novo" (B4). `lab/run.sh` copia o `db.key` nos cenários com device pareado.
 - **Provas**: testes primeiro (34 vermelhos), CI e Lab verdes; mutações M1 a M4 lidas no log (1, 2, 1 e 12 testes falham); auditoria sem crítico/alto, achados 1, 2, 3 e 5 aplicados (detalhe em `SESSIONS.md`, Sessão 42). Falta: build no PC do dono (OpenSSL 4.1.0) e o lab com reinício (fatia 4).
+
+## Implementação, fatia 4 (PR #321)
+
+Só o laboratório: cenários `encrypted-db` e `protect-migration` (`lab/run.sh`, README e matriz do `lab.yml`). Provam com o **binário real**, pelos **bytes** dentro do container: `db.key` e `identity.key` selados, cabeçalho dos dois bancos diferente de `SQLite format 3`, texto conhecido ausente dos bancos e do `-wal`, reinício sobre banco cifrado (estado MLS e `/history` voltam), `--protect` num diretório legado (com controle em claro) mantendo a conversa, e recusa de subir sem o `db.key`. Mutações L1 (sem migrar), L2 (chave nova sem `db.key`) e L3 (sem `PRAGMA key`) derrubam os cenários certos (lidas no log). Limites: só o modo `Master`; o Lab não é check obrigatório.
