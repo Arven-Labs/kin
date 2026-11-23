@@ -531,8 +531,10 @@ scenario_paired_device() {
   # cenários só LEEM o arquivo copiado (identity.key), por isso não sofrem.
   export A2_ARGS="--data-dir /root --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
   compose create a2 >/dev/null 2>&1
-  for f in primary.id device.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
-    [ -e "$t/paired/$f" ] || { case $f in *-wal|*-shm) continue ;; esac; fail "falta $f no diretório pareado"; rm -rf "$t"; return; }
+  # `db.key` (P13 fatia 3): com senha, o `mls.sqlite` do pareamento nasce cifrado e só abre com ele; sem senha
+  # (`--no-passphrase`) não existe.
+  for f in primary.id device.key db.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
+    [ -e "$t/paired/$f" ] || { case $f in *-wal|*-shm|db.key) continue ;; esac; fail "falta $f no diretório pareado"; rm -rf "$t"; return; }
     compose cp "$t/paired/$f" "a2:/root/$f" >/dev/null 2>&1 || { fail "copiar $f para a2"; rm -rf "$t"; return; }
   done
   rm -rf "$t"
@@ -618,7 +620,7 @@ scenario_revoke_device() {
     export "A${n}_ARGS=--data-dir /root --no-mdns --relay $RELAY_ADDR --dial /ip4/10.1.0.10/tcp/4002/p2p/$A1_ID"
     compose create "a$n" >/dev/null 2>&1
     d="$t/p$n"
-    for f in primary.id device.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
+    for f in primary.id device.key db.key mls.sqlite mls.sqlite-wal mls.sqlite-shm; do
       [ -e "$d/$f" ] || continue
       compose cp "$d/$f" "a$n:/root/$f" >/dev/null 2>&1 || { fail "copiar $f para a$n"; rm -rf "$t"; return; }
     done
