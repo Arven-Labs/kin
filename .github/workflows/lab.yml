@@ -85,6 +85,8 @@ jobs:
           - revoke-device
           - reconnect
           - reconnect-restart
+          - encrypted-db
+          - protect-migration
           - stale-connection-rst
           - stale-connection-silent
     steps:
