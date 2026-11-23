@@ -67,6 +67,8 @@ pub fn open_db(path: &Path, key: Option<&DbKey>) -> Result<Connection, Error> {
     let conn = Connection::open(path).map_err(Error::storage)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .map_err(Error::storage)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .map_err(Error::storage)?;
     if let Some(key) = key {
         apply_key(&conn, key)?;
     }
