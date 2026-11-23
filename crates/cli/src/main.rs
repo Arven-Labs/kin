@@ -271,7 +271,8 @@ fn parse_from(
 /// ADR 0012). Por padrão ficam **cifradas** com uma senha (prompt, `--passphrase-file` ou
 /// `KIN_PASSPHRASE_FILE`); `--no-passphrase` grava em claro; `--protect` cifra no lugar um diretório
 /// antigo em claro. Com senha, também cria e abre o `db.key` dos bancos; `--protect` cifra os bancos
-/// em claro (P13 fatia 3, ADR 0045).
+/// em claro (P13 fatia 3, ADR 0045). Com `--serve-relay` isso não acontece: o relay não abre banco, e o
+/// terceiro valor devolvido é sempre `None`.
 ///
 /// `params` é o custo do Argon2 de tudo o que for criado ou re-selado aqui (`DEFAULT` em produção; os
 /// testes passam `MIN`).
@@ -315,12 +316,18 @@ fn open_keys(
         protect,
         params,
     )?;
-    let db_key = keys::open_db_key(
-        dir,
-        passphrase.as_ref().map(|p| p.as_slice()),
-        protect,
-        params,
-    )?;
+    // O relay não abre banco: nem cria, nem lê, nem migra o `db.key` (um `db.key` ausente ou ilegível
+    // não pode impedi-lo de subir). `None` aqui só quer dizer "não aplicável"; `main` não o usa no relay.
+    let db_key = if args.serve_relay {
+        None
+    } else {
+        keys::open_db_key(
+            dir,
+            passphrase.as_ref().map(|p| p.as_slice()),
+            protect,
+            params,
+        )?
+    };
     // O pareado só se anuncia depois de o `Chat::open_paired` e o `ensure_current_issuer` passarem (em
     // `main`): antes disso ainda pode ser um pareamento pendente ou um banco v3.
     if matches!(loaded.0, keys::LocalIdentity::Primary(_)) {
