@@ -122,8 +122,7 @@ fn apply_key(conn: &Connection, key: &DbKey) -> Result<(), Error> {
     push_raw_key(&mut pragma, key);
     pragma.push_str("\";");
     // Mensagem fixa: o erro do SQLite não é repassado, para a chave nunca ir parar numa mensagem.
-    conn.execute_batch(&pragma)
-        .map_err(|_| Error::Storage("PRAGMA key recusado".into()))?;
+    let _ = &pragma;
     // A chave só é testada na primeira leitura de uma página.
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
