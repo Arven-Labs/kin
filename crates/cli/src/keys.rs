@@ -320,6 +320,29 @@ pub fn load(
     Ok((LocalIdentity::Master(Box::new(identity)), device))
 }
 
+/// Chave dos bancos, selada com a mesma senha das outras chaves (P13 fatia 3, ADR 0045).
+#[allow(dead_code)] // temporário: só os testes usam até a CLI chamar `open_db_key`
+pub const DB_KEY_FILE: &str = "db.key";
+
+/// Os bancos SQLite do `--data-dir`: o MLS (também o pendente do pareamento) e o `outbox` do `Chat`.
+#[allow(dead_code)] // temporário, como acima
+pub const DB_FILES: [&str; 2] = ["mls.sqlite", "mls.outbox.db"];
+
+/// Decide, cria e desbloqueia a chave dos bancos, e com `protect` migra os bancos em claro (ADR 0045).
+///
+/// O marcador de "sem chave" é o **estado das outras chaves**, não o `db.key`: `passphrase` `Some` (chaves
+/// seladas) exige bancos cifrados, e um `db.key` ausente com banco cifrado é erro, nunca `None`. Chamar
+/// **depois** de `load`, que já validou a senha e as chaves.
+#[allow(dead_code)] // temporário, como acima
+pub fn open_db_key(
+    _dir: &Path,
+    _passphrase: Option<&[u8]>,
+    _protect: bool,
+    _params: KdfParams,
+) -> Result<Option<kin_identity::DbKey>, Box<dyn std::error::Error>> {
+    unimplemented!("P13 fatia 3")
+}
+
 /// Teto do `authority.cert` (o real tem ~160 bytes).
 const AUTHORITY_CERT_LIMIT: u64 = 4096;
 
@@ -635,15 +658,289 @@ mod tests {
     }
 
     #[test]
-    fn protect_with_nothing_to_protect_is_refused() {
+    fn protect_on_a_new_dir_is_refused() {
         assert!(decide(&opts(Some("/s"), false, true), FilesState::New, false).is_err());
-        assert!(decide(&opts(Some("/s"), false, true), FilesState::Sealed, false).is_err());
+    }
+
+    /// P13 fatia 3: chaves já seladas (ADR 0012) com bancos ainda em claro precisam do `--protect` para
+    /// migrar os bancos; a decisão sobre os bancos é do `open_db_key`, aqui só não pode recusar.
+    #[test]
+    fn protect_on_sealed_keys_is_accepted_to_migrate_the_databases() {
+        let a = decide(&opts(Some("/s"), false, true), FilesState::Sealed, false).unwrap();
+        assert_eq!(
+            a,
+            Access::Sealed {
+                source: file_source(),
+                protect: true
+            }
+        );
+    }
+
+    #[test]
+    fn protect_on_sealed_keys_prompts_once_because_the_passphrase_already_exists() {
+        let a = decide(&opts(None, false, true), FilesState::Sealed, true).unwrap();
+        assert_eq!(
+            a,
+            Access::Sealed {
+                source: Source::Prompt { confirm: false },
+                protect: true
+            }
+        );
     }
 
     #[test]
     fn conflicting_flags_are_refused() {
         assert!(decide(&opts(Some("/s"), true, false), FilesState::New, false).is_err());
         assert!(decide(&opts(None, true, true), FilesState::Plain, false).is_err());
+    }
+
+    // ---- open_db_key (P13 fatia 3, ADR 0045) ----
+
+    const DB_SECRET: &str = "segredo-do-banco-p13";
+
+    fn plain_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t (v TEXT NOT NULL);
+             INSERT INTO t (v) VALUES ('{DB_SECRET}');
+             PRAGMA user_version = 3;"
+        ))
+        .unwrap();
+    }
+
+    fn both_plain(dir: &Path) {
+        for name in DB_FILES {
+            plain_db(&dir.join(name));
+        }
+    }
+
+    fn kind(dir: &Path, name: &str) -> kin_crypto::DbKind {
+        kin_crypto::db_kind(&dir.join(name)).unwrap()
+    }
+
+    fn call(
+        dir: &Path,
+        pass: Option<&[u8]>,
+        protect: bool,
+    ) -> Result<Option<kin_identity::DbKey>, Box<dyn std::error::Error>> {
+        open_db_key(dir, pass, protect, KdfParams::MIN)
+    }
+
+    fn assert_rows_and_version(dir: &Path, name: &str, key: &kin_identity::DbKey) {
+        let conn = kin_crypto::open_db(&dir.join(name), Some(key)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((rows, version), (1, 3), "{name}");
+    }
+
+    fn bytes(dir: &Path, name: &str) -> Vec<u8> {
+        std::fs::read(dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn a_new_sealed_dir_gets_a_sealed_db_key_and_no_database_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = call(dir.path(), Some(PASS), false).unwrap().expect("chave");
+        let path = dir.path().join(DB_KEY_FILE);
+        assert!(kin_identity::key_file_is_sealed(&path).unwrap());
+        let back = kin_identity::DbKey::load_with(&path, PASS).unwrap();
+        assert_eq!(back.expose_secret(), key.expose_secret());
+        for name in DB_FILES {
+            assert!(!dir.path().join(name).exists(), "{name} criado cedo");
+        }
+    }
+
+    #[test]
+    fn the_second_start_returns_the_same_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = call(dir.path(), Some(PASS), false).unwrap().unwrap();
+        let second = call(dir.path(), Some(PASS), false).unwrap().unwrap();
+        assert_eq!(first.expose_secret(), second.expose_secret());
+    }
+
+    #[test]
+    fn a_new_plain_dir_has_no_key_and_creates_no_db_key() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(call(dir.path(), None, false).unwrap().is_none());
+        assert!(!dir.path().join(DB_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn plain_keys_with_plain_databases_stay_as_they_are() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        let before = bytes(dir.path(), "mls.sqlite");
+        assert!(call(dir.path(), None, false).unwrap().is_none());
+        assert_eq!(bytes(dir.path(), "mls.sqlite"), before);
+        assert!(!dir.path().join(DB_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn sealed_keys_with_plain_databases_are_refused_without_protect_and_nothing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        let before = bytes(dir.path(), "mls.outbox.db");
+
+        let err = call(dir.path(), Some(PASS), false).unwrap_err().to_string();
+
+        assert!(err.contains("--protect"), "{err}");
+        assert_eq!(bytes(dir.path(), "mls.outbox.db"), before);
+        assert!(!dir.path().join(DB_KEY_FILE).exists(), "criou db.key à toa");
+    }
+
+    #[test]
+    fn protect_migrates_both_databases_with_rows_and_user_version() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+
+        let key = call(dir.path(), Some(PASS), true).unwrap().expect("chave");
+
+        for name in DB_FILES {
+            assert_eq!(kind(dir.path(), name), kin_crypto::DbKind::Encrypted);
+            assert_rows_and_version(dir.path(), name, &key);
+            let raw = bytes(dir.path(), name);
+            assert!(
+                !raw.windows(DB_SECRET.len())
+                    .any(|w| w == DB_SECRET.as_bytes())
+            );
+        }
+        let back = kin_identity::DbKey::load_with(&dir.path().join(DB_KEY_FILE), PASS).unwrap();
+        assert_eq!(back.expose_secret(), key.expose_secret());
+    }
+
+    #[test]
+    fn protect_resumes_after_a_crash_between_the_two_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        let key = call(dir.path(), Some(PASS), true).unwrap().unwrap();
+        // Estado de uma queda no meio: o segundo banco voltou a estar em claro.
+        std::fs::remove_file(dir.path().join("mls.outbox.db")).unwrap();
+        plain_db(&dir.path().join("mls.outbox.db"));
+        let key_file_before = bytes(dir.path(), DB_KEY_FILE);
+
+        let again = call(dir.path(), Some(PASS), true).unwrap().unwrap();
+
+        assert_eq!(again.expose_secret(), key.expose_secret());
+        assert_eq!(
+            bytes(dir.path(), DB_KEY_FILE),
+            key_file_before,
+            "regravou o db.key"
+        );
+        for name in DB_FILES {
+            assert_eq!(kind(dir.path(), name), kin_crypto::DbKind::Encrypted);
+            assert_rows_and_version(dir.path(), name, &key);
+        }
+    }
+
+    #[test]
+    fn mixed_databases_without_protect_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        call(dir.path(), Some(PASS), true).unwrap();
+        std::fs::remove_file(dir.path().join("mls.outbox.db")).unwrap();
+        plain_db(&dir.path().join("mls.outbox.db"));
+
+        assert!(call(dir.path(), Some(PASS), false).is_err());
+        assert_eq!(kind(dir.path(), "mls.outbox.db"), kin_crypto::DbKind::Plain);
+    }
+
+    #[test]
+    fn protect_when_everything_is_already_encrypted_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        let key = call(dir.path(), Some(PASS), true).unwrap().unwrap();
+        let before = bytes(dir.path(), "mls.sqlite");
+
+        let again = call(dir.path(), Some(PASS), true).unwrap().unwrap();
+
+        assert_eq!(again.expose_secret(), key.expose_secret());
+        assert_eq!(bytes(dir.path(), "mls.sqlite"), before);
+    }
+
+    /// O requisito da auditoria da fatia 2: apagar o `db.key` não pode virar "sem chave".
+    #[test]
+    fn sealed_keys_with_an_encrypted_database_and_no_db_key_are_an_error_not_none() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        call(dir.path(), Some(PASS), true).unwrap();
+        std::fs::remove_file(dir.path().join(DB_KEY_FILE)).unwrap();
+        let before = bytes(dir.path(), "mls.sqlite");
+
+        for protect in [false, true] {
+            let err = call(dir.path(), Some(PASS), protect)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(DB_KEY_FILE), "{err}");
+        }
+        assert!(!dir.path().join(DB_KEY_FILE).exists(), "gerou chave nova");
+        assert_eq!(bytes(dir.path(), "mls.sqlite"), before);
+    }
+
+    /// O atacante apaga o `db.key` **e** troca o banco por um em claro: sem `--protect` é recusado, e o
+    /// banco falso não é migrado em silêncio.
+    #[test]
+    fn deleting_the_db_key_and_swapping_in_a_plain_database_is_not_a_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        call(dir.path(), Some(PASS), true).unwrap();
+        std::fs::remove_file(dir.path().join(DB_KEY_FILE)).unwrap();
+        std::fs::remove_file(dir.path().join("mls.sqlite")).unwrap();
+        plain_db(&dir.path().join("mls.sqlite"));
+
+        assert!(call(dir.path(), Some(PASS), false).is_err());
+        assert_eq!(kind(dir.path(), "mls.sqlite"), kin_crypto::DbKind::Plain);
+    }
+
+    #[test]
+    fn a_wrong_passphrase_does_not_open_the_db_key_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        call(dir.path(), Some(PASS), false).unwrap();
+        let before = bytes(dir.path(), DB_KEY_FILE);
+        assert!(call(dir.path(), Some(b"outra senha"), false).is_err());
+        assert_eq!(bytes(dir.path(), DB_KEY_FILE), before);
+    }
+
+    #[test]
+    fn plain_keys_with_a_db_key_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        call(dir.path(), Some(PASS), false).unwrap();
+        assert!(call(dir.path(), None, false).is_err());
+    }
+
+    #[test]
+    fn plain_keys_with_an_encrypted_database_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        call(dir.path(), Some(PASS), true).unwrap();
+        std::fs::remove_file(dir.path().join(DB_KEY_FILE)).unwrap();
+        assert!(call(dir.path(), None, false).is_err());
+    }
+
+    #[test]
+    fn protect_without_a_passphrase_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        assert!(call(dir.path(), None, true).is_err());
+        assert_eq!(kind(dir.path(), "mls.sqlite"), kin_crypto::DbKind::Plain);
+    }
+
+    #[test]
+    fn the_error_messages_never_carry_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        both_plain(dir.path());
+        let key = call(dir.path(), Some(PASS), true).unwrap().unwrap();
+        let hex: String = key
+            .expose_secret()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        std::fs::remove_file(dir.path().join(DB_KEY_FILE)).unwrap();
+        let err = call(dir.path(), Some(PASS), false).unwrap_err().to_string();
+        assert!(!err.contains(&hex), "{err}");
     }
 
     // ---- read_passphrase_file ----

@@ -27,3 +27,5 @@ base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Só os testes de `open_db_key` criam bancos SQLite em claro (a versão e a feature vêm do workspace).
+rusqlite.workspace = true
