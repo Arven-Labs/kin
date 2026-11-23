@@ -172,3 +172,74 @@ fn a_directory_in_place_of_the_database_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     assert!(migrate_to_encrypted(dir.path(), &key()).is_err());
 }
+
+/// Auditoria da fatia 3, achado 3: o `outbox` usa `AUTOINCREMENT`; se o `sqlite_sequence` não viesse na cópia,
+/// o próximo `seq` reutilizaria o de uma linha apagada e quebraria o cursor do histórico.
+#[test]
+fn autoincrement_counters_survive_the_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mls.outbox.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE h (seq INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT NOT NULL);
+             INSERT INTO h (v) VALUES ('a'), ('b'), ('c');
+             DELETE FROM h WHERE seq = 3;",
+        )
+        .unwrap();
+    }
+
+    assert!(migrate_to_encrypted(&path, &key()).unwrap());
+
+    let conn = open_db(&path, Some(&key())).unwrap();
+    conn.execute("INSERT INTO h (v) VALUES ('d')", []).unwrap();
+    let seq: i64 = conn
+        .query_row("SELECT max(seq) FROM h", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seq, 4, "o contador voltou atrás");
+}
+
+#[test]
+fn a_symlink_in_place_of_the_database_is_refused_and_the_target_is_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("alvo.db");
+    plain_db_with_wal(&target);
+    let link = dir.path().join("mls.sqlite");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let before = fs::read(&target).unwrap();
+
+    assert!(migrate_to_encrypted(&link, &key()).is_err());
+
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&target).unwrap(), before);
+}
+
+/// Auditoria, achado 2: outro processo com uma leitura aberta impede o checkpoint; migrar assim perderia o que
+/// ele gravar depois. A migração tem de recusar e deixar o original intacto.
+#[test]
+fn a_database_in_use_by_another_connection_is_not_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mls.sqlite");
+    plain_db_with_wal(&path);
+    let other = Connection::open(&path).unwrap();
+    other
+        .execute_batch("BEGIN; SELECT count(*) FROM t;")
+        .unwrap();
+    // Uma escrita depois da leitura aberta deixa frames no -wal que o checkpoint não consegue consolidar.
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch("INSERT INTO t (v) VALUES ('depois-da-leitura');")
+        .unwrap();
+
+    let result = migrate_to_encrypted(&path, &key());
+
+    assert!(result.is_err(), "migrou com o banco em uso: {result:?}");
+    assert_eq!(db_kind(&path).unwrap(), DbKind::Plain);
+    drop(other);
+    drop(writer);
+}

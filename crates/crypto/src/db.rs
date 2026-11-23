@@ -172,6 +172,12 @@ fn migrate_inner(
     key: &DbKey,
     after_export: impl FnOnce(&Path) -> Result<(), Error>,
 ) -> Result<bool, Error> {
+    // O `rename` substituiria o próprio link e deixaria o arquivo em claro do alvo no disco.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(Error::Storage(
+            "o banco é um link simbólico: recusado".into(),
+        ));
+    }
     if !matches!(inspect(path)?, OnDisk::Plain) {
         return Ok(false);
     }
@@ -240,15 +246,24 @@ fn export_and_swap(
     let plain = Connection::open(path).map_err(Error::storage)?;
     // Consolida o `-wal` no arquivo principal: o export lê pela conexão, mas o que ficar só no `-wal` não
     // pode sobreviver ao lado do arquivo novo.
-    plain
-        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    // A primeira coluna é `busy`: outro processo com o banco aberto impede o checkpoint, e migrar assim
+    // perderia o que ele gravar depois (auditoria da fatia 3, achado 2).
+    let busy: i64 = plain
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
         .map_err(Error::storage)?;
+    if busy != 0 {
+        return Err(Error::Storage(
+            "o banco está em uso por outro processo: feche o kin e tente de novo".into(),
+        ));
+    }
     let version: i64 = plain
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(Error::storage)?;
 
     // O SQL leva a chave: um buffer que é zerado, e o erro do SQLite nunca é repassado.
-    let mut attach = Zeroizing::new(String::with_capacity(tmp_str.len() + 96));
+    // Capacidade para o pior caso (cada `'` do caminho dobra, mais 100 bytes fixos): se o `String` crescesse
+    // no meio da chave, o bloco antigo seria liberado sem zerar (auditoria, achado 1).
+    let mut attach = Zeroizing::new(String::with_capacity(tmp_str.len() * 2 + 128));
     attach.push_str("ATTACH DATABASE '");
     attach.push_str(&tmp_str.replace('\'', "''"));
     attach.push_str("' AS enc KEY \"");
@@ -286,6 +301,12 @@ fn export_and_swap(
         .and_then(|f| f.sync_all())
         .map_err(Error::storage)?;
     // O `-wal` e o `-shm` do banco em claro não podem ficar ao lado do arquivo cifrado.
+    // Um `-wal` com conteúdo depois do fechamento limpo é dado que o export não viu: aborta, não apaga.
+    if std::fs::metadata(sidecar(path, "-wal")).is_ok_and(|m| m.len() > 0) {
+        return Err(Error::Storage(
+            "o -wal do banco tem dados não consolidados: feche o kin e tente de novo".into(),
+        ));
+    }
     for suffix in ["-wal", "-shm", "-journal"] {
         match std::fs::remove_file(sidecar(path, suffix)) {
             Ok(()) => {}
