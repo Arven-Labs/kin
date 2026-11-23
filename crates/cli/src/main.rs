@@ -306,9 +306,7 @@ fn open_keys(
         }
     };
     if protect {
-        eprintln!(
-            "aviso: o arquivo em claro antigo (chaves e bancos) pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate a chave e o histórico como expostos"
-        );
+        eprintln!("{}", protect_warning(args.serve_relay));
     }
     let loaded = keys::load(
         dir,
@@ -340,6 +338,19 @@ fn open_keys(
         );
     }
     Ok((loaded.0, loaded.1, db_key))
+}
+
+/// Aviso do `--protect`: o arquivo em claro antigo pode continuar no disco. O relay só cifra as chaves
+/// (não toca os bancos), então o texto dele não fala de bancos nem de histórico.
+fn protect_warning(relay: bool) -> String {
+    let (what, exposed) = if relay {
+        ("chaves", "a chave como exposta")
+    } else {
+        ("chaves e bancos", "a chave e o histórico como expostos")
+    };
+    format!(
+        "aviso: o arquivo em claro antigo ({what}) pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate {exposed}"
+    )
 }
 
 /// Pede a senha no terminal, sem eco; `confirm` pede de novo e exige que conferam. Normalizada em NFKC.
@@ -1930,6 +1941,24 @@ mod tests {
             std::fs::read(dir.path().join(keys::DB_KEY_FILE)).unwrap(),
         );
 
+        // Controle: o chat, numa cópia do mesmo estado, migra o banco (é o que o relay não pode fazer).
+        let copy = tempfile::tempdir().unwrap();
+        for name in [
+            "identity.key",
+            "device.key",
+            keys::DB_KEY_FILE,
+            "mls.sqlite",
+        ] {
+            std::fs::copy(dir.path().join(name), copy.path().join(name)).unwrap();
+        }
+        let chat = key_args(copy.path(), &pass, false, &["--protect"]);
+        open_keys(&chat, FAST).unwrap();
+        assert_eq!(
+            kin_crypto::db_kind(&copy.path().join("mls.sqlite")).unwrap(),
+            kin_crypto::DbKind::Encrypted,
+            "o chat com --protect devia migrar o banco"
+        );
+
         let relay = key_args(dir.path(), &pass, true, &["--protect"]);
         open_keys(&relay, FAST).unwrap();
 
@@ -1942,6 +1971,113 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join(keys::DB_KEY_FILE)).unwrap(),
             key_before
+        );
+    }
+
+    /// Sem `--protect`, o chat recusa banco em claro com chaves seladas; o relay não olha o banco: abre,
+    /// não cria `db.key` e deixa o banco byte a byte igual.
+    #[test]
+    fn serve_relay_ignores_a_plain_database_without_protect() {
+        let (dir, pass) = data_dir_and_passphrase();
+        let relay = key_args(dir.path(), &pass, true, &[]);
+        open_keys(&relay, FAST).unwrap();
+        let database = dir.path().join("mls.sqlite");
+        plain_database(&database);
+        let before = std::fs::read(&database).unwrap();
+
+        let chat = key_args(dir.path(), &pass, false, &[]);
+        assert!(open_keys(&chat, FAST).is_err(), "o chat devia recusar");
+        assert!(!dir.path().join(keys::DB_KEY_FILE).exists());
+
+        let (_, _, db_key) = open_keys(&relay, FAST).unwrap();
+        assert!(db_key.is_none());
+        assert!(!dir.path().join(keys::DB_KEY_FILE).exists());
+        assert_eq!(
+            kin_crypto::db_kind(&database).unwrap(),
+            kin_crypto::DbKind::Plain
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    /// Banco cifrado sem `db.key` é erro para o chat (nunca "sem chave"); o relay não abre banco, então
+    /// sobe, e não inventa um `db.key` novo (que não abriria o banco).
+    #[test]
+    fn serve_relay_ignores_an_encrypted_database_with_no_db_key() {
+        let (dir, pass) = data_dir_and_passphrase();
+        open_keys(&key_args(dir.path(), &pass, false, &[]), FAST).unwrap();
+        let database = dir.path().join("mls.sqlite");
+        plain_database(&database);
+        open_keys(&key_args(dir.path(), &pass, false, &["--protect"]), FAST).unwrap();
+        assert_eq!(
+            kin_crypto::db_kind(&database).unwrap(),
+            kin_crypto::DbKind::Encrypted
+        );
+        std::fs::remove_file(dir.path().join(keys::DB_KEY_FILE)).unwrap();
+        let before = std::fs::read(&database).unwrap();
+
+        let chat = key_args(dir.path(), &pass, false, &[]);
+        assert!(open_keys(&chat, FAST).is_err(), "o chat devia recusar");
+
+        let relay = key_args(dir.path(), &pass, true, &[]);
+        let (_, _, db_key) = open_keys(&relay, FAST).unwrap();
+        assert!(db_key.is_none());
+        assert!(
+            !dir.path().join(keys::DB_KEY_FILE).exists(),
+            "o relay criou um db.key"
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    /// O `--protect` das chaves segue valendo no relay: identidade e `device.key` em claro terminam
+    /// seladas, e ainda assim nenhum `db.key` é criado.
+    #[test]
+    fn serve_relay_with_protect_still_seals_the_plain_keys() {
+        let (dir, pass) = data_dir_and_passphrase();
+        let plain = parse(
+            &[
+                "--data-dir",
+                dir.path().to_str().unwrap(),
+                "--no-passphrase",
+                "--serve-relay",
+            ],
+            None,
+        )
+        .unwrap();
+        open_keys(&plain, FAST).unwrap();
+        for name in ["identity.key", "device.key"] {
+            let path = dir.path().join(name);
+            assert!(
+                !kin_identity::key_file_is_sealed(&path).unwrap(),
+                "{name} devia começar em claro"
+            );
+        }
+
+        let relay = key_args(dir.path(), &pass, true, &["--protect"]);
+        let (_, _, db_key) = open_keys(&relay, FAST).unwrap();
+        assert!(db_key.is_none());
+        for name in ["identity.key", "device.key"] {
+            let path = dir.path().join(name);
+            assert!(
+                kin_identity::key_file_is_sealed(&path).unwrap(),
+                "{name} devia ter sido selado pelo --protect"
+            );
+        }
+        assert!(!dir.path().join(keys::DB_KEY_FILE).exists());
+    }
+
+    /// O relay só fala de chaves no aviso do `--protect`; o chat segue falando de bancos e histórico.
+    #[test]
+    fn the_protect_warning_mentions_databases_only_for_the_chat() {
+        let relay = protect_warning(true);
+        assert!(relay.contains("(chaves)"), "{relay}");
+        assert!(
+            !relay.contains("bancos") && !relay.contains("histórico"),
+            "{relay}"
+        );
+        let chat = protect_warning(false);
+        assert!(
+            chat.contains("(chaves e bancos)") && chat.contains("histórico"),
+            "{chat}"
         );
     }
 }
