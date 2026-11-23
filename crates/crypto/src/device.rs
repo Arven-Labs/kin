@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use kin_identity::{
-    DeviceCertificate, DeviceRevocation, IdentityId, IdentityProvider, Issuer, NostrPublicKey,
+    DbKey, DeviceCertificate, DeviceRevocation, IdentityId, IdentityProvider, Issuer, NostrPublicKey,
     PublicKey, public_key_from_ed25519,
 };
 use openmls::prelude::tls_codec::Serialize as _;
@@ -42,7 +42,7 @@ impl CryptoDevice {
         created_at: u64,
     ) -> Result<Self, Error> {
         Self::build(
-            Provider::open(None)?,
+            Provider::open(None, None)?,
             identity,
             network_key,
             nostr_key,
@@ -52,16 +52,18 @@ impl CryptoDevice {
 
     /// Device persistente: o estado MLS vive no banco SQLite em `path`. Na primeira vez gera e
     /// certifica a chave; nas seguintes recarrega a mesma (e falha se o banco é de outra identidade
-    /// ou foi criado com outra chave de rede ou Nostr).
+    /// ou foi criado com outra chave de rede ou Nostr). Com `key` o banco é cifrado (SQLCipher, P13); a
+    /// política de abertura (chave errada, ausente, banco em claro) está em [`crate::open_db`].
     pub fn open(
         identity: &dyn IdentityProvider,
         network_key: &PublicKey,
         nostr_key: &NostrPublicKey,
         path: &std::path::Path,
         created_at: u64,
+        key: Option<&DbKey>,
     ) -> Result<Self, Error> {
         Self::build(
-            Provider::open(Some(path))?,
+            Provider::open(Some(path), key)?,
             identity,
             network_key,
             nostr_key,
@@ -82,8 +84,9 @@ impl CryptoDevice {
         network_key: &PublicKey,
         nostr_key: &NostrPublicKey,
         path: &std::path::Path,
+        key: Option<&DbKey>,
     ) -> Result<Self, Error> {
-        let provider = Provider::open(Some(path))?;
+        let provider = Provider::open(Some(path), key)?;
         let Some((signer, certificate)) = load_signer(&provider)? else {
             return Err(Error::NotPaired);
         };

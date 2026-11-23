@@ -28,7 +28,7 @@ fn primary_of(master: &StandaloneIdentity) -> AuthorityIdentity {
 
 /// O pareamento inteiro, como a pessoa faria: pede, o primário responde com o código confirmado, instala.
 fn pair(db: &Path, key: &DeviceKey, primary: &AuthorityIdentity) {
-    let pending = PendingDevice::open(db).unwrap();
+    let pending = PendingDevice::open(db, None).unwrap();
     let request = pending.request(key).unwrap();
     let sas = request.sas_code(&primary.id());
     let cert = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
@@ -54,7 +54,7 @@ impl Paired {
     }
 
     fn open(&self) -> Chat {
-        Chat::open_paired(&self.primary.id(), &self.key, config(), &self.db).unwrap()
+        Chat::open_paired(&self.primary.id(), &self.key, config(), &self.db, None).unwrap()
     }
 }
 
@@ -83,7 +83,7 @@ fn another_expected_identity_is_refused() {
     let paired = Paired::new(dir.path(), "s");
     let other: IdentityId = StandaloneIdentity::generate().id();
 
-    let error = open_error(Chat::open_paired(&other, &paired.key, config(), &paired.db));
+    let error = open_error(Chat::open_paired(&other, &paired.key, config(), &paired.db, None));
 
     assert!(matches!(
         error,
@@ -96,10 +96,10 @@ fn a_device_still_waiting_for_its_certificate_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("s.db");
     let key = DeviceKey::generate();
-    PendingDevice::open(&db).unwrap().request(&key).unwrap();
+    PendingDevice::open(&db, None).unwrap().request(&key).unwrap();
     let expected = StandaloneIdentity::generate().id();
 
-    let error = open_error(Chat::open_paired(&expected, &key, config(), &db));
+    let error = open_error(Chat::open_paired(&expected, &key, config(), &db, None));
 
     assert!(matches!(error, Error::Crypto(CryptoError::NotPaired)));
 }
@@ -112,9 +112,9 @@ fn a_database_created_by_the_master_is_refused_as_paired() {
     let master = StandaloneIdentity::generate();
     let key = DeviceKey::generate();
     let db = dir.path().join("v3.db");
-    drop(Chat::open(&master, &key, config(), &db).unwrap());
+    drop(Chat::open(&master, &key, config(), &db, None).unwrap());
 
-    let error = open_error(Chat::open_paired(&master.id(), &key, config(), &db));
+    let error = open_error(Chat::open_paired(&master.id(), &key, config(), &db, None));
 
     assert!(matches!(
         error,
@@ -132,6 +132,7 @@ fn another_device_key_is_refused() {
         &DeviceKey::generate(),
         config(),
         &paired.db,
+        None,
     ));
 
     assert!(matches!(error, Error::Crypto(CryptoError::DeviceMismatch)));

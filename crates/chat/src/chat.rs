@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kin_crypto::{Conversation, CryptoDevice, Decrypted, Error as CryptoError, Expected};
 use kin_identity::{
-    DeviceCertificate, DeviceKey, DeviceRevocation, IdentityId, IdentityProvider, InviteSigner,
+    DbKey, DeviceCertificate, DeviceKey, DeviceRevocation, IdentityId, IdentityProvider, InviteSigner,
 };
 use kin_transport::{Multiaddr, NatStatus, Node, NodeConfig, NodeEvent, PeerId, SendId};
 
@@ -715,12 +715,15 @@ impl Chat {
     }
 
     /// Chat persistente: o estado MLS e a lista de conversas ficam no banco SQLite `db`. Ao
-    /// reabrir, as conversas voltam sozinhas e já aceitam mensagens, sem novo handshake.
+    /// reabrir, as conversas voltam sozinhas e já aceitam mensagens, sem novo handshake. Com `key`, os dois
+    /// bancos (`db` e `db.outbox.db`) são cifrados com ela (SQLCipher, P13, ADR 0045); a política de abertura
+    /// (chave errada, ausente, banco em claro) é a de `kin_crypto::open_db`.
     pub fn open(
         identity: &dyn IdentityProvider,
         device_key: &DeviceKey,
         config: NodeConfig,
         db: &Path,
+        key: Option<&DbKey>,
     ) -> Result<Self, Error> {
         let device = CryptoDevice::open(
             identity,
@@ -728,8 +731,9 @@ impl Chat {
             &device_key.nostr_public_key(),
             db,
             now_secs(),
+            key,
         )?;
-        Self::open_with_device(device, device_key, config, db)
+        Self::open_with_device(device, device_key, config, db, key)
     }
 
     /// Chat persistente de um device **pareado** (P30 fatia 2d-i): sem mestra nem autoridade, só com o
@@ -742,14 +746,16 @@ impl Chat {
         device_key: &DeviceKey,
         config: NodeConfig,
         db: &Path,
+        key: Option<&DbKey>,
     ) -> Result<Self, Error> {
         let device = CryptoDevice::open_paired(
             expected,
             &device_key.public_key(),
             &device_key.nostr_public_key(),
             db,
+            key,
         )?;
-        Self::open_with_device(device, device_key, config, db)
+        Self::open_with_device(device, device_key, config, db, key)
     }
 
     /// O que `open` e `open_paired` têm em comum: outbox, confiança e conversas recarregadas do banco.
@@ -758,9 +764,10 @@ impl Chat {
         device_key: &DeviceKey,
         config: NodeConfig,
         db: &Path,
+        key: Option<&DbKey>,
     ) -> Result<Self, Error> {
-        // A outbox fica num arquivo ao lado do banco do `crypto` (`a.db` → `a.outbox.db`).
-        let outbox = Outbox::open(&db.with_extension("outbox.db"))?;
+        // A outbox fica num arquivo ao lado do banco do `crypto` (`a.db` → `a.outbox.db`), com a mesma chave.
+        let outbox = Outbox::open(&db.with_extension("outbox.db"), key)?;
         let mut chat = Self::with_device(device, device_key, config, outbox)?;
         chat.trusted = chat.outbox.trusted_identities()?;
         chat.distrusted = chat.outbox.distrusted_identities()?;
@@ -9089,11 +9096,11 @@ mod tests {
             ..Default::default()
         };
         {
-            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
             bia.trust(ana.clone()).unwrap();
         }
 
-        let bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+        let bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
 
         assert!(bia.is_trusted(&ana));
         assert!(!bia.is_trusted(&cleo));
@@ -9130,19 +9137,19 @@ mod tests {
             ..Default::default()
         };
         {
-            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
             bia.trust(ana.clone()).unwrap();
             bia.untrust(&ana).unwrap();
         }
         {
-            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
             assert!(!bia.is_trusted(&ana));
             assert!(bia.is_distrusted(&ana));
             assert!(!bia.is_distrusted(&cleo));
             bia.trust(ana.clone()).unwrap();
         }
 
-        let bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+        let bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
 
         assert!(bia.is_trusted(&ana));
         assert!(!bia.is_distrusted(&ana));
@@ -9161,12 +9168,12 @@ mod tests {
             ..Default::default()
         };
         {
-            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+            let mut bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
             bia.trust(ana.clone()).unwrap();
             bia.outbox.add_distrusted(&ana).unwrap();
         }
 
-        let bia = Chat::open(&bia_key, &bia_device, config(), &db).unwrap();
+        let bia = Chat::open(&bia_key, &bia_device, config(), &db, None).unwrap();
 
         assert!(bia.is_distrusted(&ana));
         assert!(!bia.is_trusted(&ana));

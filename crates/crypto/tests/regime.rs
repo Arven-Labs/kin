@@ -20,7 +20,7 @@ fn primary_of(master: &StandaloneIdentity) -> AuthorityIdentity {
 /// `P`: um device de X pareado por autoridade (v4), no banco `db`.
 fn v4_device(db: &Path, primary: &AuthorityIdentity) -> CryptoDevice {
     let key = DeviceKey::generate();
-    let pending = PendingDevice::open(db).unwrap();
+    let pending = PendingDevice::open(db, None).unwrap();
     let request = pending.request(&key).unwrap();
     let sas = request.sas_code(&primary.id());
     let cert = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
@@ -139,12 +139,12 @@ fn the_latch_survives_reopening_the_database() {
     let c_id = StandaloneIdentity::generate();
     let key = DeviceKey::generate();
     let db = dir.path().join("c.db");
-    let c = CryptoDevice::open(&c_id, &key.public_key(), &key.nostr_public_key(), &db, 1).unwrap();
+    let c = CryptoDevice::open(&c_id, &key.public_key(), &key.nostr_public_key(), &db, 1, None).unwrap();
     invite(&c, &p).unwrap();
     drop(c);
 
     let reopened =
-        CryptoDevice::open(&c_id, &key.public_key(), &key.nostr_public_key(), &db, 1).unwrap();
+        CryptoDevice::open(&c_id, &key.public_key(), &key.nostr_public_key(), &db, 1, None).unwrap();
 
     assert!(matches!(invite(&reopened, &m), Err(Error::Downgrade)));
 }

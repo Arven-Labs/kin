@@ -226,7 +226,7 @@ mod tests {
 
     /// Banco em memória, sem nenhum tombstone.
     fn fresh() -> Provider {
-        Provider::open(None).unwrap()
+        Provider::open(None, None).unwrap()
     }
 
     /// Um certificado da `id`, com as chaves de signing/rede/Nostr, e o signing em bytes crus.

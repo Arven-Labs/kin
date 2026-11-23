@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use kin_identity::{
-    DeviceCertificate, DeviceKey, IdentityId, Issuer, PairRequest, public_key_from_ed25519,
+    DbKey, DeviceCertificate, DeviceKey, IdentityId, Issuer, PairRequest, public_key_from_ed25519,
 };
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
@@ -43,8 +43,8 @@ pub struct PendingDevice {
 impl PendingDevice {
     /// Abre (ou cria) o banco pendente em `path`. Recusa um banco que já tem certificado
     /// ([`Error::AlreadyPaired`]). Reaproveita a chave MLS guardada ou gera uma, sem certificá-la.
-    pub fn open(path: &Path) -> Result<Self, Error> {
-        let provider = Provider::open(Some(path))?;
+    pub fn open(path: &Path, key: Option<&DbKey>) -> Result<Self, Error> {
+        let provider = Provider::open(Some(path), key)?;
         if provider.meta(META_CERT)?.is_some() {
             return Err(Error::AlreadyPaired);
         }

@@ -40,7 +40,7 @@ impl V4 {
             .unwrap();
         let primary = AuthorityIdentity::new(authority_key, cert).unwrap();
         let (key, db) = (DeviceKey::generate(), dir.join(format!("{name}.db")));
-        let pending = PendingDevice::open(&db).unwrap();
+        let pending = PendingDevice::open(&db, None).unwrap();
         let request = pending.request(&key).unwrap();
         let sas = request.sas_code(&primary.id());
         let cert = primary.answer_pair_request(&request, &sas, 2_000).unwrap();
@@ -57,7 +57,7 @@ impl V4 {
     }
 
     fn open(&self) -> Chat {
-        Chat::open_paired(&self.x, &self.key, config(), &self.db).unwrap()
+        Chat::open_paired(&self.x, &self.key, config(), &self.db, None).unwrap()
     }
 }
 
@@ -88,10 +88,11 @@ fn legacy_conversation_with_v4(c: &Person, p: &V4) {
         &c.device.nostr_public_key(),
         &c.db,
         1,
+        None,
     )
     .unwrap();
     let p_device =
-        CryptoDevice::open_paired(&p.x, &p.key.public_key(), &p.key.nostr_public_key(), &p.db)
+        CryptoDevice::open_paired(&p.x, &p.key.public_key(), &p.key.nostr_public_key(), &p.db, None)
             .unwrap();
     let mut conversation = Conversation::create(&c_device).unwrap();
     conversation
@@ -232,7 +233,7 @@ async fn reopening_with_an_unreadable_regime_store_fails() {
         .execute_batch("DROP TABLE kin_regime; CREATE TABLE kin_regime (other TEXT);")
         .unwrap();
 
-    let result = Chat::open(&c.identity, &c.device, config(), &c.db);
+    let result = Chat::open(&c.identity, &c.device, config(), &c.db, None);
 
     assert!(result.is_err(), "abriu com o store do trinco quebrado");
 }

@@ -2,7 +2,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use kin_identity::{
-    DeviceCertificate, DeviceRevocation, IdentityId, NostrPublicKey, PublicKey, ed25519_bytes,
+    DbKey, DeviceCertificate, DeviceRevocation, IdentityId, NostrPublicKey, PublicKey,
+    ed25519_bytes,
 };
 use openmls_rust_crypto::RustCrypto;
 use openmls_sqlite_storage::{Codec, Connection, SqliteStorageProvider};
@@ -11,7 +12,7 @@ use openmls_traits::random::OpenMlsRand as _;
 use rusqlite::{OptionalExtension as _, params};
 use serde::Serialize;
 
-use crate::Error;
+use crate::{Error, open_db};
 
 /// Chave em `kin_meta` da identidade da instância de estado (P36).
 const STATE_ID_KEY: &str = "state_id";
@@ -41,19 +42,13 @@ pub(crate) struct Provider {
 }
 
 impl Provider {
-    /// Abre (ou cria) o banco em `path`; sem caminho, usa memória (nada sobrevive ao processo).
-    pub(crate) fn open(path: Option<&Path>) -> Result<Self, Error> {
+    /// Abre (ou cria) o banco em `path`, cifrado se houver `key` (política em [`open_db`]); sem caminho, usa
+    /// memória (nada sobrevive ao processo, e `key` não tem o que cifrar).
+    pub(crate) fn open(path: Option<&Path>, key: Option<&DbKey>) -> Result<Self, Error> {
         let mut conn = match path {
-            Some(path) => Connection::open(path),
-            None => Connection::open_in_memory(),
-        }
-        .map_err(Error::storage)?;
-        if let Some(path) = path {
-            // Só o dono lê o estado MLS (sem cifra em repouso, P13); -wal e -shm herdam o modo.
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .map_err(Error::storage)?;
-        }
+            Some(path) => open_db(path, key)?,
+            None => Connection::open_in_memory().map_err(Error::storage)?,
+        };
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS kin_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -395,7 +390,7 @@ mod tests {
     fn revoked(master: &StandaloneIdentity, k: &Keys) -> (Provider, DeviceCertificate) {
         let authority = authority_of(master);
         let cert = cert_for(&authority, k);
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         provider
             .store_revocation(&authority.revoke_device(&cert, NOW + 60).unwrap())
             .unwrap();
@@ -427,7 +422,7 @@ mod tests {
     fn a_revocation_from_the_master_revokes_a_v3_device() {
         let master = StandaloneIdentity::generate();
         let cert = cert_for(&master, &keys());
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         provider
             .store_revocation(&master.revoke_device(&cert, NOW + 60).unwrap())
             .unwrap();
@@ -495,7 +490,7 @@ mod tests {
                 ax.revoke_device(&cx, NOW + 60).unwrap(),
                 av.revoke_device(&cv, NOW + 60).unwrap(),
             );
-            let provider = Provider::open(None).unwrap();
+            let provider = Provider::open(None, None).unwrap();
             if victim_first {
                 provider.store_revocation(&rv).unwrap();
                 provider.store_revocation(&rx).unwrap();
@@ -515,7 +510,7 @@ mod tests {
         let authority = authority_of(&master);
         let cert = cert_for(&authority, &keys());
         let revocation = authority.revoke_device(&cert, NOW + 60).unwrap();
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         // 3c-ii: o retorno diz se era nova (decide o repasse): a primeira sim, a repetida não.
         assert!(provider.store_revocation(&revocation).unwrap());
         assert!(!provider.store_revocation(&revocation).unwrap());
@@ -528,7 +523,7 @@ mod tests {
     fn many_revocations_are_all_kept() {
         let master = StandaloneIdentity::generate();
         let authority = authority_of(&master);
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         let certs: Vec<_> = (0..1200)
             .map(|_| {
                 let cert = cert_for(&authority, &keys());
@@ -549,7 +544,7 @@ mod tests {
         let cert = cert_for(&authority, &keys());
         let mut revocation = authority.revoke_device(&cert, NOW + 60).unwrap();
         revocation.signature[0] ^= 1;
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         assert!(provider.store_revocation(&revocation).is_err());
         assert_eq!(rows(&provider), 0);
         assert!(!provider.is_revoked(&cert).unwrap());
@@ -560,7 +555,7 @@ mod tests {
     fn revocations_come_most_recent_first_and_respect_the_limit() {
         let master = StandaloneIdentity::generate();
         let authority = authority_of(&master);
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         let stored: Vec<_> = (0..5)
             .map(|_| {
                 let cert = cert_for(&authority, &keys());
@@ -581,7 +576,7 @@ mod tests {
     /// recentes da identidade pedida ainda aparecem (filtrar depois do limite devolveria zero).
     #[test]
     fn revocations_filter_by_identity_before_applying_the_limit() {
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         let (wanted, other) = (
             StandaloneIdentity::generate(),
             StandaloneIdentity::generate(),
@@ -648,12 +643,12 @@ mod tests {
         let authority = authority_of(&master);
         let cert = cert_for(&authority, &keys());
         {
-            let provider = Provider::open(Some(&path)).unwrap();
+            let provider = Provider::open(Some(&path), None).unwrap();
             provider
                 .store_revocation(&authority.revoke_device(&cert, NOW + 60).unwrap())
                 .unwrap();
         }
-        let reopened = Provider::open(Some(&path)).unwrap();
+        let reopened = Provider::open(Some(&path), None).unwrap();
         assert!(reopened.is_revoked(&cert).unwrap());
     }
 
@@ -661,7 +656,7 @@ mod tests {
 
     #[test]
     fn marking_an_identity_is_per_identity_and_idempotent() {
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         let (a, b) = (
             StandaloneIdentity::generate().id(),
             StandaloneIdentity::generate().id(),
@@ -682,7 +677,7 @@ mod tests {
 
     #[test]
     fn a_broken_regime_store_fails_closed() {
-        let provider = Provider::open(None).unwrap();
+        let provider = Provider::open(None, None).unwrap();
         let id = StandaloneIdentity::generate().id();
         provider.conn.execute("DROP TABLE kin_regime", []).unwrap();
 
@@ -695,13 +690,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mls.sqlite");
         let id = StandaloneIdentity::generate().id();
-        Provider::open(Some(&path))
+        Provider::open(Some(&path), None)
             .unwrap()
             .mark_authority_regime(&id)
             .unwrap();
 
         assert!(
-            Provider::open(Some(&path))
+            Provider::open(Some(&path), None)
                 .unwrap()
                 .is_authority_regime(&id)
                 .unwrap()

@@ -64,7 +64,7 @@ fn setup() -> (
 #[test]
 fn a_certificate_is_installed_up_to_900_seconds_after_the_request() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
 
     let device = pending
@@ -77,7 +77,7 @@ fn a_certificate_is_installed_up_to_900_seconds_after_the_request() {
 #[test]
 fn a_certificate_one_second_late_is_refused_and_the_device_stays_pending() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
     let cert = answer(&primary, &request);
 
@@ -85,7 +85,7 @@ fn a_certificate_one_second_late_is_refused_and_the_device_stays_pending() {
     assert!(matches!(refused, Err(Error::PairRequestExpired)));
 
     // Continua pendente (não virou pareado): o mesmo certificado, mas dentro do prazo, ainda instala.
-    let again = PendingDevice::open(&db).unwrap();
+    let again = PendingDevice::open(&db, None).unwrap();
     again
         .install_certificate_at(&key, &cert, &primary.id(), T0 + 500)
         .unwrap();
@@ -94,7 +94,7 @@ fn a_certificate_one_second_late_is_refused_and_the_device_stays_pending() {
 #[test]
 fn asking_again_before_the_deadline_gives_the_same_request() {
     let (_dir, db, key, _primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
 
     let first = pending.request_at(&key, T0).unwrap();
     let again = pending.request_at(&key, T0 + 900).unwrap();
@@ -105,7 +105,7 @@ fn asking_again_before_the_deadline_gives_the_same_request() {
 #[test]
 fn asking_after_the_deadline_gives_a_new_request() {
     let (_dir, db, key, _primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
 
     let first = pending.request_at(&key, T0).unwrap();
     let renewed = pending.request_at(&key, T0 + 901).unwrap();
@@ -119,14 +119,14 @@ fn asking_after_the_deadline_gives_a_new_request() {
 #[test]
 fn a_request_without_a_stored_time_counts_as_expired() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
     drop(pending);
     set_meta(&db, "pair_requested_at", None);
     let cert = answer(&primary, &request);
 
     let result =
-        PendingDevice::open(&db)
+        PendingDevice::open(&db, None)
             .unwrap()
             .install_certificate_at(&key, &cert, &primary.id(), T0);
 
@@ -136,14 +136,14 @@ fn a_request_without_a_stored_time_counts_as_expired() {
 #[test]
 fn a_garbled_stored_time_counts_as_expired() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
     drop(pending);
     set_meta(&db, "pair_requested_at", Some(b"lixo"));
     let cert = answer(&primary, &request);
 
     let result =
-        PendingDevice::open(&db)
+        PendingDevice::open(&db, None)
             .unwrap()
             .install_certificate_at(&key, &cert, &primary.id(), T0);
 
@@ -155,7 +155,7 @@ fn a_garbled_stored_time_counts_as_expired() {
 #[test]
 fn a_stored_time_up_to_300_seconds_ahead_is_tolerated_and_beyond_that_it_expires() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0 + 300).unwrap();
     let cert = answer(&primary, &request);
 
@@ -165,7 +165,7 @@ fn a_stored_time_up_to_300_seconds_ahead_is_tolerated_and_beyond_that_it_expires
         .unwrap();
 
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0 + 301).unwrap();
     let cert = answer(&primary, &request);
 
@@ -176,14 +176,14 @@ fn a_stored_time_up_to_300_seconds_ahead_is_tolerated_and_beyond_that_it_expires
 #[test]
 fn a_stored_time_of_u64_max_does_not_make_the_request_immortal() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
     drop(pending);
     set_meta(&db, "pair_requested_at", Some(&u64::MAX.to_be_bytes()));
     let cert = answer(&primary, &request);
 
     let result =
-        PendingDevice::open(&db)
+        PendingDevice::open(&db, None)
             .unwrap()
             .install_certificate_at(&key, &cert, &primary.id(), T0);
 
@@ -193,7 +193,7 @@ fn a_stored_time_of_u64_max_does_not_make_the_request_immortal() {
 #[test]
 fn a_stored_time_of_u64_max_is_renewed_by_the_next_request() {
     let (_dir, db, key, _primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
     set_meta(&db, "pair_requested_at", Some(&u64::MAX.to_be_bytes()));
 
@@ -206,7 +206,7 @@ fn a_stored_time_of_u64_max_is_renewed_by_the_next_request() {
 #[test]
 fn the_stored_time_is_gone_after_pairing() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request_at(&key, T0).unwrap();
     assert!(get_meta(&db, "pair_requested_at").is_some());
 
@@ -220,7 +220,7 @@ fn the_stored_time_is_gone_after_pairing() {
 #[test]
 fn discarding_the_request_also_discards_its_time() {
     let (_dir, db, key, _primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     pending.request_at(&key, T0).unwrap();
 
     pending.discard_request().unwrap();
@@ -234,9 +234,9 @@ fn discarding_the_request_also_discards_its_time() {
 fn a_time_without_a_request_is_overwritten_by_the_next_request() {
     let (_dir, db, key, _primary) = setup();
     // Abrir cria o esquema do banco; só então dá para gravar a hora solta.
-    drop(PendingDevice::open(&db).unwrap());
+    drop(PendingDevice::open(&db, None).unwrap());
     set_meta(&db, "pair_requested_at", Some(&5u64.to_be_bytes()));
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
 
     pending.request_at(&key, T0).unwrap();
 
@@ -251,7 +251,7 @@ fn a_time_without_a_request_is_overwritten_by_the_next_request() {
 #[test]
 fn a_certificate_for_an_expired_request_still_installs_after_renewal() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let old = pending.request_at(&key, T0).unwrap();
     let cert = answer(&primary, &old);
     let renewed = pending.request_at(&key, T0 + 901).unwrap();
@@ -266,7 +266,7 @@ fn a_certificate_for_an_expired_request_still_installs_after_renewal() {
 #[test]
 fn the_system_clock_variants_accept_a_fresh_request() {
     let (_dir, db, key, primary) = setup();
-    let pending = PendingDevice::open(&db).unwrap();
+    let pending = PendingDevice::open(&db, None).unwrap();
     let request = pending.request(&key).unwrap();
 
     pending

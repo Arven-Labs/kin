@@ -83,6 +83,16 @@ pub enum Error {
         "esta identidade já usa certificados de autoridade (v4): um certificado da mestra (v3) é recusado"
     )]
     Downgrade,
+    /// O banco é cifrado e nenhuma chave foi informada (P13, ADR 0045).
+    #[error("o banco é cifrado: informe a chave")]
+    DbKeyRequired,
+    /// O banco é cifrado e a chave informada não o abre.
+    #[error("a chave não abre o banco")]
+    DbWrongKey,
+    /// Foi informada uma chave, mas o banco está em claro: recusa, para que trocar o banco por um em claro não
+    /// passe despercebido (política contra downgrade, ADR 0045).
+    #[error("o banco está em claro, mas uma chave foi informada: recusado")]
+    DbNotEncrypted,
     #[error("armazenamento: {0}")]
     Storage(String),
     #[error("falha no MLS: {0}")]

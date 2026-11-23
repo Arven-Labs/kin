@@ -41,6 +41,7 @@ fn open(identity: &StandaloneIdentity, device: &DeviceKey, dir: &Path, name: &st
             ..Default::default()
         },
         &dir.join(format!("{name}.db")),
+        None,
     )
     .unwrap()
 }
