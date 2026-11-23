@@ -61,6 +61,7 @@ fn inspect(path: &Path) -> Result<OnDisk, Error> {
 pub fn open_db(path: &Path, key: Option<&DbKey>) -> Result<Connection, Error> {
     match (inspect(path)?, key) {
         (OnDisk::Plain, Some(_)) => return Err(Error::DbNotEncrypted),
+        (OnDisk::Other, None) => {}
         _ => {}
     }
     let conn = Connection::open(path).map_err(Error::storage)?;
