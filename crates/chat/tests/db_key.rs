@@ -36,6 +36,14 @@ fn outbox_of(db: &Path) -> PathBuf {
     db.with_extension("outbox.db")
 }
 
+/// Cria um banco com conteúdo: sem nenhuma escrita o arquivo fica com 0 bytes, que a política trata como "novo".
+fn create_db(path: &Path, key: Option<&DbKey>) {
+    kin_crypto::open_db(path, key)
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v INTEGER);")
+        .unwrap();
+}
+
 fn wal_of(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-wal", path.display()))
 }
@@ -162,7 +170,7 @@ fn a_refused_outbox_leaves_no_mls_database_behind() {
     let k = key();
 
     // Só a outbox existe, cifrada; abrir sem chave é recusado e não cria o `a.db`.
-    drop(kin_crypto::open_db(&outbox_of(&a.db), Some(&k)).unwrap());
+    create_db(&outbox_of(&a.db), Some(&k));
     assert!(matches!(
         open(&a, None),
         Err(Error::Crypto(CryptoError::DbKeyRequired))
@@ -171,7 +179,7 @@ fn a_refused_outbox_leaves_no_mls_database_behind() {
 
     // E o inverso: só a outbox existe, em claro; abrir com chave é recusado e não cria o `a.db`.
     let b = Person::new(dir.path(), "b");
-    drop(kin_crypto::open_db(&outbox_of(&b.db), None).unwrap());
+    create_db(&outbox_of(&b.db), None);
     assert!(matches!(
         open(&b, Some(&k)),
         Err(Error::Crypto(CryptoError::DbNotEncrypted))

@@ -66,6 +66,14 @@ fn wal_of(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-wal", path.display()))
 }
 
+/// Cria um banco com conteúdo: sem nenhuma escrita o arquivo fica com 0 bytes, que a política trata como "novo".
+fn create_db(path: &Path, key: Option<&DbKey>) {
+    kin_crypto::open_db(path, key)
+        .unwrap()
+        .execute_batch("CREATE TABLE t (v INTEGER);")
+        .unwrap();
+}
+
 /// Nomes e tamanhos dos arquivos do diretório, em ordem.
 fn listing(dir: &Path) -> Vec<(String, u64)> {
     let mut files: Vec<_> = fs::read_dir(dir)
@@ -302,7 +310,7 @@ fn check_db_applies_the_policy_without_creating_anything() {
     assert!(!missing.exists());
 
     let plain = dir.path().join("plain");
-    drop(kin_crypto::open_db(&plain, None).unwrap());
+    create_db(&plain, None);
     assert!(matches!(
         kin_crypto::check_db(&plain, Some(&key())),
         Err(Error::DbNotEncrypted)
@@ -310,7 +318,7 @@ fn check_db_applies_the_policy_without_creating_anything() {
     assert!(kin_crypto::check_db(&plain, None).is_ok());
 
     let encrypted = dir.path().join("encrypted");
-    drop(kin_crypto::open_db(&encrypted, Some(&key())).unwrap());
+    create_db(&encrypted, Some(&key()));
     assert!(matches!(
         kin_crypto::check_db(&encrypted, None),
         Err(Error::DbKeyRequired)
