@@ -60,7 +60,6 @@ fn inspect(path: &Path) -> Result<OnDisk, Error> {
 /// antes dele lê ou grava a página 1 sem cifra). O arquivo fica 0600; `-wal` e `-shm` herdam o modo.
 pub fn open_db(path: &Path, key: Option<&DbKey>) -> Result<Connection, Error> {
     match (inspect(path)?, key) {
-        (OnDisk::Plain, Some(_)) => return Err(Error::DbNotEncrypted),
         (OnDisk::Other, None) => return Err(Error::DbKeyRequired),
         _ => {}
     }
