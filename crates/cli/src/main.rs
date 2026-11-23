@@ -272,8 +272,12 @@ fn parse_from(
 /// `KIN_PASSPHRASE_FILE`); `--no-passphrase` grava em claro; `--protect` cifra no lugar um diretório
 /// antigo em claro. Com senha, também cria e abre o `db.key` dos bancos; `--protect` cifra os bancos
 /// em claro (P13 fatia 3, ADR 0045).
+///
+/// `params` é o custo do Argon2 de tudo o que for criado ou re-selado aqui (`DEFAULT` em produção; os
+/// testes passam `MIN`).
 fn open_keys(
     args: &Args,
+    params: kin_identity::KdfParams,
 ) -> Result<(keys::LocalIdentity, DeviceKey, Option<kin_identity::DbKey>), Box<dyn std::error::Error>>
 {
     let dir = &args.data_dir;
@@ -309,13 +313,13 @@ fn open_keys(
         dir,
         passphrase.as_ref().map(|p| p.as_slice()),
         protect,
-        kin_identity::KdfParams::DEFAULT,
+        params,
     )?;
     let db_key = keys::open_db_key(
         dir,
         passphrase.as_ref().map(|p| p.as_slice()),
         protect,
-        kin_identity::KdfParams::DEFAULT,
+        params,
     )?;
     // O pareado só se anuncia depois de o `Chat::open_paired` e o `ensure_current_issuer` passarem (em
     // `main`): antes disso ainda pode ser um pareamento pendente ou um banco v3.
@@ -434,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         e
     })?;
-    let (identity, device, db_key) = open_keys(&args)?;
+    let (identity, device, db_key) = open_keys(&args, kin_identity::KdfParams::DEFAULT)?;
     if args.serve_relay {
         return serve_relay(&args, &device).await;
     }
@@ -1814,5 +1818,123 @@ mod tests {
         let met = vec![(a, x.clone()), (b, x.clone())];
         assert_eq!(identity_of(&met, a), identity_of(&met, b));
         assert_eq!(identity_of(&met, a), Some(x));
+    }
+
+    // ---- `--serve-relay` não toca no `db.key` nem nos bancos (P13, ADR 0045) ----
+
+    /// Custo mínimo do Argon2 (o `open_keys` de produção recebe `DEFAULT`).
+    const FAST: kin_identity::KdfParams = kin_identity::KdfParams::MIN;
+
+    /// Diretório de dados novo + arquivo de senha (0600, como o `read_passphrase_file` exige).
+    fn data_dir_and_passphrase() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let pass = dir.path().join("senha.txt");
+        std::fs::write(&pass, "senha-de-teste-p13\n").unwrap();
+        std::fs::set_permissions(&pass, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, pass)
+    }
+
+    /// `kin --data-dir <dir> --passphrase-file <pass> [extra...]`; `relay` acrescenta `--serve-relay`.
+    fn key_args(dir: &Path, pass: &Path, relay: bool, extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ];
+        argv.extend_from_slice(extra);
+        if relay {
+            argv.push("--serve-relay");
+        }
+        parse(&argv, None).unwrap()
+    }
+
+    fn plain_database(path: &Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (v TEXT NOT NULL); INSERT INTO t (v) VALUES ('p13'); PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+
+    /// O relay não abre banco: com chaves seladas e sem `db.key`, não cria um (o caminho normal cria,
+    /// como no teste seguinte), mas a identidade e o `device.key` continuam sendo criados e devolvidos.
+    #[test]
+    fn serve_relay_with_sealed_keys_does_not_create_a_db_key() {
+        let (dir, pass) = data_dir_and_passphrase();
+        let args = key_args(dir.path(), &pass, true, &[]);
+        let (_, _, db_key) = open_keys(&args, FAST).unwrap();
+        assert!(db_key.is_none(), "o relay não devolve chave de banco");
+        assert!(
+            !dir.path().join(keys::DB_KEY_FILE).exists(),
+            "o relay criou o db.key"
+        );
+        for name in ["identity.key", "device.key"] {
+            let path = dir.path().join(name);
+            assert!(
+                kin_identity::key_file_is_sealed(&path).unwrap(),
+                "{name} devia existir e estar selado"
+            );
+        }
+    }
+
+    /// A outra metade: o caminho do chat, com as mesmas chaves seladas, segue criando o `db.key`. Sem isto
+    /// a correção do relay poderia ter removido a criação no caminho errado.
+    #[test]
+    fn the_chat_path_with_sealed_keys_still_creates_the_db_key() {
+        let (dir, pass) = data_dir_and_passphrase();
+        let args = key_args(dir.path(), &pass, false, &[]);
+        let (_, _, db_key) = open_keys(&args, FAST).unwrap();
+        assert!(db_key.is_some(), "o chat precisa da chave dos bancos");
+        let path = dir.path().join(keys::DB_KEY_FILE);
+        assert!(kin_identity::key_file_is_sealed(&path).unwrap());
+    }
+
+    /// Fora do caso feliz (dir novo): o relay num diretório do chat com `db.key` ilegível não falha por
+    /// ele. O chat falha neste mesmo diretório (premissa: é o `db.key` que o derruba), o relay não, e o
+    /// arquivo fica byte a byte igual.
+    #[test]
+    fn serve_relay_ignores_a_db_key_it_could_not_open() {
+        let (dir, pass) = data_dir_and_passphrase();
+        open_keys(&key_args(dir.path(), &pass, true, &[]), FAST).unwrap();
+        let db_key = dir.path().join(keys::DB_KEY_FILE);
+        std::fs::write(&db_key, b"isto nao e um db.key").unwrap();
+
+        let chat = key_args(dir.path(), &pass, false, &[]);
+        assert!(open_keys(&chat, FAST).is_err(), "o chat devia recusar");
+
+        let relay = key_args(dir.path(), &pass, true, &[]);
+        let (_, _, opened) = open_keys(&relay, FAST).unwrap();
+        assert!(opened.is_none());
+        assert_eq!(std::fs::read(&db_key).unwrap(), b"isto nao e um db.key");
+    }
+
+    /// Com `--protect` o caminho do chat cifra no lugar o banco em claro; o relay não pode migrar banco
+    /// nenhum (nem ler: o arquivo e o `db.key` ficam byte a byte iguais).
+    #[test]
+    fn serve_relay_with_protect_leaves_a_plain_database_and_the_db_key_untouched() {
+        let (dir, pass) = data_dir_and_passphrase();
+        open_keys(&key_args(dir.path(), &pass, false, &[]), FAST).unwrap();
+        let database = dir.path().join("mls.sqlite");
+        plain_database(&database);
+        let (database_before, key_before) = (
+            std::fs::read(&database).unwrap(),
+            std::fs::read(dir.path().join(keys::DB_KEY_FILE)).unwrap(),
+        );
+
+        let relay = key_args(dir.path(), &pass, true, &["--protect"]);
+        open_keys(&relay, FAST).unwrap();
+
+        assert_eq!(
+            kin_crypto::db_kind(&database).unwrap(),
+            kin_crypto::DbKind::Plain,
+            "o relay migrou o banco"
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), database_before);
+        assert_eq!(
+            std::fs::read(dir.path().join(keys::DB_KEY_FILE)).unwrap(),
+            key_before
+        );
     }
 }
