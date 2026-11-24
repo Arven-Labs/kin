@@ -559,9 +559,6 @@ pub fn change_passphrase(
     if new.is_empty() {
         return Err("a senha nova não pode ser vazia".into());
     }
-    if new == old {
-        return Err("a senha nova é igual à atual".into());
-    }
     let mut files = Vec::new();
     for name in SEALED_KEY_FILES {
         let path = dir.join(name);
