@@ -259,7 +259,10 @@ mod tests {
         use_mock_store();
         let dir = tempfile::tempdir().unwrap();
         let pass: &[u8] = &[0xff, 0x00, 0xfe, b'a', 0xc3, 0x28];
-        assert!(std::str::from_utf8(pass).is_err(), "controle: não é UTF-8");
+        assert!(
+            String::from_utf8(pass.to_vec()).is_err(),
+            "controle: não é UTF-8"
+        );
         save(dir.path(), pass).unwrap();
         assert_eq!(&*load(dir.path()).unwrap(), pass);
         let utf8 = "senha com açaí e ✓".as_bytes();
