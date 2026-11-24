@@ -137,6 +137,8 @@ pub enum Source {
         confirm: bool,
     },
     /// Keyring do SO (`--keyring`, P13, ADR 0047): a senha foi gravada por `kin keyring save`.
+    // Esqueleto do commit de testes: o `decide` ainda não a constrói. O `allow` sai na implementação.
+    #[allow(dead_code)]
     Keyring,
 }
 
