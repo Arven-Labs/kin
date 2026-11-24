@@ -52,6 +52,7 @@ mod cold;
 mod devices;
 mod keys;
 mod pair;
+mod passwd;
 
 use kin_chat::nostr::{NostrMailbox, RelaySource, resolve_relays};
 use kin_chat::{
@@ -465,6 +466,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e
         })?;
         return pair::run(command).map_err(Into::into);
+    }
+    // `kin passwd ...` (P13): troca a senha dos arquivos de chave, sem rede nem chat.
+    if std::env::args().nth(1).as_deref() == Some("passwd") {
+        let command = passwd::parse(std::env::args().skip(2)).map_err(|e| {
+            eprintln!(
+                "{e}\nuso: kin passwd [--data-dir DIR] [--passphrase-file ARQ_DA_SENHA_ATUAL] [--new-passphrase-file ARQ_DA_SENHA_NOVA]"
+            );
+            e
+        })?;
+        return passwd::run(command).map_err(Into::into);
     }
     let args = parse_args().map_err(|e| {
         eprintln!(

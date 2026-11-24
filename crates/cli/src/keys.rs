@@ -550,8 +550,6 @@ const SEALED_KEY_FILES: [&str; 4] = [
 /// uma queda termina o serviço. Antes de gravar qualquer arquivo, confere **todos**: se algum não abre
 /// nem com a velha nem com a nova, aborta sem gravar nada. Recusa senha nova vazia ou igual à velha,
 /// diretório sem arquivo de chave e arquivo em claro (isso é o `--protect`).
-// Só os testes a chamam até o subcomando `passwd` ser ligado (próxima etapa do P13).
-#[allow(dead_code)]
 pub fn change_passphrase(
     dir: &Path,
     old: &[u8],
