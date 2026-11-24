@@ -1,8 +1,10 @@
 //! CLI de desenvolvimento: sobe um nó Kin e conversa 1:1 pelo terminal.
 //!
 //! ```text
-//! kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--accept LINK] [--relay ADDR]...
+//! kin [--data-dir DIR] [--passphrase-file ARQ | --keyring | --no-passphrase] [--protect]
+//!     [--listen ADDR] [--dial ADDR] [--accept LINK] [--relay ADDR]...
 //!     [--relay-count N] [--external-addr ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns]
+//! kin keyring save|forget [--data-dir DIR] [--passphrase-file ARQ]   (senha no keyring do SO, ADR 0047)
 //! kin --serve-relay [--listen ADDR] [--external-addr ADDR]... [--relay-max-bytes N]
 //!     [--relay-max-circuits N]
 //! ```
@@ -51,6 +53,7 @@ use std::path::{Path, PathBuf};
 mod cold;
 mod devices;
 mod keys;
+mod os_keyring;
 mod pair;
 mod passwd;
 
@@ -228,6 +231,7 @@ fn parse_from(
             "--passphrase-file" => args.keys.passphrase_file = Some(value()?.into()),
             "--protect" => args.keys.protect = true,
             "--no-passphrase" => args.keys.no_passphrase = true,
+            "--keyring" => args.keys.keyring = true,
             "--relay-count" => {
                 args.relay_count = Some(value()?.parse().map_err(|e| format!("{e}"))?);
             }
@@ -260,7 +264,7 @@ fn parse_from(
                 .to_string(),
         );
     }
-    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
+    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase && !args.keys.keyring {
         args.keys.passphrase_file = env_passphrase_file
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
@@ -287,6 +291,13 @@ fn open_keys(
     let state = keys::files_state(dir)?;
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let access = keys::decide(&args.keys, state, tty)?;
+    let from_keyring = matches!(
+        &access,
+        keys::Access::Sealed {
+            source: keys::Source::Keyring,
+            ..
+        }
+    );
     let (passphrase, protect) = match &access {
         keys::Access::Plain(keys::PlainReason::Explicit) => {
             eprintln!("aviso: --no-passphrase: as chaves ficam em claro no disco (só 0600)");
@@ -302,6 +313,7 @@ fn open_keys(
             let pass = match source {
                 keys::Source::File(path) => keys::read_passphrase_file(path)?,
                 keys::Source::Prompt { confirm } => prompt_passphrase(*confirm)?,
+                keys::Source::Keyring => os_keyring::load(dir)?,
             };
             (Some(pass), *protect)
         }
@@ -317,7 +329,18 @@ fn open_keys(
         passphrase.as_ref().map(|p| p.as_slice()),
         protect,
         params,
-    )?;
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> {
+        if from_keyring {
+            // O caso comum é a entrada velha (depois de `kin passwd`) ou alterada por outro programa.
+            format!(
+                "{e} (a senha gravada no keyring pode estar velha ou ter sido alterada: rode `kin keyring save`)"
+            )
+            .into()
+        } else {
+            e
+        }
+    })?;
     // O relay não abre banco: nem cria, nem lê, nem migra o `db.key` (um `db.key` ausente ou ilegível
     // não pode impedi-lo de subir). `None` aqui só quer dizer "não aplicável"; `main` não o usa no relay.
     let db_key = if args.serve_relay {
@@ -477,9 +500,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         return passwd::run(command).map_err(Into::into);
     }
+    // `kin keyring save|forget ...` (P13, ADR 0047): a senha das chaves no keyring do SO, sem rede nem chat.
+    if std::env::args().nth(1).as_deref() == Some("keyring") {
+        let command = os_keyring::parse(std::env::args().skip(2)).map_err(|e| {
+            eprintln!(
+                "{e}\nuso: kin keyring save [--data-dir DIR] [--passphrase-file ARQ]\n     kin keyring forget [--data-dir DIR]"
+            );
+            e
+        })?;
+        return os_keyring::run(command).map_err(Into::into);
+    }
     let args = parse_args().map_err(|e| {
         eprintln!(
-            "{e}\nuso: kin [--data-dir DIR] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission | --require-approval]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
+            "{e}\nuso: kin [--data-dir DIR] [--passphrase-file ARQ | --keyring | --no-passphrase] [--protect] [--listen ADDR] [--dial ADDR] [--relay ADDR]... [--nostr-relay URL]... [--no-nostr] [--no-mdns] [--open-admission | --require-approval]\n     kin --serve-relay [--listen ADDR] [--relay-max-bytes N] [--relay-max-circuits N]"
         );
         e
     })?;
@@ -1654,6 +1687,19 @@ mod tests {
         assert_eq!(args.keys.passphrase_file, None);
     }
 
+    /// `--keyring` (P13, ADR 0047) vence a variável de ambiente, como `--no-passphrase`: quem a deixou
+    /// no shell não pode ver `--keyring` recusado por causa dela.
+    #[test]
+    fn keyring_ignores_the_environment_variable() {
+        let args = parse(&["--keyring"], Some("/env/p")).unwrap();
+        assert!(args.keys.keyring);
+        assert_eq!(args.keys.passphrase_file, None);
+        // Controle: sem `--keyring` a variável segue valendo.
+        let without = parse(&[], Some("/env/p")).unwrap();
+        assert!(!without.keys.keyring);
+        assert_eq!(without.keys.passphrase_file, Some(PathBuf::from("/env/p")));
+    }
+
     #[test]
     fn passphrase_file_without_a_value_is_an_error() {
         assert!(parse(&["--passphrase-file"], None).is_err());
@@ -1934,6 +1980,76 @@ mod tests {
         assert!(db_key.is_some(), "o chat precisa da chave dos bancos");
         let path = dir.path().join(keys::DB_KEY_FILE);
         assert!(kin_identity::key_file_is_sealed(&path).unwrap());
+    }
+
+    // ---- `--keyring` em `open_keys` (P13, ADR 0047); o store é o mock do `keyring-core` ----
+
+    fn keyring_args(dir: &Path, relay: bool) -> Args {
+        let mut argv = vec!["--data-dir", dir.to_str().unwrap(), "--keyring"];
+        if relay {
+            argv.push("--serve-relay");
+        }
+        parse(&argv, None).unwrap()
+    }
+
+    /// Cria as chaves com a senha do arquivo e grava essa senha no keyring (como `kin keyring save`).
+    fn dir_with_the_passphrase_in_the_keyring(relay: bool) -> (tempfile::TempDir, PathBuf) {
+        os_keyring::use_mock_store();
+        let (dir, pass) = data_dir_and_passphrase();
+        open_keys(&key_args(dir.path(), &pass, relay, &[]), FAST).unwrap();
+        let secret = keys::read_passphrase_file(&pass).unwrap();
+        os_keyring::save_verified(dir.path(), &secret).unwrap();
+        (dir, pass)
+    }
+
+    /// A ligação que faltava entre `decide` e `os_keyring::load`: com `--keyring`, `open_keys` abre as
+    /// chaves do diretório com a senha que veio do keyring (a mesma identidade que o arquivo abriria).
+    #[test]
+    fn open_keys_with_keyring_opens_the_keys_with_the_stored_passphrase() {
+        let (dir, pass) = dir_with_the_passphrase_in_the_keyring(false);
+        let (by_file, _, _) = open_keys(&key_args(dir.path(), &pass, false, &[]), FAST).unwrap();
+        let (by_keyring, _, db_key) = open_keys(&keyring_args(dir.path(), false), FAST).unwrap();
+        assert_eq!(by_keyring.id(), by_file.id());
+        assert!(db_key.is_some(), "o chat precisa da chave dos bancos");
+    }
+
+    /// O relay com `--keyring`: abre as chaves e segue sem `db.key` (nem cria um).
+    #[test]
+    fn open_keys_with_keyring_serves_a_relay_without_a_db_key() {
+        let (dir, _) = dir_with_the_passphrase_in_the_keyring(true);
+        let (_, _, db_key) = open_keys(&keyring_args(dir.path(), true), FAST).unwrap();
+        assert!(db_key.is_none());
+        assert!(!dir.path().join(keys::DB_KEY_FILE).exists());
+    }
+
+    /// Entrada velha (senha trocada por `kin passwd`): erro que cita o keyring e manda regravar, sem
+    /// alterar arquivo. Controle: uma senha errada por arquivo NÃO recebe a dica do keyring.
+    #[test]
+    fn open_keys_with_a_stale_keyring_entry_points_to_keyring_save() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, pass) = dir_with_the_passphrase_in_the_keyring(false);
+        let secret = keys::read_passphrase_file(&pass).unwrap();
+        keys::change_passphrase(dir.path(), &secret, b"senha nova", FAST).unwrap();
+        let before = std::fs::read(dir.path().join("identity.key")).unwrap();
+
+        let err = open_keys(&keyring_args(dir.path(), false), FAST)
+            .err()
+            .expect("a entrada velha não abre as chaves")
+            .to_string();
+        assert!(err.contains("kin keyring save"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("identity.key")).unwrap(),
+            before
+        );
+
+        let wrong = dir.path().join("errada.txt");
+        std::fs::write(&wrong, "outra senha qualquer\n").unwrap();
+        std::fs::set_permissions(&wrong, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let by_file = open_keys(&key_args(dir.path(), &wrong, false, &[]), FAST)
+            .err()
+            .expect("senha errada por arquivo falha")
+            .to_string();
+        assert!(!by_file.contains("keyring"), "{by_file}");
     }
 
     /// Fora do caso feliz (dir novo): o relay num diretório do chat com `db.key` ilegível não falha por

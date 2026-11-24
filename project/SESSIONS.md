@@ -2417,3 +2417,17 @@ Escopo do dono: só descoberta; sem relay real; espelho de fora (a CLI usa `send
 - **Lab `revoke-device`**: falhou em 3 commits desta branch ("repetir o /revoke deixa o a3 revogado") e passou nos outros; **sem controle, não chamo de instável**. Já tinha falhado na Sessão 44.
 - **Não verificado**: o prompt interativo (sem TTY no CI); primário e pareado só nos testes unitários, não no lab; lab só no modo Master; `kin` vivo durante a troca (só o aviso).
 - **Próximo passo**: o dono mescla o #332. Sobra do P13: keyring do SO e `pair --protect` (não recomendado).
+- **Atualização**: #332 mesclado (`b05c452`).
+
+### 2026-11-24 — Sessão 46
+
+#### P13: keyring do SO como fonte da senha, `--keyring` (PR #337, ADR 0047), sessão individual
+
+- **Decisões do dono**: o keyring guarda só a senha (não as chaves); `keyring` v4 com features padrão, opt-in por `--keyring`, mais `kin keyring save|forget`; sem fallback silencioso. Avaliação da dependência no ADR 0047.
+- **O que mudou**: `crates/cli/src/os_keyring.rs` (novo), `keys.rs` (`Source::Keyring`, `decide`, `check_passphrase`), `main.rs` (flag, despacho, `open_keys` com dica), `passwd.rs` (avisa da entrada velha; parse sem eco), `Cargo.toml` (`keyring =4.2.0`, `keyring-core =1.1.0`).
+- **Provas (lidas no CI)**: testes primeiro: 20 vermelhos (217 passaram); o 21º, `keyring_ignores_the_environment_variable`, passou de saída porque a flag já estava no esqueleto, e só a mutação provou. Esqueleto reprovou antes no clippy (`Source::Keyring` sem uso), corrigido. Mutações (PRs rascunho #338 a #342, fechados): M1 `check_passphrase` pula o `db.key`, M2 `--keyring` aceita `--protect`, M3 a variável de ambiente vence `--keyring`, M4 sem caminho canônico, M5 `forget` não idempotente; **cada uma derrubou 1 teste**, todas compilaram e passaram o clippy.
+- **Revisão**: `security-auditor` (sem crítico/alto; 2 médios: `Cargo.lock` sem a dependência e CI sem `--locked`, e sem timeout com o keyring bloqueado) e `adversarial-reviewer` (sem crítico; 3 importantes). Aplicado: `open_keys` com dica "rode `kin keyring save`", `passwd` avisa da entrada velha, erros do store com dica, sem `to_string_lossy`, parse sem eco de flag, testes de `open_keys --keyring` (chat, relay, entrada velha), symlink, bytes não-UTF-8, primário e troca pela metade, uso e cabeçalho com `--keyring`. **Não aplicado, no ADR**: timeout, relay com `db.key` corrompido, entrada órfã no `forget`. Um lint `invalid_from_utf8` num teste meu parou o clippy uma vez (corrigido).
+- **Lab**: falhou em cenários sem relação com o keyring: `stale-connection-silent` (esqueleto), `invite` (commit das correções); `revoke-device` já havia falhado 3 vezes no #332. **Sem controle, não chamo de instável.**
+- **Não verificado**: o Secret Service real (nada roda fora do `mock`: CI e lab sem D-Bus); keyring bloqueado; persistência depois de reiniciar a sessão; macOS e Windows; a árvore de dependências transitivas (sem `Cargo.lock` atualizado).
+- **Depende do dono**: (1) gerar e commitar o `Cargo.lock` (`cargo metadata --format-version 1 > /dev/null` na branch, depois `git diff --stat Cargo.lock`); (2) roteiro manual no `archlinux`: `kin keyring save`, partir com `--keyring`, `secret-tool search service kin`, `kin keyring forget`, partir de novo e ver a recusa; testar também com o keyring bloqueado.
+- **Próximo passo**: o dono confere o lock e o roteiro e mescla o #337. Sobra do P13: Secure Enclave/Keystore no mobile e `pair --protect` (não recomendado).

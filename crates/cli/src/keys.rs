@@ -114,6 +114,8 @@ pub struct KeyOptions {
     pub passphrase_file: Option<PathBuf>,
     pub no_passphrase: bool,
     pub protect: bool,
+    /// `--keyring`: a senha vem do keyring do SO (P13, ADR 0047).
+    pub keyring: bool,
 }
 
 /// Estado dos arquivos de chave que **existem** no diretório.
@@ -134,6 +136,8 @@ pub enum Source {
     Prompt {
         confirm: bool,
     },
+    /// Keyring do SO (`--keyring`, P13, ADR 0047): a senha foi gravada por `kin keyring save`.
+    Keyring,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +156,29 @@ pub enum Access {
 
 /// Decisão pura: dado o pedido, o estado dos arquivos e se há terminal, o que fazer (ou por que recusar).
 pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access, String> {
+    // `--keyring` (P13, ADR 0047) só lê a senha de chaves já cifradas; não cria nem migra nada.
+    if opts.keyring {
+        if opts.no_passphrase || opts.passphrase_file.is_some() || opts.protect {
+            return Err(
+                "--keyring não combina com --no-passphrase, --passphrase-file nem --protect (para cifrar, rode --protect com a senha e depois `kin keyring save`)"
+                    .into(),
+            );
+        }
+        return match state {
+            FilesState::Sealed => Ok(Access::Sealed {
+                source: Source::Keyring,
+                protect: false,
+            }),
+            FilesState::New => Err(
+                "--keyring: não há chaves neste --data-dir; crie-as com senha (prompt ou --passphrase-file) e depois rode `kin keyring save`"
+                    .into(),
+            ),
+            FilesState::Plain | FilesState::Mixed => Err(
+                "--keyring: há chave em claro neste --data-dir; rode uma vez com --protect (senha por prompt ou arquivo) e depois `kin keyring save`"
+                    .into(),
+            ),
+        };
+    }
     if opts.no_passphrase {
         if opts.passphrase_file.is_some() {
             return Err("--no-passphrase e --passphrase-file são excludentes".into());
@@ -535,6 +562,33 @@ pub(crate) fn load_or_create_device(
     Ok(device)
 }
 
+/// Confere, sem gravar nada, que `pass` abre **todos** os arquivos de chave cifrados de `dir` (P13, ADR
+/// 0047): o `kin keyring save` só guarda uma senha que o kin consegue usar na partida. Uma senha que abre a
+/// identidade mas não o `db.key` não serve. Recusa chave em claro (o keyring só guarda senha de chave
+/// cifrada) e diretório sem arquivo de chave.
+pub fn check_passphrase(dir: &Path, pass: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut found = false;
+    for name in SEALED_KEY_FILES {
+        let path = dir.join(name);
+        if !present(&path)? {
+            continue;
+        }
+        if !kin_identity::key_file_is_sealed(&path)? {
+            return Err(format!(
+                "{name} está em claro: o keyring só guarda a senha de chaves cifradas; rode uma vez com --protect antes"
+            )
+            .into());
+        }
+        // Com a mesma senha dos dois lados, `rekey_state` só diz se o arquivo abre com ela.
+        kin_identity::rekey_state(&path, pass, pass).map_err(|e| format!("{name}: {e}"))?;
+        found = true;
+    }
+    if !found {
+        return Err("não há arquivo de chave neste --data-dir".into());
+    }
+    Ok(())
+}
+
 /// Os arquivos de chave que a senha sela, na ordem da troca (`db.key` por último).
 const SEALED_KEY_FILES: [&str; 4] = [
     "identity.key",
@@ -673,6 +727,14 @@ mod tests {
             passphrase_file: file.map(PathBuf::from),
             no_passphrase,
             protect,
+            keyring: false,
+        }
+    }
+
+    fn keyring_opts() -> KeyOptions {
+        KeyOptions {
+            keyring: true,
+            ..KeyOptions::default()
         }
     }
 
@@ -704,6 +766,126 @@ mod tests {
                 protect: false
             }
         );
+    }
+
+    // ---- --keyring (P13, ADR 0047) ----
+
+    /// Com chaves já cifradas, `--keyring` é a fonte da senha e não precisa de terminal.
+    #[test]
+    fn keyring_on_sealed_keys_reads_the_passphrase_from_the_keyring() {
+        for tty in [false, true] {
+            let a = decide(&keyring_opts(), FilesState::Sealed, tty).unwrap();
+            assert_eq!(
+                a,
+                Access::Sealed {
+                    source: Source::Keyring,
+                    protect: false
+                },
+                "tty={tty}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyring_does_not_mix_with_another_source_or_with_protect() {
+        for opts in [
+            KeyOptions {
+                passphrase_file: Some(PathBuf::from("/s")),
+                ..keyring_opts()
+            },
+            KeyOptions {
+                no_passphrase: true,
+                ..keyring_opts()
+            },
+            KeyOptions {
+                protect: true,
+                ..keyring_opts()
+            },
+        ] {
+            assert!(
+                decide(&opts, FilesState::Sealed, true).is_err(),
+                "{opts:?} devia ser recusado"
+            );
+        }
+    }
+
+    /// Sem chave cifrada não há senha a ler: diretório novo e chaves em claro recusam, e dizem o caminho.
+    #[test]
+    fn keyring_without_sealed_keys_is_refused_and_says_what_to_do() {
+        for state in [FilesState::New, FilesState::Plain, FilesState::Mixed] {
+            let err = decide(&keyring_opts(), state, true).unwrap_err();
+            assert!(err.contains("--keyring"), "{state:?}: {err}");
+        }
+        let plain = decide(&keyring_opts(), FilesState::Plain, true).unwrap_err();
+        assert!(plain.contains("--protect"), "{plain}");
+        let new = decide(&keyring_opts(), FilesState::New, true).unwrap_err();
+        assert!(new.contains("kin keyring save"), "{new}");
+    }
+
+    // ---- check_passphrase: o `kin keyring save` só grava uma senha que abre tudo ----
+
+    #[test]
+    fn check_passphrase_accepts_the_right_one_and_refuses_a_wrong_one() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let before = key_bytes(dir.path());
+        check_passphrase(dir.path(), PASS).unwrap();
+        assert!(check_passphrase(dir.path(), b"errada").is_err());
+        assert_eq!(key_bytes(dir.path()), before, "conferir não grava");
+    }
+
+    /// Uma senha que abre a identidade mas não o `db.key` não serve: o kin falharia na partida.
+    #[test]
+    fn check_passphrase_needs_every_sealed_file_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        check_passphrase(dir.path(), PASS).unwrap();
+        let db_path = dir.path().join(DB_KEY_FILE);
+        std::fs::remove_file(&db_path).unwrap();
+        kin_identity::DbKey::generate()
+            .save_sealed(&db_path, b"outra senha", KdfParams::MIN)
+            .unwrap();
+        assert!(check_passphrase(dir.path(), PASS).is_err());
+    }
+
+    #[test]
+    fn check_passphrase_refuses_plain_keys_and_empty_directories() {
+        let plain = tempfile::tempdir().unwrap();
+        make_plain(plain.path());
+        let err = check_passphrase(plain.path(), PASS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--protect"), "{err}");
+        let empty = tempfile::tempdir().unwrap();
+        assert!(check_passphrase(empty.path(), PASS).is_err());
+    }
+
+    /// O primário sela `authority.key` em vez de `identity.key`: a conferência o cobre.
+    #[test]
+    fn check_passphrase_covers_a_primary_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        primary_load(&primary).unwrap();
+        assert!(primary.join(AUTHORITY_KEY_FILE).exists());
+        check_passphrase(&primary, PASS).unwrap();
+        assert!(check_passphrase(&primary, b"errada").is_err());
+    }
+
+    /// Uma troca de senha interrompida deixa arquivos em senhas diferentes: nenhuma das duas serve para o
+    /// keyring até a troca terminar (o kin não abriria o diretório com nenhuma).
+    #[test]
+    fn check_passphrase_refuses_a_change_left_half_done() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        kin_identity::rekey_file(
+            &dir.path().join("device.key"),
+            PASS,
+            NEW_PASS,
+            KdfParams::MIN,
+        )
+        .unwrap();
+        assert!(check_passphrase(dir.path(), PASS).is_err());
+        assert!(check_passphrase(dir.path(), NEW_PASS).is_err());
     }
 
     #[test]

@@ -23,6 +23,8 @@ tokio.workspace = true
 qrcode.workspace = true
 zeroize.workspace = true
 rpassword.workspace = true
+keyring.workspace = true
+keyring-core.workspace = true
 base64.workspace = true
 
 [dev-dependencies]

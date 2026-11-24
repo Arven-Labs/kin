@@ -27,13 +27,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<PasswdCommand, St
             "--data-dir" => command.data_dir = value()?.into(),
             "--passphrase-file" => command.old_file = Some(value()?.into()),
             "--new-passphrase-file" => command.new_file = Some(value()?.into()),
-            other if other.starts_with("--") => {
-                // Só o nome: `--new-passphrase=segredo` não pode ser ecoado no terminal.
-                let name = other.split('=').next().unwrap_or(other);
-                return Err(format!("argumento desconhecido: {name}"));
+            // Nunca ecoa o argumento, nem o nome da flag: uma senha digitada no lugar errado pode começar por `--`.
+            _ => {
+                return Err(
+                    "argumento inesperado (aceitos: --data-dir, --passphrase-file, --new-passphrase-file; as senhas vão por arquivo ou prompt)"
+                        .into(),
+                );
             }
-            // Sem `--`: pode ser a senha digitada no lugar errado; não ecoa nada.
-            _ => return Err("argumento inesperado (as senhas vão por arquivo ou prompt)".into()),
         }
     }
     Ok(command)
@@ -56,11 +56,14 @@ pub fn run(command: PasswdCommand) -> Result<(), String> {
         println!("nada a trocar: todos os arquivos já estão na senha nova");
     } else {
         println!("senha trocada em: {}", changed.join(", "));
-        eprintln!(
-            "aviso: a troca re-sela as MESMAS chaves (a identidade, o device e o db.key não mudaram), e não mexe na mestra fria (que tem senha própria). Os arquivos com a senha antiga podem continuar recuperáveis no disco (SSD, snapshot, backup); se a senha antiga vazou, trate a chave como exposta: quem tem uma cópia antiga e a senha antiga abre a mesma identidade"
-        );
+        eprintln!("{}", done_warning());
     }
     Ok(())
+}
+
+/// Aviso depois de uma troca: re-selar não é rotacionar, e a senha gravada no keyring (se houver) fica velha.
+fn done_warning() -> &'static str {
+    "aviso: a troca re-sela as MESMAS chaves (a identidade, o device e o db.key não mudaram), e não mexe na mestra fria (que tem senha própria). Os arquivos com a senha antiga podem continuar recuperáveis no disco (SSD, snapshot, backup); se a senha antiga vazou, trate a chave como exposta: quem tem uma cópia antiga e a senha antiga abre a mesma identidade. Se este diretório usa `--keyring`, a senha gravada no keyring ficou velha: rode `kin keyring save` de novo"
 }
 
 #[cfg(test)]
@@ -105,9 +108,17 @@ mod tests {
     /// A senha digitada no lugar errado (flag com `=` ou argumento solto) nunca volta no erro.
     #[test]
     fn a_parse_error_never_echoes_a_passphrase() {
-        for bad in ["--new-passphrase=hunter2", "hunter2"] {
+        for bad in ["--new-passphrase=hunter2", "hunter2", "--hunter2"] {
             let err = parse_strs(&[bad]).unwrap_err();
             assert!(!err.contains("hunter2"), "ecoou a senha: {err}");
         }
+    }
+
+    /// Depois do `passwd` a senha do keyring fica velha: quem troca precisa ser avisado de regravá-la.
+    #[test]
+    fn the_done_warning_tells_to_resave_the_keyring_entry() {
+        let warning = done_warning();
+        assert!(warning.contains("kin keyring save"), "{warning}");
+        assert!(warning.contains("--keyring"), "{warning}");
     }
 }

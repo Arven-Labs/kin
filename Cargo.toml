@@ -56,6 +56,11 @@ sha2 = { version = "=0.11.0", default-features = false }
 unicode-normalization = "=0.1.26"
 # Prompt de senha sem eco no terminal (CLI).
 rpassword = "=7.5.4"
+# Keyring do SO como fonte da senha das chaves (P13, ADR 0047): Secret Service (Linux), Keychain (macOS), Credential Manager
+# (Windows). `keyring` (features padrão, `v1`) só escolhe e inicia o store; o `Entry` usado é o do `keyring-core`, onde os
+# testes ligam o store `mock`. Versões exatas (segredo; mantenedor único nos stores).
+keyring = "=4.2.0"
+keyring-core = "=1.1.0"
 qrcode = { version = "0.14", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "io-std"] }
 futures = "0.3"
