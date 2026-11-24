@@ -138,7 +138,7 @@ pub fn save_verified(dir: &Path, pass: &[u8]) -> Result<(), String> {
 pub fn forget(dir: &Path) -> Result<bool, String> {
     match entry(dir)?.delete_credential() {
         Ok(()) => Ok(true),
-        Err(KeyringError::NoEntry) => Ok(false),
+        Err(KeyringError::NoEntry) => Err("sem entrada".to_string()),
         Err(e) => Err(format!("keyring: {e}")),
     }
 }
