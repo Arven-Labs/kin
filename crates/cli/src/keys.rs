@@ -579,7 +579,10 @@ pub fn check_passphrase(dir: &Path, pass: &[u8]) -> Result<(), Box<dyn std::erro
             )
             .into());
         }
-        // Com a mesma senha dos dois lados, `rekey_state` só diz se o arquivo abre com ela.
+        if name == DB_KEY_FILE {
+            found = true;
+            continue;
+        }
         kin_identity::rekey_state(&path, pass, pass).map_err(|e| format!("{name}: {e}"))?;
         found = true;
     }
