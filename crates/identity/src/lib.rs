@@ -27,4 +27,4 @@ pub use provider::{IdentityId, IdentityProvider};
 pub use revocation::DeviceRevocation;
 pub use sealed::{KdfParams, is_sealed, normalize_passphrase, open, seal};
 pub use standalone::StandaloneIdentity;
-pub use store::key_file_is_sealed;
+pub use store::{RekeyState, key_file_is_sealed, rekey_file, rekey_state};
