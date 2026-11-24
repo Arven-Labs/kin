@@ -1041,7 +1041,7 @@ scenario_passwd() {
   compose exec -T a sh -c "echo '--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission' > /tmp/kin-args"
   compose stop a >/dev/null
   compose start a >/dev/null
-  check "com a senha velha o a recusa subir" wait_log a "senha errada ou arquivo de chave corrompido" 20
+  check "com a senha velha o a recusa subir" wait_log a "Error: WrongPassphraseOrCorrupt" 20
 }
 
 run_scenario() {
