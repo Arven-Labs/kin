@@ -356,9 +356,17 @@ fn protect_warning(relay: bool) -> String {
     )
 }
 
-/// Aviso antes do Argon2id (P13). Esqueleto do commit de testes: ainda não diz nada.
-fn kdf_notice(_protect: bool) -> String {
-    String::new()
+/// Aviso antes do Argon2id (P13): a derivação leva segundos de CPU sem nenhuma saída, e quem aperta
+/// Ctrl-C achando que travou, com `--protect`, deixa as chaves seladas e os bancos ainda em claro.
+fn kdf_notice(protect: bool) -> String {
+    let base = "derivando a chave da senha (Argon2id); pode levar alguns segundos...";
+    if protect {
+        format!(
+            "{base} não interrompa: um Ctrl-C no meio deixa as chaves cifradas e os bancos em claro; se acontecer, rode --protect de novo"
+        )
+    } else {
+        base.to_string()
+    }
 }
 
 /// Pede a senha no terminal, sem eco; `confirm` pede de novo e exige que conferam. Normalizada em NFKC.
