@@ -579,14 +579,7 @@ pub fn change_passphrase(
         return Err("não há arquivo de chave neste --data-dir".into());
     }
     // Confere todos antes de gravar o primeiro.
-    let mut pending = Vec::new();
-    for (name, path) in &files {
-        let state = kin_identity::rekey_state(path, old, new)
-            .map_err(|e| format!("{name}: {e} (nada foi alterado)"))?;
-        if state == kin_identity::RekeyState::Old {
-            pending.push((*name, path));
-        }
-    }
+    let pending: Vec<_> = files.iter().map(|(name, path)| (*name, path)).collect();
     let mut changed = Vec::new();
     for (name, path) in pending {
         kin_identity::rekey_file(path, old, new, params)
