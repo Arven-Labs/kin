@@ -87,6 +87,7 @@ jobs:
           - reconnect-restart
           - encrypted-db
           - protect-migration
+          - passwd
           - stale-connection-rst
           - stale-connection-silent
     steps:
