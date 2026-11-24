@@ -360,7 +360,7 @@ fn protect_warning(relay: bool) -> String {
 /// Ctrl-C achando que travou, com `--protect`, deixa as chaves seladas e os bancos ainda em claro.
 fn kdf_notice(protect: bool) -> String {
     let base = "derivando a chave da senha (Argon2id); pode levar alguns segundos...";
-    if protect {
+    if !protect {
         format!(
             "{base} não interrompa: um Ctrl-C no meio deixa as chaves cifradas e os bancos em claro; se acontecer, rode --protect de novo"
         )
