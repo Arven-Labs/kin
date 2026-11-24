@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 mod cold;
 mod devices;
 mod keys;
+mod os_keyring;
 mod pair;
 mod passwd;
 
@@ -228,6 +229,7 @@ fn parse_from(
             "--passphrase-file" => args.keys.passphrase_file = Some(value()?.into()),
             "--protect" => args.keys.protect = true,
             "--no-passphrase" => args.keys.no_passphrase = true,
+            "--keyring" => args.keys.keyring = true,
             "--relay-count" => {
                 args.relay_count = Some(value()?.parse().map_err(|e| format!("{e}"))?);
             }
@@ -260,7 +262,7 @@ fn parse_from(
                 .to_string(),
         );
     }
-    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
+    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase && !args.keys.keyring {
         args.keys.passphrase_file = env_passphrase_file
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
@@ -302,6 +304,7 @@ fn open_keys(
             let pass = match source {
                 keys::Source::File(path) => keys::read_passphrase_file(path)?,
                 keys::Source::Prompt { confirm } => prompt_passphrase(*confirm)?,
+                keys::Source::Keyring => os_keyring::load(dir)?,
             };
             (Some(pass), *protect)
         }
@@ -476,6 +479,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e
         })?;
         return passwd::run(command).map_err(Into::into);
+    }
+    // `kin keyring save|forget ...` (P13, ADR 0047): a senha das chaves no keyring do SO, sem rede nem chat.
+    if std::env::args().nth(1).as_deref() == Some("keyring") {
+        let command = os_keyring::parse(std::env::args().skip(2)).map_err(|e| {
+            eprintln!(
+                "{e}\nuso: kin keyring save [--data-dir DIR] [--passphrase-file ARQ]\n     kin keyring forget [--data-dir DIR]"
+            );
+            e
+        })?;
+        return os_keyring::run(command).map_err(Into::into);
     }
     let args = parse_args().map_err(|e| {
         eprintln!(
@@ -1652,6 +1665,19 @@ mod tests {
         let args = parse(&["--no-passphrase"], Some("/env/p")).unwrap();
         assert!(args.keys.no_passphrase);
         assert_eq!(args.keys.passphrase_file, None);
+    }
+
+    /// `--keyring` (P13, ADR 0047) vence a variável de ambiente, como `--no-passphrase`: quem a deixou
+    /// no shell não pode ver `--keyring` recusado por causa dela.
+    #[test]
+    fn keyring_ignores_the_environment_variable() {
+        let args = parse(&["--keyring"], Some("/env/p")).unwrap();
+        assert!(args.keys.keyring);
+        assert_eq!(args.keys.passphrase_file, None);
+        // Controle: sem `--keyring` a variável segue valendo.
+        let without = parse(&[], Some("/env/p")).unwrap();
+        assert!(!without.keys.keyring);
+        assert_eq!(without.keys.passphrase_file, Some(PathBuf::from("/env/p")));
     }
 
     #[test]
