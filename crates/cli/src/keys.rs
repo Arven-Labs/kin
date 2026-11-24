@@ -535,6 +535,17 @@ pub(crate) fn load_or_create_device(
     Ok(device)
 }
 
+/// Esqueleto do commit de testes (P13, `kin passwd`): ainda não implementado.
+#[allow(dead_code)]
+pub fn change_passphrase(
+    _dir: &Path,
+    _old: &[u8],
+    _new: &[u8],
+    _params: KdfParams,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Err("não implementado".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,5 +1614,171 @@ mod tests {
             .unwrap();
         assert!(matches!(v3.issuer, Issuer::Master(_)));
         assert!(ensure_current_issuer(&LocalIdentity::Paired(identity), &v3).is_err());
+    }
+
+    // ---- troca de senha de um diretório (P13, `kin passwd`) ----
+
+    const NEW_PASS: &[u8] = b"outra senha";
+    const KEY_FILES: [&str; 4] = [
+        "identity.key",
+        AUTHORITY_KEY_FILE,
+        "device.key",
+        DB_KEY_FILE,
+    ];
+
+    /// Bytes de cada arquivo de chave que existe: para provar que nada mudou.
+    fn key_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        KEY_FILES
+            .iter()
+            .filter(|name| dir.join(name).exists())
+            .map(|name| (name.to_string(), std::fs::read(dir.join(name)).unwrap()))
+            .collect()
+    }
+
+    fn db_key_bytes(dir: &Path, pass: &[u8]) -> [u8; 32] {
+        *kin_identity::DbKey::load_with(&dir.join(DB_KEY_FILE), pass)
+            .unwrap()
+            .expose_secret()
+    }
+
+    /// Diretório Master com `identity.key`, `device.key` e `db.key`, todos na senha `PASS`.
+    fn master_dir(dir: &Path) -> IdentityId {
+        let (loaded, _) = load(dir, Some(PASS), false, KdfParams::MIN).unwrap();
+        open_db_key(dir, Some(PASS), false, KdfParams::MIN)
+            .unwrap()
+            .unwrap();
+        loaded.id()
+    }
+
+    fn change(dir: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        change_passphrase(dir, PASS, NEW_PASS, KdfParams::MIN)
+    }
+
+    #[test]
+    fn changing_the_passphrase_of_a_master_dir_keeps_identity_device_and_db_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = master_dir(dir.path());
+        let (_, device_before) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
+        let db_before = db_key_bytes(dir.path(), PASS);
+
+        let changed = change(dir.path()).unwrap();
+
+        assert_eq!(changed, ["identity.key", "device.key", DB_KEY_FILE]);
+        let (loaded, device) = load(dir.path(), Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert_eq!(loaded.id(), id);
+        assert_eq!(device.peer_id(), device_before.peer_id());
+        assert_eq!(db_key_bytes(dir.path(), NEW_PASS), db_before);
+    }
+
+    #[test]
+    fn after_the_change_the_old_passphrase_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        change(dir.path()).unwrap();
+        assert!(load(dir.path(), Some(PASS), false, KdfParams::MIN).is_err());
+        assert!(kin_identity::DbKey::load_with(&dir.path().join(DB_KEY_FILE), PASS).is_err());
+    }
+
+    #[test]
+    fn changing_the_passphrase_of_a_primary_dir_keeps_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+        primary_load(&primary).unwrap();
+        open_db_key(&primary, Some(PASS), false, KdfParams::MIN)
+            .unwrap()
+            .unwrap();
+
+        let changed = change(&primary).unwrap();
+
+        assert_eq!(changed, [AUTHORITY_KEY_FILE, "device.key", DB_KEY_FILE]);
+        let (loaded, _) = load(&primary, Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert!(matches!(loaded, LocalIdentity::Primary(_)));
+        assert_eq!(loaded.id(), identity);
+    }
+
+    #[test]
+    fn changing_the_passphrase_of_a_paired_dir_keeps_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, identity, _) = paired_dir(root.path());
+        change(&dir).unwrap();
+        let (loaded, _) = load(&dir, Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert!(matches!(loaded, LocalIdentity::Paired(_)));
+        assert_eq!(loaded.id(), identity);
+        assert!(load(&dir, Some(PASS), false, KdfParams::MIN).is_err());
+    }
+
+    #[test]
+    fn a_wrong_old_passphrase_changes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let before = key_bytes(dir.path());
+        assert!(change_passphrase(dir.path(), b"errada", NEW_PASS, KdfParams::MIN).is_err());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    /// Um arquivo que não abre nem com a velha nem com a nova trava a troca **antes** de gravar o primeiro.
+    #[test]
+    fn one_unreadable_file_stops_the_change_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let db_path = dir.path().join(DB_KEY_FILE);
+        std::fs::remove_file(&db_path).unwrap();
+        kin_identity::DbKey::generate()
+            .save_sealed(&db_path, b"terceira senha", KdfParams::MIN)
+            .unwrap();
+        let before = key_bytes(dir.path());
+        assert!(change(dir.path()).is_err());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    /// Queda no meio: o `device.key` já está na senha nova, o resto na velha. Repetir termina o serviço.
+    #[test]
+    fn repeating_the_change_after_an_interruption_finishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = master_dir(dir.path());
+        kin_identity::rekey_file(
+            &dir.path().join("device.key"),
+            PASS,
+            NEW_PASS,
+            KdfParams::MIN,
+        )
+        .unwrap();
+
+        let changed = change(dir.path()).unwrap();
+
+        assert_eq!(changed, ["identity.key", DB_KEY_FILE]);
+        let (loaded, _) = load(dir.path(), Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert_eq!(loaded.id(), id);
+        assert_eq!(db_key_bytes(dir.path(), NEW_PASS).len(), 32);
+        // Uma terceira vez não encontra nada para trocar nem grava.
+        let before = key_bytes(dir.path());
+        assert!(change(dir.path()).unwrap().is_empty());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn a_plain_key_file_refuses_the_change_and_points_to_protect() {
+        let dir = tempfile::tempdir().unwrap();
+        make_plain(dir.path());
+        let before = key_bytes(dir.path());
+        let err = change(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("--protect"), "{err}");
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn an_empty_or_equal_new_passphrase_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let before = key_bytes(dir.path());
+        assert!(change_passphrase(dir.path(), PASS, b"", KdfParams::MIN).is_err());
+        assert!(change_passphrase(dir.path(), PASS, PASS, KdfParams::MIN).is_err());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn a_directory_without_key_files_has_nothing_to_change() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(change(dir.path()).is_err());
     }
 }
