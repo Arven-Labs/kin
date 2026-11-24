@@ -137,8 +137,6 @@ pub enum Source {
         confirm: bool,
     },
     /// Keyring do SO (`--keyring`, P13, ADR 0047): a senha foi gravada por `kin keyring save`.
-    // Esqueleto do commit de testes: o `decide` ainda não a constrói. O `allow` sai na implementação.
-    #[allow(dead_code)]
     Keyring,
 }
 
@@ -158,6 +156,29 @@ pub enum Access {
 
 /// Decisão pura: dado o pedido, o estado dos arquivos e se há terminal, o que fazer (ou por que recusar).
 pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access, String> {
+    // `--keyring` (P13, ADR 0047) só lê a senha de chaves já cifradas; não cria nem migra nada.
+    if opts.keyring {
+        if opts.no_passphrase || opts.passphrase_file.is_some() || opts.protect {
+            return Err(
+                "--keyring não combina com --no-passphrase, --passphrase-file nem --protect (para cifrar, rode --protect com a senha e depois `kin keyring save`)"
+                    .into(),
+            );
+        }
+        return match state {
+            FilesState::Sealed => Ok(Access::Sealed {
+                source: Source::Keyring,
+                protect: false,
+            }),
+            FilesState::New => Err(
+                "--keyring: não há chaves neste --data-dir; crie-as com senha (prompt ou --passphrase-file) e depois rode `kin keyring save`"
+                    .into(),
+            ),
+            FilesState::Plain | FilesState::Mixed => Err(
+                "--keyring: há chave em claro neste --data-dir; rode uma vez com --protect (senha por prompt ou arquivo) e depois `kin keyring save`"
+                    .into(),
+            ),
+        };
+    }
     if opts.no_passphrase {
         if opts.passphrase_file.is_some() {
             return Err("--no-passphrase e --passphrase-file são excludentes".into());
@@ -541,10 +562,31 @@ pub(crate) fn load_or_create_device(
     Ok(device)
 }
 
-/// Esqueleto do commit de testes (P13, ADR 0047): ainda não implementado.
-#[allow(dead_code, unused_variables)]
+/// Confere, sem gravar nada, que `pass` abre **todos** os arquivos de chave cifrados de `dir` (P13, ADR
+/// 0047): o `kin keyring save` só guarda uma senha que o kin consegue usar na partida. Uma senha que abre a
+/// identidade mas não o `db.key` não serve. Recusa chave em claro (o keyring só guarda senha de chave
+/// cifrada) e diretório sem arquivo de chave.
 pub fn check_passphrase(dir: &Path, pass: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    Err("não implementado".into())
+    let mut found = false;
+    for name in SEALED_KEY_FILES {
+        let path = dir.join(name);
+        if !present(&path)? {
+            continue;
+        }
+        if !kin_identity::key_file_is_sealed(&path)? {
+            return Err(format!(
+                "{name} está em claro: o keyring só guarda a senha de chaves cifradas; rode uma vez com --protect antes"
+            )
+            .into());
+        }
+        // Com a mesma senha dos dois lados, `rekey_state` só diz se o arquivo abre com ela.
+        kin_identity::rekey_state(&path, pass, pass).map_err(|e| format!("{name}: {e}"))?;
+        found = true;
+    }
+    if !found {
+        return Err("não há arquivo de chave neste --data-dir".into());
+    }
+    Ok(())
 }
 
 /// Os arquivos de chave que a senha sela, na ordem da troca (`db.key` por último).

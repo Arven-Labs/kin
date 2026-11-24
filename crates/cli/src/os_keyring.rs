@@ -1,11 +1,18 @@
 //! Keyring do SO como fonte da senha das chaves (P13, ADR 0047): `kin --keyring` lê a senha, e
-//! `kin keyring save|forget` a grava e a apaga. Esqueleto do commit de testes: nada disto está
-//! implementado ainda, e o `allow` abaixo sai junto com o esqueleto.
-#![allow(dead_code, unused_variables)]
+//! `kin keyring save|forget` a grava e a apaga. O keyring guarda só a **senha** (como segredo binário,
+//! byte a byte); os arquivos selados e o formato do ADR 0012 não mudam. A entrada é `("kin", caminho
+//! canônico do --data-dir)`: não há identidade legível antes de abrir as chaves, e mover o diretório
+//! exige um novo `save`.
+//!
+//! Quem lê o keyring abre as chaves: qualquer programa da mesma sessão, com o keyring desbloqueado, lê a
+//! senha. A cifra em repouso continua valendo contra disco ou backup roubado, não contra isso.
 
 use std::path::{Path, PathBuf};
 
+use keyring_core::Error as KeyringError;
 use zeroize::Zeroizing;
+
+const SERVICE: &str = "kin";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -20,32 +27,120 @@ pub struct KeyringCommand {
     pub passphrase_file: Option<PathBuf>,
 }
 
+/// `kin keyring save [--data-dir DIR] [--passphrase-file ARQ]` e `kin keyring forget [--data-dir DIR]`.
+/// Os erros citam só o nome do argumento: a senha digitada no lugar errado nunca volta no terminal.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<KeyringCommand, String> {
-    Err("não implementado".into())
+    let mut it = args.into_iter();
+    let action = match it.next().as_deref() {
+        Some("save") => Action::Save,
+        Some("forget") => Action::Forget,
+        _ => return Err("subcomando esperado: save ou forget".to_string()),
+    };
+    let mut command = KeyringCommand {
+        action,
+        data_dir: PathBuf::from(".kin"),
+        passphrase_file: None,
+    };
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or(format!("{flag} precisa de um valor"));
+        match flag.as_str() {
+            "--data-dir" => command.data_dir = value()?.into(),
+            // Esquecer não lê senha nenhuma: aqui a flag cai em "desconhecido".
+            "--passphrase-file" if command.action == Action::Save => {
+                command.passphrase_file = Some(value()?.into());
+            }
+            other if other.starts_with("--") => {
+                let name = other.split('=').next().unwrap_or(other);
+                return Err(format!("argumento desconhecido: {name}"));
+            }
+            _ => return Err("argumento inesperado (a senha vai por arquivo ou prompt)".to_string()),
+        }
+    }
+    Ok(command)
 }
 
 pub fn run(command: KeyringCommand) -> Result<(), String> {
-    Err("não implementado".into())
+    match command.action {
+        Action::Save => {
+            let pass = crate::cold::passphrase(command.passphrase_file, "senha das chaves", false)?;
+            eprintln!(
+                "conferindo a senha contra as chaves (Argon2id em cada arquivo; pode levar alguns segundos)..."
+            );
+            save_verified(&command.data_dir, &pass)?;
+            println!(
+                "senha gravada no keyring do SO para {}",
+                command.data_dir.display()
+            );
+            eprintln!(
+                "aviso: quem lê o keyring abre as chaves (qualquer programa desta sessão com o keyring desbloqueado lê a senha); a cifra em repouso segue valendo contra disco ou backup roubado. Depois de `kin passwd` ou de mover o --data-dir, rode `kin keyring save` de novo"
+            );
+        }
+        Action::Forget => {
+            if forget(&command.data_dir)? {
+                println!("senha removida do keyring do SO");
+            } else {
+                println!("não havia senha gravada para este --data-dir");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Inicia o store padrão do SO uma vez (o `keyring` v1 escolhe Secret Service, Keychain ou Credential
+/// Manager). Se já há um store padrão (os testes ligam o `mock`), não mexe nele.
+fn init_store() -> Result<(), String> {
+    if keyring_core::get_default_store().is_some() {
+        return Ok(());
+    }
+    match keyring::Entry::store_status() {
+        Ok(()) => Ok(()),
+        Err(e) => Err(format!(
+            "keyring do SO indisponível ({e}): sem Secret Service, Keychain ou Credential Manager nesta sessão; use --passphrase-file ou o prompt"
+        )),
+    }
+}
+
+fn entry(dir: &Path) -> Result<keyring_core::Entry, String> {
+    init_store()?;
+    let path = std::fs::canonicalize(dir)
+        .or_else(|_| std::path::absolute(dir))
+        .map_err(|e| format!("caminho do --data-dir inválido: {e}"))?;
+    keyring_core::Entry::new(SERVICE, &path.to_string_lossy()).map_err(|e| format!("keyring: {e}"))
 }
 
 /// A senha gravada para `dir`, ou o erro que diz como gravá-la.
 pub fn load(dir: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
-    Err("não implementado".into())
+    match entry(dir)?.get_secret() {
+        Ok(secret) => Ok(Zeroizing::new(secret)),
+        Err(KeyringError::NoEntry) => Err(
+            "não há senha gravada no keyring para este --data-dir: rode `kin keyring save --data-dir DIR` (uma vez, com a senha)"
+                .to_string(),
+        ),
+        Err(e) => Err(format!("keyring: {e}")),
+    }
 }
 
 /// Grava `pass` como a senha de `dir`, sem conferir nada.
 pub fn save(dir: &Path, pass: &[u8]) -> Result<(), String> {
-    Err("não implementado".into())
+    entry(dir)?
+        .set_secret(pass)
+        .map_err(|e| format!("keyring: {e}"))
 }
 
-/// Confere que `pass` abre as chaves de `dir` e só então a grava.
+/// Confere que `pass` abre as chaves de `dir` e só então a grava: uma senha errada no keyring só
+/// apareceria na partida seguinte.
 pub fn save_verified(dir: &Path, pass: &[u8]) -> Result<(), String> {
-    Err("não implementado".into())
+    crate::keys::check_passphrase(dir, pass).map_err(|e| e.to_string())?;
+    save(dir, pass)
 }
 
 /// Apaga a senha gravada de `dir`; `false` se não havia.
 pub fn forget(dir: &Path) -> Result<bool, String> {
-    Err("não implementado".into())
+    match entry(dir)?.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(KeyringError::NoEntry) => Ok(false),
+        Err(e) => Err(format!("keyring: {e}")),
+    }
 }
 
 #[cfg(test)]
