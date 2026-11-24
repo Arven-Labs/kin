@@ -158,7 +158,7 @@ pub enum Access {
 pub fn decide(opts: &KeyOptions, state: FilesState, tty: bool) -> Result<Access, String> {
     // `--keyring` (P13, ADR 0047) só lê a senha de chaves já cifradas; não cria nem migra nada.
     if opts.keyring {
-        if opts.no_passphrase || opts.passphrase_file.is_some() || opts.protect {
+        if opts.no_passphrase || opts.passphrase_file.is_some() {
             return Err(
                 "--keyring não combina com --no-passphrase, --passphrase-file nem --protect (para cifrar, rode --protect com a senha e depois `kin keyring save`)"
                     .into(),
