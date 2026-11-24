@@ -308,6 +308,9 @@ fn open_keys(
     if protect {
         eprintln!("{}", protect_warning(args.serve_relay));
     }
+    if passphrase.is_some() {
+        eprintln!("{}", kdf_notice(protect));
+    }
     let loaded = keys::load(
         dir,
         passphrase.as_ref().map(|p| p.as_slice()),
@@ -351,6 +354,11 @@ fn protect_warning(relay: bool) -> String {
     format!(
         "aviso: o arquivo em claro antigo ({what}) pode continuar recuperável no disco (SSD, snapshot, backup); se o disco ou o backup não for confiável, trate {exposed}"
     )
+}
+
+/// Aviso antes do Argon2id (P13). Esqueleto do commit de testes: ainda não diz nada.
+fn kdf_notice(_protect: bool) -> String {
+    String::new()
 }
 
 /// Pede a senha no terminal, sem eco; `confirm` pede de novo e exige que conferam. Normalizada em NFKC.
@@ -2078,6 +2086,33 @@ mod tests {
         assert!(
             chat.contains("(chaves e bancos)") && chat.contains("histórico"),
             "{chat}"
+        );
+    }
+
+    /// Antes do Argon2id (segundos de CPU, sem saída nenhuma) o kin avisa que está derivando a chave.
+    #[test]
+    fn the_kdf_notice_says_the_key_is_being_derived() {
+        for protect in [false, true] {
+            let notice = kdf_notice(protect);
+            assert!(
+                notice.contains("Argon2id") && notice.contains("derivando"),
+                "protect={protect}: {notice}"
+            );
+        }
+    }
+
+    /// Só o `--protect` deixa um estado pela metade se interrompido, e só ele avisa disso e diz o conserto.
+    #[test]
+    fn only_the_protect_notice_warns_about_interrupting() {
+        let protect = kdf_notice(true);
+        assert!(
+            protect.contains("Ctrl-C") && protect.contains("--protect de novo"),
+            "{protect}"
+        );
+        let plain = kdf_notice(false);
+        assert!(
+            !plain.contains("Ctrl-C") && !plain.contains("--protect"),
+            "{plain}"
         );
     }
 }
