@@ -262,7 +262,7 @@ fn parse_from(
                 .to_string(),
         );
     }
-    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase && !args.keys.keyring {
+    if args.keys.passphrase_file.is_none() && !args.keys.no_passphrase {
         args.keys.passphrase_file = env_passphrase_file
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
