@@ -535,15 +535,67 @@ pub(crate) fn load_or_create_device(
     Ok(device)
 }
 
-/// Esqueleto do commit de testes (P13, `kin passwd`): ainda não implementado.
+/// Os arquivos de chave que a senha sela, na ordem da troca (`db.key` por último).
+const SEALED_KEY_FILES: [&str; 4] = [
+    "identity.key",
+    AUTHORITY_KEY_FILE,
+    "device.key",
+    DB_KEY_FILE,
+];
+
+/// Troca a senha de todos os arquivos de chave de `dir` (P13, `kin passwd`) e devolve os que foram
+/// regravados. Os bancos não são tocados: o SQLCipher usa o `db.key`, e só ele é re-selado.
+///
+/// **Retomável**: um arquivo que já abre com a senha nova é pulado, então repetir o comando depois de
+/// uma queda termina o serviço. Antes de gravar qualquer arquivo, confere **todos**: se algum não abre
+/// nem com a velha nem com a nova, aborta sem gravar nada. Recusa senha nova vazia ou igual à velha,
+/// diretório sem arquivo de chave e arquivo em claro (isso é o `--protect`).
+// Só os testes a chamam até o subcomando `passwd` ser ligado (próxima etapa do P13).
 #[allow(dead_code)]
 pub fn change_passphrase(
-    _dir: &Path,
-    _old: &[u8],
-    _new: &[u8],
-    _params: KdfParams,
+    dir: &Path,
+    old: &[u8],
+    new: &[u8],
+    params: KdfParams,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Err("não implementado".into())
+    if new.is_empty() {
+        return Err("a senha nova não pode ser vazia".into());
+    }
+    if new == old {
+        return Err("a senha nova é igual à atual".into());
+    }
+    let mut files = Vec::new();
+    for name in SEALED_KEY_FILES {
+        let path = dir.join(name);
+        if present(&path)? {
+            if !kin_identity::key_file_is_sealed(&path)? {
+                return Err(format!(
+                    "{name} está em claro: rode uma vez com --protect para cifrá-lo antes de trocar a senha"
+                )
+                .into());
+            }
+            files.push((name, path));
+        }
+    }
+    if files.is_empty() {
+        return Err("não há arquivo de chave neste --data-dir".into());
+    }
+    // Confere todos antes de gravar o primeiro.
+    let mut pending = Vec::new();
+    for (name, path) in &files {
+        let state = kin_identity::rekey_state(path, old, new)
+            .map_err(|e| format!("{name}: {e} (nada foi alterado)"))?;
+        if state == kin_identity::RekeyState::Old {
+            pending.push((*name, path));
+        }
+    }
+    let mut changed = Vec::new();
+    for (name, path) in pending {
+        kin_identity::rekey_file(path, old, new, params)
+            .map_err(|e| format!("{name}: {e} (repita o comando para terminar a troca)"))?;
+        changed.push(name.to_string());
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -1619,16 +1671,10 @@ mod tests {
     // ---- troca de senha de um diretório (P13, `kin passwd`) ----
 
     const NEW_PASS: &[u8] = b"outra senha";
-    const KEY_FILES: [&str; 4] = [
-        "identity.key",
-        AUTHORITY_KEY_FILE,
-        "device.key",
-        DB_KEY_FILE,
-    ];
 
     /// Bytes de cada arquivo de chave que existe: para provar que nada mudou.
     fn key_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
-        KEY_FILES
+        SEALED_KEY_FILES
             .iter()
             .filter(|name| dir.join(name).exists())
             .map(|name| (name.to_string(), std::fs::read(dir.join(name)).unwrap()))
