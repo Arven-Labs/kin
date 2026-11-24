@@ -860,6 +860,34 @@ mod tests {
         assert!(check_passphrase(empty.path(), PASS).is_err());
     }
 
+    /// O primário sela `authority.key` em vez de `identity.key`: a conferência o cobre.
+    #[test]
+    fn check_passphrase_covers_a_primary_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, _) = cold_init(root.path());
+        primary_load(&primary).unwrap();
+        assert!(primary.join(AUTHORITY_KEY_FILE).exists());
+        check_passphrase(&primary, PASS).unwrap();
+        assert!(check_passphrase(&primary, b"errada").is_err());
+    }
+
+    /// Uma troca de senha interrompida deixa arquivos em senhas diferentes: nenhuma das duas serve para o
+    /// keyring até a troca terminar (o kin não abriria o diretório com nenhuma).
+    #[test]
+    fn check_passphrase_refuses_a_change_left_half_done() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        kin_identity::rekey_file(
+            &dir.path().join("device.key"),
+            PASS,
+            NEW_PASS,
+            KdfParams::MIN,
+        )
+        .unwrap();
+        assert!(check_passphrase(dir.path(), PASS).is_err());
+        assert!(check_passphrase(dir.path(), NEW_PASS).is_err());
+    }
+
     #[test]
     fn new_dir_without_source_and_without_terminal_is_refused() {
         assert!(decide(&opts(None, false, false), FilesState::New, false).is_err());

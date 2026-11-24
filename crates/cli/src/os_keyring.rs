@@ -49,11 +49,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<KeyringCommand, S
             "--passphrase-file" if command.action == Action::Save => {
                 command.passphrase_file = Some(value()?.into());
             }
-            other if other.starts_with("--") => {
-                let name = other.split('=').next().unwrap_or(other);
-                return Err(format!("argumento desconhecido: {name}"));
+            // Nunca ecoa o argumento, nem o nome da flag: uma senha digitada no lugar errado pode começar por `--`.
+            _ => {
+                return Err(
+                    "argumento inesperado (aceitos: --data-dir e, no save, --passphrase-file; a senha vai por arquivo ou prompt)"
+                        .to_string(),
+                );
             }
-            _ => return Err("argumento inesperado (a senha vai por arquivo ou prompt)".to_string()),
         }
     }
     Ok(command)
@@ -72,7 +74,7 @@ pub fn run(command: KeyringCommand) -> Result<(), String> {
                 command.data_dir.display()
             );
             eprintln!(
-                "aviso: quem lê o keyring abre as chaves (qualquer programa desta sessão com o keyring desbloqueado lê a senha); a cifra em repouso segue valendo contra disco ou backup roubado. Depois de `kin passwd` ou de mover o --data-dir, rode `kin keyring save` de novo"
+                "aviso: quem lê o keyring abre as chaves (qualquer programa desta sessão com o keyring desbloqueado lê a senha); a cifra em repouso segue valendo contra disco ou backup roubado. A entrada também guarda o caminho do --data-dir (legível por esses programas). Depois de `kin passwd` ou de mover o --data-dir, rode `kin keyring save` de novo"
             );
         }
         Action::Forget => {
@@ -84,6 +86,30 @@ pub fn run(command: KeyringCommand) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// O store padrão do `keyring-core` é global ao processo: o mock entra uma vez só (trocá-lo no meio de
+/// outro teste apagaria as entradas dele), e cada teste usa o próprio diretório temporário, que é o `user`
+/// da entrada. Nenhum teste toca o Secret Service de verdade. `pub(crate)` para os testes de `main.rs`
+/// (`open_keys --keyring`) usarem o mesmo store.
+#[cfg(test)]
+pub(crate) fn use_mock_store() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
+    });
+}
+
+/// Traduz o erro do keyring com a dica do que fazer; nunca cita a senha. `Ambiguous` é mais de uma
+/// entrada com o mesmo (serviço, usuário), por exemplo criada por outro programa da sessão.
+fn keyring_error(e: KeyringError) -> String {
+    match e {
+        KeyringError::Ambiguous(_) => "keyring: há mais de uma entrada duplicada para este --data-dir (serviço `kin`); apague as duplicadas no gerenciador de senhas do SO (seahorse, `secret-tool`) e rode `kin keyring save` de novo".to_string(),
+        KeyringError::NoStorageAccess(_) => format!(
+            "keyring bloqueado ou inacessível ({e}): desbloqueie-o ou use --passphrase-file ou o prompt"
+        ),
+        e => format!("keyring: {e}"),
+    }
 }
 
 /// Inicia o store padrão do SO uma vez (o `keyring` v1 escolhe Secret Service, Keychain ou Credential
@@ -105,7 +131,11 @@ fn entry(dir: &Path) -> Result<keyring_core::Entry, String> {
     let path = std::fs::canonicalize(dir)
         .or_else(|_| std::path::absolute(dir))
         .map_err(|e| format!("caminho do --data-dir inválido: {e}"))?;
-    keyring_core::Entry::new(SERVICE, &path.to_string_lossy()).map_err(|e| format!("keyring: {e}"))
+    // Sem `to_string_lossy`: dois caminhos que diferem só em bytes não-UTF-8 virariam a mesma entrada.
+    let user = path
+        .to_str()
+        .ok_or("o caminho do --data-dir não é UTF-8: o keyring não o aceita")?;
+    keyring_core::Entry::new(SERVICE, user).map_err(keyring_error)
 }
 
 /// A senha gravada para `dir`, ou o erro que diz como gravá-la.
@@ -116,15 +146,13 @@ pub fn load(dir: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
             "não há senha gravada no keyring para este --data-dir: rode `kin keyring save --data-dir DIR` (uma vez, com a senha)"
                 .to_string(),
         ),
-        Err(e) => Err(format!("keyring: {e}")),
+        Err(e) => Err(keyring_error(e)),
     }
 }
 
 /// Grava `pass` como a senha de `dir`, sem conferir nada.
 pub fn save(dir: &Path, pass: &[u8]) -> Result<(), String> {
-    entry(dir)?
-        .set_secret(pass)
-        .map_err(|e| format!("keyring: {e}"))
+    entry(dir)?.set_secret(pass).map_err(keyring_error)
 }
 
 /// Confere que `pass` abre as chaves de `dir` e só então a grava: uma senha errada no keyring só
@@ -139,7 +167,7 @@ pub fn forget(dir: &Path) -> Result<bool, String> {
     match entry(dir)?.delete_credential() {
         Ok(()) => Ok(true),
         Err(KeyringError::NoEntry) => Ok(false),
-        Err(e) => Err(format!("keyring: {e}")),
+        Err(e) => Err(keyring_error(e)),
     }
 }
 
@@ -149,16 +177,6 @@ mod tests {
     use kin_identity::KdfParams;
 
     const PASS: &[u8] = b"senha de teste";
-
-    /// O store padrão do `keyring-core` é global ao processo: o mock entra uma vez só (trocá-lo no meio
-    /// de outro teste apagaria as entradas dele), e cada teste usa o próprio diretório temporário, que
-    /// é o `user` da entrada. Nenhum teste toca o Secret Service de verdade.
-    fn use_mock_store() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            keyring_core::set_default_store(keyring_core::mock::Store::new().unwrap());
-        });
-    }
 
     fn sealed_dir() -> tempfile::TempDir {
         use_mock_store();
@@ -220,14 +238,55 @@ mod tests {
         assert_eq!(&*load(&dir.path().join(".")).unwrap(), PASS);
     }
 
-    /// Senha com acento e bytes que não são texto simples voltam idênticos (vai como segredo binário).
+    /// Um link simbólico para o diretório é o mesmo diretório: só o `canonicalize` resolve isto (o
+    /// `path::absolute` não segue link), então este teste prende o `canonicalize`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_the_dir_shares_the_entry() {
+        use_mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let link = other.path().join("atalho");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        save(dir.path(), PASS).unwrap();
+        assert_eq!(&*load(&link).unwrap(), PASS);
+    }
+
+    /// Bytes que não são UTF-8 voltam idênticos: vai como segredo binário, não como texto (um
+    /// `set_password` os estragaria). Na prática a senha digitada é UTF-8; isto prende o contrato do módulo.
     #[test]
     fn the_secret_round_trips_byte_for_byte() {
         use_mock_store();
         let dir = tempfile::tempdir().unwrap();
-        let pass = "senha com açaí e ✓".as_bytes();
+        let pass: &[u8] = &[0xff, 0x00, 0xfe, b'a', 0xc3, 0x28];
+        assert!(std::str::from_utf8(pass).is_err(), "controle: não é UTF-8");
         save(dir.path(), pass).unwrap();
         assert_eq!(&*load(dir.path()).unwrap(), pass);
+        let utf8 = "senha com açaí e ✓".as_bytes();
+        save(dir.path(), utf8).unwrap();
+        assert_eq!(&*load(dir.path()).unwrap(), utf8);
+    }
+
+    /// Erro do store com dica: entrada duplicada e keyring bloqueado dizem o que fazer, sem citar senha.
+    #[test]
+    fn store_errors_come_with_a_hint() {
+        use_mock_store();
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), PASS).unwrap();
+        let cred = entry(dir.path()).unwrap();
+        let mock: &keyring_core::mock::Cred = cred.as_any().downcast_ref().unwrap();
+
+        mock.set_error(KeyringError::Ambiguous(Vec::new()));
+        let err = load(dir.path()).unwrap_err();
+        assert!(err.contains("duplicadas"), "{err}");
+
+        mock.set_error(KeyringError::NoStorageAccess("bloqueado".into()));
+        let err = load(dir.path()).unwrap_err();
+        assert!(err.contains("bloqueado ou inacessível"), "{err}");
+        assert!(err.contains("--passphrase-file"), "{err}");
+
+        // Controle: sem erro armado, a senha volta.
+        assert_eq!(&*load(dir.path()).unwrap(), PASS);
     }
 
     // ---- save_verified ----
@@ -236,9 +295,11 @@ mod tests {
     fn save_verified_stores_only_a_passphrase_that_opens_the_keys() {
         let dir = sealed_dir();
         assert!(save_verified(dir.path(), b"errada").is_err());
+        // Tem de ser "não há entrada" (e não outro erro qualquer): nada foi gravado.
+        let err = load(dir.path()).unwrap_err();
         assert!(
-            load(dir.path()).is_err(),
-            "uma senha errada não pode ser gravada"
+            err.contains("kin keyring save"),
+            "uma senha errada não pode ser gravada: {err}"
         );
         save_verified(dir.path(), PASS).unwrap();
         assert_eq!(&*load(dir.path()).unwrap(), PASS);
@@ -251,7 +312,11 @@ mod tests {
         crate::keys::load(dir.path(), None, false, KdfParams::MIN).unwrap();
         let err = save_verified(dir.path(), PASS).unwrap_err();
         assert!(err.contains("--protect"), "{err}");
-        assert!(load(dir.path()).is_err());
+        let stored = load(dir.path()).unwrap_err();
+        assert!(
+            stored.contains("kin keyring save"),
+            "nada gravado: {stored}"
+        );
     }
 
     /// De ponta a ponta: a senha que voltou do keyring abre as chaves do diretório.
@@ -331,6 +396,9 @@ mod tests {
             &["save", "hunter2"],
             &["save", "--passphrase=hunter2"],
             &["forget", "--data-dir=hunter2"],
+            // Uma senha pode começar por `--`: nem o nome da "flag" é ecoado.
+            &["save", "--hunter2"],
+            &["forget", "--hunter2"],
         ] {
             let err = parse_strs(bad).unwrap_err();
             assert!(!err.contains("hunter2"), "{bad:?} ecoou a senha: {err}");
