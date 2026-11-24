@@ -1003,8 +1003,50 @@ scenario_protect_migration() {
   check "com o db.key de volta o a sobe de novo" wait_log_n a "reserva aceita no relay" $((n + 1)) 30
 }
 
+contains() { case "$1" in *"$2"*) return 0 ;; esac; return 1; } # texto, trecho
+
+scenario_passwd() {
+  echo "== kin passwd com o binário real: troca a senha das chaves, a conversa sobrevive, a senha velha não abre (P13)"
+  setup cone || { fail "montar o laboratório"; return; }
+  check "mensagem chega com as chaves e os bancos na senha do lab" delivered b a "$DB_TEXT"
+  check "controle: os arquivos estão cifrados antes da troca" db_is_encrypted a
+
+  local before after out out2 n
+  before=$(compose exec -T a sh -c 'cksum /data/identity.key /data/device.key /data/db.key')
+  # A senha atual é a do lab (/tmp/kin-passphrase, do node.sh); a nova vai para outro arquivo 0600.
+  compose exec -T a sh -c "printf 'senha nova do lab\n' > /tmp/new.pass; chmod 600 /tmp/new.pass"
+  out=$(compose exec -T a kin passwd --data-dir /data --passphrase-file /tmp/kin-passphrase \
+    --new-passphrase-file /tmp/new.pass 2>&1) || { fail "kin passwd falhou: $out"; return; }
+  check "passwd diz que trocou as três chaves" contains "$out" "senha trocada em: identity.key, device.key, db.key"
+  after=$(compose exec -T a sh -c 'cksum /data/identity.key /data/device.key /data/db.key')
+  check "os três arquivos mudaram no disco (6 linhas distintas antes e depois)" \
+    [ "$(printf '%s\n%s\n' "$before" "$after" | sort | uniq -u | wc -l)" = 6 ]
+  check "continuam cifrados (chaves e bancos)" db_is_encrypted a
+  # Retomada: repetir o mesmo comando não acha nada para trocar (o que uma queda no meio deixaria pela metade).
+  out2=$(compose exec -T a kin passwd --data-dir /data --passphrase-file /tmp/kin-passphrase \
+    --new-passphrase-file /tmp/new.pass 2>&1) || { fail "kin passwd (repetido) falhou: $out2"; return; }
+  check "repetir o comando não troca nada" contains "$out2" "nada a trocar"
+
+  # Reinicia o `a` na senha nova: a identidade e o estado MLS (db.key) sobrevivem, e a conversa continua.
+  n=$(count_log a "reserva aceita no relay")
+  compose exec -T a sh -c "echo '--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission --passphrase-file /tmp/new.pass' > /tmp/kin-args"
+  compose stop a >/dev/null
+  compose start a >/dev/null
+  wait_log_n a "reserva aceita no relay" $((n + 1)) 30 \
+    || { fail "a não subiu com a senha nova"; logs a | tail -20; return; }
+  say b "depois do passwd"
+  check "a conversa sobreviveu: a mensagem nova chega ao a" wait_log a "peer: depois do passwd" 90
+
+  # A senha velha não abre mais: sem o --passphrase-file do args, o node.sh volta à senha do lab.
+  compose exec -T a sh -c "echo '--data-dir /data --no-mdns --relay $RELAY_ADDR --open-admission' > /tmp/kin-args"
+  compose stop a >/dev/null
+  compose start a >/dev/null
+  check "com a senha velha o a recusa subir" wait_log a "Error: WrongPassphraseOrCorrupt" 20
+}
+
 run_scenario() {
   case "$1" in
+    passwd) scenario_passwd ;;
     cone) scenario_cone ;;
     symmetric) scenario_symmetric ;;
     lossy) scenario_lossy ;;
@@ -1033,7 +1075,7 @@ run_scenario() {
 }
 
 SCENARIOS=("$@")
-[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked invite-approved invite-denied relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart encrypted-db protect-migration)
+[ ${#SCENARIOS[@]} -eq 0 ] && SCENARIOS=(cone symmetric cone-quic symmetric-quic lossy relay-down invite invite-single-use invite-revoked invite-approved invite-denied relay-failover multi-device multi-device-plain history-sync paired-device revoke-device reconnect reconnect-restart encrypted-db protect-migration passwd)
 
 # REPEAT=N roda cada cenário N vezes e resume x/N (o hole punching varia de rodada para rodada).
 REPEAT=${REPEAT:-1}

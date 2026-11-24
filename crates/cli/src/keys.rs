@@ -535,6 +535,88 @@ pub(crate) fn load_or_create_device(
     Ok(device)
 }
 
+/// Os arquivos de chave que a senha sela, na ordem da troca (`db.key` por último).
+const SEALED_KEY_FILES: [&str; 4] = [
+    "identity.key",
+    AUTHORITY_KEY_FILE,
+    "device.key",
+    DB_KEY_FILE,
+];
+
+/// Troca a senha de todos os arquivos de chave de `dir` (P13, `kin passwd`) e devolve os que foram
+/// regravados. Os bancos não são tocados: o SQLCipher usa o `db.key`, e só ele é re-selado.
+///
+/// **Retomável**: um arquivo que já abre com a senha nova é pulado, então repetir o comando depois de
+/// uma queda termina o serviço. Antes de gravar qualquer arquivo, confere **todos**: se algum não abre
+/// nem com a velha nem com a nova, aborta sem gravar nada. Recusa senha nova vazia ou igual à velha,
+/// diretório sem arquivo de chave e arquivo em claro (isso é o `--protect`).
+pub fn change_passphrase(
+    dir: &Path,
+    old: &[u8],
+    new: &[u8],
+    params: KdfParams,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if new.is_empty() {
+        return Err("a senha nova não pode ser vazia".into());
+    }
+    if new == old {
+        return Err("a senha nova é igual à atual".into());
+    }
+    let mut files = Vec::new();
+    for name in SEALED_KEY_FILES {
+        let path = dir.join(name);
+        if present(&path)? {
+            // A troca substitui o arquivo por `rename`: num link, o link some e o alvo segue na senha antiga.
+            if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                return Err(format!(
+                    "{name} é um link simbólico: a troca o substituiria por um arquivo e deixaria o alvo na senha antiga; troque a senha no diretório do arquivo de destino"
+                )
+                .into());
+            }
+            if !kin_identity::key_file_is_sealed(&path)? {
+                return Err(format!(
+                    "{name} está em claro: rode uma vez com --protect para cifrá-lo antes de trocar a senha"
+                )
+                .into());
+            }
+            files.push((name, path));
+        }
+    }
+    if files.is_empty() {
+        return Err("não há arquivo de chave neste --data-dir".into());
+    }
+    // Banco cifrado sem `db.key`: o kin recusaria subir depois da troca, e "senha trocada" seria falso alívio.
+    if !files.iter().any(|(name, _)| *name == DB_KEY_FILE) {
+        for name in DB_FILES {
+            if kin_crypto::db_kind(&dir.join(name))? == kin_crypto::DbKind::Encrypted {
+                return Err(format!(
+                    "há banco cifrado ({name}) mas o {DB_KEY_FILE} não está neste --data-dir: restaure-o do backup antes de trocar a senha"
+                )
+                .into());
+            }
+        }
+    }
+    // Confere todos antes de gravar o primeiro.
+    let mut pending = Vec::new();
+    for (name, path) in &files {
+        let state = kin_identity::rekey_state(path, old, new).map_err(|e| {
+            format!(
+                "{name}: {e} (esta execução não alterou nada; se uma troca anterior foi interrompida, repita com a MESMA senha nova daquela tentativa)"
+            )
+        })?;
+        if state == kin_identity::RekeyState::Old {
+            pending.push((*name, path));
+        }
+    }
+    let mut changed = Vec::new();
+    for (name, path) in pending {
+        kin_identity::rekey_file(path, old, new, params)
+            .map_err(|e| format!("{name}: {e} (repita o comando para terminar a troca)"))?;
+        changed.push(name.to_string());
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,5 +1685,237 @@ mod tests {
             .unwrap();
         assert!(matches!(v3.issuer, Issuer::Master(_)));
         assert!(ensure_current_issuer(&LocalIdentity::Paired(identity), &v3).is_err());
+    }
+
+    // ---- troca de senha de um diretório (P13, `kin passwd`) ----
+
+    const NEW_PASS: &[u8] = b"outra senha";
+
+    /// Bytes de cada arquivo de chave que existe: para provar que nada mudou.
+    fn key_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        SEALED_KEY_FILES
+            .iter()
+            .filter(|name| dir.join(name).exists())
+            .map(|name| (name.to_string(), std::fs::read(dir.join(name)).unwrap()))
+            .collect()
+    }
+
+    fn db_key_bytes(dir: &Path, pass: &[u8]) -> [u8; 32] {
+        *kin_identity::DbKey::load_with(&dir.join(DB_KEY_FILE), pass)
+            .unwrap()
+            .expose_secret()
+    }
+
+    /// Diretório Master com `identity.key`, `device.key` e `db.key`, todos na senha `PASS`.
+    fn master_dir(dir: &Path) -> IdentityId {
+        let (loaded, _) = load(dir, Some(PASS), false, KdfParams::MIN).unwrap();
+        open_db_key(dir, Some(PASS), false, KdfParams::MIN)
+            .unwrap()
+            .unwrap();
+        loaded.id()
+    }
+
+    fn change(dir: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        change_passphrase(dir, PASS, NEW_PASS, KdfParams::MIN)
+    }
+
+    #[test]
+    fn changing_the_passphrase_of_a_master_dir_keeps_identity_device_and_db_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = master_dir(dir.path());
+        let (_, device_before) = load(dir.path(), Some(PASS), false, KdfParams::MIN).unwrap();
+        let db_before = db_key_bytes(dir.path(), PASS);
+
+        let changed = change(dir.path()).unwrap();
+
+        assert_eq!(changed, ["identity.key", "device.key", DB_KEY_FILE]);
+        let (loaded, device) = load(dir.path(), Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert_eq!(loaded.id(), id);
+        assert_eq!(device.peer_id(), device_before.peer_id());
+        assert_eq!(db_key_bytes(dir.path(), NEW_PASS), db_before);
+    }
+
+    #[test]
+    fn after_the_change_the_old_passphrase_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        change(dir.path()).unwrap();
+        assert!(load(dir.path(), Some(PASS), false, KdfParams::MIN).is_err());
+        assert!(kin_identity::DbKey::load_with(&dir.path().join(DB_KEY_FILE), PASS).is_err());
+    }
+
+    #[test]
+    fn changing_the_passphrase_of_a_primary_dir_keeps_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (primary, identity) = cold_init(root.path());
+        primary_load(&primary).unwrap();
+        open_db_key(&primary, Some(PASS), false, KdfParams::MIN)
+            .unwrap()
+            .unwrap();
+
+        let changed = change(&primary).unwrap();
+
+        assert_eq!(changed, [AUTHORITY_KEY_FILE, "device.key", DB_KEY_FILE]);
+        let (loaded, _) = load(&primary, Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert!(matches!(loaded, LocalIdentity::Primary(_)));
+        assert_eq!(loaded.id(), identity);
+    }
+
+    #[test]
+    fn changing_the_passphrase_of_a_paired_dir_keeps_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (dir, identity, _) = paired_dir(root.path());
+        change(&dir).unwrap();
+        let (loaded, _) = load(&dir, Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert!(matches!(loaded, LocalIdentity::Paired(_)));
+        assert_eq!(loaded.id(), identity);
+        assert!(load(&dir, Some(PASS), false, KdfParams::MIN).is_err());
+    }
+
+    #[test]
+    fn a_wrong_old_passphrase_changes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let before = key_bytes(dir.path());
+        assert!(change_passphrase(dir.path(), b"errada", NEW_PASS, KdfParams::MIN).is_err());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    /// Um arquivo que não abre nem com a velha nem com a nova trava a troca **antes** de gravar o primeiro.
+    #[test]
+    fn one_unreadable_file_stops_the_change_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let db_path = dir.path().join(DB_KEY_FILE);
+        std::fs::remove_file(&db_path).unwrap();
+        kin_identity::DbKey::generate()
+            .save_sealed(&db_path, b"terceira senha", KdfParams::MIN)
+            .unwrap();
+        let before = key_bytes(dir.path());
+        assert!(change(dir.path()).is_err());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    /// Queda no meio: o `device.key` já está na senha nova, o resto na velha. Repetir termina o serviço.
+    #[test]
+    fn repeating_the_change_after_an_interruption_finishes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = master_dir(dir.path());
+        let db_before = db_key_bytes(dir.path(), PASS);
+        kin_identity::rekey_file(
+            &dir.path().join("device.key"),
+            PASS,
+            NEW_PASS,
+            KdfParams::MIN,
+        )
+        .unwrap();
+
+        let changed = change(dir.path()).unwrap();
+
+        assert_eq!(changed, ["identity.key", DB_KEY_FILE]);
+        let (loaded, _) = load(dir.path(), Some(NEW_PASS), false, KdfParams::MIN).unwrap();
+        assert_eq!(loaded.id(), id);
+        assert_eq!(db_key_bytes(dir.path(), NEW_PASS), db_before);
+        // Uma terceira vez não encontra nada para trocar nem grava.
+        let before = key_bytes(dir.path());
+        assert!(change(dir.path()).unwrap().is_empty());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn a_plain_key_file_refuses_the_change_and_points_to_protect() {
+        let dir = tempfile::tempdir().unwrap();
+        make_plain(dir.path());
+        let before = key_bytes(dir.path());
+        let err = change(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("--protect"), "{err}");
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn an_empty_or_equal_new_passphrase_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let before = key_bytes(dir.path());
+        assert!(change_passphrase(dir.path(), PASS, b"", KdfParams::MIN).is_err());
+        assert!(change_passphrase(dir.path(), PASS, PASS, KdfParams::MIN).is_err());
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    #[test]
+    fn a_directory_without_key_files_has_nothing_to_change() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(change(dir.path()).is_err());
+    }
+
+    /// Link simbólico: o `rename` o trocaria por um arquivo e o alvo ficaria na senha antiga.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_key_file_refuses_the_change_and_leaves_the_target_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("identity.key");
+        std::fs::rename(dir.path().join("identity.key"), &target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("identity.key")).unwrap();
+        let target_before = std::fs::read(&target).unwrap();
+        let others_before = key_bytes(dir.path());
+
+        let err = change(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains("link simbólico"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), target_before);
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("identity.key"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(key_bytes(dir.path()), others_before);
+    }
+
+    /// Banco cifrado sem `db.key`: "senha trocada" seria falso alívio, o kin recusaria subir.
+    #[test]
+    fn an_encrypted_database_without_the_db_key_refuses_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let key = kin_identity::DbKey::load_with(&dir.path().join(DB_KEY_FILE), PASS).unwrap();
+        let conn = kin_crypto::open_db(&dir.path().join("mls.sqlite"), Some(&key)).unwrap();
+        conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            kin_crypto::db_kind(&dir.path().join("mls.sqlite")).unwrap(),
+            kin_crypto::DbKind::Encrypted
+        );
+        std::fs::remove_file(dir.path().join(DB_KEY_FILE)).unwrap();
+        let before = key_bytes(dir.path());
+
+        let err = change(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains(DB_KEY_FILE), "{err}");
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    /// Repetir depois de uma queda com OUTRA senha nova: não troca nada e diz como se recuperar.
+    #[test]
+    fn retrying_with_a_different_new_passphrase_explains_the_interrupted_change() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        kin_identity::rekey_file(
+            &dir.path().join("identity.key"),
+            PASS,
+            NEW_PASS,
+            KdfParams::MIN,
+        )
+        .unwrap();
+        let before = key_bytes(dir.path());
+
+        let err = change_passphrase(dir.path(), PASS, b"digitada errado", KdfParams::MIN)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("MESMA senha nova"), "{err}");
+        assert_eq!(key_bytes(dir.path()), before);
     }
 }

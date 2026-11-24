@@ -189,6 +189,64 @@ pub(crate) fn protect_with(
     write_secret_atomic(path, &sealed)
 }
 
+/// Em que estado está um arquivo de chave selado numa troca de senha (P13, `kin passwd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RekeyState {
+    /// Abre com a senha velha: ainda falta trocar.
+    Old,
+    /// Já abre com a senha nova (troca anterior, interrompida ou repetida): nada a fazer.
+    New,
+}
+
+/// Abre os bytes selados com a senha nova (`New`) ou, se não abre, com a velha (`Old`). A nova vem
+/// primeiro: é o que torna a troca retomável. Se nenhuma abre: `WrongPassphraseOrCorrupt`.
+fn rekey_open(
+    sealed: &[u8],
+    old: &[u8],
+    new: &[u8],
+) -> Result<(RekeyState, Zeroizing<Vec<u8>>), Error> {
+    if !crate::is_sealed(sealed) {
+        return Err(Error::PlainFileWhereSealedExpected);
+    }
+    if let Ok(plain) = crate::open(sealed, new) {
+        return Ok((RekeyState::New, plain));
+    }
+    Ok((RekeyState::Old, crate::open(sealed, old)?))
+}
+
+/// Diz se o arquivo selado em `path` já está na senha nova ou ainda na velha, sem gravar nada. Serve
+/// para conferir **todos** os arquivos de um diretório antes de trocar qualquer um.
+pub fn rekey_state(path: &Path, old: &[u8], new: &[u8]) -> Result<RekeyState, Error> {
+    Ok(rekey_open(&read_limited(path)?, old, new)?.0)
+}
+
+/// Troca a senha de um arquivo de chave **selado**, no lugar e de forma atômica (P13, `kin passwd`).
+/// Idempotente: se já abre com a senha nova, não grava nada e devolve [`RekeyState::New`]. Senão abre
+/// com a velha, sela com a nova (salt e nonce novos), **reabre** antes de substituir e troca por
+/// `rename`; em qualquer falha o original fica intacto. Recusa senha nova vazia e arquivo em claro.
+///
+/// **Limite**: os blocos do arquivo antigo (senha velha) podem seguir no disco, como no `protect_with`.
+pub fn rekey_file(
+    path: &Path,
+    old: &[u8],
+    new: &[u8],
+    params: KdfParams,
+) -> Result<RekeyState, Error> {
+    if new.is_empty() {
+        return Err(Error::EmptyPassphrase);
+    }
+    let (state, plain) = rekey_open(&read_limited(path)?, old, new)?;
+    if state == RekeyState::New {
+        return Ok(state);
+    }
+    let sealed = crate::seal(&plain, new, params)?;
+    if *crate::open(&sealed, new)? != *plain {
+        return Err(Error::WrongPassphraseOrCorrupt);
+    }
+    write_secret_atomic(path, &sealed)?;
+    Ok(RekeyState::Old)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +373,111 @@ mod tests {
         let err = protect_with(&path, PASS, KdfParams::MIN, reject).unwrap_err();
         assert!(matches!(err, Error::InvalidDeviceKey));
         assert_eq!(fs::read(&path).unwrap(), SECRET);
+    }
+
+    // ---- troca de senha (P13, `kin passwd`) ----
+
+    const NEW_PASS: &[u8] = b"outra senha";
+
+    fn sealed_file(dir: &Path) -> std::path::PathBuf {
+        let path = plain_file(dir);
+        protect_with(&path, PASS, KdfParams::MIN, ok).unwrap();
+        path
+    }
+
+    #[test]
+    fn rekey_moves_the_content_to_the_new_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        let state = rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
+        assert_eq!(state, RekeyState::Old);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&*open(&bytes, NEW_PASS).unwrap(), SECRET);
+        assert!(matches!(
+            open(&bytes, PASS).unwrap_err(),
+            Error::WrongPassphraseOrCorrupt
+        ));
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn rekey_uses_a_fresh_salt_and_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        let before = fs::read(&path).unwrap();
+        rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
+        let after = fs::read(&path).unwrap();
+        // Cabeçalho (magic, versão, custo) igual; salt e nonce (bytes 14..54) mudam.
+        assert_eq!(before[..14], after[..14]);
+        assert_ne!(before[14..54], after[14..54]);
+    }
+
+    #[test]
+    fn rekey_repeated_is_a_no_op_that_reports_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
+        let after_first = fs::read(&path).unwrap();
+        let state = rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
+        assert_eq!(state, RekeyState::New);
+        assert_eq!(fs::read(&path).unwrap(), after_first);
+    }
+
+    #[test]
+    fn rekey_with_a_wrong_old_passphrase_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        let before = fs::read(&path).unwrap();
+        let err = rekey_file(&path, b"errada", NEW_PASS, KdfParams::MIN).unwrap_err();
+        assert!(matches!(err, Error::WrongPassphraseOrCorrupt));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn rekey_refuses_a_plain_file_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = plain_file(dir.path());
+        let err = rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap_err();
+        assert!(matches!(err, Error::PlainFileWhereSealedExpected));
+        assert_eq!(fs::read(&path).unwrap(), SECRET);
+    }
+
+    #[test]
+    fn rekey_to_an_empty_passphrase_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        let before = fs::read(&path).unwrap();
+        let err = rekey_file(&path, PASS, b"", KdfParams::MIN).unwrap_err();
+        assert!(matches!(err, Error::EmptyPassphrase));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn rekey_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("identity.key")]);
+    }
+
+    #[test]
+    fn rekey_state_tells_old_new_and_neither_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_file(dir.path());
+        let before = fs::read(&path).unwrap();
+        assert_eq!(rekey_state(&path, PASS, NEW_PASS).unwrap(), RekeyState::Old);
+        assert!(matches!(
+            rekey_state(&path, b"errada", NEW_PASS).unwrap_err(),
+            Error::WrongPassphraseOrCorrupt
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
+        assert_eq!(rekey_state(&path, PASS, NEW_PASS).unwrap(), RekeyState::New);
     }
 
     #[test]
