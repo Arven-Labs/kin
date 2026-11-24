@@ -102,9 +102,7 @@ fn init_store() -> Result<(), String> {
 
 fn entry(dir: &Path) -> Result<keyring_core::Entry, String> {
     init_store()?;
-    let path = std::fs::canonicalize(dir)
-        .or_else(|_| std::path::absolute(dir))
-        .map_err(|e| format!("caminho do --data-dir inválido: {e}"))?;
+    let path = dir.to_path_buf();
     keyring_core::Entry::new(SERVICE, &path.to_string_lossy()).map_err(|e| format!("keyring: {e}"))
 }
 
