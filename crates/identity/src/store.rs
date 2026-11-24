@@ -436,20 +436,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = sealed_file(dir.path());
         let before = fs::read(&path).unwrap();
-        assert_eq!(
-            rekey_state(&path, PASS, NEW_PASS).unwrap(),
-            RekeyState::Old
-        );
+        assert_eq!(rekey_state(&path, PASS, NEW_PASS).unwrap(), RekeyState::Old);
         assert!(matches!(
             rekey_state(&path, b"errada", NEW_PASS).unwrap_err(),
             Error::WrongPassphraseOrCorrupt
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
         rekey_file(&path, PASS, NEW_PASS, KdfParams::MIN).unwrap();
-        assert_eq!(
-            rekey_state(&path, PASS, NEW_PASS).unwrap(),
-            RekeyState::New
-        );
+        assert_eq!(rekey_state(&path, PASS, NEW_PASS).unwrap(), RekeyState::New);
     }
 
     #[test]
