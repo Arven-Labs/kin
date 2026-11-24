@@ -566,6 +566,13 @@ pub fn change_passphrase(
     for name in SEALED_KEY_FILES {
         let path = dir.join(name);
         if present(&path)? {
+            // A troca substitui o arquivo por `rename`: num link, o link some e o alvo segue na senha antiga.
+            if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                return Err(format!(
+                    "{name} é um link simbólico: a troca o substituiria por um arquivo e deixaria o alvo na senha antiga; troque a senha no diretório do arquivo de destino"
+                )
+                .into());
+            }
             if !kin_identity::key_file_is_sealed(&path)? {
                 return Err(format!(
                     "{name} está em claro: rode uma vez com --protect para cifrá-lo antes de trocar a senha"
@@ -578,11 +585,25 @@ pub fn change_passphrase(
     if files.is_empty() {
         return Err("não há arquivo de chave neste --data-dir".into());
     }
+    // Banco cifrado sem `db.key`: o kin recusaria subir depois da troca, e "senha trocada" seria falso alívio.
+    if !files.iter().any(|(name, _)| *name == DB_KEY_FILE) {
+        for name in DB_FILES {
+            if kin_crypto::db_kind(&dir.join(name))? == kin_crypto::DbKind::Encrypted {
+                return Err(format!(
+                    "há banco cifrado ({name}) mas o {DB_KEY_FILE} não está neste --data-dir: restaure-o do backup antes de trocar a senha"
+                )
+                .into());
+            }
+        }
+    }
     // Confere todos antes de gravar o primeiro.
     let mut pending = Vec::new();
     for (name, path) in &files {
-        let state = kin_identity::rekey_state(path, old, new)
-            .map_err(|e| format!("{name}: {e} (nada foi alterado)"))?;
+        let state = kin_identity::rekey_state(path, old, new).map_err(|e| {
+            format!(
+                "{name}: {e} (esta execução não alterou nada; se uma troca anterior foi interrompida, repita com a MESMA senha nova daquela tentativa)"
+            )
+        })?;
         if state == kin_identity::RekeyState::Old {
             pending.push((*name, path));
         }
@@ -1780,6 +1801,7 @@ mod tests {
     fn repeating_the_change_after_an_interruption_finishes_it() {
         let dir = tempfile::tempdir().unwrap();
         let id = master_dir(dir.path());
+        let db_before = db_key_bytes(dir.path(), PASS);
         kin_identity::rekey_file(
             &dir.path().join("device.key"),
             PASS,
@@ -1793,7 +1815,7 @@ mod tests {
         assert_eq!(changed, ["identity.key", DB_KEY_FILE]);
         let (loaded, _) = load(dir.path(), Some(NEW_PASS), false, KdfParams::MIN).unwrap();
         assert_eq!(loaded.id(), id);
-        assert_eq!(db_key_bytes(dir.path(), NEW_PASS).len(), 32);
+        assert_eq!(db_key_bytes(dir.path(), NEW_PASS), db_before);
         // Uma terceira vez não encontra nada para trocar nem grava.
         let before = key_bytes(dir.path());
         assert!(change(dir.path()).unwrap().is_empty());
@@ -1824,5 +1846,76 @@ mod tests {
     fn a_directory_without_key_files_has_nothing_to_change() {
         let dir = tempfile::tempdir().unwrap();
         assert!(change(dir.path()).is_err());
+    }
+
+    /// Link simbólico: o `rename` o trocaria por um arquivo e o alvo ficaria na senha antiga.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_key_file_refuses_the_change_and_leaves_the_target_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("identity.key");
+        std::fs::rename(dir.path().join("identity.key"), &target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("identity.key")).unwrap();
+        let target_before = std::fs::read(&target).unwrap();
+        let others_before = key_bytes(dir.path());
+
+        let err = change(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains("link simbólico"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), target_before);
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("identity.key"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(key_bytes(dir.path()), others_before);
+    }
+
+    /// Banco cifrado sem `db.key`: "senha trocada" seria falso alívio, o kin recusaria subir.
+    #[test]
+    fn an_encrypted_database_without_the_db_key_refuses_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        let key = kin_identity::DbKey::load_with(&dir.path().join(DB_KEY_FILE), PASS).unwrap();
+        let conn = kin_crypto::open_db(&dir.path().join("mls.sqlite"), Some(&key)).unwrap();
+        conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            kin_crypto::db_kind(&dir.path().join("mls.sqlite")).unwrap(),
+            kin_crypto::DbKind::Encrypted
+        );
+        std::fs::remove_file(dir.path().join(DB_KEY_FILE)).unwrap();
+        let before = key_bytes(dir.path());
+
+        let err = change(dir.path()).unwrap_err().to_string();
+
+        assert!(err.contains(DB_KEY_FILE), "{err}");
+        assert_eq!(key_bytes(dir.path()), before);
+    }
+
+    /// Repetir depois de uma queda com OUTRA senha nova: não troca nada e diz como se recuperar.
+    #[test]
+    fn retrying_with_a_different_new_passphrase_explains_the_interrupted_change() {
+        let dir = tempfile::tempdir().unwrap();
+        master_dir(dir.path());
+        kin_identity::rekey_file(
+            &dir.path().join("identity.key"),
+            PASS,
+            NEW_PASS,
+            KdfParams::MIN,
+        )
+        .unwrap();
+        let before = key_bytes(dir.path());
+
+        let err = change_passphrase(dir.path(), PASS, b"digitada errado", KdfParams::MIN)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("MESMA senha nova"), "{err}");
+        assert_eq!(key_bytes(dir.path()), before);
     }
 }

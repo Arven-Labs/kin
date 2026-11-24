@@ -27,7 +27,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<PasswdCommand, St
             "--data-dir" => command.data_dir = value()?.into(),
             "--passphrase-file" => command.old_file = Some(value()?.into()),
             "--new-passphrase-file" => command.new_file = Some(value()?.into()),
-            other => return Err(format!("argumento desconhecido: {other}")),
+            other if other.starts_with("--") => {
+                // Só o nome: `--new-passphrase=segredo` não pode ser ecoado no terminal.
+                let name = other.split('=').next().unwrap_or(other);
+                return Err(format!("argumento desconhecido: {name}"));
+            }
+            // Sem `--`: pode ser a senha digitada no lugar errado; não ecoa nada.
+            _ => return Err("argumento inesperado (as senhas vão por arquivo ou prompt)".into()),
         }
     }
     Ok(command)
@@ -37,7 +43,7 @@ pub fn run(command: PasswdCommand) -> Result<(), String> {
     let old = crate::cold::passphrase(command.old_file, "senha atual", false)?;
     let new = crate::cold::passphrase(command.new_file, "senha nova", true)?;
     eprintln!(
-        "trocando a senha (Argon2id em cada arquivo; pode levar alguns segundos). Feche o kin que usa este diretório. Se interromper, repita o mesmo comando para terminar a troca."
+        "trocando a senha (Argon2id em cada arquivo; pode levar alguns segundos). O kin que usa este diretório TEM de estar fechado (não há trava de diretório). Se interromper, repita o mesmo comando, com a mesma senha nova, para terminar a troca."
     );
     let changed = crate::keys::change_passphrase(
         &command.data_dir,
@@ -51,7 +57,7 @@ pub fn run(command: PasswdCommand) -> Result<(), String> {
     } else {
         println!("senha trocada em: {}", changed.join(", "));
         eprintln!(
-            "aviso: os arquivos com a senha antiga podem continuar recuperáveis no disco (SSD, snapshot, backup); se a senha antiga vazou, trate a chave como exposta"
+            "aviso: a troca re-sela as MESMAS chaves (a identidade, o device e o db.key não mudaram), e não mexe na mestra fria (que tem senha própria). Os arquivos com a senha antiga podem continuar recuperáveis no disco (SSD, snapshot, backup); se a senha antiga vazou, trate a chave como exposta: quem tem uma cópia antiga e a senha antiga abre a mesma identidade"
         );
     }
     Ok(())
@@ -94,5 +100,14 @@ mod tests {
         assert!(parse_strs(&["--protect"]).is_err());
         assert!(parse_strs(&["--no-passphrase"]).is_err());
         assert!(parse_strs(&["--new-passphrase-file"]).is_err());
+    }
+
+    /// A senha digitada no lugar errado (flag com `=` ou argumento solto) nunca volta no erro.
+    #[test]
+    fn a_parse_error_never_echoes_a_passphrase() {
+        for bad in ["--new-passphrase=hunter2", "hunter2"] {
+            let err = parse_strs(&[bad]).unwrap_err();
+            assert!(!err.contains("hunter2"), "ecoou a senha: {err}");
+        }
     }
 }
