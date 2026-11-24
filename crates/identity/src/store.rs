@@ -235,10 +235,7 @@ pub fn rekey_file(
     if new.is_empty() {
         return Err(Error::EmptyPassphrase);
     }
-    let (state, plain) = rekey_open(&read_limited(path)?, old, new)?;
-    if state == RekeyState::New {
-        return Ok(state);
-    }
+    let (_state, plain) = rekey_open(&read_limited(path)?, old, new)?;
     let sealed = crate::seal(&plain, new, params)?;
     if *crate::open(&sealed, new)? != *plain {
         return Err(Error::WrongPassphraseOrCorrupt);
