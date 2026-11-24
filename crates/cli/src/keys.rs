@@ -566,12 +566,6 @@ pub fn change_passphrase(
     for name in SEALED_KEY_FILES {
         let path = dir.join(name);
         if present(&path)? {
-            if !kin_identity::key_file_is_sealed(&path)? {
-                return Err(format!(
-                    "{name} está em claro: rode uma vez com --protect para cifrá-lo antes de trocar a senha"
-                )
-                .into());
-            }
             files.push((name, path));
         }
     }
