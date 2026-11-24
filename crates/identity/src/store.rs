@@ -198,19 +198,53 @@ pub enum RekeyState {
     New,
 }
 
-/// Esqueleto do commit de testes: ainda não implementado.
-pub fn rekey_state(_path: &Path, _old: &[u8], _new: &[u8]) -> Result<RekeyState, Error> {
-    Err(Error::InvalidSealedFile)
+/// Abre os bytes selados com a senha nova (`New`) ou, se não abre, com a velha (`Old`). A nova vem
+/// primeiro: é o que torna a troca retomável. Se nenhuma abre: `WrongPassphraseOrCorrupt`.
+fn rekey_open(
+    sealed: &[u8],
+    old: &[u8],
+    new: &[u8],
+) -> Result<(RekeyState, Zeroizing<Vec<u8>>), Error> {
+    if !crate::is_sealed(sealed) {
+        return Err(Error::PlainFileWhereSealedExpected);
+    }
+    if let Ok(plain) = crate::open(sealed, new) {
+        return Ok((RekeyState::New, plain));
+    }
+    Ok((RekeyState::Old, crate::open(sealed, old)?))
 }
 
-/// Esqueleto do commit de testes: ainda não implementado.
+/// Diz se o arquivo selado em `path` já está na senha nova ou ainda na velha, sem gravar nada. Serve
+/// para conferir **todos** os arquivos de um diretório antes de trocar qualquer um.
+pub fn rekey_state(path: &Path, old: &[u8], new: &[u8]) -> Result<RekeyState, Error> {
+    Ok(rekey_open(&read_limited(path)?, old, new)?.0)
+}
+
+/// Troca a senha de um arquivo de chave **selado**, no lugar e de forma atômica (P13, `kin passwd`).
+/// Idempotente: se já abre com a senha nova, não grava nada e devolve [`RekeyState::New`]. Senão abre
+/// com a velha, sela com a nova (salt e nonce novos), **reabre** antes de substituir e troca por
+/// `rename`; em qualquer falha o original fica intacto. Recusa senha nova vazia e arquivo em claro.
+///
+/// **Limite**: os blocos do arquivo antigo (senha velha) podem seguir no disco, como no `protect_with`.
 pub fn rekey_file(
-    _path: &Path,
-    _old: &[u8],
-    _new: &[u8],
-    _params: KdfParams,
+    path: &Path,
+    old: &[u8],
+    new: &[u8],
+    params: KdfParams,
 ) -> Result<RekeyState, Error> {
-    Err(Error::InvalidSealedFile)
+    if new.is_empty() {
+        return Err(Error::EmptyPassphrase);
+    }
+    let (state, plain) = rekey_open(&read_limited(path)?, old, new)?;
+    if state == RekeyState::New {
+        return Ok(state);
+    }
+    let sealed = crate::seal(&plain, new, params)?;
+    if *crate::open(&sealed, new)? != *plain {
+        return Err(Error::WrongPassphraseOrCorrupt);
+    }
+    write_secret_atomic(path, &sealed)?;
+    Ok(RekeyState::Old)
 }
 
 #[cfg(test)]
